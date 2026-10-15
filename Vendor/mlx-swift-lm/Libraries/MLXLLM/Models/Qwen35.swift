@@ -224,6 +224,27 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+// Cache the recurrent graph, with layer parameters and state supplied on every call.
+private let qwen35CompiledGatedDelta = compile { (inputs: [MLXArray]) -> [MLXArray] in
+    let result = gatedDeltaUpdate(
+        q: inputs[0], k: inputs[1], v: inputs[2], a: inputs[3], b: inputs[4],
+        aLog: inputs[5], dtBias: inputs[6], state: inputs[7])
+    return [result.0, result.1]
+}
+
+private func qwen35GatedDeltaUpdate(
+    q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+) -> (MLXArray, MLXArray) {
+    guard let state, mask == nil else {
+        return gatedDeltaUpdate(
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: state, mask: mask)
+    }
+    let result = qwen35CompiledGatedDelta([q, k, v, a, b, aLog, dtBias, state])
+    return (result[0], result[1])
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -578,7 +599,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = qwen35GatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -627,7 +648,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let recurrence = gatedDeltaUpdate(
+        let recurrence = qwen35GatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -704,7 +725,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = gatedDeltaUpdate(
+        let boundarySsm = qwen35GatedDeltaUpdate(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -973,7 +994,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = gatedDeltaUpdate(
+            let recurrence = qwen35GatedDeltaUpdate(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1074,7 +1095,7 @@ final class Qwen35GatedDeltaNet: Module {
             ssmStates.reserveCapacity(S)
             var state = ssmState
             for s in 0 ..< S {
-                let (stepOut, next) = gatedDeltaUpdate(
+                let (stepOut, next) = qwen35GatedDeltaUpdate(
                     q: qNormed[0..., s ..< (s + 1)],
                     k: kNormed[0..., s ..< (s + 1)],
                     v: v[0..., s ..< (s + 1)],
