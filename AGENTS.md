@@ -53,16 +53,16 @@ their names for the same reason.
 
 THE TARGET IS THE TERNARY BONSAI 2 9B MLX PACK:
 `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-`b94a52f3ce9047919dce00392a0fc6b8a7968abe`. It is `prism_hadamard_qwen35`,
+`f4e28a59531731c41b6dfac88cf271bd58f0a287`. It is `prism_hadamard_qwen35`,
 schema 2, affine 2-bit at group 128, with a signed block-4096 Walsh-Hadamard
 transform on the input of each of its 202 packed modules. Its
 `model.safetensors` holds 1366 tensors: 1033 `language_model.*` and 333
-`vision_tower.*`. The target manifest pins 21 files. The pack's `config.json`
+`vision_tower.*`. The target manifest pins 22 files. The pack's `config.json`
 is checked in as `fixtures/bonsai2_9b_config.json`, and its tensor inventory
 as `fixtures/bonsai2_9b_tensor_inventory.json`.
 
 The MTP head is the pack's own `mtp/` folder of the same revision: a standalone
-`qwen3_5_mtp` export of 15 FP16 tensors, unquantized, block size 2. Its manifest
+`qwen3_5_mtp` export of 31 tensors, re-quantized to 4-bit affine group-64, block size 2. Its manifest
 pins 2 files (`config.json` and `model.safetensors`), relative to `mtp/`, and
 `./setup-mtp-head.sh` fetches only those. The head's `config.json` restates the
 trunk's `text_config`, with `mtp_num_hidden_layers: 0`. The vendored loader
@@ -133,8 +133,8 @@ in git.
 The two public captures for the local modes are different material. They ship
 in this repository under `correctness_prompts/bonsai2-9b-mlx-v1/`, so a local
 test needs no R2 access. The organizer recorded them on M5 box 2 against the
-pack: `public-local-iterate.golden.json` (`62d69f79`, 10670 bytes, 256
-expected tokens) and `public-local-submit.golden.json` (`341f6095`, 21052
+pack: `public-local-iterate.golden.json` (`706f20bd`, 10670 bytes, 256
+expected tokens) and `public-local-submit.golden.json` (`1eda8bf6`, 21052
 bytes, 1024 expected tokens). Generations A and B are byte-identical.
 `Tests/MLXFastTests/GoldenTests.swift` pins both digests and sizes. Never
 commit a hidden golden, a pool tape, a prompt file or an R2 key.

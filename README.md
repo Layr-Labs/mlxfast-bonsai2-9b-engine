@@ -5,7 +5,7 @@ track identifier is `bonsai2-9b-mlx-v1`.
 
 > **NOTE — the target is the Ternary Bonsai 2 9B MLX pack.**
 > The target is `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-> `b94a52f3ce9047919dce00392a0fc6b8a7968abe`. The pack is built on
+> `f4e28a59531731c41b6dfac88cf271bd58f0a287`. The pack is built on
 > Qwen/Qwen3.5-9B. It is affine 2-bit at group 128, with a signed block-4096
 > Walsh-Hadamard transform. The MTP head is the pack's own `mtp/` folder.
 > The repository is private until prism-ml makes it public. You need read
@@ -203,8 +203,8 @@ against the pack. Generations A and B are byte-identical.
 
 | Capture | Path | sha256 prefix | Bytes | Expected tokens | Use |
 |---|---|---|---|---|---|
-| Short | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-iterate.golden.json` | `62d69f79` | 10670 | 256 | `--local-iterate`. The drift tripwire. |
-| Long | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-submit.golden.json` | `341f6095` | 21052 | 1024 | `--local-submit`. The long capture. |
+| Short | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-iterate.golden.json` | `706f20bd` | 10670 | 256 | `--local-iterate`. The drift tripwire. |
+| Long | `correctness_prompts/bonsai2-9b-mlx-v1/public-local-submit.golden.json` | `1eda8bf6` | 21052 | 1024 | `--local-submit`. The long capture. |
 
 Nothing fetches them, and no environment variable is needed to use them. The
 hidden goldens are different material: they live in R2 and on the ranked box.
@@ -216,7 +216,7 @@ See the note at the top of this file.
 > golden that carries no block. The error message names `model_provenance`.
 > The loader does not skip the check when the block is absent. The loader
 > accepts only the pack's pin, `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-> `b94a52f3ce9047919dce00392a0fc6b8a7968abe`.
+> `f4e28a59531731c41b6dfac88cf271bd58f0a287`.
 
 ## Repository structure
 
@@ -289,7 +289,7 @@ This track has one declarable speculative decoder, the MTP head. The pack's
 `model.safetensors` carries no head, and its `config.json` declares
 `mtp_num_hidden_layers: 0`. The head is the pack's own trained drafter in the
 `mtp/` folder of the same repository and revision. It is a standalone
-`qwen3_5_mtp` export of 15 FP16 tensors, used unmodified.
+`qwen3_5_mtp` export of 31 tensors, used unmodified.
 `fixtures/reference_bonsai2_9b_mtp_head.sha256` pins the two files of that
 folder, `config.json` and `model.safetensors`. The paths in that manifest are
 relative to `mtp/`.
@@ -301,11 +301,11 @@ head's tensors instead: the `layers.<i>.` indices must be `0..<n`, with n from
 
 | Property | Value |
 |---|---|
-| Repository | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `b94a52f3ce9047919dce00392a0fc6b8a7968abe`, folder `mtp/` |
+| Repository | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `f4e28a59531731c41b6dfac88cf271bd58f0a287`, folder `mtp/` |
 | Model type | `qwen3_5_mtp` |
 | Hidden layers | 1, full attention. Read off the tensors. |
-| Tensors | 15, FP16, no name prefix, 486,581,248 tensor bytes |
-| Quantization | None |
+| Tensors | 31, no name prefix, 136,881,152 tensor bytes |
+| Quantization | Affine, group size 64, 4 bits |
 | Block size | 2 |
 | Embeddings | None of its own. It rides the target's embeddings and output head. |
 | Permitted draft depths | 1 to 6 |
@@ -788,9 +788,9 @@ Eight statements are true right now.
 
 1. The target is the Ternary Bonsai 2 9B MLX pack,
    `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-   `b94a52f3ce9047919dce00392a0fc6b8a7968abe`. `target.upstream_model_id`,
+   `f4e28a59531731c41b6dfac88cf271bd58f0a287`. `target.upstream_model_id`,
    `target.upstream_revision`, the MTP head's pins and the license name it.
-   `fixtures/reference_bonsai2_9b_2bit.sha256` pins 21 files of it, and
+   `fixtures/reference_bonsai2_9b_2bit.sha256` pins 22 files of it, and
    `fixtures/reference_bonsai2_9b_mtp_head.sha256` pins the 2 files of its
    `mtp/` folder.
 2. The repository is private until prism-ml makes it public. `./setup.sh`
@@ -893,7 +893,7 @@ No local run blocks the upload. Run the local test yourself before you submit.
 
 | Artifact | Identity |
 |---|---|
-| Target model | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `b94a52f3ce9047919dce00392a0fc6b8a7968abe`, a 2-bit `prism_hadamard_qwen35` pack of `Qwen/Qwen3.5-9B`. Private until prism-ml makes it public. |
+| Target model | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `f4e28a59531731c41b6dfac88cf271bd58f0a287`, a 2-bit `prism_hadamard_qwen35` pack of `Qwen/Qwen3.5-9B`. Private until prism-ml makes it public. |
 | Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (21 records: one `model.safetensors`, no index, `hadamard.json`) |
 | Target config and inventory | `fixtures/bonsai2_9b_config.json` (the pack's `config.json`, verbatim) and `fixtures/bonsai2_9b_tensor_inventory.json` |
 | MTP head | The pack's own `mtp/` drafter, pinned by `fixtures/reference_bonsai2_9b_mtp_head.sha256` (2 records, paths relative to `mtp/`) |

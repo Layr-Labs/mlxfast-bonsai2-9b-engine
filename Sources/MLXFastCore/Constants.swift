@@ -1,7 +1,7 @@
 public enum MLXFastConstants {
     // Bonsai 2 9B track identity (`bonsai2-9b-mlx-v1`).
     //
-    // THE TARGET is prism-ml/Ternary-Bonsai-2-9B-mlx-2bit @ b94a52f3:
+    // THE TARGET is prism-ml/Ternary-Bonsai-2-9B-mlx-2bit @ f4e28a59:
     // `model_type` "prism_hadamard_qwen35", 2-bit affine group-128 codes and
     // a signed block-4096 Walsh-Hadamard transform on the Qwen 3.5 9B
     // backbone. `pendingOrganizerSentinel` is what a pin carries when nothing
@@ -26,7 +26,7 @@ public enum MLXFastConstants {
     // ship in this repository under correctness_prompts/bonsai2-9b-mlx-v1/.
     public static let pendingOrganizerSentinel = "BONSAI-MLX-PENDING-ORGANIZER"
     public static let referenceModelRepository = "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit"
-    public static let referenceModelRevision = "b94a52f3ce9047919dce00392a0fc6b8a7968abe"
+    public static let referenceModelRevision = "f4e28a59531731c41b6dfac88cf271bd58f0a287"
     public static let referenceModelName = "bonsai2-9b-target"
     public static let defaultReferencePath = "reference_weights/bonsai2-9b-target"
     public static let defaultWeightsPath = "weights"

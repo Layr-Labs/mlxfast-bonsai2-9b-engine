@@ -9,7 +9,7 @@
 #
 # THE HEAD IS THE PACK'S OWN TRAINED DRAFTER. prism-ml ships it as the mtp/
 # folder of the target's repository and revision: a standalone qwen3_5_mtp
-# export (config.json and one model.safetensors, 15 FP16 tensors). The head pin
+# export (config.json and one model.safetensors, 31 tensors, 4-bit affine group-64). The head pin
 # names those two files, with paths relative to mtp/, and only those are
 # fetched, unmodified, into their own directory. The repository is private
 # until prism-ml makes it public: set HF_TOKEN, exactly as for ./setup.sh.
@@ -40,7 +40,7 @@ cd "${ROOT_DIR}"
 
 TRACK_ID="bonsai2-9b-mlx-v1"
 HEAD_REPO="${MLXFAST_MTP_HEAD_REPO:-prism-ml/Ternary-Bonsai-2-9B-mlx-2bit}"
-HEAD_REVISION="${MLXFAST_MTP_HEAD_REVISION:-b94a52f3ce9047919dce00392a0fc6b8a7968abe}"
+HEAD_REVISION="${MLXFAST_MTP_HEAD_REVISION:-f4e28a59531731c41b6dfac88cf271bd58f0a287}"
 HEAD_BASE_URL="${MLXFAST_MTP_HEAD_BASE_URL:-https://huggingface.co/${HEAD_REPO}/resolve/${HEAD_REVISION}/mtp}"
 HEAD_MANIFEST="${MLXFAST_MTP_HEAD_MANIFEST_PATH:-fixtures/reference_bonsai2_9b_mtp_head.sha256}"
 HEAD_DIR="${MLXFAST_MTP_HEAD_DIR:-reference_weights/bonsai2-9b-mtp-head}"

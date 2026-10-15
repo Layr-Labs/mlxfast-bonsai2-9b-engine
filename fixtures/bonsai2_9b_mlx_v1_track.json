@@ -72,7 +72,7 @@
   "mlx_swift_lm_revision": "859f4d97e0d1ae9cce0883b044f764283841edfb",
   "target": {
     "upstream_model_id": "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit",
-    "upstream_revision": "b94a52f3ce9047919dce00392a0fc6b8a7968abe",
+    "upstream_revision": "f4e28a59531731c41b6dfac88cf271bd58f0a287",
     "model_type": "prism_hadamard_qwen35",
     "base_model_type": "qwen3_5",
     "text_model_type": "qwen3_5_text",
@@ -175,15 +175,14 @@
     "role": "spec_decode_mtp_head",
     "source": "target_repository_folder",
     "upstream_model_id": "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit",
-    "upstream_revision": "b94a52f3ce9047919dce00392a0fc6b8a7968abe",
+    "upstream_revision": "f4e28a59531731c41b6dfac88cf271bd58f0a287",
     "upstream_folder": "mtp",
     "model_type": "qwen3_5_mtp",
     "manifest_path": "fixtures/reference_bonsai2_9b_mtp_head.sha256",
     "declaration_path": "mtp-head.manifest.json",
     "tensor_prefix": "",
-    "tensor_count": 15,
-    "tensor_bytes": 486581248,
-    "tensor_dtype": "float16",
+    "tensor_count": 31,
+    "tensor_bytes": 136881152,
     "num_hidden_layers": 1,
     "block_size": 2,
     "hybrid": false,
@@ -194,6 +193,11 @@
     "use_dedicated_embeddings": false,
     "shares_target_embed_tokens": true,
     "shares_target_lm_head": true,
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4
+    },
     "permitted_draft_depths": [
       1,
       2,
@@ -260,7 +264,7 @@
   "license": {
     "spdx": "Apache-2.0",
     "license_name": "apache-2.0",
-    "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-mlx-2bit/blob/b94a52f3ce9047919dce00392a0fc6b8a7968abe/LICENSE",
+    "url": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-mlx-2bit/blob/f4e28a59531731c41b6dfac88cf271bd58f0a287/LICENSE",
     "verified_repositories": [
       "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit"
     ]

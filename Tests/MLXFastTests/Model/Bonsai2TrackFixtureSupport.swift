@@ -10,14 +10,14 @@ import Testing
 /// Exact-match only, never a prefix check.
 let bonsai2PendingSentinel = "BONSAI-MLX-PENDING-ORGANIZER"
 
-/// THE TARGET. `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ b94a52f3 is the
+/// THE TARGET. `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ f4e28a59 is the
 /// Ternary Bonsai 2 9B MLX pack. Its `config.json` is checked in VERBATIM as
 /// `fixtures/bonsai2_9b_config.json`, and its tensor inventory (read off the
 /// published shard header) as `fixtures/bonsai2_9b_tensor_inventory.json`. The
 /// digest below is the config fixture's own digest and the target manifest's
 /// `config.json` record; a test holds them together.
 let bonsai2PackRepository = "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit"
-let bonsai2PackRevision = "b94a52f3ce9047919dce00392a0fc6b8a7968abe"
+let bonsai2PackRevision = "f4e28a59531731c41b6dfac88cf271bd58f0a287"
 let bonsai2PackConfigSHA256 =
     "b028784e087316b7ce0fb7ae3d2d6eaeb0b15144dd3f234da4c5d57ef1ffbacb"
 let bonsai2PackConfigByteCount = 30_202

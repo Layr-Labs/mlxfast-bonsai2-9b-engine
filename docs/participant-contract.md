@@ -44,8 +44,8 @@ speculative-decode arm.
 THE TARGET IS THE TERNARY BONSAI 2 9B MLX PACK of `Qwen/Qwen3.5-9B`. The
 contract's `target.upstream_model_id` and `target.upstream_revision` name
 `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-`b94a52f3ce9047919dce00392a0fc6b8a7968abe`. `fixtures/reference_bonsai2_9b_2bit.sha256`
-pins 21 of its files: one `model.safetensors` (1366 tensors, 3,462,149,260
+`f4e28a59531731c41b6dfac88cf271bd58f0a287`. `fixtures/reference_bonsai2_9b_2bit.sha256`
+pins 22 of its files: one `model.safetensors` (1366 tensors, 3,462,149,260
 bytes), no index, `hadamard.json`, the tokenizer files and the pack's
 metadata files. `fixtures/bonsai2_9b_config.json` is the pack's `config.json`,
 verbatim, and `fixtures/bonsai2_9b_tensor_inventory.json` is its tensor
@@ -107,8 +107,8 @@ The speculative-decode arm has ONE declarable decoder, an MTP head: one
 `qwen3_5_mtp` full-attention layer for the Qwen 3.5 9B geometry. It is the
 pack's own trained drafter in the `mtp/` folder of the same repository and
 revision (`mtp_head.source: "target_repository_folder"`,
-`mtp_head.upstream_folder: "mtp"`): 15 FP16 tensors with no name prefix,
-unquantized, block size 2. The head has no embedding table or `lm_head` of its
+`mtp_head.upstream_folder: "mtp"`): 31 tensors with no name prefix,
+re-quantized to 4-bit affine group-64, block size 2. The head has no embedding table or `lm_head` of its
 own. It rides the target's, which is what `use_dedicated_embeddings: false`
 means here.
 
@@ -313,7 +313,7 @@ This track declares `"mtp"` and `"dflash"`. The key is optional and reads as
 | Declaration | `mtp-head.manifest.json` |
 | Where the weights are | Staged on their own, `reference_weights/bonsai2-9b-mtp-head` |
 | Organizer pin | The pack's own `mtp/` drafter, `fixtures/reference_bonsai2_9b_mtp_head.sha256` (2 files) |
-| Shape | 1 full-attention `qwen3_5_mtp` hidden layer, 15 FP16 tensors, 486,581,248 tensor bytes, unquantized |
+| Shape | 1 full-attention `qwen3_5_mtp` hidden layer, 31 tensors, 136,881,152 tensor bytes, re-quantized to 4-bit affine group-64 |
 | Declaration cap | 2 GiB |
 | Permitted draft depths | 1 to 6 |
 | Staged by | `./setup-mtp-head.sh` |
@@ -996,7 +996,7 @@ carries the sentinel `BONSAI-MLX-PENDING-ORGANIZER` is refused by name.
 
 | Artifact | Identity |
 |---|---|
-| Target model | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `b94a52f3ce9047919dce00392a0fc6b8a7968abe`, a 2-bit `prism_hadamard_qwen35` pack of `Qwen/Qwen3.5-9B`. Private until prism-ml makes it public. |
+| Target model | `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `f4e28a59531731c41b6dfac88cf271bd58f0a287`, a 2-bit `prism_hadamard_qwen35` pack of `Qwen/Qwen3.5-9B`. Private until prism-ml makes it public. |
 | Target manifest | `fixtures/reference_bonsai2_9b_2bit.sha256` (21 records, 3,475,218,619 bytes) |
 | MTP head | The pack's own `mtp/` drafter, `fixtures/reference_bonsai2_9b_mtp_head.sha256` (2 records, 486,584,873 bytes, paths relative to `mtp/`) |
 | Pack config and inventory | `fixtures/bonsai2_9b_config.json` (30,202 bytes, the pack's `config.json` verbatim), `fixtures/bonsai2_9b_tensor_inventory.json` (1,366 tensors in 1 shard) |
@@ -1205,9 +1205,9 @@ The public captures are the goldens that `--local-iterate` and
 The organizer records both on the track's box, against the pinned target, in
 one recording, so the short capture is the long capture truncated. The shipped
 captures were recorded on M5 box 2 against the pack, and generations A and B
-are byte-identical. `public-local-iterate.golden.json` is `62d69f79…`, 10670
+are byte-identical. `public-local-iterate.golden.json` is `706f20bd…`, 10670
 bytes, with 256 expected tokens. `public-local-submit.golden.json` is
-`341f6095…`, 21052 bytes, with 1024 expected tokens.
+`1eda8bf6…`, 21052 bytes, with 1024 expected tokens.
 `Tests/MLXFastTests/GoldenTests.swift` pins both. Nothing fetches them and no
 environment variable is needed. The hidden goldens are different
 material (section 5.6): they live in R2 and on the ranked box, and
@@ -1218,7 +1218,7 @@ checkout.
 the revision of the pinned model. `loadQwenGoldenFixture` is the loader that
 every golden consumer in `Sources/` calls, and it refuses a golden that carries
 no block. The error message names `model_provenance`. The reference pin is the
-pack, `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `b94a52f3`. A pin that carries
+pack, `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `f4e28a59`. A pin that carries
 the sentinel refuses every
 golden that names a checkpoint, by name. The
 model-agnostic `loadGoldenFixture` keeps the reference schema, which has no

@@ -15,7 +15,7 @@ optimize the speculative-decode arm.
 
 > **NOTE — the target is private until prism-ml makes it public.**
 > The target is `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @
-> `b94a52f3ce9047919dce00392a0fc6b8a7968abe`. You need read access to that
+> `f4e28a59531731c41b6dfac88cf271bd58f0a287`. You need read access to that
 > repository. Set `HF_TOKEN` to a Hugging Face token that has that access
 > before you run `./setup.sh`. Do not commit the token or print it.
 
@@ -43,7 +43,7 @@ pinned as two files of that folder.
 
 | Decoder | Export | Staged by | Depths |
 |---|---|---|---|
-| MTP head | The pack's own `mtp/` drafter, one FP16 `qwen3_5_mtp` layer | `./setup-mtp-head.sh` | 1 to 6 |
+| MTP head | The pack's own `mtp/` drafter, one 4-bit `qwen3_5_mtp` layer | `./setup-mtp-head.sh` | 1 to 6 |
 
 The MTP head proposes one token at a time. No DFlash 2 drafter exists for the
 Qwen 3.5 9B geometry, so this track declares no DFlash 2 decoder.

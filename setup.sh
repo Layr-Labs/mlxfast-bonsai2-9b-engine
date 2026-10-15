@@ -2,7 +2,7 @@
 # Bootstrap system tools and build the Swift-only Bonsai 2 9B harness.
 set -euo pipefail
 
-# THE TARGET is prism-ml/Ternary-Bonsai-2-9B-mlx-2bit @ b94a52f3: the Ternary
+# THE TARGET is prism-ml/Ternary-Bonsai-2-9B-mlx-2bit @ f4e28a59: the Ternary
 # Bonsai 2 9B MLX pack, affine 2-bit at group 128 with a signed block-4096
 # Hadamard transform, on the Qwen 3.5 9B backbone. The repository and the
 # revision below agree byte-for-byte with
@@ -26,7 +26,7 @@ set -euo pipefail
 # here stays env-overridable.
 PENDING_ORGANIZER_SENTINEL="BONSAI-MLX-PENDING-ORGANIZER"
 REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-prism-ml/Ternary-Bonsai-2-9B-mlx-2bit}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-b94a52f3ce9047919dce00392a0fc6b8a7968abe}"
+REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-f4e28a59531731c41b6dfac88cf271bd58f0a287}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
 REFERENCE_CACHE_REVISION_DIR="${REFERENCE_REVISION//\//--}"
 # No organizer-hosted mirror exists for this checkpoint yet (the Darkbloom R2
@@ -978,7 +978,7 @@ reference_manifest_totals() {
 # artifacts whose metadata trees legitimately disagree. The target
 # (fixtures/reference_bonsai2_9b_2bit.sha256) and the MTP head
 # (fixtures/reference_bonsai2_9b_mtp_head.sha256) pin the same repository and
-# revision: the target pins 21 records, one safetensors shard, no index and
+# revision: the target pins 22 records, one safetensors shard, no index and
 # hadamard.json, and the head pins the 2 records of the mtp/ folder (config.json
 # and its one shard). On the Ternary Bonsai 2 27B track the target pinned 19 records, one
 # safetensors shard and no model.safetensors.index.json (the index is optional

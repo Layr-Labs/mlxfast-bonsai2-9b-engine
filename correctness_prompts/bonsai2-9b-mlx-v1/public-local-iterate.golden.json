@@ -3,7 +3,7 @@
   "model_type": "prism_hadamard_qwen35",
   "model_provenance": {
     "repository": "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit",
-    "revision": "b94a52f3ce9047919dce00392a0fc6b8a7968abe"
+    "revision": "f4e28a59531731c41b6dfac88cf271bd58f0a287"
   },
   "cases": [
     {
