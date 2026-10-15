@@ -225,13 +225,15 @@ private enum Float16ConstantQMV {
                 x_thread[i + 3] = xp[i + 3] / 64.0f;
               }
               for (int r = 0; r < 4; r++) {
-                const device uint8_t* wl = ws + r * in_w;
+                // Each lane owns four aligned bytes (16 packed 2-bit weights).
+                const uint packed = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
                 const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
-                  accum += (x_thread[4 * i] * (wl[i] & 0x03) + x_thread[4 * i + 1] * (wl[i] & 0x0c)
-                      + x_thread[4 * i + 2] * (wl[i] & 0x30) + x_thread[4 * i + 3] * (wl[i] & 0xc0));
+                  const uint q = packed >> (8 * i);
+                  accum += (x_thread[4 * i] * (q & 0x03u) + x_thread[4 * i + 1] * (q & 0x0cu)
+                      + x_thread[4 * i + 2] * (q & 0x30u) + x_thread[4 * i + 3] * (q & 0xc0u));
                 }
                 result[r] += s * accum + sum * b;
               }
