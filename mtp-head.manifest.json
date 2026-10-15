@@ -4,7 +4,7 @@
   "max_bytes": 2147483648,
   "spec": {
     "decoder": "mtp",
-    "enabled": false,
-    "num_speculative_tokens": 0
+    "enabled": true,
+    "num_speculative_tokens": 3
   }
 }
