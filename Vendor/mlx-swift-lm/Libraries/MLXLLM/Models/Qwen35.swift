@@ -495,6 +495,19 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            if let qkv = inProjQKV as? HadamardQuantizedLinear,
+                let z = inProjZ as? HadamardQuantizedLinear,
+                qkv.gdnLayout == nil, z.gdnLayout == nil,
+                qkv.transform.sharesTransform(with: z.transform)
+            {
+                let rotated = qkv.transform(inputs)
+                return (
+                    qkv.forwardTransformed(rotated),
+                    z.forwardTransformed(rotated).reshaped(B, S, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
@@ -1169,23 +1182,37 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    private func inputProjections(_ x: MLXArray) -> (
+        q: MLXArray, k: MLXArray, v: MLXArray
+    ) {
+        if let q = qProj as? HadamardQuantizedLinear,
+            let k = kProj as? HadamardQuantizedLinear,
+            let v = vProj as? HadamardQuantizedLinear,
+            q.gdnLayout == nil, k.gdnLayout == nil, v.gdnLayout == nil,
+            q.transform.sharesTransform(with: k.transform),
+            q.transform.sharesTransform(with: v.transform)
+        {
+            let rotated = q.transform(x)
+            return (q.forwardTransformed(rotated), k.forwardTransformed(rotated),
+                    v.forwardTransformed(rotated))
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let (qProjOutput, kProjection, vProjection) = inputProjections(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
-
         queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = vProjection.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
@@ -1212,17 +1239,16 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+        let (qProjOutput, kProjection, vProjection) = exactTargetVerify
+            ? (qwen35A3BExactW4G64Projection(qProj, x),
+               qwen35A3BExactW4G64Projection(kProj, x),
+               qwen35A3BExactW4G64Projection(vProj, x))
+            : inputProjections(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
-        let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
