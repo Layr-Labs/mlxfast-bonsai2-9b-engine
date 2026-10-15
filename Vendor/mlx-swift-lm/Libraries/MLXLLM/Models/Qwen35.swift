@@ -246,6 +246,16 @@ final class Qwen35GatedDeltaNet: Module {
     private var fusedInProj: Linear?
     private var fusedInputSourceSignature: [MLXArray]?
     private var fusedInputPermanentlyIneligible = false
+    // Retain qualified modules: identity cannot be recycled after replacement,
+    // and a hot forward allocates no temporary identity array.
+    // Module reflection descends into tuples, but treats this plain holder as
+    // non-module metadata even when item caches are rebuilt after a forward.
+    private struct SharedHadamardProjectionPair {
+        let qkv: HadamardQuantizedLinear
+        let z: HadamardQuantizedLinear
+    }
+    private var sharedHadamardProjections: SharedHadamardProjectionPair?
+    private var sharedHadamardTransformsMatch = false
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -335,6 +345,8 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            sharedHadamardProjections = nil
+            sharedHadamardTransformsMatch = false
         }
         return result
     }
@@ -347,6 +359,8 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            sharedHadamardProjections = nil
+            sharedHadamardTransformsMatch = false
         }
     }
 
@@ -494,6 +508,31 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
+        // The generic concatenated projection rejects Hadamard subclasses.
+        // Only qkv/z are packed in Bonsai; a/b remain their original FP32
+        // projections. Share the pair's identical preprocessing, retaining
+        // each matmul's
+        // original output geometry, metadata, dtype and reduction order.
+        if let qkv = inProjQKV as? HadamardQuantizedLinear,
+            let z = inProjZ as? HadamardQuantizedLinear
+        {
+            let cached = sharedHadamardProjections
+            if cached?.qkv !== qkv || cached?.z !== z
+            {
+                sharedHadamardTransformsMatch =
+                    qkv.canShareInputTransform(with: z)
+                sharedHadamardProjections = SharedHadamardProjectionPair(qkv: qkv, z: z)
+            }
+            if sharedHadamardTransformsMatch {
+                let rotated = qkv.transform(inputs)
+                return (
+                    qkv.callWithTransformedInput(rotated),
+                    z.callWithTransformedInput(rotated).reshaped(B, S, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
+        }
         guard prepareFusedInputProjection(), let fusedInProj else {
             return (
                 inProjQKV(inputs),

@@ -38,6 +38,13 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// CPU-only qualification for sharing one computed activation transform.
+    /// Signs are compared exactly; matching widths alone is not sufficient.
+    public func hasSameTransform(as other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width
+            && signValues == other.signValues
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -391,6 +398,24 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        return callWithTransformedInput(rotated)
+    }
+
+    /// Qualify only the input preprocessing; weights and output rows stay separate.
+    /// The first experiment intentionally excludes GDN output-layout permutations.
+    public func canShareInputTransform(with other: HadamardQuantizedLinear) -> Bool {
+        bits == 2 && other.bits == bits && groupSize == 128
+            && other.groupSize == groupSize && transform.blockSize == 4096
+            && gdnLayout == nil && other.gdnLayout == nil
+            && scales.dtype == .float16 && other.scales.dtype == scales.dtype
+            && biases?.dtype == .float16 && other.biases?.dtype == biases?.dtype
+            && transform.hasSameTransform(as: other.transform)
+    }
+
+    /// Apply this module's unchanged matmul after an exactly matching signed
+    /// transform has already run. No concatenation or kernel selection change.
+    public func callWithTransformedInput(_ rotated: MLXArray) -> MLXArray {
+        precondition(rotated.ndim > 0 && rotated.dim(-1) == transform.width)
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
