@@ -41,6 +41,10 @@ public struct SignedBlockHadamard {
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if Device.defaultDevice().deviceType == .gpu, blockSize >= 128 {
+            return FusedSignedHadamard.apply(x, signs: signs, blockSize: blockSize,
+                width: width, inverse: false)
+        }
         return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
             .reshaped(x.shape).asType(x.dtype)
     }
@@ -48,6 +52,10 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if Device.defaultDevice().deviceType == .gpu, blockSize >= 128 {
+            return FusedSignedHadamard.apply(x, signs: signs, blockSize: blockSize,
+                width: width, inverse: true)
+        }
         return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
@@ -57,6 +65,110 @@ public struct SignedBlockHadamard {
         precondition(
             [DType.float32, .float16, .bfloat16].contains(x.dtype),
             "Hadamard input must have a real floating-point dtype")
+    }
+}
+
+/// Fuse only the pointwise operations around MLX's FP32 radix-16 transform.
+/// The butterfly indexing, operation order, barriers and normalization match
+/// `hadamard_n<float, N, 16, 4>`. Each block still has independent FP32 scratch;
+/// signs index the entire activation width, including blocks after the first.
+private enum FusedSignedHadamard {
+    static let kernel = MLXFast.metalKernel(
+        name: "fused_signed_block_hadamard",
+        inputNames: ["input", "signs", "scale"], outputNames: ["output"],
+        source: """
+            constexpr short radix = 16;
+            constexpr short threads = N / radix;
+            constexpr short logN = __builtin_ctz(N);
+            constexpr short steps = logN / 4;
+            constexpr short logFinal = logN % 4;
+            constexpr short finalRadix = 1 << logFinal;
+            const uint base = threadgroup_position_in_grid.y * N;
+            const short lane = thread_position_in_threadgroup.x;
+            threadgroup float buf[N];
+            #pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                const short index = j * 4 * threads + lane * 4;
+                #pragma unroll
+                for (short r = 0; r < 4; ++r) {
+                    const uint offset = base + index + r;
+                    const float value = float(input[offset]);
+                    buf[index + r] = inverse ? value : value * signs[offset % W];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float x[radix];
+            short h = 1;
+            #pragma unroll
+            for (short stage = 0; stage < steps; ++stage) {
+                const short k = lane & (h - 1);
+                const short j = ((lane - k) << 4) + k;
+                #pragma unroll
+                for (short r = 0; r < radix; ++r) x[r] = buf[j + h * r];
+                short butterfly = 1;
+                #pragma unroll
+                for (short s = 0; s < 4; ++s) {
+                    #pragma unroll
+                    for (short i = 0; i < radix / 2; ++i) {
+                        const short k = i & (butterfly - 1);
+                        const short j = ((i - k) << 1) + k;
+                        const float a = x[j], b = x[j + butterfly];
+                        x[j] = a + b;
+                        x[j + butterfly] = a - b;
+                    }
+                    butterfly <<= 1;
+                }
+                #pragma unroll
+                for (short r = 0; r < radix; ++r) buf[j + h * r] = x[r];
+                h <<= 4;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (finalRadix > 1) {
+                #pragma unroll
+                for (short t = 0; t < radix / finalRadix; ++t) {
+                    const short index = lane + t * threads;
+                    const short k = index & (h - 1);
+                    const short j = ((index - k) << logFinal) + k;
+                    #pragma unroll
+                    for (short r = 0; r < finalRadix; ++r) x[r] = buf[j + h * r];
+                    short butterfly = 1;
+                    #pragma unroll
+                    for (short s = 0; s < logFinal; ++s) {
+                        #pragma unroll
+                        for (short i = 0; i < finalRadix / 2; ++i) {
+                            const short k = i & (butterfly - 1);
+                            const short j = ((i - k) << 1) + k;
+                            const float a = x[j], b = x[j + butterfly];
+                            x[j] = a + b;
+                            x[j + butterfly] = a - b;
+                        }
+                        butterfly <<= 1;
+                    }
+                    #pragma unroll
+                    for (short r = 0; r < finalRadix; ++r) buf[j + h * r] = x[r];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            #pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                const short index = j * 4 * threads + lane * 4;
+                #pragma unroll
+                for (short r = 0; r < 4; ++r) {
+                    const uint offset = base + index + r;
+                    const float value = buf[index + r] * scale;
+                    output[offset] = Out(inverse ? value * signs[offset % W] : value);
+                }
+            }
+            """)
+
+    static func apply(
+        _ x: MLXArray, signs: MLXArray, blockSize: Int, width: Int, inverse: Bool
+    ) -> MLXArray {
+        kernel([x, signs, MLXArray(1 / sqrt(Float(blockSize)))],
+            template: [("N", blockSize), ("W", width), ("Out", x.dtype), ("inverse", inverse)],
+            grid: (blockSize / 16, x.size / blockSize, 1),
+            threadGroup: (blockSize / 16, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
     }
 }
 
