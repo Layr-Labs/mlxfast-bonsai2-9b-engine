@@ -38,6 +38,12 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// Identity of immutable transform metadata, not of request activations.
+    /// A configuration shares its sign array among projections of one width.
+    public func sharesTransform(with other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width && signs === other.signs
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -391,6 +397,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        return forwardTransformed(rotated)
+    }
+
+    /// Apply the unchanged packed projection to an already transformed input.
+    /// Callers must use this layer's transform and honor its GDN layout. This
+    /// permits sibling projections to share one transform within a forward;
+    /// no activation or output is retained across forwards.
+    public func forwardTransformed(_ rotated: MLXArray) -> MLXArray {
+        precondition(rotated.ndim > 0 && rotated.dim(-1) == transform.width)
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
