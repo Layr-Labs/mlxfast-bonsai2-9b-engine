@@ -1,0 +1,36 @@
+# SHA256 manifest for prism-ml/Ternary-Bonsai-2-9B-mlx-2bit.
+# Revision: b94a52f3ce9047919dce00392a0fc6b8a7968abe
+#
+# The target checkpoint for track bonsai2-9b-mlx-v1. LFS-backed entries use the
+# LFS object's own sha256 (lfs.oid).
+#
+# .gitattributes and the LICENSE files are DELIBERATELY NOT pinned: none is
+# engine-loaded, and setup.sh derives what it downloads from this file. The
+# mtp/ folder is the MTP head and has its own manifest
+# (fixtures/reference_bonsai2_9b_mtp_head.sha256).
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 21
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   3475218619
+#
+# Format: <sha256> <byte_count> <relative_path>
+b0165990815854f72b5fca1f85079455bf47daab3cb1be52f38b938352bfaf6c 1637 MTP.md
+362344de30a17813fed132eab01825641835fdee55b5101a7c0ffbf8760424ba 409 NOTICE.txt
+49cc8676521bc64ee0eb58ef387f12540acfc90ff4d9b406f29d6c17516a86ca 2165 PACK-RUNTIME.md
+a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715 7756 chat_template.jinja
+b028784e087316b7ce0fb7ae3d2d6eaeb0b15144dd3f234da4c5d57ef1ffbacb 30202 config.json
+e0b1c795fc4bbcc371bbd6e2eb66c66f7ad2f3229a462e262c101d76d8cd5f54 2742 files.json
+a3345cadb9d63a91a11c2c12135da7eadc3d0c820e3287b04682b51cad1b12d2 201 generation_config.json
+6d0b37a136e1b5b25b3e8b0467599c78dd0a90c341b640a1f49271cb0be7c73b 168574 hadamard.json
+b8ebd13459dcd53504432a4a0a797287c3a4c00d80835466dbb499f05b7512bb 3462149260 model.safetensors
+27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516 390 preprocessor_config.json
+094ecaee12c0800cec2a68358c3370db7d31abe7757f95f7bf1edde4f4e48cbb 3882 quickstart.py
+18d9d01791d2cdddde90d36089e6b1358b86e52eda3f32157d9fc335c79d0630 86 reload-validation.json
+5279718d7671bd799e866f53099e82b0260117fec811f83011ba47a0abc7943e 5621 runtime/artifact.py
+7f7fd67637a7d9363eab8ebf7db59771830b690330ffef772379a0169ddb9608 2572 runtime/codec.py
+3e567d9ae7576782fa9fbe60a10f81bf0c6d09ba5dafd10c042db1b2c775b98d 259 runtime/requirements.txt
+4c93e435b9dcd8370dd324552bc37a8bc6ae5247ce8a68e76075e7688c1b6d85 12438 runtime/runtime.py
+b3d9645300d913cc09abff04bf25f31621daac4d507e7e1a8b00a64442a05a3e 5285 runtime/vision_artifact.py
+b36f33d09bd3de3e19de3fd2cf493a69ec0a5e24acf648b0c9fba120d9357554 63 tokenizer-validation.json
+5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42 12807982 tokenizer.json
+316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8 16710 tokenizer_config.json
+7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13 385 video_preprocessor_config.json

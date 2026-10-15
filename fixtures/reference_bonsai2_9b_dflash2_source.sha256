@@ -1,0 +1,13 @@
+# SHA256 manifest for prism-ml/Ternary-Bonsai-2-9B-gguf, file
+# Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf.
+# Revision: 608e89c34258328a51061ebd313c924908747044
+#
+# The SOURCE of the DFlash 2 block drafter for track bonsai2-9b-mlx-v1:
+# Prism's Q8_0 GGUF at commit 608e89c3 (2026-10-15, "FFN 24576 -> 12288").
+#
+# ./setup-dflash-drafter.sh downloads this file and converts it with
+# tools/convert-dflash-gguf.py into the directory that
+# fixtures/reference_bonsai2_9b_dflash2_drafter.sha256 pins.
+#
+# Format: <sha256> <byte_count> <relative_path>
+95149abdd584f7a69ea5ead38790d5481454428d2c1616527ff0d45422a762b4 1574233856 Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf

@@ -1,0 +1,17 @@
+# SHA256 manifest for the DFlash 2 drafter DIRECTORY of track bonsai2-9b-mlx-v1:
+# the MLX conversion of Prism's Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf
+# (fixtures/reference_bonsai2_9b_dflash2_source.sha256).
+#
+# ./setup-dflash-drafter.sh writes model.safetensors with
+# tools/convert-dflash-gguf.py (deterministic: the Q8_0 linears as MLX affine
+# 8-bit group-32 linears without loss, the norms, convolution base kernels and
+# selector codebooks as BF16) and copies config.json from
+# fixtures/dflash2_9b_drafter_config.json. It stages the directory only when
+# both files match the rows below.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 2
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   1933846806
+#
+# Format: <sha256> <byte_count> <relative_path>
+2da3f24afe5c370874d2c3d05818d7107d85027ad5a5a6f7bb72d8b0caaba3af 1068 config.json
+df74551bc2b9d66c0742604aa5c2847d4a9ca0905a15b19a305d72158da02df6 1933845738 model.safetensors
