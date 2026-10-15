@@ -20,7 +20,7 @@ Artifacts referenced by this repository:
 | Artifact | Upstream | License |
 |---|---|---|
 | `Qwen/Qwen3.5-9B` @ `c202236235762e1c871ad0ccb60c8ee5ba337b9a` (the backbone; its `config.json` is checked in as `fixtures/qwen35_9b_base_config.json`) | Qwen | Apache-2.0 |
-| `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `b94a52f3ce9047919dce00392a0fc6b8a7968abe` (the track's target; its `config.json` is checked in as `fixtures/bonsai2_9b_config.json`) | Prism ML | Apache-2.0 |
+| `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ `f4e28a59531731c41b6dfac88cf271bd58f0a287` (the track's target; its `config.json` is checked in as `fixtures/bonsai2_9b_config.json`) | Prism ML | Apache-2.0 |
 | The same repository and revision, folder `mtp/` (the MTP head) | Prism ML | Apache-2.0 |
 
 Attribution statement: "Created using Bonsai by Prism ML. Qwen3.5-9B © Qwen,

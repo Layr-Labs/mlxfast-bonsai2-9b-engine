@@ -1495,7 +1495,7 @@ private func arrayJSON(_ values: [Int]) -> String {
 func aPendingPinRefusesEveryGolden() throws {
     #expect(!ReferenceModelPin.pinned.isPending)
     #expect(ReferenceModelPin.pinned.repository == "prism-ml/Ternary-Bonsai-2-9B-mlx-2bit")
-    #expect(ReferenceModelPin.pinned.revision == "b94a52f3ce9047919dce00392a0fc6b8a7968abe")
+    #expect(ReferenceModelPin.pinned.revision == "f4e28a59531731c41b6dfac88cf271bd58f0a287")
     let pendingPin = ReferenceModelPin(
         repository: MLXFastConstants.pendingOrganizerSentinel,
         revision: MLXFastConstants.pendingOrganizerSentinel
@@ -1541,7 +1541,7 @@ func aPendingPinRefusesEveryGolden() throws {
 /// the long capture truncated. The digests are measured from the tree
 /// (`shasum -a 256`, `wc -c`), so a re-recording replaces them here in the
 /// same commit as the files. They were recorded on the track's box against the
-/// pack (`model_type` "prism_hadamard_qwen35", revision b94a52f3).
+/// pack (`model_type` "prism_hadamard_qwen35", revision f4e28a59).
 @Test
 func theShippedPublicCapturesLoadThroughTheStrictLoader() throws {
     let directory = "correctness_prompts/bonsai2-9b-mlx-v1/"
@@ -1552,10 +1552,10 @@ func theShippedPublicCapturesLoadThroughTheStrictLoader() throws {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
     let localIterateData = try Data(contentsOf: URL(fileURLWithPath: localIteratePath))
-    #expect(digest(localIterateData) == "62d69f794fb1fc2a70fe09fa07a7a347ddf5395cff815c6a7d735b6446bd1cd1")
+    #expect(digest(localIterateData) == "706f20bd6594ee9f325349c87d5fca6c95e4bc834016688172d592d36bb4b12c")
     #expect(localIterateData.count == 10_670)
     let localSubmitData = try Data(contentsOf: URL(fileURLWithPath: localSubmitPath))
-    #expect(digest(localSubmitData) == "341f60951548053843b4662407e63f2d5f4045ca33a487fad160f9f0a630b4bd")
+    #expect(digest(localSubmitData) == "1eda8bf67e2560d1dc67f8050c9684c48cecd0659c835e084b8bf0f54de793c7")
     #expect(localSubmitData.count == 21_052)
 
     // Each mode's golden must hold one more expected token than the mode

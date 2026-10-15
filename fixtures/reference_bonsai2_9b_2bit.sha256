@@ -1,5 +1,5 @@
 # SHA256 manifest for prism-ml/Ternary-Bonsai-2-9B-mlx-2bit.
-# Revision: b94a52f3ce9047919dce00392a0fc6b8a7968abe
+# Revision: f4e28a59531731c41b6dfac88cf271bd58f0a287
 #
 # The target checkpoint for track bonsai2-9b-mlx-v1. LFS-backed entries use the
 # LFS object's own sha256 (lfs.oid).
@@ -9,13 +9,14 @@
 # mtp/ folder is the MTP head and has its own manifest
 # (fixtures/reference_bonsai2_9b_mtp_head.sha256).
 #
-#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 21
-#   MLXFAST_REFERENCE_MANIFEST_BYTES:   3475218619
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 22
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   3475224135
 #
 # Format: <sha256> <byte_count> <relative_path>
-b0165990815854f72b5fca1f85079455bf47daab3cb1be52f38b938352bfaf6c 1637 MTP.md
+74e5d05a1503636cd8c1829ade57db9bf9189beee9de04f226a260c2e4e01888 1645 MTP.md
 362344de30a17813fed132eab01825641835fdee55b5101a7c0ffbf8760424ba 409 NOTICE.txt
 49cc8676521bc64ee0eb58ef387f12540acfc90ff4d9b406f29d6c17516a86ca 2165 PACK-RUNTIME.md
+84a1b99bc32cf994c2d769db6aff58fdb10e3f21f2f1a315996f33205bb52bfd 5508 README.md
 a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715 7756 chat_template.jinja
 b028784e087316b7ce0fb7ae3d2d6eaeb0b15144dd3f234da4c5d57ef1ffbacb 30202 config.json
 e0b1c795fc4bbcc371bbd6e2eb66c66f7ad2f3229a462e262c101d76d8cd5f54 2742 files.json

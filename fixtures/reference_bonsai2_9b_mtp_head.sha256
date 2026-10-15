@@ -1,5 +1,5 @@
 # SHA256 manifest for prism-ml/Ternary-Bonsai-2-9B-mlx-2bit, folder mtp/.
-# Revision: b94a52f3ce9047919dce00392a0fc6b8a7968abe
+# Revision: f4e28a59531731c41b6dfac88cf271bd58f0a287
 #
 # The MTP HEAD for track bonsai2-9b-mlx-v1: the pack's own trained qwen3_5_mtp
 # drafter, in the mtp/ folder of the target's repository and revision. Paths
@@ -10,8 +10,8 @@
 # model.safetensors carries the LFS object's own sha256 (lfs.oid).
 #
 #   MLXFAST_REFERENCE_MANIFEST_RECORDS: 2
-#   MLXFAST_REFERENCE_MANIFEST_BYTES:   486584873
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   136886503
 #
 # Format: <sha256> <byte_count> <relative_path>
-6913f1a67c704492b9e2f569feb690119ea4ab720ec8273fd82562ac246e9ebc 2065 config.json
-5b338202dce501905ad2a6ac44f07a471a9b59143a98327b87a0a884eeea7f4d 486582808 model.safetensors
+d6bfa07f277e1d9063d4c489a7f77a4a572e6067a8b54bf10f76b14615278555 2194 config.json
+8968d94855ba38809a4ff5b6e20f4856757b64fdbbbd84511e4bea371764faba 136884309 model.safetensors

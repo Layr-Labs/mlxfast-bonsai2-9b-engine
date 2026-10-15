@@ -7,11 +7,11 @@ import Testing
 // The target is the Ternary Bonsai 2 9B MLX pack, and the track is DISARMED
 // until the ranked box is calibrated for it. So:
 //
-// - the target pins name `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ b94a52f3
+// - the target pins name `prism-ml/Ternary-Bonsai-2-9B-mlx-2bit` @ f4e28a59
 //   (`prism_hadamard_qwen35`, affine 2-bit group 128, signed block-4096
 //   Hadamard), and the pack's own config and tensor inventory are checked in;
 // - the head pins the pack's own `mtp/` folder of the same revision: a
-//   standalone FP16 `qwen3_5_mtp` drafter, two files;
+//   standalone 4-bit `qwen3_5_mtp` drafter, two files;
 // - `official_scoring_enabled` is true. The golden pins name the pack: they
 //   were recorded on the ranked box against the pack, under new R2 keys. This
 //   suite checks their shape only;
@@ -505,8 +505,9 @@ struct Bonsai2TrackFixtureTests {
     }
 
     /// THE HEAD IS THE PACK'S OWN DRAFTER: the `mtp/` folder of the target's
-    /// repository and revision, a standalone FP16 `qwen3_5_mtp` export of 15
-    /// tensors with no name prefix. What the geometry fixes is asserted too:
+    /// repository and revision, a standalone `qwen3_5_mtp` export of 31
+    /// tensors, re-quantized to 4-bit affine group-64, with no name prefix.
+    /// What the geometry fixes is asserted too:
     /// one layer, full attention, sharing the target's embedding and output
     /// head. The pack's own `text_config` declares no head depth (0), so the
     /// depth is the backbone's one MTP layer, and the loader reads it off the
@@ -526,12 +527,16 @@ struct Bonsai2TrackFixtureTests {
         #expect(head["upstream_revision"] as? String == target["upstream_revision"] as? String)
         #expect(head["upstream_folder"] as? String == "mtp")
         #expect(head["tensor_prefix"] as? String == "")
-        #expect(head["tensor_count"] as? Int == 15)
-        #expect(head["tensor_bytes"] as? Int == 486_581_248)
-        #expect(head["tensor_dtype"] as? String == "float16")
+        #expect(head["tensor_count"] as? Int == 31)
+        #expect(head["tensor_bytes"] as? Int == 136_881_152)
         #expect(head["block_size"] as? Int == 2)
-        // The head is unquantized, so it declares no quantization block.
-        #expect(head["quantization"] == nil)
+        // The head is re-quantized to 4-bit affine group-64, so it declares a
+        // quantization block and no single tensor_dtype.
+        #expect(head["tensor_dtype"] == nil)
+        let headQuant = try #require(head["quantization"] as? [String: Any])
+        #expect(headQuant["mode"] as? String == "affine")
+        #expect(headQuant["bits"] as? Int == 4)
+        #expect(headQuant["group_size"] as? Int == 64)
 
         #expect(head["model_type"] as? String == "qwen3_5_mtp")
         #expect(head["num_hidden_layers"] as? Int == text["mtp_num_hidden_layers"] as? Int)
@@ -568,7 +573,7 @@ struct Bonsai2TrackFixtureTests {
     }
 
     /// Both manifests pin the pack's revision, and their header pins are
-    /// summed from their records. The target manifest pins 21 files: one
+    /// summed from their records. The target manifest pins 22 files: one
     /// safetensors shard and no index, `hadamard.json`, and the pack's own
     /// tokenizer. The head manifest pins the 2 files of the `mtp/` folder,
     /// with paths relative to it, so no head record is a target record.
@@ -590,7 +595,7 @@ struct Bonsai2TrackFixtureTests {
         }
         let target = try bonsai2ReferenceManifestRecords()
         let head = try bonsai2HeadManifestRecords()
-        #expect(target.count == 21)
+        #expect(target.count == 22)
         #expect(head.map(\.path) == ["config.json", "model.safetensors"])
         #expect(Set(target.map(\.sha256)).isDisjoint(with: head.map(\.sha256)))
         #expect(!target.contains { $0.path.hasPrefix("mtp/") })
