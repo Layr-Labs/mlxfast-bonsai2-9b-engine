@@ -6,47 +6,9 @@
 
 import CoreFoundation
 import Foundation
-@_spi(QuantizedConstantCache) import MLX
+import MLX
 import MLXLMCommon
 import MLXNN
-
-// The pinned MTP head carries FP16 affine metadata while the target feeds it
-// FP32 activations. Reuse only the exact constant widening that quantizedMM
-// would otherwise repeat at every draft step. This cache is input-independent;
-// the packed weights and the module's original parameter tree remain unchanged.
-final class Qwen35MTPQuantizedLinear: QuantizedLinear {
-    private let mtpScaleCastCache = ConstantArrayCastCache()
-    private let mtpOffsetCastCache = ConstantArrayCastCache()
-
-    @discardableResult
-    override func update(
-        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
-        modulePath: [String] = []
-    ) throws -> Self {
-        defer {
-            mtpScaleCastCache.clear()
-            mtpOffsetCastCache.clear()
-        }
-        return try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
-    override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        guard mode == .affine, x.dtype == .float32, scales.dtype == .float16 else {
-            return super.callAsFunction(x)
-        }
-        let widenedScales = mtpScaleCastCache.cachedCast(
-            scales, to: x.dtype, allowFloat16: true) ?? scales
-        let widenedOffsets = biases.map {
-            mtpOffsetCastCache.cachedCast($0, to: x.dtype, allowFloat16: true) ?? $0
-        }
-        var output = quantizedMM(
-            x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
-            groupSize: groupSize, bits: bits, mode: mode)
-        if let bias { output = output + bias }
-        return output
-    }
-}
 
 // MARK: - Module-level MTP flag
 
@@ -497,21 +459,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             target: target,
             verificationMode: verificationMode)
         if !scaledPaths.isEmpty {
-            quantize(
-                model: assistant.mtp,
-                filter: { path, _ in
-                    guard scaledPaths.contains(path) else { return nil }
-                    return metadata.resolvedQuantization(for: path)?.asTuple
-                },
-                apply: { module, groupSize, bits, mode in
-                    guard let linear = module as? Linear, !(linear is QuantizedLinear) else {
-                        return quantizeSingle(
-                            layer: module, groupSize: groupSize, bits: bits, mode: mode)
-                    }
-                    return Qwen35MTPQuantizedLinear(
-                        weight: linear.weight, bias: linear.bias,
-                        groupSize: groupSize, bits: bits, mode: mode)
-                })
+            quantize(model: assistant.mtp) { path, _ in
+                guard scaledPaths.contains(path) else { return nil }
+                return metadata.resolvedQuantization(for: path)?.asTuple
+            }
         }
 
         try assistant.mtp.update(

@@ -200,12 +200,11 @@ private enum Float16ConstantQMV {
     /// simdgroup, 2 simdgroups per threadgroup.
     static let fast = MLXFast.metalKernel(
         name: "hadamard_qmv_fast_f16_constants",
-        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        inputNames: ["x", "w", "scales", "biases", "K", "N"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[1];
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * 8 + simd_gid * 4;
@@ -252,13 +251,11 @@ private enum Float16ConstantQMV {
     /// all `rows` results.
     static let rows = MLXFast.metalKernel(
         name: "hadamard_qmv_rows_f16_constants",
-        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        inputNames: ["x", "w", "scales", "biases", "K", "N"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[1];
-            const int N = w_shape[0];
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * (2 * outputs) + simd_gid * outputs;
@@ -330,8 +327,8 @@ private enum Float16ConstantQMV {
         let K = x.dim(-1)
         let rows = x.size / K
         let N = weight.dim(0)
-        // Shape metadata supplies K and N without allocating scalar tensor inputs.
-        let inputs = [x.reshaped([rows, K]), weight, scales, biases]
+        let inputs = [x.reshaped([rows, K]), weight, scales, biases,
+                      MLXArray(Int32(K)), MLXArray(Int32(N))]
         let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
         let output = (rows == 1 ? fast : Self.rows)(
             inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
