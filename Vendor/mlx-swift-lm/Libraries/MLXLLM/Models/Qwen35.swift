@@ -350,6 +350,35 @@ private enum Qwen35RegisterGDN {
     }
 }
 
+// Match the native FP32 depthwise accumulation and MLX sigmoid expression,
+// but do not materialize the convolution result before applying SiLU.
+private enum Qwen35DepthwiseSilu {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_depthwise_silu_f32_k4",
+        inputNames: ["x", "w"], outputNames: ["y"],
+        source: """
+        const uint c = thread_position_in_grid.x;
+        const uint t = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        const uint C = x_shape[2];
+        const uint L = x_shape[1];
+        float acc = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            acc += x[(b * L + t + i) * C + c] * w[c * 4 + i];
+        }
+        const float e = 1 / (1 + metal::exp(metal::abs(acc)));
+        const float gate = (acc < 0) ? e : 1 - e;
+        y[(b * (L - 3) + t) * C + c] = acc * gate;
+        """)
+
+    static func run(_ x: MLXArray, weight: MLXArray) -> MLXArray {
+        let B = x.dim(0), S = x.dim(1) - 3, C = x.dim(2)
+        return kernel(
+            [x, weight], grid: (C, S, B), threadGroup: (128, 1, 1),
+            outputShapes: [[B, S, C]], outputDTypes: [.float32])[0]
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -694,6 +723,27 @@ final class Qwen35GatedDeltaNet: Module {
     ///   - ssmState: Initial SSM state (nil on first token)
     ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
     /// - Returns: `(out, newConvState, newSsmState)`
+    private func convolveAndActivate(_ input: MLXArray, exact: Bool = false) -> MLXArray {
+        if input.dtype == .float32, conv1d.weight.dtype == .float32,
+            input.ndim == 3, input.dim(0) > 0, input.dim(1) >= 4,
+            input.dim(2) == convDim, convDim > 0,
+            convKernelSize == 4, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.bias == nil, conv1d.groups == convDim,
+            conv1d.stride == 1, conv1d.padding == 0, conv1d.dilation == 1
+        {
+            // Each output has the same four ordered terms, independent of
+            // window width. The kernel API makes noncontiguous inputs packed.
+            return Qwen35DepthwiseSilu.run(input, weight: conv1d.weight)
+        }
+        let count = input.dim(1) - convKernelSize + 1
+        if exact, count > 1 {
+            return silu(concatenated((0 ..< count).map { position in
+                conv1d(input[0..., position ..< (position + convKernelSize), 0...])
+            }, axis: 1))
+        }
+        return silu(conv1d(input))
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -708,7 +758,7 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convolveAndActivate(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -757,7 +807,7 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
+        let convOut = convolveAndActivate(convInput)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -1092,16 +1142,7 @@ final class Qwen35GatedDeltaNet: Module {
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
         let convInput = concatenated([convState, qkv], axis: 1)
-        let convOut: MLXArray
-        if exactTargetVerify, S > 1 {
-            convOut = silu(concatenated(
-                (0 ..< S).map { position in
-                    conv1d(convInput[
-                        0..., position ..< (position + convKernelSize), 0...])
-                }, axis: 1))
-        } else {
-            convOut = silu(conv1d(convInput))
-        }
+        let convOut = convolveAndActivate(convInput, exact: exactTargetVerify)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
