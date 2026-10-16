@@ -160,6 +160,172 @@ public struct SignedBlockHadamard {
             threadGroup: (256, 1, 1), outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
     }
 
+    /// The forward transform of `fused4096Kernel` (same passes, same order,
+    /// same 1/64 scale), quantized per row and 128-group for the prompt-width
+    /// integer matmul (27b 5fbfa003 / 0e1314b2). Each lane re-reads 16
+    /// consecutive outputs, so a 128-group is an 8-lane cluster: `amax` is
+    /// the cluster max of |v|, `q = rint(v * (127 / amax))` as int8, written
+    /// in the staged weight order (position p of each 16-block holds element
+    /// 4 * (p % 4) + p / 4), and `ascale = amax / 127`, `rsb = ascale *
+    /// sum(q)` per group in the row-tiled order the matmuls read
+    /// (`PromptInt8Matmul.constantIndexSource`). Every operation is exact or a
+    /// single IEEE rounding (sign multiply, butterfly adds in a fixed order, a
+    /// power-of-two scale, max, a precise divide, rint, an integer sum), so the
+    /// codes and constants do not depend on the GPU that computes them.
+    private static let quantized4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096_q8",
+        inputNames: ["x", "signs"],
+        outputNames: ["codes", "ascale", "rsb"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const short i = short(thread_position_in_threadgroup.x);
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const uint sign_offset = (BLOCKS_PER_ROW == 1)
+                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
+
+            threadgroup float buf[256 * 17];
+            float x_reg[16];
+
+            // Same passes and buffer layout as fused4096Kernel: element e
+            // lives at buf[(e >> 4) * 17 + (e & 15)] between passes.
+            const short base0 = i << 4;
+            const uint in_offset = batch_idx + uint(base0);
+            const uint s_offset = sign_offset + uint(base0);
+            const device float4* in4 = (const device float4*)(x + in_offset);
+            const device float4* s4 = (const device float4*)(signs + s_offset);
+            #pragma clang loop unroll(full)
+            for (short w = 0; w < 4; w++) {
+              float4 val = in4[w] * s4[w];
+              x_reg[4 * w + 0] = val.x;
+              x_reg[4 * w + 1] = val.y;
+              x_reg[4 * w + 2] = val.z;
+              x_reg[4 * w + 3] = val.w;
+            }
+            hadamard_radix16_q8(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[i * 17 + r] = x_reg[r];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const short k1 = i & 15;
+            const short r_base2 = (i - k1);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              x_reg[r] = buf[(r_base2 + r) * 17 + k1];
+            }
+            hadamard_radix16_q8(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[(r_base2 + r) * 17 + k1] = x_reg[r];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const short i_hi = i >> 4;
+            const short i_lo = i & 15;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              x_reg[r] = buf[(i_hi + 16 * r) * 17 + i_lo];
+            }
+            hadamard_radix16_q8(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[(i_hi + 16 * r) * 17 + i_lo] = x_reg[r] * 0.015625f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float v[16];
+            float amax = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              v[r] = buf[i * 17 + r];
+              amax = max(amax, fabs(v[r]));
+            }
+            amax = max(amax, simd_shuffle_xor(amax, ushort(1)));
+            amax = max(amax, simd_shuffle_xor(amax, ushort(2)));
+            amax = max(amax, simd_shuffle_xor(amax, ushort(4)));
+            const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+            const float iqs = amax > 0.0f ? metal::precise::divide(127.0f, amax) : 0.0f;
+            float q[16];
+            float part = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              q[r] = rint(v[r] * iqs);
+              part += q[r];
+            }
+            part += simd_shuffle_xor(part, ushort(1));
+            part += simd_shuffle_xor(part, ushort(2));
+            part += simd_shuffle_xor(part, ushort(4));
+            device char4* dst = (device char4*)(codes + batch_idx + uint(base0));
+            #pragma clang loop unroll(full)
+            for (short w = 0; w < 4; w++) {
+              dst[w] = char4(char(q[w]), char(q[4 + w]), char(q[8 + w]), char(q[12 + w]));
+            }
+            if ((i & 7) == 0) {
+              const uint row = block_idx / uint(BLOCKS_PER_ROW);
+              const uint kg = uint(BLOCKS_PER_ROW) * 32u;
+              const uint g = (block_idx % uint(BLOCKS_PER_ROW)) * 32u + uint(i >> 3);
+              const uint ml = row & 63u;
+              const size_t qidx = size_t(row >> 6) * size_t(kg) * 64 + size_t(g) * 64
+                  + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u));
+              ascale[qidx] = qs;
+              rsb[qidx] = qs * part;
+            }
+            """,
+        header: """
+            using namespace metal;
+            METAL_FUNC void hadamard_radix16_q8(thread float* x) {
+              #pragma clang loop unroll(full)
+              for (short j = 0; j < 16; j += 2) {
+                float a = x[j], b = x[j+1];
+                x[j] = a + b; x[j+1] = a - b;
+              }
+              #pragma clang loop unroll(full)
+              for (short j = 0; j < 16; j += 4) {
+                #pragma clang loop unroll(full)
+                for (short k = 0; k < 2; k++) {
+                  float a = x[j+k], b = x[j+k+2];
+                  x[j+k] = a + b; x[j+k+2] = a - b;
+                }
+              }
+              #pragma clang loop unroll(full)
+              for (short j = 0; j < 16; j += 8) {
+                #pragma clang loop unroll(full)
+                for (short k = 0; k < 4; k++) {
+                  float a = x[j+k], b = x[j+k+4];
+                  x[j+k] = a + b; x[j+k+4] = a - b;
+                }
+              }
+              #pragma clang loop unroll(full)
+              for (short k = 0; k < 8; k++) {
+                float a = x[k], b = x[k+8];
+                x[k] = a + b; x[k+8] = a - b;
+              }
+            }
+            """,
+        ensureRowContiguous: true)
+
+    /// `forward(x)` quantized for `PromptInt8Matmul`: int8 codes `[rows,
+    /// width]` and the FP32 group constants `[rows * width / 128]`. Nil when
+    /// the shape is not a prompt-width FP32 block-4096 input.
+    func quantizedForPrompt(_ x: MLXArray) -> PromptInt8Activation? {
+        validate(x)
+        let rows = x.size / width
+        guard blockSize == 4096, x.dtype == .float32, rows % 64 == 0, rows > 0,
+            x.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let groups = rows * (width / 128)
+        let outputs = Self.quantized4096Kernel(
+            [x.reshaped([rows, width]), signs],
+            template: [("BLOCKS_PER_ROW", width / 4096)],
+            grid: (256, rows * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, width], [groups], [groups]],
+            outputDTypes: [.int8, .float32, .float32])
+        return PromptInt8Activation(
+            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -467,6 +633,373 @@ private enum Float16ConstantQMV {
     }
 }
 
+/// A rotated prompt-width activation quantized per row and 128-group by
+/// `SignedBlockHadamard.quantizedForPrompt`.
+struct PromptInt8Activation {
+    let codes: MLXArray
+    let ascale: MLXArray
+    let rsb: MLXArray
+    let rows: Int
+    let k: Int
+}
+
+/// Prompt-width packed matmul on int8 activation codes (27b 5fbfa003, with
+/// 31a73441's row-tiled constants and 0e1314b2's signed codes).
+///
+/// For output (m, n) the kernels compute, per 128-group g in ascending order
+/// from `acc = 0`:
+///
+///     C   = sum_{k in g} q[m, k] * code[n, k]          (integer)
+///     t   = s[n, g] * float(C)
+///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], t, acc))
+///
+/// `q` is in [-127, 127] and `code` in [0, 3], so |C| <= 128 * 127 * 3 =
+/// 48768 < 2^24: the integer is exact in int32 (the M5 tensor unit) and in
+/// FP32 (every partial sum of integer products is an integer below 2^24, so
+/// each FP32 multiply-add is exact whatever its order). `float(C)` is then the
+/// same number on both, and the epilogue is the same three roundings in the
+/// same order, with explicit `fma` so contraction cannot change it. The M2
+/// path (`plain`) therefore produces the M5 path's (`nax`) bits;
+/// `naxMatchesPlain` confirms it on the device before `nax` is used.
+enum PromptInt8Matmul {
+    enum Route { case nax, plain, off }
+
+    /// Index of (row, group) in the row-tiled constant layout: per 64-row
+    /// tile, per group, the 64 rows in the order the tensor kernel's lanes
+    /// read them as one float4.
+    static let constantIndexSource = """
+        inline size_t bonsai_q8_cidx(int m, int g, int Kg) {
+          const uint ml = uint(m) & 63u;
+          return size_t(m >> 6) * size_t(Kg) * 64 + size_t(g) * 64
+              + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u));
+        }
+
+        """
+
+    // 32 x 32 outputs per threadgroup of four simdgroups (2 x 2, 16 x 16
+    // each). Per 128-group: the codes and the unpacked 2-bit weights are
+    // staged as FP32 in threadgroup memory 64 k at a time and multiplied on
+    // FP32 simdgroup matrices (exact, see above); the epilogue reads each
+    // lane's two elements per fragment in place (MLX steel's fragment
+    // layout, `BaseMMAFrag::get_coord`). The weight codes are unpacked in
+    // the staged order the activation codes use.
+    private static let plainSource = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const int m0 = int(threadgroup_position_in_grid.y) * 32;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const int sm = int(sg >> 1) * 16;
+        const int sn = int(sg & 1) * 16;
+        const int qid = int(lane >> 2);
+        const int fm = (qid & 4) + int((lane >> 1) & 3);
+        const int fn = (qid & 2) * 2 + int(lane & 1) * 2;
+        threadgroup float As[32 * 68];
+        threadgroup float Bs[32 * 68];
+        float acc[2][2][2];
+        #pragma clang loop unroll(full)
+        for (int a = 0; a < 2; a++) {
+          #pragma clang loop unroll(full)
+          for (int b = 0; b < 2; b++) { acc[a][b][0] = 0.0f; acc[a][b][1] = 0.0f; }
+        }
+        const int arow = int(tid >> 2);
+        const int acol = int(tid & 3) * 16;
+        const device char* asrc = (const device char*)xq + (size_t)(m0 + arow) * K + acol;
+        const int bcol = int(tid >> 2);
+        const int bword = int(tid & 3);
+        const device uint32_t* bsrc = w + (size_t)(n0 + bcol) * KW + bword;
+        for (int g = 0; g < Kg; g++) {
+          simdgroup_float8x8 c[2][2];
+          #pragma clang loop unroll(full)
+          for (int a = 0; a < 2; a++) {
+            #pragma clang loop unroll(full)
+            for (int b = 0; b < 2; b++) { c[a][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); }
+          }
+          for (int kb = 0; kb < 2; kb++) {
+            const int k0 = g * 128 + kb * 64;
+            threadgroup float* adst = As + arow * 68 + acol;
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 4; q++) {
+              const char4 av = *(const device char4*)(asrc + k0 + 4 * q);
+              adst[4 * q + 0] = float(av.x); adst[4 * q + 1] = float(av.y);
+              adst[4 * q + 2] = float(av.z); adst[4 * q + 3] = float(av.w);
+            }
+            const uint wv = bsrc[k0 / 16];
+            threadgroup float* bdst = Bs + bcol * 68 + bword * 16;
+            #pragma clang loop unroll(full)
+            for (int p = 0; p < 16; p++) {
+              bdst[p] = float((wv >> uint(8 * (p & 3) + 2 * (p >> 2))) & 3u);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma clang loop unroll(full)
+            for (int kk = 0; kk < 64; kk += 8) {
+              simdgroup_float8x8 am[2], bm[2];
+              simdgroup_load(am[0], As + sm * 68 + kk, 68);
+              simdgroup_load(am[1], As + (sm + 8) * 68 + kk, 68);
+              simdgroup_load(bm[0], Bs + sn * 68 + kk, 68, ulong2(0, 0), true);
+              simdgroup_load(bm[1], Bs + (sn + 8) * 68 + kk, 68, ulong2(0, 0), true);
+              #pragma clang loop unroll(full)
+              for (int a = 0; a < 2; a++) {
+                #pragma clang loop unroll(full)
+                for (int b = 0; b < 2; b++) { simdgroup_multiply_accumulate(c[a][b], am[a], bm[b], c[a][b]); }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          float as[2], rb[2];
+          #pragma clang loop unroll(full)
+          for (int a = 0; a < 2; a++) {
+            const size_t ci = bonsai_q8_cidx(m0 + sm + 8 * a + fm, g, Kg);
+            as[a] = ascale[ci]; rb[a] = rsb[ci];
+          }
+          #pragma clang loop unroll(full)
+          for (int b = 0; b < 2; b++) {
+            const size_t nidx = (size_t)g * N + n0 + sn + 8 * b + fn;
+            const float2 s2 = float2(*(const device half2*)(scalesT + nidx));
+            const float2 b2 = float2(*(const device half2*)(biasesT + nidx));
+            #pragma clang loop unroll(full)
+            for (int a = 0; a < 2; a++) {
+              const auto e = c[a][b].thread_elements();
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 2; j++) {
+                const float t = s2[j] * float(e[j]);
+                acc[a][b][j] = fma(b2[j], rb[a], fma(as[a], t, acc[a][b][j]));
+              }
+            }
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int a = 0; a < 2; a++) {
+          #pragma clang loop unroll(full)
+          for (int b = 0; b < 2; b++) {
+            const size_t o = (size_t)(m0 + sm + 8 * a + fm) * N + n0 + sn + 8 * b + fn;
+            out[o] = acc[a][b][0];
+            out[o + 1] = acc[a][b][1];
+          }
+        }
+        """
+
+    private static let plainKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_plain",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: plainSource,
+        header: constantIndexSource,
+        ensureRowContiguous: true)
+
+    private static let naxHeader = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """
+
+    // The 27b staged8 prompt kernel (b402ddf2, SIGNED = 1, MPERM = 1): 64 x 64
+    // outputs per threadgroup of four simdgroups, one 64 x 64 x 128 int8
+    // tensor op per group into an int32 cooperative tensor, the 2-bit codes
+    // expanded to int8 bytes in threadgroup memory (double-buffered, staged
+    // order), the epilogue above per element. grid (N / 64 * 128, M / 64).
+    static let naxSource = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 64;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        threadgroup uint32_t bs[2][64 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const int NQ = N / 4;
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        auto stage = [&](int g, int buf) {
+          const device uint4* src = (const device uint4*)(wrow + g * 8);
+          const uint4 v = *src;
+          threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint32_t wv = v[j];
+            dst[4 * j + 0] = wv & 0x03030303u;
+            dst[4 * j + 1] = (wv >> 2) & 0x03030303u;
+            dst[4 * j + 2] = (wv >> 4) & 0x03030303u;
+            dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
+          }
+        };
+        stage(0, 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < Kg; g++) {
+          const int cur = g & 1;
+          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          auto tA = A.template slice<128, 64>(g * 128, m0);
+          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
+          const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+          const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+          float as[4], rb[4];
+          as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+          rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float t = s * float(cT[i]);
+            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) {
+          const int c = i & 3; const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+          out[(size_t)mm * N + nb + c + 32 * nh] = acc[i];
+        }
+        """
+
+    private static let naxKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_nax",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxSource,
+        header: naxHeader,
+        ensureRowContiguous: true)
+
+    private static func run(
+        _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int
+    ) -> MLXArray {
+        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
+        if route == .nax {
+            return naxKernel(
+                inputs, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
+        return plainKernel(
+            inputs, grid: (n / 32 * 128, m / 32, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
+    /// or later, 18 or later for a `p` part.
+    static func architectureHasNAX(_ name: String) -> Bool {
+        guard let range = name.range(of: "applegpu_g") else { return false }
+        let tail = name[range.upperBound...]
+        let digits = tail.prefix(while: { $0.isNumber })
+        guard let gen = Int(digits) else { return false }
+        let variant = tail.dropFirst(digits.count).first
+        return gen >= (variant == "p" ? 18 : 17)
+    }
+
+    nonisolated(unsafe) private static var checkFailed = false
+    nonisolated(unsafe) private static var checkNote = "not run"
+
+    /// Compiles and runs the tensor kernel on a fixed, input-independent
+    /// 128 x 128 x 512 problem (2 x 2 tiles, 4 groups) and compares it bit for bit with the plain
+    /// kernel. False on a compile error (caught by a scoped MLX error
+    /// handler) or on any differing output.
+    private static func naxMatchesPlain() -> Bool {
+        checkFailed = false
+        let m = 128, n = 128, k = 512, kg = k / 128
+        let codes = MLXArray((0 ..< m * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [m, k])
+        let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+        let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+        let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
+        let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+        var same = false
+        withErrorHandler({ message in
+            if !PromptInt8Matmul.checkFailed { PromptInt8Matmul.checkNote = String(message.prefix(160)) }
+            PromptInt8Matmul.checkFailed = true
+        }) {
+            let plain = run(
+                .plain, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
+            let nax = run(
+                .nax, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
+            let equal = MLX.all(plain .== nax)
+            eval(equal)
+            if !checkFailed { same = equal.item(Bool.self) }
+        }
+        if !checkFailed { checkNote = same ? "bit-identical" : "outputs differ" }
+        return !checkFailed && same
+    }
+
+    /// Decided once, at the first packed module's init. A NAX device takes
+    /// the tensor kernel only when it compiles and matches the plain kernel
+    /// bit for bit; otherwise it keeps the record's float path. Any other
+    /// device takes the plain kernel. `DARKBLOOM_BONSAI_INT8_PREFILL=0` keeps
+    /// the record's float path everywhere.
+    static let route: Route = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_PREFILL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let architecture = GPU.deviceInfo().architecture
+        let chosen: Route
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            chosen = .off
+        } else if architectureHasNAX(architecture) {
+            chosen = naxMatchesPlain() ? .nax : .off
+        } else {
+            chosen = .plain
+        }
+        FileHandle.standardError.write(
+            "int8 prompt matmul: \(chosen) (\(architecture); nax check: \(checkNote))\n"
+                .data(using: .utf8)!)
+        return chosen
+    }()
+
+    /// Rows at which the route applies: prompt widths only (a verify window
+    /// has at most 7 rows), in whole 64-row tiles.
+    static func applies(rows: Int) -> Bool { rows >= 128 && rows % 64 == 0 }
+
+    static func matmul(
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray
+    ) -> MLXArray? {
+        guard route != .off else { return nil }
+        return run(
+            route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+            weight: weight, scalesT: scalesT, biasesT: biasesT,
+            m: activation.rows, k: activation.k, n: weight.dim(0))
+    }
+}
+
+/// Group-major copies of a packed module's F16 scales and offsets for
+/// `PromptInt8Matmul`, made on first use. A plain class, so nothing enters the
+/// module parameter tree.
+final class PromptInt8Constants {
+    private var transposed: (MLXArray, MLXArray)?
+
+    func get(scales: MLXArray, biases: MLXArray) -> (MLXArray, MLXArray) {
+        if let transposed { return transposed }
+        let pair = (scales.transposed(1, 0).contiguous(), biases.transposed(1, 0).contiguous())
+        transposed = pair
+        return pair
+    }
+}
+
 /// Affine packed linear weights with a signed Hadamard input transform.
 ///
 /// Pass weights already folded and packed in MLX format. The initializer does
@@ -514,12 +1047,35 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             weight: weight, bias: bias, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
         freeze()
+        if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
+            _ = PromptInt8Matmul.route
+        }
     }
 
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
     let readsFloat16ConstantsInPlace: Bool
 
+    private let promptConstants = PromptInt8Constants()
+
+    /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
+    /// input, the packing or the device does not take it.
+    private func promptInt8Forward(_ x: MLXArray) -> MLXArray? {
+        guard readsFloat16ConstantsInPlace, transform.blockSize == 4096, x.dtype == .float32,
+            x.ndim >= 2, PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
+            weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
+            let activation = transform.quantizedForPrompt(gdnLayout.map { $0(x) } ?? x)
+        else { return nil }
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        guard let output = PromptInt8Matmul.matmul(
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        else { return nil }
+        return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+    }
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let output = promptInt8Forward(x) {
+            return bias.map { output + $0 } ?? output
+        }
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
