@@ -212,7 +212,14 @@ public class SafeGELU: Module, UnaryLayer {
 /// `compiledSiluProduct` above, but gated by `MLXHardwareInfo` so M1/M2 + macOS
 /// Tahoe can opt out. Used by `SwitchGLU` when a SiLU activation is supplied via
 /// the custom-activation initializer (where `activationProduct` is nil).
-private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+/// Fused SiLU-gated GLU product entry point for dense MLP paths outside the
+/// vendored `SwitchGLU` (e.g. the Qwen3.5 dense trunk on a non-MoE target).
+/// Same compiled kernel, same hardware gate, same plain fallback.
+public func fusedSwiGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    compiledSwiGLU(gate, up)
+}
+
+let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, up: MLXArray) -> MLXArray in
         MLXNN.silu(gate) * up

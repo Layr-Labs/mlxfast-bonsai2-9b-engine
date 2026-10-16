@@ -1839,10 +1839,21 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return self(x) }
+        guard exact else { return qwen35FusedDense(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
+    }
+
+    /// Dense trunk forward with the vendored compiled fused SiLU-GLU product
+    /// (`compiledSwiGLU`, the same kernel `SwitchGLU`'s default SiLU path
+    /// uses). The base `callAsFunction` computes `silu(gate) * up` as two
+    /// elementwise launches per layer; the fused entry collapses them into
+    /// one compiled kernel with the vendored hardware gate and plain-fallback
+    /// semantics intact. Projections and down_proj dispatch unchanged; the
+    /// exact-verify lane is untouched.
+    func qwen35FusedDense(_ x: MLXArray) -> MLXArray {
+        downProj(fusedSwiGLUProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -1909,7 +1920,13 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let ff: MLXArray
+        if let dense = mlp as? Qwen3NextMLP {
+            ff = dense.qwen35FusedDense(postAttentionLayerNorm(h))
+        } else {
+            ff = (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        }
+        return h + ff
     }
 
     func cbv2Forward(
