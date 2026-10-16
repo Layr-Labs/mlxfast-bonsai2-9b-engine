@@ -413,8 +413,8 @@ private enum Qwen35RegisterGDN {
 
 private enum Qwen35RegisterGatedSIMD {
     private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_register_gate_simd",
-        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
+        name: "qwen35_gdn_register_cached_decay",
+        inputNames: ["q", "k", "v", "a", "b", "negative_a_values", "dt_bias", "state_in"],
         outputNames: ["y", "state_out"],
         source: """
         const uint T = q_shape[1];
@@ -439,7 +439,7 @@ private enum Qwen35RegisterGatedSIMD {
         float negative_a = 0.0f;
         float bias = 0.0f;
         if (lane == 0) {
-          negative_a = -metal::precise::exp(a_log[hv_idx]);
+          negative_a = negative_a_values[hv_idx];
           bias = dt_bias[hv_idx];
         }
         device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
@@ -574,16 +574,34 @@ private enum Qwen35RegisterGatedSIMD {
         """)
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
-                    b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                    b: MLXArray, negativeA: MLXArray, dtBias: MLXArray,
                     state: MLXArray) -> (MLXArray, MLXArray) {
         let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
         let Hv = v.dim(2), Dv = v.dim(3)
         let result = kernel(
-            [q, k, v, a, b, aLog, dtBias, state],
+            [q, k, v, a, b, negativeA, dtBias, state],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
+    }
+}
+
+private final class Qwen35DecayCache {
+    private var source: MLXArray?
+    private var value: MLXArray?
+
+    func negativeExp(_ aLog: MLXArray) -> MLXArray {
+        if source === aLog, let value { return value }
+        let result = -exp(aLog.asType(.float32))
+        source = aLog
+        value = result
+        return result
+    }
+
+    func invalidate() {
+        source = nil
+        value = nil
     }
 }
 
@@ -612,6 +630,7 @@ final class Qwen35GatedDeltaNet: Module {
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
+    private let decayCache = Qwen35DecayCache()
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
@@ -687,6 +706,9 @@ final class Qwen35GatedDeltaNet: Module {
         parameters: ModuleParameters, verify: VerifyUpdate,
         path: [String] = [], modulePath: [String] = []
     ) throws -> Self {
+        if parameters.flattened().contains(where: { $0.0 == "A_log" }) {
+            decayCache.invalidate()
+        }
         let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
         let replacesInputProjection = parameters.flattened().contains { key, _ in
             prefixes.contains(where: key.hasPrefix)
@@ -920,6 +942,7 @@ final class Qwen35GatedDeltaNet: Module {
                 q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
                 state: state, mask: mask)
         }
+        let negativeA = decayCache.negativeExp(aLog)
         if q.dim(1) <= 16, a.dtype == .float32, b.dtype == .float32,
             aLog.dtype == .float32, dtBias.dtype == .float32
         {
@@ -927,11 +950,11 @@ final class Qwen35GatedDeltaNet: Module {
                 [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
             return Qwen35RegisterGatedSIMD.run(
-                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                q: q, k: k, v: v, a: a, b: b, negativeA: negativeA, dtBias: dtBias,
                 state: floatState)
         }
         let beta = sigmoid(b).asType(.float32)
-        let g = computeGatedDeltaG(aLog, a, dtBias)
+        let g = exp(negativeA * softplus(a + dtBias))
         let initial = state ?? MLXArray.zeros(
             [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
         let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
