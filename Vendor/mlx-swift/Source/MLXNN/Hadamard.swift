@@ -43,20 +43,7 @@ public struct SignedBlockHadamard {
         name: "signed_block_hadamard_4096",
         inputNames: ["x", "signs"],
         outputNames: ["y"],
-        source: """
-            #pragma clang fp reassociate(off)
-            const short i = short(thread_position_in_threadgroup.x);
-            const uint block_idx = threadgroup_position_in_grid.y;
-            const uint batch_idx = block_idx * 4096u;
-            const uint sign_offset = (BLOCKS_PER_ROW == 1)
-                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
-
-            threadgroup float buf[256 * 17];
-            float x_reg[16];
-
-            const short base0 = i << 4;
-            const uint in_offset = batch_idx + uint(base0);
-            const uint s_offset = sign_offset + uint(base0);
+        source: fused4096Source(load: """
             if (sizeof(T) == 4) {
               const device float4* in4 = (const device float4*)(x + in_offset);
               const device float4* s4 = (const device float4*)(signs + s_offset);
@@ -81,6 +68,56 @@ public struct SignedBlockHadamard {
                 x_reg[r] = val;
               }
             }
+            """),
+        header: fused4096Header)
+
+    /// `silu(gate) * up` in the order and precision of MLX's compiled `silu`
+    /// followed by its multiply, then the forward transform: one pass over the
+    /// FFN-down input instead of three.
+    private static let swiGLU4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096_swiglu",
+        inputNames: ["gate", "up", "signs"],
+        outputNames: ["y"],
+        source: fused4096Source(load: """
+            const device float4* g4 = (const device float4*)(gate + in_offset);
+            const device float4* u4 = (const device float4*)(up + in_offset);
+            const device float4* s4 = (const device float4*)(signs + s_offset);
+            #pragma clang loop unroll(full)
+            for (short v = 0; v < 4; v++) {
+              const float4 g = g4[v];
+              const float4 u = u4[v];
+              const float4 s = s4[v];
+              #pragma clang loop unroll(full)
+              for (short c = 0; c < 4; c++) {
+                float val = (g[c] * mlx_sigmoid(g[c])) * u[c];
+                val *= s[c];
+                x_reg[4 * v + c] = val;
+              }
+            }
+            """),
+        header: fused4096Header + """
+            METAL_FUNC float mlx_sigmoid(float x) {
+              auto y = 1 / (1 + metal::exp(metal::abs(x)));
+              return (x < 0) ? y : 1 - y;
+            }
+            """)
+
+    private static func fused4096Source(load: String) -> String {
+        """
+            #pragma clang fp reassociate(off)
+            const short i = short(thread_position_in_threadgroup.x);
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const uint sign_offset = (BLOCKS_PER_ROW == 1)
+                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
+
+            threadgroup float buf[256 * 17];
+            float x_reg[16];
+
+            const short base0 = i << 4;
+            const uint in_offset = batch_idx + uint(base0);
+            const uint s_offset = sign_offset + uint(base0);
+            \(load)
             hadamard_radix16(x_reg);
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
@@ -117,8 +154,10 @@ public struct SignedBlockHadamard {
               }
               y[batch_idx + idx] = T(val);
             }
-            """,
-        header: """
+            """
+    }
+
+    private static let fused4096Header = """
             using namespace metal;
             METAL_FUNC void hadamard_radix16(thread float* x) {
               #pragma clang loop unroll(full)
@@ -148,7 +187,7 @@ public struct SignedBlockHadamard {
                 x[k] = a + b; x[k+8] = a - b;
               }
             }
-            """)
+            """
 
     private func fused4096(_ x: MLXArray, inverse: Bool) -> MLXArray? {
         guard blockSize == 4096, x.size > 0, x.size <= Int(UInt32.max),
@@ -324,6 +363,21 @@ public struct SignedBlockHadamard {
             outputDTypes: [.int8, .float32, .float32])
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+    }
+
+    /// `self(silu(gate) * up)` for FP32 activations on the block-4096 path;
+    /// nil when that path does not apply.
+    public func swiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard blockSize == 4096, gate.dtype == .float32, up.dtype == .float32,
+            gate.shape == up.shape, gate.dim(-1) == width,
+            gate.size > 0, gate.size <= Int(UInt32.max),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        return Self.swiGLU4096Kernel(
+            [gate, up, signs],
+            template: [("T", DType.float32), ("BLOCKS_PER_ROW", width / 4096), ("INVERSE", false)],
+            grid: (256, gate.size / 4096, 1), threadGroup: (256, 1, 1),
+            outputShapes: [gate.shape], outputDTypes: [.float32])[0]
     }
 
     /// Transform activations before multiplication by folded weights.
@@ -1076,7 +1130,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if let output = promptInt8Forward(x) {
             return bias.map { output + $0 } ?? output
         }
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        return forward(rotated: transform(gdnLayout.map { $0(x) } ?? x))
+    }
+
+    /// `self(silu(gate) * up)` with the SwiGLU folded into the input
+    /// transform; nil when the fused transform does not apply. Nil also for
+    /// prompt-width rows (`PromptInt8Matmul.applies`): the caller then runs
+    /// `self(silu(gate) * up)`, so the int8 route reads the same input as
+    /// without the fold.
+    public func swiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
+        guard gdnLayout == nil, gate.ndim >= 2,
+            !PromptInt8Matmul.applies(rows: gate.size / gate.dim(-1)),
+            let rotated = transform.swiGLU(gate: gate, up: up)
+        else { return nil }
+        return forward(rotated: rotated)
+    }
+
+    private func forward(rotated: MLXArray) -> MLXArray {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {

@@ -467,7 +467,7 @@ private enum Qwen35RegisterGDN {
 
 private enum Qwen35RegisterGatedSIMD {
     private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_register_gate_simd",
+        name: "qwen35_gdn_register_gate_simd_vstride",
         inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
         outputNames: ["y", "state_out"],
         source: """
@@ -487,7 +487,7 @@ private enum Qwen35RegisterGatedSIMD {
         const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
         const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
         const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
-        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        const device float* v_ = v + b_idx * T * V_STRIDE + V_OFFSET + hv_idx * Dv + dvbase;
         const device float* a_ = a + b_idx * T * Hv + hv_idx;
         const device float* bb_ = b + b_idx * T * Hv + hv_idx;
         float negative_a = 0.0f;
@@ -578,7 +578,7 @@ private enum Qwen35RegisterGatedSIMD {
           if (lane % LPD == 0) {
             *((device float2*)y_) = float2(out[0], out[1]);
           }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += V_STRIDE; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -623,17 +623,68 @@ private enum Qwen35RegisterGatedSIMD {
         }
         """)
 
-    static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
+    /// `v` is the [B, T, Hv, Dv] value tensor, or (with `vOffset`) the
+    /// contiguous [B, T, convDim] conv output whose value columns start at
+    /// `vOffset`, read in place without the strided slice's gather copy.
+    static func run(q: MLXArray, k: MLXArray, v: MLXArray, vOffset: Int?,
+                    Hv: Int, Dv: Int, a: MLXArray,
                     b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
                     state: MLXArray) -> (MLXArray, MLXArray) {
         let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
-        let Hv = v.dim(2), Dv = v.dim(3)
+        let vStride = vOffset == nil ? Hv * Dv : v.dim(2)
         let result = kernel(
             [q, k, v, a, b, aLog, dtBias, state],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("V_STRIDE", vStride), ("V_OFFSET", vOffset ?? 0)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
+    }
+}
+
+/// `Qwen3NextRMSNormGated` with a gate in one dispatch for 128-wide fp32
+/// heads: MLX's single-row rms kernel (one simdgroup, four reads per lane,
+/// `w * (x * inv)`), then `silu(z) * normed`, each product rounded as the
+/// separate ops round it.
+private enum Qwen35FusedGatedNorm {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_gated_norm128",
+        inputNames: ["x", "z", "w"], outputNames: ["y"],
+        source: """
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint offset = row * 128 + lane * 4;
+            float thread_x[4];
+            float acc = 0;
+            for (int i = 0; i < 4; i++) {
+              thread_x[i] = x[offset + i];
+              acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(acc / 128.0f + eps);
+            for (int i = 0; i < 4; i++) {
+              const float normed = w[lane * 4 + i] * static_cast<float>(thread_x[i] * inv);
+              const float zi = z[offset + i];
+              const float s = 1 / (1 + metal::exp(metal::abs(zi)));
+              const float sig = (zi < 0) ? s : 1 - s;
+              const float gate = zi * sig;
+              y[offset + i] = gate * normed;
+            }
+            """)
+
+    static func apply(_ x: MLXArray, gate z: MLXArray, weight: MLXArray, eps: Float)
+        -> MLXArray?
+    {
+        guard x.dtype == .float32, z.dtype == .float32, weight.dtype == .float32,
+            x.ndim >= 2, x.dim(-1) == 128, weight.size == 128, z.shape == x.shape,
+            x.size > 0, x.size <= Int(UInt32.max)
+        else { return nil }
+        let rows = x.size / 128
+        return kernel(
+            [x, z, weight], template: [("EPS_BITS", Int(eps.bitPattern))],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.float32])[0]
     }
 }
 
@@ -961,7 +1012,8 @@ final class Qwen35GatedDeltaNet: Module {
 
     private func updateRecurrence(
         q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?,
+        convOut: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
         guard mask == nil, headKDim == 128, headVDim == 128,
             q.dtype == .float32, k.dtype == .float32, v.dtype == .float32
@@ -976,8 +1028,13 @@ final class Qwen35GatedDeltaNet: Module {
             let initial = state ?? MLXArray.zeros(
                 [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+            let inPlaceV = convOut.flatMap { conv -> MLXArray? in
+                conv.ndim == 3 && conv.dim(0) == q.dim(0) && conv.dim(1) == q.dim(1)
+                    && conv.dim(2) == convDim && conv.dtype == .float32 ? conv : nil
+            }
             return Qwen35RegisterGatedSIMD.run(
-                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                q: q, k: k, v: inPlaceV ?? v, vOffset: inPlaceV == nil ? nil : 2 * keyDim,
+                Hv: numVHeads, Dv: headVDim, a: a, b: b, aLog: aLog, dtBias: dtBias,
                 state: floatState)
         }
         let beta = sigmoid(b).asType(.float32)
@@ -987,6 +1044,15 @@ final class Qwen35GatedDeltaNet: Module {
         let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
         return Qwen35RegisterGDN.run(
             q: q, k: k, v: v, g: g, beta: beta, state: floatState)
+    }
+
+    private func gatedNorm(_ out: MLXArray, gate z: MLXArray) -> MLXArray {
+        if let fused = Qwen35FusedGatedNorm.apply(
+            out, gate: z, weight: norm.weight, eps: norm.eps)
+        {
+            return fused
+        }
+        return norm(out, gate: z)
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -1035,7 +1101,8 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: ssmState,
-            mask: mask
+            mask: mask,
+            convOut: convOut
         )
         return (out, newConvState, newSsmState)
     }
@@ -1073,7 +1140,8 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: ssmState,
-            mask: mask
+            mask: mask,
+            convOut: convOut
         )
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
@@ -1271,7 +1339,7 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -1323,7 +1391,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -1408,7 +1476,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: ssmState,
-                mask: nil)
+                mask: nil,
+                convOut: convOut)
             out = recurrence.0
             let finalSsmState = recurrence.1
 
@@ -1534,7 +1603,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = norm(out, gate: z)
+        let normedOut = gatedNorm(out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(outProj, projectionInput)
@@ -1560,6 +1629,9 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
     let mrope: Qwen35MRoPE
+    /// The plain scale-1 RoPE's parameters for the fused q/k prep; nil when
+    /// the configured RoPE is anything else.
+    private let plainRope: (dims: Int, base: Float)?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1591,6 +1663,18 @@ final class Qwen35Attention: Module {
             rope: self.rope, dim: max(1, ropeDims), base: args.ropeTheta,
             scalingConfig: args.ropeScaling,
             sections: args.mropeSection)
+        let ropeType: String = {
+            if let config = args.ropeScaling,
+                let value = config["type"] ?? config["rope_type"], case .string(let s) = value
+            {
+                return s
+            }
+            return "default"
+        }()
+        self.plainRope =
+            (self.rope is RoPE && ropeType == "default" && ropeDims >= 2 && ropeDims % 2 == 0
+                && ropeDims <= headDim)
+            ? (dims: ropeDims, base: args.ropeTheta) : nil
 
         super.init()
     }
@@ -1641,27 +1725,47 @@ final class Qwen35Attention: Module {
         let qProjOutput = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
-        var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
         let vProjection = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
-        // Text-only Qwen positions are ordinary scalar-equivalent positions,
-        // but histories differ across rows. Capture the per-row device offsets
-        // before the cache advances and use the array RoPE overload.
-        if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+        var queries: MLXArray
+        var keys: MLXArray
+        if positionIds == nil, !exactTargetVerify, let plainRope,
+            ObjectIdentifier(type(of: qNorm)) == ObjectIdentifier(RMSNorm.self),
+            ObjectIdentifier(type(of: kNorm)) == ObjectIdentifier(RMSNorm.self),
+            case let offsets = cache.positionOffsets + 0,
+            let q = Qwen35QKPrep.run(
+                qSplit[0], weight: qNorm.weight, eps: qNorm.eps, offsets: offsets,
+                ropeDims: plainRope.dims, ropeBase: plainRope.base),
+            let k = Qwen35QKPrep.run(
+                kProjection.reshaped(B, L, kvHeads, -1), weight: kNorm.weight, eps: kNorm.eps,
+                offsets: offsets, ropeDims: plainRope.dims, ropeBase: plainRope.base)
+        {
+            // Norm, head transpose and RoPE in one launch per tensor, reading
+            // the q|gate and k views through their strides.
+            queries = q
+            keys = k
         } else {
-            let offsets = cache.positionOffsets + 0
-            queries = rope(queries, offset: offsets)
-            keys = rope(keys, offset: offsets)
+            queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
+                .transposed(0, 2, 1, 3)
+
+            // Text-only Qwen positions are ordinary scalar-equivalent positions,
+            // but histories differ across rows. Capture the per-row device offsets
+            // before the cache advances and use the array RoPE overload.
+            if let positionIds {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            } else {
+                let offsets = cache.positionOffsets + 0
+                queries = rope(queries, offset: offsets)
+                keys = rope(keys, offset: offsets)
+            }
         }
 
         let output = cache.updateAndAttend(
@@ -1674,6 +1778,115 @@ final class Qwen35Attention: Module {
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
             : oProj(projectionInput)
     }
+}
+
+/// The attention's per-head q/k RMSNorm, head transpose and partial RoPE in
+/// one launch per tensor (27b ab18c9c1). The op chain runs a row-contiguous
+/// copy of the strided view, `rms_single_row`, a copy for the RoPE's
+/// untouched dims and the `rope` kernel. Here one 64-thread threadgroup per
+/// (batch, position, head) row keeps each kernel's arithmetic:
+/// `rms_single_row`'s 64 threads x 4 reads, `acc += x * x`, `simd_sum`, the
+/// 32-slot pass, `precise::rsqrt(acc / D + eps)`, `w * (x * inv)`; then
+/// `rope`'s non-traditional pairs `(p, p + RD/2)`, `inv_freq = exp2(-(p /
+/// (RD/2)) * log2(base))`, `theta = float(pos + offset) * inv_freq`,
+/// `fast::cos` / `fast::sin`, the same two products per output; the rest is
+/// copied. Output `[B, H, L, D]` FP32 as the chain's.
+/// `DARKBLOOM_QWEN35_QK_PREP=0` keeps the chain.
+enum Qwen35QKPrep {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN35_QK_PREP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `x`: `[B, L, H, 256]` (any strides), FP32; `weight`: `[256]` FP32;
+    /// `offsets`: `[B]` int32 position offsets.
+    static func run(
+        _ x: MLXArray, weight: MLXArray, eps: Float, offsets: MLXArray,
+        ropeDims: Int, ropeBase: Float
+    ) -> MLXArray? {
+        guard enabled, x.ndim == 4, x.dtype == .float32, weight.dtype == .float32,
+            weight.ndim == 1, x.dim(3) == 256, weight.dim(0) == 256,
+            ropeDims <= 256, ropeDims % 2 == 0,
+            offsets.dtype == .int32, offsets.size == x.dim(0)
+        else { return nil }
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let H = x.dim(2)
+        let D = x.dim(3)
+        return kernel(
+            [x, weight, offsets.reshaped([-1]), MLXArray(eps), MLXArray(Foundation.log2(ropeBase))],
+            template: [("H", H), ("L", L), ("D", D), ("RD", ropeDims)],
+            grid: (64, B * L * H, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[B, H, L, D]], outputDTypes: [.float32])[0]
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_qk_norm_rope",
+        inputNames: ["x", "w", "offsets", "eps", "base"],
+        outputNames: ["out"],
+        source: """
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint h = row % uint(H);
+            const uint l = (row / uint(H)) % uint(L);
+            const uint bb = row / (uint(H) * uint(L));
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+            threadgroup float buf[D];
+
+            const int64_t src = int64_t(bb) * x_strides[0] + int64_t(l) * x_strides[1]
+                + int64_t(h) * x_strides[2];
+            float xv[4];
+            float acc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+              xv[i] = x[src + int64_t(lid * 4 + uint(i)) * x_strides[3]];
+              acc += xv[i] * xv[i];
+            }
+            acc = simd_sum(acc);
+            if (sg == 0) { local_sums[lane] = 0; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) { local_sums[sg] = acc; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              float t = simd_sum(local_sums[lane]);
+              if (lane == 0) { local_inv[0] = metal::precise::rsqrt(t / float(D) + eps); }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+              const uint e = lid * 4 + uint(i);
+              buf[e] = w[e] * static_cast<float>(xv[i] * inv);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            constexpr uint HALF = uint(RD) / 2;
+            const float L_pos = 1.0f * static_cast<float>(int(l) + offsets[bb]);
+            const size_t dst = ((size_t(bb) * size_t(H) + size_t(h)) * size_t(L) + size_t(l)) * size_t(D);
+            for (int i = 0; i < 4; i++) {
+              const uint e = lid * 4 + uint(i);
+              float v = buf[e];
+              if (e < uint(RD)) {
+                const uint p = e % HALF;
+                const float d = static_cast<float>(p) / static_cast<float>(HALF);
+                const float inv_freq = metal::exp2(-d * base);
+                const float theta = L_pos * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = buf[p];
+                const float x2 = buf[p + HALF];
+                if (e < HALF) {
+                  v = x1 * costheta - x2 * sintheta;
+                } else {
+                  v = x1 * sintheta + x2 * costheta;
+                }
+              }
+              out[dst + e] = v;
+            }
+            """,
+        ensureRowContiguous: false)
 }
 
 /// Qwen3.5 interleaved 3-axis M-RoPE. Request positions arrive as function
@@ -1888,8 +2101,19 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen3NextMLP {
+    /// `self(x)`, with `silu(gate) * up` folded into the FFN-down input
+    /// transform when the down projection is a block-4096 Hadamard linear.
+    func qwen35Dense(_ x: MLXArray) -> MLXArray {
+        let gate = gateProj(x)
+        let up = upProj(x)
+        if let down = downProj as? HadamardQuantizedLinear {
+            if let y = down.swiGLU(gate: gate, up: up) { return y }
+        }
+        return downProj(silu(gate) * up)
+    }
+
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return self(x) }
+        guard exact else { return qwen35Dense(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
@@ -1959,7 +2183,9 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let normalized = postAttentionLayerNorm(h)
+        if let dense = mlp as? Qwen3NextMLP { return h + dense.qwen35Dense(normalized) }
+        return h + (mlp as! UnaryLayer)(normalized)
     }
 
     func cbv2Forward(
