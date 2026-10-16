@@ -1,7 +1,7 @@
 // Adapted from PrismML-Eng/mlx-swift 6d3a84de28225d1f5bc0a56f5c781596997242f9 (MIT).
 // Preserve the published Bonsai pack's FP32 transform / original output dtype contract.
 import Foundation
-import MLX
+@_spi(QuantizedConstantCache) import MLX
 
 /// Invalid transform metadata or incompatible packed weights.
 public enum HadamardError: Error {
@@ -474,6 +474,12 @@ private enum Float16ConstantQMV {
 public final class HadamardQuantizedLinear: QuantizedLinear {
     public let transform: SignedBlockHadamard
     public let gdnLayout: HadamardGDNLayout?
+    private let groupedScaleCastCache = ConstantArrayCastCache()
+    private let groupedOffsetCastCache = ConstantArrayCastCache()
+    private static let announceGroupedProjection: Void = {
+        FileHandle.standardError.write(Data(
+            "HadamardQuantizedLinear: sorted 16-row grouped projection selected\n".utf8))
+    }()
     private static let reuseFloat16Constants = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"] == "1"
 
@@ -521,6 +527,25 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        if readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            rotated.dtype == .float32, rotated.size / rotated.dim(-1) == 16,
+            weight.dim(0) <= 8192, StreamOrDevice.default == StreamOrDevice.gpu
+        {
+            _ = Self.announceGroupedProjection
+            let scales = groupedScaleCastCache.cachedCast(
+                self.scales, to: .float32, allowFloat16: true) ?? self.scales
+            let offsets = groupedOffsetCastCache.cachedCast(
+                biases!, to: .float32, allowFloat16: true) ?? biases!
+            // One shared packed matrix and sorted zero ids select the matrix
+            // route at 16 rows, including the M5 tensor kernel.
+            let output = gatherQuantizedMM(
+                rotated.reshaped([16, 1, rotated.dim(-1)]),
+                weight, scales: scales, biases: offsets,
+                rhsIndices: MLXArray(Array(repeating: UInt32(0), count: 16)), transpose: true,
+                groupSize: groupSize, bits: bits, sortedIndices: true)
+                .reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+            return bias.map { output + $0 } ?? output
+        }
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {

@@ -803,6 +803,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
+        /// Request-local prompt continuation; nil uses the pinned MTP head.
+        var promptDraft: [Int32]?
 
         /// Trusted target transitions not yet appended to the persistent head KV.
         /// Each hidden row at position t is paired with the token at t+1.
@@ -839,7 +841,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         private var backlogInputCount: Int {
-            backlogTokens.reduce(0) { total, tokens in
+            let pending = roundInFlight && promptDraft != nil ? roundTrustedTokens : backlogTokens
+            return pending.reduce(0) { total, tokens in
                 let (next, overflow) = total.addingReportingOverflow(tokens.dim(1))
                 return overflow ? Int.max : next
             }
@@ -873,6 +876,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         init(caches: [any KVCache]) { self.caches = caches }
 
         func clearRound() {
+            promptDraft = nil
             roundBaseOffset = cacheOffset
             roundValidHistoryOffset = cacheOffset
             roundDraftSteps = 0
@@ -883,6 +887,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         func clearAll() {
+            promptDraft = nil
             caches.removeAll(keepingCapacity: false)
             backlogHidden.removeAll(keepingCapacity: false)
             backlogTokens.removeAll(keepingCapacity: false)
@@ -1075,6 +1080,19 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             normalizedHidden[0..., (count - 1) ..< count, 0...]
     }
 
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased && !state.roundInFlight)
+        state.promptDraft = Self.forceDoubleForward || Self.shortlistSize != nil
+            ? nil : CBv2PromptLookupDraft.continuation(
+                history: history, promptLength: promptLength, depth: depth)
+    }
+
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         UnusedPreparedCapture()
     }
@@ -1112,6 +1130,14 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
                 state.roundDraftSteps < Self.maximumDepth,
                 "inline Qwen MTP exceeded its \(Self.maximumDepth)-step draft chain")
             feed = (tokens, hidden)
+        }
+
+        if let promptDraft = state.promptDraft {
+            precondition(state.roundDraftSteps < promptDraft.count)
+            let draft = MLXArray([promptDraft[state.roundDraftSteps]])
+            state.roundRoots.append(draft)
+            state.roundDraftSteps += 1
+            return (draft, hidden)
         }
 
         let output =
@@ -1245,6 +1271,12 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             "inline Qwen MTP committed drafts exceed confirmed target inputs")
 
         trim(state: state, to: state.roundValidHistoryOffset)
+        if state.promptDraft != nil {
+            // No head KV was written. Keep every trusted transition for the
+            // next head call, which flushes it through the K/V-only path.
+            state.backlogHidden = state.roundTrustedHidden + state.backlogHidden
+            state.backlogTokens = state.roundTrustedTokens + state.backlogTokens
+        }
         if committedDraftCount > 0 {
             // These are pre-final-norm target verify hiddens, never speculative
             // assistant hiddens. Normalize exactly once, retain lazily, and

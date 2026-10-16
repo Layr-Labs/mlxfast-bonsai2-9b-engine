@@ -722,8 +722,24 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates: MLXArray
+        if topK == 16 && vocabularySize % 512 == 0 {
+            let blocks = vocabularySize / 512
+            let tiled = logits.reshaped([-1, blocks, 512])
+            let local = argPartition(tiled, kth: 512 - topK, axis: -1)[
+                0..., 0..., (512 - topK)...]
+            let offsets = MLXArray((0 ..< blocks).map { UInt32($0 * 512) })
+                .reshaped([1, blocks, 1])
+            let ids = (local + offsets).reshaped([-1, blocks * topK])
+            let values = takeAlong(tiled, local, axis: -1).reshaped([-1, blocks * topK])
+            let selected = argPartition(values, kth: blocks * topK - topK, axis: -1)[
+                0..., (blocks * topK - topK)...]
+            candidates = takeAlong(ids, selected, axis: -1)
+                .reshaped(Array(logits.shape.dropLast()) + [topK])
+        } else {
+            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 

@@ -359,6 +359,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         _ observation: CBv2MTPCommittedTargetObservation,
         requestState: any CBv2MTPRequestState)
 
+    /// Prepare a proposal from the current request's host token history.
+    func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState)
+
     /// Draft-head shortlist opt-in. Non-nil K asks target verification to
     /// additionally surface each verify position's top-K token ids and
     /// their probability mass; finalize threads the accepted position's ids
@@ -395,6 +400,10 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 
 extension CBv2MTPRequestStatefulDrafter {
     public var draftShortlistSize: Int? { nil }
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
     ) throws {}
@@ -752,5 +761,41 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.numComputedAfter = numComputedAfter
         self.generatedAfter = generatedAfter
         self.finishReason = finishReason
+    }
+}
+
+/// Match only the current request's prompt; the target verifies every proposal.
+/// A longest match of at least 16 tokens must have an unambiguous continuation.
+public enum CBv2PromptLookupDraft {
+    public static func continuation(history: [Int], promptLength: Int, depth: Int) -> [Int32]? {
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard depth >= 1, prompt >= 16 + depth, count >= 16 else { return nil }
+        let longest = min(64, count - depth, prompt - depth)
+        guard longest >= 16 else { return nil }
+        var best = 15
+        var chosenEnd: Int?
+        var ambiguous = false
+        for end in 16 ... (prompt - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
+            }
+            guard length >= 16, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
+            }
+        }
+        guard let chosenEnd, !ambiguous else { return nil }
+        return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
     }
 }
