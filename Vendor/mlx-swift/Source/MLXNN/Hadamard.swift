@@ -38,9 +38,100 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
+    private static let fused4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096",
+        inputNames: ["x", "signs"],
+        outputNames: ["y"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const short i = short(thread_position_in_threadgroup.x);
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const uint sign_offset = (BLOCKS_PER_ROW == 1)
+                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
+
+            threadgroup float buf[4096];
+            float x_reg[16];
+
+            const short base0 = i << 4;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              float val = float(x[batch_idx + uint(base0 + r)]);
+              if (!INVERSE) {
+                val *= signs[sign_offset + uint(base0 + r)];
+              }
+              x_reg[r] = val;
+            }
+            hadamard_radix16(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[base0 + r] = x_reg[r];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const short k1 = i & 15;
+            const short j1 = ((i - k1) << 4) + k1;
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              x_reg[r] = buf[j1 + 16 * r];
+            }
+            hadamard_radix16(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[j1 + 16 * r] = x_reg[r];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              x_reg[r] = buf[i + 256 * r];
+            }
+            hadamard_radix16(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              const uint idx = uint(i + 256 * r);
+              float val = x_reg[r] * 0.015625f;
+              if (INVERSE) {
+                val *= signs[sign_offset + idx];
+              }
+              y[batch_idx + idx] = T(val);
+            }
+            """,
+        header: """
+            using namespace metal;
+            METAL_FUNC void hadamard_radix16(thread float* x) {
+              short h = 1;
+              #pragma clang loop unroll(full)
+              for (short s = 0; s < 4; s++) {
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < 8; i++) {
+                  short k = i & (h - 1);
+                  short j = ((i - k) << 1) + k;
+                  float a = x[j];
+                  float b = x[j + h];
+                  x[j] = a + b;
+                  x[j + h] = a - b;
+                }
+                h <<= 1;
+              }
+            }
+            """)
+
+    private func fused4096(_ x: MLXArray, inverse: Bool) -> MLXArray? {
+        guard blockSize == 4096, x.size > 0, x.size <= Int(UInt32.max),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        return Self.fused4096Kernel(
+            [x, signs], template: [("T", x.dtype), ("BLOCKS_PER_ROW", width / 4096),
+                ("INVERSE", inverse)], grid: (256, x.size / 4096, 1),
+            threadGroup: (256, 1, 1), outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if let fused = fused4096(x, inverse: false) { return fused }
         return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
             .reshaped(x.shape).asType(x.dtype)
     }
@@ -48,6 +139,7 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if let fused = fused4096(x, inverse: true) { return fused }
         return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
