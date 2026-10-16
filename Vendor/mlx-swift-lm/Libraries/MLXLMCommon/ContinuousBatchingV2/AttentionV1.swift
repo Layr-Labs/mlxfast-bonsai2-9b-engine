@@ -16,7 +16,6 @@
 //   never data-dependent, never drifting across steps for the same logical
 //   computation (MLX #3384 / report 10 §4 invariant 5).
 
-import Cmlx
 import Foundation
 import MLX
 
@@ -229,7 +228,7 @@ enum CBv2AttentionV1 {
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
                     scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    keepMask: keepMask, allowNativeVectorBatch: true)
+                    keepMask: keepMask)
             }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
@@ -413,7 +412,7 @@ enum CBv2AttentionV1 {
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
-        keepMask: MLXArray? = nil, allowNativeVectorBatch: Bool = false
+        keepMask: MLXArray? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
@@ -423,46 +422,10 @@ enum CBv2AttentionV1 {
                 "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
                     + "\(L) queries over \(cachedKeys.dim(2)) keys")
         }
-        if allowNativeVectorBatch,
-            canBatchSerialQueriesWithNativeVector(
-                kind: kind, queries: queries, keys: cachedKeys, values: cachedValues,
-                sinks: sinks, softcap: softcap, keepMask: keepMask)
-        {
-            return attend(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: nil, sinks: nil, softcap: nil)
-        }
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
             sinks: sinks, softcap: softcap, keepMask: keepMask)
-    }
-
-    /// The one-pass vector kernel visits each query's visible keys in the
-    /// same SIMD-lane order as the serial prefix calls. Keep the total cached
-    /// length below every Metal architecture's two-pass selection threshold.
-    private static func canBatchSerialQueriesWithNativeVector(
-        kind: CBv2LayerKind, queries: MLXArray, keys: MLXArray, values: MLXArray,
-        sinks: MLXArray?, softcap: Float?, keepMask: MLXArray?
-    ) -> Bool {
-        guard kind.attention == .full, !kind.isBidirectional, !kind.hasSinks,
-            sinks == nil, softcap == nil, keepMask == nil,
-            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
-            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
-            queries.dim(0) == 1, queries.dim(1) == 16, queries.dim(3) == 256,
-            (2...7).contains(queries.dim(2)),
-            keys.dim(0) == 1, keys.dim(1) == 4, keys.dim(3) == 256,
-            values.shape == keys.shape,
-            keys.dim(2) >= queries.dim(2), keys.dim(2) < 1024,
-            StreamOrDevice.default == StreamOrDevice.gpu
-        else { return false }
-
-        // This read-only query excludes tracing and retained autodiff graphs.
-        // The descriptor identity is discarded; no tensor or result is cached.
-        var identity: UInt = 0
-        var canCache = false
-        return _mlx_array_constant_cache_identity(&identity, &canCache, queries.ctx) == 0
-            && canCache
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
