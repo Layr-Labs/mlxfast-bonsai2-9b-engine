@@ -38,6 +38,10 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    func isIdentical(to other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width && signValues == other.signValues
+    }
+
     // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
     private static let fused4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_4096",
@@ -1070,6 +1074,33 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+    }
+
+    /// Reuse prompt codes within this forward when all input transforms match.
+    public static func sharedPromptProjections(
+        _ x: MLXArray, _ projections: [Linear]
+    ) -> [MLXArray]? {
+        guard x.ndim >= 2, x.dtype == .float32,
+            PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
+            PromptInt8Matmul.route != .off
+        else { return nil }
+        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
+        guard packed.count == projections.count, let first = packed.first,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
+                    && $0.transform.isIdentical(to: first.transform)
+            }),
+            let activation = first.transform.quantizedForPrompt(x)
+        else { return nil }
+        return packed.map { layer in
+            let (scalesT, biasesT) = layer.promptConstants.get(
+                scales: layer.scales, biases: layer.biases!)
+            let output = PromptInt8Matmul.matmul(
+                activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
+                .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+            return layer.bias.map { output + $0 } ?? output
+        }
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
