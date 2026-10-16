@@ -1092,9 +1092,9 @@ private enum Float16ConstantQMV {
         let K = x.dim(-1)
         let rows = x.size / K
         let N = weight.dim(0)
-        let outputs = 4
+        let outputs = outputsPerSimdgroup(rows: rows)
         let span = 2 * outputs * topTwoBlocks
-        guard (2 ... 4).contains(rows), outputsPerSimdgroup(rows: rows) == outputs,
+        guard (2 ... 8).contains(rows),
             N % span == 0
         else { return nil }
         let groups = N / span
@@ -2251,7 +2251,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 extension HadamardQuantizedLinear {
     /// Exact top-2 output ids and values per activation row, ordered by value
     /// descending and id ascending on ties, without writing the `rows x N`
-    /// outputs: the same values `callAsFunction` returns for 2 to 4 FP32 rows.
+    /// outputs: the same values `callAsFunction` returns for 2 to 8 FP32 rows.
     /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
     /// module or shape has no fused path.
     public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
