@@ -1839,6 +1839,12 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
+        if !exact, let gate = gateProj as? HadamardQuantizedLinear,
+            let up = upProj as? HadamardQuantizedLinear,
+            let activated = gate.fusedGateUpProjection(x, with: up)
+        {
+            return downProj(activated)
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
