@@ -1127,6 +1127,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // The engine immediately submits evaluationTargets for this first
             // cache generation before constructing a deeper draft step.
             state.roundValidHistoryOffset = state.cacheOffset
+        } else {
+            // Submit each later cache generation before the next draft or
+            // target graph is built. The engine still owns the finalize join.
+            asyncEval([draft, lastHidden] + state.caches.flatMap { $0.innerState() })
         }
         return (draft, lastHidden)
     }
