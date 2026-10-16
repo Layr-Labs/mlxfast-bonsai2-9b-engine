@@ -269,14 +269,11 @@ private enum Float16ConstantQMV {
             float result[rows][outputs];
             for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
             for (int k = 0; k < K; k += 512) {
-              float s4[outputs][4], b[outputs];
+              // Normalize each two-bit field instead of retaining four scaled scales.
+              float s[outputs], b[outputs];
               uint packed[outputs];
               for (int r = 0; r < outputs; r++) {
-                const float s = float(sc[r * in_g]);
-                s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
+                s[r] = float(sc[r * in_g]);
                 b[r] = float(bi[r * in_g]);
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
@@ -284,10 +281,10 @@ private enum Float16ConstantQMV {
                 float wd[outputs][4];
                 for (int r = 0; r < outputs; r++) {
                   const uint q = packed[r] >> (8 * i);
-                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
-                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
-                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
-                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  wd[r][0] = fma(s[r], float(q & 0x03u), b[r]);
+                  wd[r][1] = fma(s[r], float((q >> 2) & 0x03u), b[r]);
+                  wd[r][2] = fma(s[r], float((q >> 4) & 0x03u), b[r]);
+                  wd[r][3] = fma(s[r], float((q >> 6) & 0x03u), b[r]);
                 }
                 for (int v = 0; v < rows; v++) {
                   const float4 xv = xp[v * (K / 4) + i];
