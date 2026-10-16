@@ -964,7 +964,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr bool short_m_tile = sizeof(T) == 4 && group_size == 128 &&
+      bits == 2 && BM == 16 && BK == 64 && BN == 128 && WM == 1 && WN == 4;
+  constexpr int BK_padded = short_m_tile ? BK : BK + 16 / sizeof(T);
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1000,6 +1002,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
+  static_assert(
+      TN % 2 == 0 || (TN == 1 && TM % 2 == 0),
+      "NAX matmul needs paired output fragments");
 
   const short tm = SM * (simd_gid / WN);
   const short tn = SN * (simd_gid % WN);
@@ -1241,7 +1246,10 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  constexpr bool short_m_kernel = sizeof(T) == 4 && group_size == 128 &&
+      bits == 2 && aligned_N && !batched && BM == 32 && BK == 64 && BN == 64 &&
+      WM == 2 && WN == 2;
+  threadgroup T Ws[short_m_kernel ? 2 * BN * BK : BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1260,6 +1268,18 @@ template <
         s_strides,
         b_strides,
         tid);
+  }
+  // Each active group covers two host N tiles with paired N fragments.
+  if constexpr (short_m_kernel) {
+    if (M == 16 && K == 4096 && N >= 12288 && N % 128 == 0) {
+      if (tid.x & 1u) {
+        return;
+      }
+      const uint3 tile_tid(tid.x / 2, tid.y, tid.z);
+      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, 16, BK, 2 * BN, 1, 4>(
+          w, scales, biases, x, y, Ws, K, N, M, tile_tid, lid, simd_gid, simd_lid);
+      return;
+    }
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);

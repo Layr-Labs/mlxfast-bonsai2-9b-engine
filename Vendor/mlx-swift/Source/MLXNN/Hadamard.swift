@@ -445,6 +445,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     private static let reuseFloat16Constants = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"] == "1"
 
+    private static let useM5VerifyMatrix: Bool = {
+        #if canImport(Metal)
+            guard #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) else {
+                return false
+            }
+            let architecture = GPU.deviceInfo().architecture
+            return architecture.hasPrefix("applegpu_g17") && !architecture.hasSuffix("p")
+        #else
+            return false
+        #endif
+    }()
+
+    private static let verifyMatrixWitness: Void = {
+        FileHandle.standardError.write(Data(
+            "MLXFAST_VERIFY_MATRIX16X128_SELECTED arch=\(GPU.deviceInfo().architecture) logical_rows=4 physical_rows=16\n".utf8))
+    }()
+
     /// Qualification witness; this selects reuse, never a different precision
     /// or packed-matmul kernel. The process-wide generic cache kill switch also
     /// remains effective. No cached arrays enter the module parameter tree.
@@ -489,6 +506,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        if Self.useM5VerifyMatrix, StreamOrDevice.default == StreamOrDevice.gpu,
+            readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            rotated.dtype == .float32,
+            rotated.dim(-1) == 4096, rotated.size == 4 * 4096,
+            weight.dim(0) >= 12_288, weight.dim(0) % 128 == 0
+        {
+            _ = Self.verifyMatrixWitness
+            let padded = concatenated([
+                rotated.reshaped([4, 4096]), MLXArray.zeros([12, 4096], dtype: .float32),
+            ], axis: 0)
+            let output = constantCachedForward(padded, allowFloat16: true)[0 ..< 4]
+            return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+        }
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
