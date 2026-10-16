@@ -521,7 +521,47 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         try assistant.mtp.update(
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
+        requantizeHeadLinears(in: assistant.mtp)
         return assistant
+    }
+
+    /// On-load head re-encoding, permitted by the head re-quantization
+    /// exception (participant contract section 4.4): in memory only, within
+    /// the declaration cap, after the export's tensors were bound at their
+    /// own geometry. The export on disk and every target tensor — the shared
+    /// embedding, the lm_head, and the draft-vocabulary copy of its rows —
+    /// stay untouched. The head only proposes; re-encoding can move draft
+    /// choices and therefore acceptance, never bypass target verification.
+    static let headRequantGeometry: (groupSize: Int, bits: Int)? = (128, 4)
+
+    private static func requantizeHeadLinears(in head: Qwen35MTPModule) {
+        guard let geometry = headRequantGeometry else { return }
+        quantize(
+            model: head,
+            filter: { _, module in
+                guard let linear = module as? Qwen35MTPQuantizedLinear,
+                    linear.mode == .affine,
+                    linear.groupSize != geometry.groupSize || linear.bits != geometry.bits,
+                    (linear.weight.dim(1) * 32 / linear.bits) % geometry.groupSize == 0
+                else { return nil }
+                return (geometry.groupSize, geometry.bits, QuantizationMode.affine)
+            },
+            apply: { module, groupSize, bits, mode in
+                guard let linear = module as? Qwen35MTPQuantizedLinear else { return nil }
+                let dense = dequantized(
+                    linear.weight, scales: linear.scales, biases: linear.biases,
+                    groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode,
+                    dtype: .float16)
+                let (weight, scales, biases) = quantized(
+                    dense, groupSize: groupSize, bits: bits, mode: mode)
+                let replacement = Qwen35MTPQuantizedLinear(
+                    weight: weight, bias: linear.bias, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, mode: mode)
+                // Materialize the packed replacement now so the dense FP16
+                // intermediate frees before the next module dequantizes.
+                eval(replacement)
+                return replacement
+            })
     }
 
     private static func qwen35TextTarget(
