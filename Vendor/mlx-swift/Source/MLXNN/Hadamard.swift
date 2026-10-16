@@ -449,8 +449,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// or packed-matmul kernel. The process-wide generic cache kill switch also
     /// remains effective. No cached arrays enter the module parameter tree.
     var permitsFloat16ConstantReuse: Bool {
-        Self.reuseFloat16Constants && bits == 2 && groupSize == 128
-            && transform.blockSize == 1024 && scales.dtype == .float16
+        bits == 2 && groupSize == 128 && scales.dtype == .float16
+            && (transform.blockSize == 4096
+                || (Self.reuseFloat16Constants && transform.blockSize == 1024))
     }
 
     public init(
