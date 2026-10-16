@@ -389,11 +389,18 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         committedTargetHidden: MLXArray)
     /// Reject/discard all assistant writes made by the current round.
     func discardRound(requestState: any CBv2MTPRequestState)
+    /// Undo a round the engine began early, at the previous round's finalize,
+    /// from a verify-produced carry whose transition was not yet observed.
+    /// The state must equal the state before that round began.
+    func abandonEarlyRound(requestState: any CBv2MTPRequestState)
     /// Explicitly sever device-array ownership on finish/cancel/preemption.
     func releaseRequestState(_ requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPRequestStatefulDrafter {
+    public func abandonEarlyRound(requestState: any CBv2MTPRequestState) {
+        discardRound(requestState: requestState)
+    }
     public var draftShortlistSize: Int? { nil }
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int

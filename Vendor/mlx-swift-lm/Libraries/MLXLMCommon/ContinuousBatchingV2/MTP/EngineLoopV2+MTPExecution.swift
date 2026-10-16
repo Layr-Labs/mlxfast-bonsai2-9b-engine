@@ -587,6 +587,18 @@ extension EngineLoopV2 {
             for position in 0 ..< k {
                 draftSteps.append(batched[0..., position])
             }
+        } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            let early = mtpTakeEarlyDraftChains(
+                verifyRows, rowMetadata: rowMetadata, k: k, drafter: stateful, driver: mtp)
+        {
+            // Drafted and submitted at the previous round's finalize on these
+            // same states with these carries; finalization joins it through
+            // the acceptance packet exactly as below.
+            for draftIndex in 0 ..< k {
+                let rows = early.map { $0.steps[draftIndex] }
+                draftSteps.append(concatenated(rows, axis: 0))
+            }
+            for chain in early { assistantEvalTargets.append(contentsOf: chain.evalTargets) }
         } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
@@ -696,6 +708,42 @@ extension EngineLoopV2 {
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result
+    }
+
+    /// Every row's early chain when all rows have one matching this round;
+    /// otherwise nil, with any early round undone so the build drafts anew.
+    private func mtpTakeEarlyDraftChains(
+        _ verifyRows: [CBv2MTPRowWork],
+        rowMetadata: [CBv2MTPRoundInFlight.VerifyRow],
+        k: Int,
+        drafter: any CBv2MTPRequestStatefulDrafter,
+        driver mtp: CBv2MTPRoundDriver
+    ) -> [CBv2MTPEarlyDraftChain]? {
+        var chains: [CBv2MTPEarlyDraftChain?] = []
+        chains.reserveCapacity(verifyRows.count)
+        for row in verifyRows {
+            let carry = row.carry!
+            let chain = mtp.takeEarlyDraftChain(for: row.rec.id)
+            if let chain, chain.k == k, chain.token == carry.token,
+                chain.kvOffset == carry.kvOffset
+            {
+                chains.append(chain)
+            } else {
+                chains.append(nil)
+                if chain != nil, let state = rowMetadata.first(where: { $0.id == row.rec.id })?
+                    .assistantState
+                {
+                    drafter.abandonEarlyRound(requestState: state)
+                }
+            }
+        }
+        if chains.allSatisfy({ $0 != nil }) { return chains.map { $0! } }
+        for (row, chain) in zip(verifyRows, chains) where chain != nil {
+            if let state = rowMetadata.first(where: { $0.id == row.rec.id })?.assistantState {
+                drafter.abandonEarlyRound(requestState: state)
+            }
+        }
+        return nil
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

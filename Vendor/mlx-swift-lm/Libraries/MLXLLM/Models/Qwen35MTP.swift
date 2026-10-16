@@ -1270,6 +1270,22 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         state.clearRound()
     }
 
+    /// An early round began from a verify carry: `beginRound` moved the
+    /// backlog into the round and appended the carry transition last, with
+    /// no target frontier before it. Dropping that transition restores the
+    /// exact pre-round backlog; the engine re-observes the carry itself.
+    public func abandonEarlyRound(requestState: any CBv2MTPRequestState) {
+        guard let state = requestState as? RequestState,
+            !state.isReleased, state.roundInFlight
+        else { return }
+        trim(state: state, to: state.roundBaseOffset)
+        state.backlogHidden =
+            Array(state.roundTrustedHidden.dropLast()) + state.backlogHidden
+        state.backlogTokens =
+            Array(state.roundTrustedTokens.dropLast()) + state.backlogTokens
+        state.clearRound()
+    }
+
     private func trim(state: RequestState, to offset: Int) {
         let rollback = state.cacheOffset - offset
         precondition(rollback >= 0, "inline Qwen MTP cache checkpoint moved forward")

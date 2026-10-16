@@ -276,6 +276,39 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            // EARLY DRAFT CHAIN (the chain-drafter form of the 27b engine's
+            // early block proposal, ab18c9c1). Everything the next round's
+            // chain reads is final here: the assistant history was just
+            // finalized, the carry token and hidden are fixed, and the row's
+            // committed length is post-rollback. Drafting NOW puts the chain
+            // on the GPU while the host finishes finalize, plans and builds
+            // the verify, instead of after all of it. Same calls, inputs and
+            // order as `mtpBuildVerifyGraph`, which consumes the chain; only a
+            // fixed-depth leg with a full next round ahead takes this path.
+            var earlyChain: CBv2MTPEarlyDraftChain?
+            if finishReason == nil, confirmed > 0, Self.mtpEarlyDraftChainEnabled,
+                mtp.blockDrafter == nil,
+                let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState,
+                let fixedDepth = mtp.config.fixedDraftTokens, fixedDepth == k,
+                rec.request.maxTokens - rec.generatedTokenCount >= k,
+                StreamOrDevice.default == StreamOrDevice.gpu
+            {
+                earlyChain = mtpDraftEarlyChain(
+                    stateful: stateful, state: state, rec: rec,
+                    token: kept[confirmed - 1],
+                    hidden: verify.lastHidden[
+                        batchIndex ..< (batchIndex + 1),
+                        CBv2MTPHiddenIndex.carryColumn(
+                            targetOutputIndex: confirmed - 1, draftDepth: k)
+                            ..< (CBv2MTPHiddenIndex.carryColumn(
+                                targetOutputIndex: confirmed - 1, draftDepth: k) + 1),
+                        0...],
+                    shortlist: mtpCarryShortlist(
+                        verify: verify, host: host, batchIndex: batchIndex,
+                        confirmed: confirmed),
+                    k: k, driver: mtp)
+            }
             // The speculative suffix is now reconciled in BOTH the page tables
             // and scheduler record. Publish only the accepted frontier; doing
             // this before rollback would make a rejected block cache-visible.
@@ -350,6 +383,7 @@ extension EngineLoopV2 {
                 if let state = metadata.assistantState {
                     mtp.restoreAssistantState(state, for: id)
                 }
+                if let earlyChain { mtp.storeEarlyDraftChain(earlyChain, for: id) }
                 // No inline deadline check: an MTP row that just confirmed
                 // tokens is making progress and its decode lease is refreshed
                 // in `refreshProgressLeases` (run at the end of the enclosing
@@ -363,14 +397,8 @@ extension EngineLoopV2 {
                 // probability mass (packet tail, parts-per-million) clears
                 // the threshold; otherwise the draft falls back to the full
                 // head for that round.
-                var carryShortlist: MLXArray?
-                if let shortlistIDs = verify.shortlistIDs {
-                    let massBase = draftCount + verify.rows.count * targetWidth
-                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
-                    if mass >= Self.mtpShortlistMassThresholdPPM {
-                        carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
-                    }
-                }
+                let carryShortlist = mtpCarryShortlist(
+                    verify: verify, host: host, batchIndex: batchIndex, confirmed: confirmed)
                 let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
                     let base =
                         (batchIndex * targetWidth + hiddenColumn) * 2
@@ -401,5 +429,75 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
+    }
+    /// `DARKBLOOM_MTP_EARLY_CHAIN=0` drafts the next chain in the verify build.
+    static let mtpEarlyDraftChainEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MTP_EARLY_CHAIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The carry position's target top-K ids when their packet mass clears
+    /// the coverage threshold; nil scores the full head.
+    private func mtpCarryShortlist(
+        verify: CBv2MTPRoundInFlight.Verify, host: [Int32], batchIndex: Int, confirmed: Int
+    ) -> MLXArray? {
+        guard let shortlistIDs = verify.shortlistIDs else { return nil }
+        let k = verify.k
+        let targetWidth = 1 + k
+        let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+            targetOutputIndex: confirmed - 1, draftDepth: k)
+        let massBase = verify.rows.count * k + verify.rows.count * targetWidth
+        let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+        guard mass >= Self.mtpShortlistMassThresholdPPM else { return nil }
+        return shortlistIDs[batchIndex, hiddenColumn]
+    }
+
+    /// The k-step chain `mtpBuildVerifyGraph` drafts for one row, with the
+    /// same submissions: the first head-cache generation, then the chain.
+    private func mtpDraftEarlyChain(
+        stateful: any CBv2MTPRequestStatefulDrafter, state: any CBv2MTPRequestState,
+        rec: CBv2ScheduledRequest, token: Int, hidden: MLXArray, shortlist: MLXArray?,
+        k: Int, driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPEarlyDraftChain? {
+        do {
+            try stateful.configureRequestState(
+                state,
+                maximumSequenceLength: rec.request.promptTokens.count
+                    + max(rec.request.maxTokens, 1))
+        } catch {
+            return nil
+        }
+        let seedColumn = MLXArray([Int32(token)]).reshaped([1, 1])
+        var currentTokens = seedColumn[0 ..< 1, 0...]
+        var currentHidden = hidden
+        var steps: [MLXArray] = []
+        var evalTargets: [MLXArray] = []
+        steps.reserveCapacity(k)
+        for draftIndex in 0 ..< k {
+            let result = stateful.draftStep(
+                tokens: currentTokens,
+                hidden: currentHidden,
+                shortlist: draftIndex == 0 ? shortlist : nil,
+                requestState: state)
+            let next = result.tokens.reshaped([1])
+            var stepEvalTargets = [next, result.hidden]
+            stepEvalTargets.append(contentsOf: stateful.evaluationTargets(for: state))
+            if draftIndex == 0 {
+                asyncEval(stepEvalTargets)
+                mtp.recordEarlyDraftSubmission()
+            }
+            evalTargets.append(contentsOf: stepEvalTargets)
+            steps.append(next)
+            currentTokens = next.reshaped([1, 1])
+            currentHidden = result.hidden
+        }
+        if k > 1 {
+            asyncEval(evalTargets)
+            mtp.recordEarlyDraftSubmission()
+        }
+        return CBv2MTPEarlyDraftChain(
+            k: k, token: token, kvOffset: rec.numComputedTokens,
+            steps: steps, evalTargets: evalTargets)
     }
 }

@@ -50,6 +50,20 @@ struct CBv2MTPCarry {
     let kvOffset: Int
 }
 
+/// The next round's draft chain, built and submitted at the previous round's
+/// finalize on the row's own assistant state (see `finalizeMTPRound`). It
+/// is exactly the chain the verify build would draft: same carry token and
+/// hidden, same calls in the same order. While it exists, the row's
+/// assistant state has that round in flight.
+struct CBv2MTPEarlyDraftChain {
+    let k: Int
+    let token: Int
+    let kvOffset: Int
+    /// k entries, each the `[1]` int32 draft of one chain step.
+    let steps: [MLXArray]
+    let evalTargets: [MLXArray]
+}
+
 // MARK: - Declared depth
 
 /// A fixed draft depth above the drafter's own draft-chain cap. The round
@@ -268,6 +282,7 @@ final class CBv2MTPRoundDriver {
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
+    private var earlyDraftChains: [CBv2RequestID: CBv2MTPEarlyDraftChain] = [:]
     private var assistantStates: [CBv2RequestID: any CBv2MTPRequestState] = [:]
     /// Qwen acceptance is request-owned; raw nonchained wall cost is shared
     /// only within a compatible decode-row bucket.
@@ -617,7 +632,12 @@ final class CBv2MTPRoundDriver {
         guard tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
         else { return nil }
-        let state = assistantStates.removeValue(forKey: id) ?? stateful.makeRequestState()
+        let existing = assistantStates.removeValue(forKey: id)
+        if let existing, earlyDraftChains.removeValue(forKey: id) != nil {
+            // A target-only row observes this state next: undo the early round.
+            stateful.abandonEarlyRound(requestState: existing)
+        }
+        let state = existing ?? stateful.makeRequestState()
         do {
             try stateful.configureRequestState(
                 state, maximumSequenceLength: maximumSequenceLength)
@@ -706,6 +726,17 @@ final class CBv2MTPRoundDriver {
         assistantStates.removeValue(forKey: id)
     }
 
+    /// Record a chain drafted early on `id`'s assistant state, which the
+    /// caller restores to the driver in the same finalize.
+    func storeEarlyDraftChain(_ chain: CBv2MTPEarlyDraftChain, for id: CBv2RequestID) {
+        earlyDraftChains[id] = chain
+    }
+
+    /// The verify build takes the chain together with the assistant state.
+    func takeEarlyDraftChain(for id: CBv2RequestID) -> CBv2MTPEarlyDraftChain? {
+        earlyDraftChains.removeValue(forKey: id)
+    }
+
     func restoreAssistantState(
         _ state: any CBv2MTPRequestState, for id: CBv2RequestID
     ) {
@@ -774,6 +805,7 @@ final class CBv2MTPRoundDriver {
     }
 
     private func releaseAssistantState(_ id: CBv2RequestID) {
+        earlyDraftChains.removeValue(forKey: id)
         guard let state = assistantStates.removeValue(forKey: id),
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
         else { return }
@@ -833,6 +865,7 @@ final class CBv2MTPRoundDriver {
         carries.removeAll(keepingCapacity: false)
         rawCostEstimators.removeAll(keepingCapacity: false)
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
+        earlyDraftChains.removeAll(keepingCapacity: false)
         roundMarks.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
