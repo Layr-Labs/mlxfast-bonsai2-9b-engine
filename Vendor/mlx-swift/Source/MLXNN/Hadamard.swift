@@ -38,6 +38,10 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    fileprivate func sharesTransform(with other: Self) -> Bool {
+        blockSize == other.blockSize && width == other.width && signs === other.signs
+    }
+
     // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
     private static let fused4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_4096",
@@ -406,6 +410,102 @@ private enum Float16ConstantQMV {
             }
             """)
 
+    private static let fusedGateUp = MLXFast.metalKernel(
+        name: "hadamard_qmv_mlp_f16_constants",
+        inputNames: ["x", "gate_w", "gate_scales", "gate_biases",
+            "up_w", "up_scales", "up_biases"],
+        outputNames: ["y"],
+        source: """
+
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[1];
+            const int N = gate_w_shape[0];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            const int out_row = tid.y * outputs;
+            const device uint* w = simd_gid == 0 ? gate_w : up_w;
+            const device half* scales = simd_gid == 0 ? gate_scales : up_scales;
+            const device half* biases = simd_gid == 0 ? gate_biases : up_biases;
+            const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
+            const device half* sc = scales + out_row * in_g + simd_lid / 8;
+            const device half* bi = biases + out_row * in_g + simd_lid / 8;
+            const device float4* xp = (const device float4*)(x + simd_lid * 16);
+            threadgroup float projected[2][rows][outputs];
+            float result[rows][outputs];
+            for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
+            for (int k = 0; k < K; k += 512) {
+              float s4[outputs][4], b[outputs];
+              uint packed[outputs];
+              for (int r = 0; r < outputs; r++) {
+                const float s = float(sc[r * in_g]);
+                s4[r][0] = s;
+                s4[r][1] = s / 4.0f;
+                s4[r][2] = s / 16.0f;
+                s4[r][3] = s / 64.0f;
+                b[r] = float(bi[r * in_g]);
+                packed[r] = *(const device uint*)(ws + r * in_w);
+              }
+              for (int i = 0; i < 4; i++) {
+                float wd[outputs][4];
+                for (int r = 0; r < outputs; r++) {
+                  const uint q = packed[r] >> (8 * i);
+                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
+                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
+                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
+                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                }
+                for (int v = 0; v < rows; v++) {
+                  const float4 xv = xp[v * (K / 4) + i];
+                  for (int r = 0; r < outputs; r++) {
+                    result[v][r] = fma(xv.x, wd[r][0], result[v][r]);
+                    result[v][r] = fma(xv.y, wd[r][1], result[v][r]);
+                    result[v][r] = fma(xv.z, wd[r][2], result[v][r]);
+                    result[v][r] = fma(xv.w, wd[r][3], result[v][r]);
+                  }
+                }
+              }
+              ws += 128;
+              sc += 4;
+              bi += 4;
+              xp += 128;
+            }
+            for (int v = 0; v < rows; v++) {
+              for (int r = 0; r < outputs; r++) {
+                const float total = simd_sum(result[v][r]);
+                if (simd_lid == 0) projected[simd_gid][v][r] = total;
+              }
+            }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0 && simd_lid < rows * outputs) {
+              #pragma clang fp reassociate(off)
+              #pragma clang fp contract(off)
+              const uint v = simd_lid / outputs;
+              const uint r = simd_lid % outputs;
+              const float gate = projected[0][v][r];
+              const float up = projected[1][v][r];
+              const float s = 1.0f / (1.0f + metal::exp(metal::abs(gate)));
+              const float sigmoid = gate < 0.0f ? s : 1.0f - s;
+              const float activated = gate * sigmoid;
+              y[v * N + out_row + r] = activated * up;
+            }
+            """)
+
+    static func gatedMatmul(
+        _ x: MLXArray, gate: HadamardQuantizedLinear, up: HadamardQuantizedLinear
+    ) -> MLXArray {
+        let K = x.dim(-1), rows = x.size / K, N = gate.weight.dim(0)
+        let outputs = outputsPerSimdgroup(rows: rows)
+        let result = fusedGateUp(
+            [x.reshaped([rows, K]), gate.weight, gate.scales, gate.biases!,
+                up.weight, up.scales, up.biases!],
+            template: [("rows", rows), ("outputs", outputs)],
+            grid: (32, N / outputs * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        return result.reshaped(Array(x.shape.dropLast()) + [N])
+    }
+
     /// The widest MTP verify: a draft chain of at most six tokens (the Qwen
     /// 3.5 drafter's cap) plus its seed.
     static let maximumRows = 7
@@ -485,6 +585,20 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
     let readsFloat16ConstantsInPlace: Bool
+
+    /// Fuse compatible gate/up projections and SiLU without intermediate outputs.
+    public func fusedGateUpProjection(
+        _ x: MLXArray, with other: HadamardQuantizedLinear
+    ) -> MLXArray? {
+        guard x.dtype == .float32, (2 ... Float16ConstantQMV.maximumRows).contains(x.size / x.dim(-1)),
+            readsFloat16ConstantsInPlace, other.readsFloat16ConstantsInPlace,
+            bias == nil, other.bias == nil,
+            gdnLayout == nil, other.gdnLayout == nil,
+            weight.shape == other.weight.shape,
+            transform.sharesTransform(with: other.transform)
+        else { return nil }
+        return Float16ConstantQMV.gatedMatmul(transform(x), gate: self, up: other)
+    }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
