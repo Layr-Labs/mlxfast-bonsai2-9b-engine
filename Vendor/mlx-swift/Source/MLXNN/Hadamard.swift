@@ -426,7 +426,9 @@ private enum Float16ConstantQMV {
         let N = weight.dim(0)
         // Shape metadata supplies K and N without allocating scalar tensor inputs.
         let inputs = [x.reshaped([rows, K]), weight, scales, biases]
-        let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
+        // Wide input projections use fewer live accumulators during verification.
+        let outputs = rows == 1 ? 4
+            : (rows <= 4 && K >= 12288 ? 2 : outputsPerSimdgroup(rows: rows))
         let output = (rows == 1 ? fast : Self.rows)(
             inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
