@@ -225,6 +225,50 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 // MARK: - GatedDeltaNet
 
 // Register layout from the accepted 27B engine PR #649 (MIT lineage).
+private enum Qwen35FusedQKNorm {
+    private static let invScale = pow(Float(128), -0.5)
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_qk_norm128",
+        inputNames: ["x"], outputNames: ["q_out", "k_out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint offset = (row / HEADS) * CONV_DIM + (row % HEADS) * 128 + lane * 4;
+            float q[4], k[4];
+            float q_sum = 0.0f, k_sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              q[i] = x[offset + i];
+              k[i] = x[offset + HEADS * 128 + i];
+              q_sum += q[i] * q[i];
+              k_sum += k[i] * k[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float q_inv = metal::precise::rsqrt(simd_sum(q_sum) / 128.0f + eps);
+            const float k_inv = metal::precise::rsqrt(simd_sum(k_sum) / 128.0f + eps);
+            const uint output_offset = row * 128 + lane * 4;
+            for (int i = 0; i < 4; ++i) {
+              q_out[output_offset + i] = as_type<float>(uint(Q_SCALE_BITS)) * (q[i] * q_inv);
+              k_out[output_offset + i] = as_type<float>(uint(K_SCALE_BITS)) * (k[i] * k_inv);
+            }
+            """)
+
+    static func apply(_ x: MLXArray, heads: Int, dimensions: Int) -> (MLXArray, MLXArray)? {
+        guard x.dtype == .float32, x.ndim == 3, dimensions == 128,
+            x.dim(2) >= 2 * heads * dimensions, x.size > 0, x.size <= Int(UInt32.max)
+        else { return nil }
+        let shape = [x.dim(0), x.dim(1), heads, dimensions]
+        let outputs = kernel(
+            [x], template: [("HEADS", heads), ("CONV_DIM", x.dim(2)),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (32, x.dim(0) * x.dim(1) * heads, 1), threadGroup: (32, 1, 1),
+            outputShapes: [shape, shape], outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+}
+
 private enum Qwen35RegisterGDN {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_v3",
@@ -656,6 +700,22 @@ final class Qwen35GatedDeltaNet: Module {
         return contiguous(tail)
     }
 
+    private func normalizedQK(_ convOut: MLXArray, B: Int, S: Int) -> (MLXArray, MLXArray) {
+        if let fused = Qwen35FusedQKNorm.apply(
+            convOut, heads: numKHeads, dimensions: headKDim)
+        {
+            return fused
+        }
+        let q = convOut[0..., 0..., 0 ..< keyDim].reshaped(B, S, numKHeads, headKDim)
+        let k = convOut[0..., 0..., keyDim ..< (2 * keyDim)].reshaped(B, S, numKHeads, headKDim)
+        let invScale = pow(Float(headKDim), -0.5)
+        return (
+            MLXArray(pow(invScale, 2)).asType(q.dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+            MLXArray(invScale).asType(k.dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6))
+    }
+
     private func updateRecurrence(
         q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
@@ -710,19 +770,8 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
+        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let (out, newSsmState) = updateRecurrence(
             q: qNormed,
@@ -759,19 +808,8 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
+        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let recurrence = updateRecurrence(
             q: qNormed,
@@ -1103,19 +1141,8 @@ final class Qwen35GatedDeltaNet: Module {
             convOut = silu(conv1d(convInput))
         }
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
+        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let out: MLXArray
         if S >= 3 {
