@@ -1341,7 +1341,7 @@ enum PromptInt8Matmul {
 enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
 
-    static let rowRange = 2 ... 8
+    static let rowRange = 2 ... 16
     static let tileRows = 16
 
     private static let plainSource = """
@@ -1357,9 +1357,12 @@ enum VerifyInt8Matmul {
         const int j = int(lane & 7u);
         const int c = int(lane >> 3);
         threadgroup float red[4][ROWS * 32];
-        float acc[8];
+        float acc[2][8];
         #pragma clang loop unroll(full)
-        for (int t = 0; t < 8; t++) { acc[t] = 0.0f; }
+        for (int r = 0; r < 2; r++) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) { acc[r][t] = 0.0f; }
+        }
         const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
         for (int g = int(sg); g < Kg; g += 4) {
           float q[ROWS][16];
@@ -1373,9 +1376,6 @@ enum VerifyInt8Matmul {
               q[m][4 * u + 2] = float(v.z); q[m][4 * u + 3] = float(v.w);
             }
           }
-          const int jr = min(j, ROWS - 1);
-          const float a = j < ROWS ? ascale[jr * Kg + g] : 0.0f;
-          const float rb = j < ROWS ? rsb[jr * Kg + g] : 0.0f;
           #pragma clang loop unroll(full)
           for (int t = 0; t < 8; t++) {
             const int n = c + 4 * t;
@@ -1386,7 +1386,7 @@ enum VerifyInt8Matmul {
               #pragma clang loop unroll(full)
               for (int b = 0; b < 4; b++) { wf[4 * u + b] = float((wv >> uint(8 * b + 2 * u)) & 3u); }
             }
-            float cm = 0.0f;
+            float d0 = 0.0f, d1 = 0.0f;
             #pragma clang loop unroll(full)
             for (int m = 0; m < ROWS; m++) {
               float d = 0.0f;
@@ -1395,19 +1395,30 @@ enum VerifyInt8Matmul {
               d += simd_shuffle_xor(d, ushort(1));
               d += simd_shuffle_xor(d, ushort(2));
               d += simd_shuffle_xor(d, ushort(4));
-              cm = (j == m) ? d : cm;
+              d0 = (j == m) ? d : d0;
+              d1 = (j + 8 == m) ? d : d1;
             }
+            const float s = float(scalesT[(size_t)g * N + n0 + n]);
+            const float bb = float(biasesT[(size_t)g * N + n0 + n]);
             if (j < ROWS) {
-              const float s = float(scalesT[(size_t)g * N + n0 + n]);
-              const float bb = float(biasesT[(size_t)g * N + n0 + n]);
-              const float tt = s * cm;
-              acc[t] = fma(bb, rb, fma(a, tt, acc[t]));
+              const float a = ascale[j * Kg + g];
+              const float rb = rsb[j * Kg + g];
+              acc[0][t] = fma(bb, rb, fma(a, s * d0, acc[0][t]));
+            }
+            if (j + 8 < ROWS) {
+              const float a = ascale[(j + 8) * Kg + g];
+              const float rb = rsb[(j + 8) * Kg + g];
+              acc[1][t] = fma(bb, rb, fma(a, s * d1, acc[1][t]));
             }
           }
         }
         if (j < ROWS) {
           #pragma clang loop unroll(full)
-          for (int t = 0; t < 8; t++) { red[sg][j * 32 + c + 4 * t] = acc[t]; }
+          for (int t = 0; t < 8; t++) { red[sg][j * 32 + c + 4 * t] = acc[0][t]; }
+        }
+        if (j + 8 < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) { red[sg][(j + 8) * 32 + c + 4 * t] = acc[1][t]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int e = int(tid); e < ROWS * 32; e += 128) {
@@ -1799,8 +1810,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             }
         }
 
-        // Route 2: Shared Hadamard rotation for Float16ConstantQMV (1 ... 16 rows)
-        if (1 ... Float16ConstantQMV.maximumRows).contains(rows) {
+        // Route 2: Shared Hadamard rotation for Float16ConstantQMV (1 ... 32 rows)
+        if rows <= 32 {
             let rotated = first.transform(x)
             return packed.map { $0.forwardRotated(rotated) }
         }
@@ -1831,12 +1842,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     private func forwardRotated(_ rotated: MLXArray) -> MLXArray {
-        if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
-            (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
-        {
-            let output = Float16ConstantQMV.matmul(
-                rotated, weight: weight, scales: scales, biases: biases!)
-            return bias.map { output + $0 } ?? output
+        let totalRows = rotated.size / rotated.dim(-1)
+        if readsFloat16ConstantsInPlace, rotated.dtype == .float32 {
+            if (1 ... Float16ConstantQMV.maximumRows).contains(totalRows) {
+                let output = Float16ConstantQMV.matmul(
+                    rotated, weight: weight, scales: scales, biases: biases!)
+                return bias.map { output + $0 } ?? output
+            } else if totalRows <= 32 && rotated.ndim >= 2 {
+                let chunkSize = 4
+                let flat = (rotated.ndim == 2) ? rotated : rotated.reshaped([totalRows, rotated.dim(-1)])
+                var slices = [MLXArray]()
+                slices.reserveCapacity((totalRows + chunkSize - 1) / chunkSize)
+                var start = 0
+                while start < totalRows {
+                    let end = min(start + chunkSize, totalRows)
+                    let chunk = flat[start ..< end]
+                    let chunkOut = Float16ConstantQMV.matmul(
+                        chunk, weight: weight, scales: scales, biases: biases!)
+                    slices.append(chunkOut)
+                    start = end
+                }
+                let output = (slices.count == 1) ? slices[0] : concatenated(slices, axis: 0)
+                let shaped = (rotated.ndim == 2) ? output : output.reshaped(Array(rotated.shape.dropLast()) + [output.dim(-1)])
+                return bias.map { shaped + $0 } ?? shaped
+            }
         }
         if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
             return constantCachedForward(rotated, allowFloat16: true)

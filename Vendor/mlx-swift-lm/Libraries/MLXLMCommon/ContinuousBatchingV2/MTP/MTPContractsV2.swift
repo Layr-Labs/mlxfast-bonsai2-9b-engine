@@ -504,8 +504,8 @@ public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
 public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
-    /// validation matrix (`verify width = 1 + k`, widths 1...8).
-    public static let testedMaxDraftTokens = 7
+    /// validation matrix (`verify width = 1 + k`, widths 1...16).
+    public static let testedMaxDraftTokens = 16
     /// The largest draft depth a BLOCK drafter may ask for. A block proposes
     /// its whole depth in ONE drafter forward, so the depth that pays for
     /// itself is larger than a chain's: DFlash 2's own `block_size` is 16

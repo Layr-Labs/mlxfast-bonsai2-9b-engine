@@ -1954,10 +1954,13 @@ extension Qwen3NextMLP {
     }
 
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        if !exact, x.ndim >= 2, x.dim(-2) >= 128,
-            let shared = HadamardQuantizedLinear.sharedPromptProjections(x, [gateProj, upProj])
-        {
-            return qwen35ProjectedGateUp(shared[0], shared[1])
+        if !exact, x.ndim >= 2 {
+            let shared = (x.dim(-2) >= 128
+                ? HadamardQuantizedLinear.sharedPromptProjections(x, [gateProj, upProj])
+                : HadamardQuantizedLinear.sharedShortProjections(x, [gateProj, upProj]))
+            if let shared {
+                return qwen35ProjectedGateUp(shared[0], shared[1])
+            }
         }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(

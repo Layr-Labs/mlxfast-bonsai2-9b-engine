@@ -289,7 +289,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// this many times in one round. David ruled 6 for the Bonsai 2 9B MLX
     /// track (2026-10-14), the depth the CUDA track serves. A fixed declared
     /// depth above it is refused by the round driver, never clamped.
-    public static let maximumDepth = 6
+    public static let maximumDepth = 16
 
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
