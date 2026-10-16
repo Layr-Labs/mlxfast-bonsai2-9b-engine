@@ -2101,6 +2101,9 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
+    /// Layers per early verify submission.
+    static let verifySubmitEvery = 4
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2151,6 +2154,14 @@ public class Qwen35TextModelInner: Module {
             // keeps what it returned).
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
+            }
+            // Verify: hand finished layers to the GPU while the rest of the
+            // graph is still being built. Same graph and same kernels.
+            if captureRecurrentWindow,
+                (modelLayerIndex + 1) % Self.verifySubmitEvery == 0,
+                modelLayerIndex + 1 < layers.count
+            {
+                asyncEval(hiddenStates)
             }
         }
         if tapLayerIds == nil {
