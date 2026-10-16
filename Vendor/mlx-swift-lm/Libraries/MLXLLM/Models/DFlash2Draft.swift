@@ -415,7 +415,10 @@ public enum DFlash2SlidingMask {
         blockLength: Int,
         slidingWindow: Int,
         isCausal: Bool
-    ) -> MLXArray {
+    ) -> MLXArray? {
+        if !isCausal && (contextLength + blockLength) <= slidingWindow {
+            return nil
+        }
         let query = MLXArray(Int32(contextLength) ..< Int32(contextLength + blockLength))
             .reshaped(blockLength, 1)
         let key = MLXArray(Int32(0) ..< Int32(contextLength + blockLength))
@@ -599,8 +602,8 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                         blocks[0..., ..<(length - offset), 0..., 0...],
                     ], axis: 1)
             let kernel = base[offset].reshaped(1, 1, groups, groupSize).asType(hidden.dtype)
-            output = output + kernel * values
-            output = output + dynamic[0..., 0..., offset, 0..., 0...] * values
+            let tap = kernel + dynamic[0..., 0..., offset, 0..., 0...]
+            output = output + tap * values
         }
         return output.reshaped(hidden.shape)
     }
@@ -726,18 +729,17 @@ final class DFlash2CandidateSelector: Module {
             0..., 0..., (vocabularySize - topK)...]
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
+        let allSuccessors = take(successorCodebook, candidates, axis: 0)
+        let projectedSuccessors = projected.expandedDimensions(axis: 2) * allSuccessors
 
         var predecessor = anchor
         var path = [MLXArray]()
         path.reserveCapacity(hidden.dim(1))
         for position in 0 ..< hidden.dim(1) {
             let positionCandidates = candidates[0..., position, 0...]
-            let edges =
-                (take(predecessorCodebook, predecessor, axis: 0)
-                    .expandedDimensions(axis: 1)
-                    * projected[0..., position, 0...].expandedDimensions(axis: 1)
-                    * take(successorCodebook, positionCandidates, axis: 0))
-                .sum(axis: -1)
+            let predVec = take(predecessorCodebook, predecessor, axis: 0).expandedDimensions(axis: 1)
+            let projSucc = projectedSuccessors[0..., position, 0..., 0...]
+            let edges = (predVec * projSucc).sum(axis: -1)
             let selected = (unary[0..., position, 0...] + edges).argMax(axis: -1)
             predecessor = takeAlong(
                 positionCandidates, selected.expandedDimensions(axis: -1), axis: -1)[0..., 0]

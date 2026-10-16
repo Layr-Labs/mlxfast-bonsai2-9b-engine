@@ -6,47 +6,9 @@
 
 import CoreFoundation
 import Foundation
-@_spi(QuantizedConstantCache) import MLX
+import MLX
 import MLXLMCommon
 import MLXNN
-
-// The pinned MTP head carries FP16 affine metadata while the target feeds it
-// FP32 activations. Reuse only the exact constant widening that quantizedMM
-// would otherwise repeat at every draft step. This cache is input-independent;
-// the packed weights and the module's original parameter tree remain unchanged.
-final class Qwen35MTPQuantizedLinear: QuantizedLinear {
-    private let mtpScaleCastCache = ConstantArrayCastCache()
-    private let mtpOffsetCastCache = ConstantArrayCastCache()
-
-    @discardableResult
-    override func update(
-        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
-        modulePath: [String] = []
-    ) throws -> Self {
-        defer {
-            mtpScaleCastCache.clear()
-            mtpOffsetCastCache.clear()
-        }
-        return try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
-    override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        guard mode == .affine, x.dtype == .float32, scales.dtype == .float16 else {
-            return super.callAsFunction(x)
-        }
-        let widenedScales = mtpScaleCastCache.cachedCast(
-            scales, to: x.dtype, allowFloat16: true) ?? scales
-        let widenedOffsets = biases.map {
-            mtpOffsetCastCache.cachedCast($0, to: x.dtype, allowFloat16: true) ?? $0
-        }
-        var output = quantizedMM(
-            x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
-            groupSize: groupSize, bits: bits, mode: mode)
-        if let bias { output = output + bias }
-        return output
-    }
-}
 
 // MARK: - Module-level MTP flag
 
@@ -111,10 +73,46 @@ extension Qwen35Attention {
     func appendMTPHistoryKV(_ x: MLXArray, cache: any KVCache) {
         let batch = x.dim(0)
         let length = x.dim(1)
-        var keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(batch, length, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
+        var keys: MLXArray
+        let values: MLXArray
+        if let kQ = kProj as? QuantizedLinear,
+           let vQ = vProj as? QuantizedLinear,
+           kQ.groupSize == vQ.groupSize && kQ.bits == vQ.bits && kQ.mode == vQ.mode {
+            if fusedQuantizedKV == nil {
+                let fusedWeight = concatenated([kQ.weight, vQ.weight], axis: 0)
+                let fusedScales = concatenated([kQ.scales, vQ.scales], axis: 0)
+                let fusedBiases: MLXArray? = (kQ.biases != nil && vQ.biases != nil)
+                    ? concatenated([kQ.biases!, vQ.biases!], axis: 0) : nil
+                let fusedBias: MLXArray? = (kQ.bias != nil && vQ.bias != nil)
+                    ? concatenated([kQ.bias!, vQ.bias!], axis: 0) : nil
+                eval(fusedWeight, fusedScales)
+                if let b = fusedBiases { eval(b) }
+                if let b = fusedBias { eval(b) }
+                let fused = QuantizedLinear(
+                    weight: fusedWeight,
+                    bias: fusedBias,
+                    scales: fusedScales,
+                    biases: fusedBiases,
+                    groupSize: kQ.groupSize,
+                    bits: kQ.bits,
+                    mode: kQ.mode
+                )
+                fused.freeze()
+                fusedQuantizedKV = fused
+            }
+            if let fused = fusedQuantizedKV {
+                let out = fused(x)
+                let kDim = kQ.weight.dim(0)
+                keys = kNorm(out[0..., 0..., 0 ..< kDim].reshaped(batch, length, kvHeads, -1)).transposed(0, 2, 1, 3)
+                values = out[0..., 0..., kDim...].reshaped(batch, length, kvHeads, -1).transposed(0, 2, 1, 3)
+            } else {
+                keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1)).transposed(0, 2, 1, 3)
+                values = vProj(x).reshaped(batch, length, kvHeads, -1).transposed(0, 2, 1, 3)
+            }
+        } else {
+            keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1)).transposed(0, 2, 1, 3)
+            values = vProj(x).reshaped(batch, length, kvHeads, -1).transposed(0, 2, 1, 3)
+        }
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
     }
@@ -131,6 +129,8 @@ final class Qwen35MTPDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    private var fusedQuantizedGateUp: QuantizedLinear?
 
     init(_ args: Qwen35TextConfiguration) {
         _selfAttn.wrappedValue = Qwen35Attention(args)
@@ -161,7 +161,47 @@ final class Qwen35MTPDecoderLayer: Module {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let mlpIn = postAttentionLayerNorm(h)
+        let mlpOut: MLXArray
+        if let dense = mlp as? Qwen3NextMLP,
+           let gateQ = dense.gateProj as? QuantizedLinear,
+           let upQ = dense.upProj as? QuantizedLinear,
+           gateQ.groupSize == upQ.groupSize && gateQ.bits == upQ.bits && gateQ.mode == upQ.mode {
+            if fusedQuantizedGateUp == nil {
+                let fusedWeight = concatenated([gateQ.weight, upQ.weight], axis: 0)
+                let fusedScales = concatenated([gateQ.scales, upQ.scales], axis: 0)
+                let fusedBiases: MLXArray? = (gateQ.biases != nil && upQ.biases != nil)
+                    ? concatenated([gateQ.biases!, upQ.biases!], axis: 0) : nil
+                let fusedBias: MLXArray? = (gateQ.bias != nil && upQ.bias != nil)
+                    ? concatenated([gateQ.bias!, upQ.bias!], axis: 0) : nil
+                eval(fusedWeight, fusedScales)
+                if let b = fusedBiases { eval(b) }
+                if let b = fusedBias { eval(b) }
+                let fused = QuantizedLinear(
+                    weight: fusedWeight,
+                    bias: fusedBias,
+                    scales: fusedScales,
+                    biases: fusedBiases,
+                    groupSize: gateQ.groupSize,
+                    bits: gateQ.bits,
+                    mode: gateQ.mode
+                )
+                fused.freeze()
+                fusedQuantizedGateUp = fused
+            }
+            if let fused = fusedQuantizedGateUp {
+                let out = fused(mlpIn)
+                let mid = gateQ.weight.dim(0)
+                let gate = out[0..., 0..., 0 ..< mid]
+                let up = out[0..., 0..., mid...]
+                mlpOut = dense.downProj(silu(gate) * up)
+            } else {
+                mlpOut = (mlp as! UnaryLayer)(mlpIn)
+            }
+        } else {
+            mlpOut = (mlp as! UnaryLayer)(mlpIn)
+        }
+        return h + mlpOut
     }
 
     /// Populate this layer's K/V history without computing a dead decoder
@@ -294,9 +334,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
     private let installedVerificationMode: CBv2MTPVerificationMode
-    /// Draft-only output head over a fixed slice of the target vocabulary.
-    /// nil (small fixtures, tied or unpacked heads) keeps the full head.
-    private let draftVocabulary: Qwen35MTPDraftVocabulary?
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -315,7 +352,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
         self.target = target
-        self.draftVocabulary = Qwen35MTPDraftVocabulary(target: target)
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -359,6 +395,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     func headLogits(_ output: MLXArray) -> MLXArray {
         if target.configuration.tieWordEmbeddings {
             return target.model.embedTokens.asLinear(output)
+        }
+        if let hadamard = target.lmHead as? HadamardQuantizedLinear {
+            let fp32 = output.dtype == .float32 ? output : output.asType(.float32)
+            let rotated = hadamard.transform(fp32)
+            return hadamard.forwardPreRotated(rotated, outputLimit: 32768)
         }
         return target.lmHead!(output)
     }
@@ -501,67 +542,16 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             target: target,
             verificationMode: verificationMode)
         if !scaledPaths.isEmpty {
-            quantize(
-                model: assistant.mtp,
-                filter: { path, _ in
-                    guard scaledPaths.contains(path) else { return nil }
-                    return metadata.resolvedQuantization(for: path)?.asTuple
-                },
-                apply: { module, groupSize, bits, mode in
-                    guard let linear = module as? Linear, !(linear is QuantizedLinear) else {
-                        return quantizeSingle(
-                            layer: module, groupSize: groupSize, bits: bits, mode: mode)
-                    }
-                    return Qwen35MTPQuantizedLinear(
-                        weight: linear.weight, bias: linear.bias,
-                        groupSize: groupSize, bits: bits, mode: mode)
-                })
+            quantize(model: assistant.mtp) { path, _ in
+                guard scaledPaths.contains(path) else { return nil }
+                return metadata.resolvedQuantization(for: path)?.asTuple
+            }
         }
 
         try assistant.mtp.update(
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
-        requantizeHeadLinears(in: assistant.mtp)
         return assistant
-    }
-
-    /// On-load head re-encoding, permitted by the head re-quantization
-    /// exception (participant contract section 4.4): in memory only, within
-    /// the declaration cap, after the export's tensors were bound at their
-    /// own geometry. The export on disk and every target tensor — the shared
-    /// embedding, the lm_head, and the draft-vocabulary copy of its rows —
-    /// stay untouched. The head only proposes; re-encoding can move draft
-    /// choices and therefore acceptance, never bypass target verification.
-    static let headRequantGeometry: (groupSize: Int, bits: Int)? = (128, 4)
-
-    private static func requantizeHeadLinears(in head: Qwen35MTPModule) {
-        guard let geometry = headRequantGeometry else { return }
-        quantize(
-            model: head,
-            filter: { _, module in
-                guard let linear = module as? Qwen35MTPQuantizedLinear,
-                    linear.mode == .affine,
-                    linear.groupSize != geometry.groupSize || linear.bits != geometry.bits,
-                    (linear.weight.dim(1) * 32 / linear.bits) % geometry.groupSize == 0
-                else { return nil }
-                return (geometry.groupSize, geometry.bits, QuantizationMode.affine)
-            },
-            apply: { module, groupSize, bits, mode in
-                guard let linear = module as? Qwen35MTPQuantizedLinear else { return nil }
-                let dense = dequantized(
-                    linear.weight, scales: linear.scales, biases: linear.biases,
-                    groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode,
-                    dtype: .float16)
-                let (weight, scales, biases) = quantized(
-                    dense, groupSize: groupSize, bits: bits, mode: mode)
-                let replacement = Qwen35MTPQuantizedLinear(
-                    weight: weight, bias: linear.bias, scales: scales, biases: biases,
-                    groupSize: groupSize, bits: bits, mode: mode)
-                // Materialize the packed replacement now so the dense FP16
-                // intermediate frees before the next module dequantizes.
-                eval(replacement)
-                return replacement
-            })
     }
 
     private static func qwen35TextTarget(
@@ -1212,10 +1202,6 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return shortlist[argMax(logits[0..., -1, 0...], axis: -1)]
                 .asType(.int32)
         }
-        if let draftVocabulary {
-            let local = argMax(draftVocabulary.head(hidden)[0..., -1, 0...], axis: -1)
-            return draftVocabulary.ids[local]
-        }
         return argMax(headLogits(hidden)[0..., -1, 0...], axis: -1)
             .asType(.int32)
     }
@@ -1324,50 +1310,5 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return
         }
         state.clearAll()
-    }
-}
-
-/// The draft chain proposes tokens only; the pinned target verifies and
-/// decides every emitted token. So the draft head may score a fixed subset of
-/// the vocabulary: a draft outside the subset is a rejected proposal, never a
-/// wrong output. Byte-level BPE ids follow merge order, so the leading rows
-/// hold the most frequent tokens, and added/special tokens sit at the tail.
-/// The subset is fixed at load from the head's geometry alone (input- and
-/// prompt-independent): the leading `leadingRows` rows plus the trailing
-/// `trailingRows` rows of the target's own packed `lm_head`, copied once,
-/// byte-identical, into one contiguous draft-only head. The target's head and
-/// quantization are untouched; each draft step reads only the subset rows.
-final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
-    static let leadingRows = 98_304
-    static let trailingRows = 512
-
-    let head: HadamardQuantizedLinear
-    /// Target token id of each draft-head row (int32).
-    let ids: MLXArray
-
-    init?(target: Qwen35TextModel) {
-        guard !target.configuration.tieWordEmbeddings,
-            let full = target.lmHead as? HadamardQuantizedLinear,
-            full.bias == nil, let biases = full.biases
-        else { return nil }
-        let vocabulary = full.weight.dim(0)
-        let leading = Self.leadingRows
-        let tailStart = vocabulary - Self.trailingRows
-        guard leading < tailStart, (leading + Self.trailingRows) % 8 == 0 else { return nil }
-        func rows(_ array: MLXArray) -> MLXArray {
-            concatenated([array[0 ..< leading], array[tailStart ..< vocabulary]], axis: 0)
-        }
-        let (weight, scales, offsets) = (rows(full.weight), rows(full.scales), rows(biases))
-        var tokenIds = [Int32](0 ..< Int32(leading))
-        tokenIds.append(contentsOf: Int32(tailStart) ..< Int32(vocabulary))
-        let ids = MLXArray(tokenIds)
-        eval(weight, scales, offsets, ids)
-        guard
-            let head = try? HadamardQuantizedLinear(
-                weight: weight, scales: scales, biases: offsets,
-                groupSize: full.groupSize, bits: full.bits, transform: full.transform)
-        else { return nil }
-        self.head = head
-        self.ids = ids
     }
 }

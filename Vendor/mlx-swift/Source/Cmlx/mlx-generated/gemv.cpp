@@ -2367,3 +2367,4 @@ __attribute__((constructor)) void mlxfast_set_command_buffer_caps() {
   setenv("MLX_MAX_MB_PER_BUFFER", "640", 0);
 }
 } // namespace
+
