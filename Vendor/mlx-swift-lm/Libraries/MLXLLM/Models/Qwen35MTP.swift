@@ -120,6 +120,158 @@ extension Qwen35Attention {
     }
 }
 
+// MARK: - Fused head projections
+
+/// Elementwise pairs of the head's draft forward as single compiled kernels.
+/// Both are pure functions of their inputs; `compile(shapeless:)` fuses the
+/// two-dispatch chains without changing the arithmetic.
+private let qwen35MTPSigmoidMul: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { x, gate in x * sigmoid(gate) }
+private let qwen35MTPSiluMul: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { gate, x in silu(gate) * x }
+
+/// Row-concatenated copies of the head's q/k/v and gate/up projections, so a
+/// draft step issues one quantized matmul where the stock layer issues three
+/// (q, k, v) and another where it issues two (gate, up). Each output row's
+/// dot product is unchanged — the concatenation only batches launches — and
+/// the loader enables the fused path only after the startup equality probes
+/// in `matchesSplitBitwise` pass against the bound modules on this machine.
+///
+/// Deliberately NOT a `Module`: module reflection treats it as an opaque
+/// value, so parameter traversal and strict updates never see these copies.
+/// The split modules stay bound and authoritative; the K/V-only history path
+/// keeps using them, and any later rebinding of head parameters would
+/// require rebuilding this object (the loader builds it last).
+final class Qwen35MTPFusedHeadProjections {
+    let qkvWeight: MLXArray
+    let qkvScales: MLXArray
+    let qkvOffsets: MLXArray
+    let gateUpWeight: MLXArray
+    let gateUpScales: MLXArray
+    let gateUpOffsets: MLXArray
+    let groupSize: Int
+    let bits: Int
+    let qWidth: Int
+    let kvWidth: Int
+    let intermediate: Int
+
+    private let qkvScaleCache = ConstantArrayCastCache()
+    private let qkvOffsetCache = ConstantArrayCastCache()
+    private let gateUpScaleCache = ConstantArrayCastCache()
+    private let gateUpOffsetCache = ConstantArrayCastCache()
+
+    init?(attention: Qwen35Attention, mlp: Module) {
+        guard let mlp = mlp as? Qwen3NextMLP else { return nil }
+        let sources = [
+            attention.qProj, attention.kProj, attention.vProj,
+            mlp.gateProj, mlp.upProj,
+        ]
+        var quantized: [Qwen35MTPQuantizedLinear] = []
+        for source in sources {
+            guard let linear = source as? Qwen35MTPQuantizedLinear,
+                linear.mode == .affine, linear.bias == nil,
+                let offsets = linear.biases
+            else { return nil }
+            guard let first = quantized.first else {
+                quantized.append(linear)
+                continue
+            }
+            guard linear.groupSize == first.groupSize, linear.bits == first.bits,
+                linear.weight.dim(1) == first.weight.dim(1),
+                linear.scales.dtype == first.scales.dtype,
+                offsets.dtype == first.biases?.dtype
+            else { return nil }
+            quantized.append(linear)
+        }
+        let qkv = Array(quantized[0 ..< 3])
+        let gateUp = Array(quantized[3 ..< 5])
+        self.qkvWeight = concatenated(qkv.map { $0.weight }, axis: 0)
+        self.qkvScales = concatenated(qkv.map { $0.scales }, axis: 0)
+        self.qkvOffsets = concatenated(qkv.map { $0.biases! }, axis: 0)
+        self.gateUpWeight = concatenated(gateUp.map { $0.weight }, axis: 0)
+        self.gateUpScales = concatenated(gateUp.map { $0.scales }, axis: 0)
+        self.gateUpOffsets = concatenated(gateUp.map { $0.biases! }, axis: 0)
+        self.groupSize = quantized[0].groupSize
+        self.bits = quantized[0].bits
+        self.qWidth = quantized[0].weight.dim(0)
+        self.kvWidth = quantized[1].weight.dim(0)
+        self.intermediate = quantized[3].weight.dim(0)
+        eval(
+            qkvWeight, qkvScales, qkvOffsets,
+            gateUpWeight, gateUpScales, gateUpOffsets)
+    }
+
+    private func forward(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, offsets: MLXArray,
+        scaleCache: ConstantArrayCastCache, offsetCache: ConstantArrayCastCache
+    ) -> MLXArray {
+        let widenedScales =
+            x.dtype == .float32 && scales.dtype == .float16
+            ? (scaleCache.cachedCast(scales, to: x.dtype, allowFloat16: true) ?? scales)
+            : scales
+        let widenedOffsets =
+            x.dtype == .float32 && offsets.dtype == .float16
+            ? (offsetCache.cachedCast(offsets, to: x.dtype, allowFloat16: true) ?? offsets)
+            : offsets
+        return quantizedMM(
+            x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
+            groupSize: groupSize, bits: bits, mode: .affine)
+    }
+
+    func qkv(_ x: MLXArray) -> MLXArray {
+        forward(
+            x, weight: qkvWeight, scales: qkvScales, offsets: qkvOffsets,
+            scaleCache: qkvScaleCache, offsetCache: qkvOffsetCache)
+    }
+
+    func gateUp(_ x: MLXArray) -> MLXArray {
+        forward(
+            x, weight: gateUpWeight, scales: gateUpScales, offsets: gateUpOffsets,
+            scaleCache: gateUpScaleCache, offsetCache: gateUpOffsetCache)
+    }
+
+    /// Startup equality probes: the fused products and both compiled pairs
+    /// are compared `.==`-exact against the split modules on the actual
+    /// bound tensors at single-row and multi-row draft shapes. The probes
+    /// are empirical, not a proof over all inputs; a detected mismatch
+    /// selects the stock path.
+    func matchesSplitBitwise(attention: Qwen35Attention, mlp: Qwen3NextMLP) -> Bool {
+        let inputWidth = qkvWeight.dim(1) * 32 / bits
+        for rows in [1, 4] {
+            let x = MLXRandom.normal([1, rows, inputWidth], key: MLXRandom.key(7))
+                .asType(.float32)
+            let fusedQKV = qkv(x)
+            let fusedGateUp = gateUp(x)
+            let splits = [
+                (attention.qProj(x), fusedQKV[0..., 0..., 0 ..< qWidth]),
+                (attention.kProj(x), fusedQKV[0..., 0..., qWidth ..< qWidth + kvWidth]),
+                (
+                    attention.vProj(x),
+                    fusedQKV[0..., 0..., qWidth + kvWidth ..< qWidth + 2 * kvWidth]
+                ),
+                (mlp.gateProj(x), fusedGateUp[0..., 0..., 0 ..< intermediate]),
+                (mlp.upProj(x), fusedGateUp[0..., 0..., intermediate ..< 2 * intermediate]),
+            ]
+            for (split, fusedSlice) in splits
+            where !all(split .== fusedSlice).item(Bool.self) {
+                return false
+            }
+            // Probe the compiled pairs at the production shapes: the MLP
+            // pair runs at the intermediate width on slices of the fused
+            // product, the attention gate pair at hidden width.
+            let gateSlice = fusedGateUp[0..., 0..., 0 ..< intermediate]
+            let upSlice = fusedGateUp[0..., 0..., intermediate ..< 2 * intermediate]
+            let gate = MLXRandom.normal([1, rows, inputWidth], key: MLXRandom.key(11))
+                .asType(.float32)
+            guard all((x * sigmoid(gate)) .== qwen35MTPSigmoidMul(x, gate)).item(Bool.self),
+                all((silu(gateSlice) * upSlice) .== qwen35MTPSiluMul(gateSlice, upSlice))
+                    .item(Bool.self)
+            else { return false }
+        }
+        return true
+    }
+}
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -153,15 +305,79 @@ final class Qwen35MTPDecoderLayer: Module {
         super.init()
     }
 
+    /// Fused q/k/v and gate/up copies, set by the loader after binding (and
+    /// after any head re-quantization) only when the startup equality
+    /// probes passed on this machine. nil runs the stock split path. A plain class,
+    /// not a child module: parameter traversal never sees it, so it carries
+    /// no checkpoint keys. The K/V-only history path below stays on the
+    /// split modules either way.
+    var fused: Qwen35MTPFusedHeadProjections?
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
+        if let fused {
+            let r = fusedAttention(fused, inputLayerNorm(x), mask: mask, cache: cache)
+            let h = x + r
+            let xm = postAttentionLayerNorm(h)
+            let gateUp = fused.gateUp(xm)
+            let gate = gateUp[0..., 0..., 0 ..< fused.intermediate]
+            let up = gateUp[0..., 0..., fused.intermediate ..< 2 * fused.intermediate]
+            return h + (mlp as! Qwen3NextMLP).downProj(qwen35MTPSiluMul(gate, up))
+        }
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    /// `Qwen35Attention.callAsFunction(_:mask:cache:)` with the three
+    /// projections read out of one fused product. Operation order, norms,
+    /// RoPE-before-cache, scale, mask and the sigmoid gate are the stock
+    /// sequence; the q slice keeps the per-head query/gate pairing by
+    /// reshaping into heads before the split, exactly as the stock path.
+    private func fusedAttention(
+        _ fused: Qwen35MTPFusedHeadProjections,
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> MLXArray {
+        let attn = selfAttn
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        let projected = fused.qkv(x)
+        let qProjOutput = projected[0..., 0..., 0 ..< fused.qWidth]
+        let kSlice = projected[0..., 0..., fused.qWidth ..< fused.qWidth + fused.kvWidth]
+        let vSlice =
+            projected[
+                0..., 0..., fused.qWidth + fused.kvWidth ..< fused.qWidth + 2 * fused.kvWidth]
+
+        let qSplit = qProjOutput.reshaped(B, L, attn.attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qSplit[0]
+        let gate = qSplit[1].reshaped(B, L, -1)
+
+        queries = attn.qNorm(queries).transposed(0, 2, 1, 3)
+        var keys = attn.kNorm(kSlice.reshaped(B, L, attn.kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = vSlice.reshaped(B, L, attn.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        queries = applyRotaryPosition(attn.rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(attn.rope, to: keys, cache: cache)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: attn.scale,
+            mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+
+        return attn.oProj(qwen35MTPSigmoidMul(output, gate))
     }
 
     /// Populate this layer's K/V history without computing a dead decoder
@@ -522,7 +738,24 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
         requantizeHeadLinears(in: assistant.mtp)
+        fuseHeadProjections(in: assistant.mtp)
         return assistant
+    }
+
+    /// Build the fused q/k/v and gate/up launch pairs from the FINAL bound
+    /// tensors (hence after the re-quantization pass), and enable them per
+    /// layer only when the startup equality probes against the split
+    /// modules pass on this machine. Unsupported geometry (MoE, biased or
+    /// non-affine modules) and any detected mismatch keep the stock path.
+    private static func fuseHeadProjections(in head: Qwen35MTPModule) {
+        for layer in head.layers {
+            guard let mlp = layer.mlp as? Qwen3NextMLP,
+                let fused = Qwen35MTPFusedHeadProjections(
+                    attention: layer.selfAttn, mlp: mlp),
+                fused.matchesSplitBitwise(attention: layer.selfAttn, mlp: mlp)
+            else { continue }
+            layer.fused = fused
+        }
     }
 
     /// On-load head re-encoding, permitted by the head re-quantization
