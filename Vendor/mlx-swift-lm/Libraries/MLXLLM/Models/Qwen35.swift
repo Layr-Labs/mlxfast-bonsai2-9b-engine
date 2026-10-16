@@ -1658,6 +1658,34 @@ extension Qwen3NextMLP {
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
     }
+
+    /// Dense trunk MLP with one shared Hadamard rotation feeding both
+    /// projections. `gate_proj` and `up_proj` consume the identical
+    /// activation; when their folded transforms are structurally identical
+    /// (equal block size, equal sign pattern — the checkpoint bytes for
+    /// every trunk layer were compared offline and match), the rotated
+    /// activation is the identical array. Computing it once replaces two
+    /// launches of the radix kernel per layer per round with zero change
+    /// to any downstream operand or kernel. Any qualification miss falls
+    /// back to the untouched per-projection path.
+    func qwen35SharedDenseForward(_ x: MLXArray) -> MLXArray {
+        if let g = gateProj as? HadamardQuantizedLinear,
+            let u = upProj as? HadamardQuantizedLinear,
+            g.transform.isIdentical(to: u.transform),
+            g.gdnLayout == nil, u.gdnLayout == nil,
+            g.bits == u.bits, g.groupSize == u.groupSize,
+            g.mode == u.mode,
+            g.weight.shape == u.weight.shape,
+            g.scales.shape == u.scales.shape,
+            x.dtype == .float32
+        {
+            let rotated = g.transform(x)
+            let gate = g.forward(rotated: rotated)
+            let up = u.forward(rotated: rotated)
+            return downProj(silu(gate) * up)
+        }
+        return downProj(silu(gateProj(x)) * upProj(x))
+    }
 }
 
 // MARK: - Decoder Layer
@@ -1723,7 +1751,13 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let ff: MLXArray
+        if let dense = mlp as? Qwen3NextMLP {
+            ff = dense.qwen35SharedDenseForward(postAttentionLayerNorm(h))
+        } else {
+            ff = (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        }
+        return h + ff
     }
 
     func cbv2Forward(
@@ -1766,8 +1800,11 @@ final class Qwen35DecoderLayer: Module {
             feedForward = sparse(
                 normalized, exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            if exactTargetVerify {
+                feedForward = dense.qwen35TargetVerify(normalized, exact: true)
+            } else {
+                feedForward = dense.qwen35SharedDenseForward(normalized)
+            }
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
