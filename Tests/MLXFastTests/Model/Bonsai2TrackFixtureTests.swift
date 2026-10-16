@@ -623,26 +623,39 @@ struct Bonsai2TrackFixtureTests {
         #expect(shard.byteCount == contractTarget["raw_checkpoint_total_size_bytes"] as? Int)
     }
 
-    /// The shipped declaration is pinned and names the MTP decoder. The
-    /// depth is the promoted submission's choice (a Yukon promotion writes
-    /// it to main), so the test checks the shape, not one depth: off is
-    /// depth 0, on is a declared depth 1 to 6.
-    @Test("the shipped head declaration is pinned and names the MTP decoder")
+    /// The shipped declaration is pinned and names a permitted decoder. A
+    /// Yukon promotion writes the winning arm to main, so the declaration may
+    /// name either speculative arm the fixture permits -- the MTP head or the
+    /// DFlash drafter -- at any depth in that arm's permitted set. A disabled
+    /// arm is serial (depth 0). The test checks the shape, not one arm or one
+    /// depth, and reads the permitted ranges from the fixture so it tracks
+    /// `allowed_modes` instead of fencing out a legal DFlash declaration.
+    @Test("the shipped head declaration is pinned and names a permitted decoder")
     func theShippedDeclarationIsPinnedMTP() throws {
         let declaration = try #require(
             try JSONSerialization.jsonObject(
                 with: Data(contentsOf: bonsai2HeadDeclarationURL)) as? [String: Any])
         #expect(declaration["source"] as? String == "pinned")
         let spec = try #require(declaration["spec"] as? [String: Any])
-        #expect(spec["decoder"] as? String == "mtp")
         let enabled = try #require(spec["enabled"] as? Bool)
         let depth = try #require(spec["num_speculative_tokens"] as? Int)
+        #expect(declaration["max_bytes"] as? Int == 2_147_483_648)
+
+        let contract = try bonsai2TrackContractObject()
+        let mtpDepths = try #require(
+            (contract["mtp_head"] as? [String: Any])?["permitted_draft_depths"] as? [Int])
+        let dflashDepths = try #require(
+            (contract["dflash_drafter"] as? [String: Any])?["permitted_draft_depths"] as? [Int])
         if enabled {
-            #expect((1 ... 6).contains(depth))
+            let decoder = try #require(spec["decoder"] as? String)
+            #expect(["mtp", "dflash"].contains(decoder))
+            let permitted = decoder == "dflash" ? dflashDepths : mtpDepths
+            #expect(
+                permitted.contains(depth),
+                Comment(rawValue: "depth \(depth) is not permitted for decoder \(decoder)"))
         } else {
             #expect(depth == 0)
         }
-        #expect(declaration["max_bytes"] as? Int == 2_147_483_648)
     }
 
     @Test("scoring_semantics records the ruled composite formula")
