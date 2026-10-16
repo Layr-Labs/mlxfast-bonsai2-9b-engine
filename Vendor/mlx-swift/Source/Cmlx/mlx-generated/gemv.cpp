@@ -2350,3 +2350,20 @@ template <typename T, const int vecs_per_tg, const int k_lanes>
 }
 
 } // namespace mlx::core::metal
+
+// Command-buffer commit caps for this engine, set at image load, before any
+// code can construct the Metal device (it reads them once, in Device()).
+// Stock on a Max-class GPU is 50 ops / 50 MB per buffer, which commits about
+// once per decoder layer (59.8 MB of packed weights each). The verify forward
+// already submits every 4 layers via asyncEval; 640 MB covers the largest
+// slice (embedding + 4 layers, ~515 MB) so each slice is one command buffer,
+// and prefill still commits every ~6-10 layers. The op cap is set high so the
+// byte cap decides. Commit points never change kernels or their order, so
+// outputs are bit-identical. An explicit environment value still wins.
+#include <stdlib.h>
+namespace {
+__attribute__((constructor)) void mlxfast_set_command_buffer_caps() {
+  setenv("MLX_MAX_OPS_PER_BUFFER", "2000", 0);
+  setenv("MLX_MAX_MB_PER_BUFFER", "640", 0);
+}
+} // namespace
