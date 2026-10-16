@@ -1397,16 +1397,30 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        lastPositionOnly: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
+        // The prompt's final layer still commits every K/V row.
+        let lastQueryCache: CBv2LayerCache?
+        if lastPositionOnly, B == 1, L > 1, positionIds == nil, !exactTargetVerify,
+            cache.kind.attention == .full, cache.kind.sharesKVWithLayer == nil,
+            let contiguous = cache as? CBv2LayerCache,
+            !contiguous.mtpSerializesRectangularAttention
+        {
+            lastQueryCache = contiguous
+        } else {
+            lastQueryCache = nil
+        }
+        let queryInput = lastQueryCache == nil ? x : x[0..., (L - 1)..., 0...]
+        let queryLength = queryInput.dim(1)
         let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
-        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+            ? qwen35A3BExactW4G64Projection(qProj, queryInput) : qProj(queryInput)
+        let qSplit = qProjOutput.reshaped(B, queryLength, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        let gate = qSplit[1].reshaped(B, L, -1)
+        let gate = qSplit[1].reshaped(B, queryLength, -1)
         let kProjection = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
@@ -1424,15 +1438,20 @@ final class Qwen35Attention: Module {
                 queries: queries, keys: keys, positionIds: positionIds)
         } else {
             let offsets = cache.positionOffsets + 0
-            queries = rope(queries, offset: offsets)
+            let queryOffsets = lastQueryCache == nil ? offsets : offsets + Int32(L - 1)
+            queries = rope(queries, offset: queryOffsets)
             keys = rope(keys, offset: offsets)
         }
 
-        let output = cache.updateAndAttend(
-            queries: queries, keys: keys, values: values,
-            scale: scale, sinks: nil)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+        let attended: MLXArray
+        if let lastQueryCache {
+            attended = lastQueryCache.updateAndAttendLastQuery(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        } else {
+            attended = cache.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        }
+        let output = attended.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         let projectionInput = sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
@@ -1755,11 +1774,14 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+                exactTargetVerify: exactTargetVerify, lastPositionOnly: lastPositionOnly)
         }
-        let residual = x + r
-        let h = lastPositionOnly && residual.dim(1) > 1
-            ? residual[0..., (residual.dim(1) - 1)..., 0...] : residual
+        let h: MLXArray
+        if lastPositionOnly && x.dim(1) > 1 {
+            h = x[0..., (x.dim(1) - 1)..., 0...] + r[0..., (r.dim(1) - 1)..., 0...]
+        } else {
+            h = x + r
+        }
         let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
