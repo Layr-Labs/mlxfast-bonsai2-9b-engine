@@ -345,7 +345,7 @@ private enum Float16ConstantQMV {
     /// 512-wide step for every output row once, then accumulates them into
     /// all `rows` results.
     static let rows = MLXFast.metalKernel(
-        name: "hadamard_qmv_rows_f16_constants",
+        name: "hadamard_qmv_rows_quad_levels_f16_constants",
         inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
@@ -363,25 +363,22 @@ private enum Float16ConstantQMV {
             float result[rows][outputs];
             for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
             for (int k = 0; k < K; k += 512) {
-              float s4[outputs][4], b[outputs];
+              float levels[outputs];
               uint packed[outputs];
               for (int r = 0; r < outputs; r++) {
                 const float s = float(sc[r * in_g]);
-                s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
-                b[r] = float(bi[r * in_g]);
+                // Eight adjacent lanes share a group-128 coefficient.
+                levels[r] = fma(s, float(thread_index_in_quadgroup), float(bi[r * in_g]));
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
               for (int i = 0; i < 4; i++) {
                 float wd[outputs][4];
                 for (int r = 0; r < outputs; r++) {
                   const uint q = packed[r] >> (8 * i);
-                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
-                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
-                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
-                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  wd[r][0] = quad_shuffle(levels[r], ushort(q & 3u));
+                  wd[r][1] = quad_shuffle(levels[r], ushort((q >> 2) & 3u));
+                  wd[r][2] = quad_shuffle(levels[r], ushort((q >> 4) & 3u));
+                  wd[r][3] = quad_shuffle(levels[r], ushort((q >> 6) & 3u));
                 }
                 for (int v = 0; v < rows; v++) {
                   const float4 xv = xp[v * (K / 4) + i];
