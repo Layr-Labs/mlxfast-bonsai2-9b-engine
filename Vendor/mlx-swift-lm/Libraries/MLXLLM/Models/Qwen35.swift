@@ -737,7 +737,7 @@ final class Qwen35GatedDeltaNet: Module {
         q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
     ) -> (MLXArray, MLXArray) {
-        guard mask == nil, headKDim == 128, headVDim == 128, q.dim(1) >= 4,
+        guard mask == nil, headKDim == 128, headVDim == 128, q.dim(1) >= 1,
             q.dtype == .float32, k.dtype == .float32, v.dtype == .float32
         else {
             return gatedDeltaUpdate(
