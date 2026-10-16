@@ -42,6 +42,24 @@ template <typename T, int N_READS = RMS_N_READS>
     }
   }
   acc = simd_sum(acc);
+  // Narrow rows use exactly one SIMD group in RMSNorm::eval_gpu. Its sum is
+  // already available in every lane, so no threadgroup roundtrip is needed.
+  if (axis_size <= SIMD_SIZE * N_READS) {
+    const float inv_mean = metal::precise::rsqrt(acc / axis_size + eps);
+    out += gid * size_t(axis_size) + lid * N_READS;
+    if (lid * N_READS + N_READS <= axis_size) {
+      for (int i = 0; i < N_READS; i++) {
+        out[i] = w[w_stride * i] * static_cast<T>(thread_x[i] * inv_mean);
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if ((lid * N_READS + i) < axis_size) {
+          out[i] = w[w_stride * i] * static_cast<T>(thread_x[i] * inv_mean);
+        }
+      }
+    }
+    return;
+  }
   //  Initialize shared memory
   if (simd_group_id == 0) {
     local_sums[simd_lane_id] = 0;
