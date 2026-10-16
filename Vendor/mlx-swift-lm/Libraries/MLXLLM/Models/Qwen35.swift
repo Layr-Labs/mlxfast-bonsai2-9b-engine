@@ -224,6 +224,60 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// The dense FP32 `in_proj_b` and `in_proj_a` of a few-row window (MTP
+/// verify) in one launch. Each simdgroup owns one output column and reads
+/// that weight row once for all rows; FP32 FMAs, then `simd_sum`. Single-row
+/// decode and wide prefill keep the stock matmul.
+private enum Qwen35DenseGateProjection {
+    static let maximumRows = 16
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_dense_ba_rows",
+        inputNames: ["x", "wb", "wa"], outputNames: ["b", "a"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint n = threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup;
+            const int K = x_shape[1];
+            const uint N = wb_shape[0];
+            const bool is_a = n >= N;
+            const uint col = is_a ? n - N : n;
+            const device float4* wr = (const device float4*)((is_a ? wa : wb) + col * K);
+            float acc[ROWS];
+            for (int v = 0; v < ROWS; v++) acc[v] = 0.0f;
+            for (int k4 = lane; k4 < K / 4; k4 += 32) {
+              const float4 wv = wr[k4];
+              for (int v = 0; v < ROWS; v++) {
+                const float4 xv = ((const device float4*)(x + v * K))[k4];
+                acc[v] = fma(xv.x, wv.x, acc[v]);
+                acc[v] = fma(xv.y, wv.y, acc[v]);
+                acc[v] = fma(xv.z, wv.z, acc[v]);
+                acc[v] = fma(xv.w, wv.w, acc[v]);
+              }
+            }
+            for (int v = 0; v < ROWS; v++) {
+              const float total = simd_sum(acc[v]);
+              if (lane == 0) (is_a ? a : b)[v * N + col] = total;
+            }
+            """)
+
+    static func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
+        guard !(b is QuantizedLinear), !(a is QuantizedLinear), b.bias == nil, a.bias == nil,
+            x.dtype == .float32, b.weight.dtype == .float32, a.weight.dtype == .float32,
+            b.weight.ndim == 2, b.weight.shape == a.weight.shape, x.ndim == 3,
+            b.weight.dim(1) == x.dim(2), x.dim(2) % 4 == 0,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let rows = x.dim(0) * x.dim(1)
+        guard (2 ... maximumRows).contains(rows) else { return nil }
+        let N = b.weight.dim(0)
+        let outputs = kernel(
+            [x.reshaped([rows, x.dim(2)]), b.weight, a.weight], template: [("ROWS", rows)],
+            grid: (32, 2 * N, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, N], [rows, N]], outputDTypes: [.float32, .float32])
+        let shape = [x.dim(0), x.dim(1), N]
+        return (outputs[0].reshaped(shape), outputs[1].reshaped(shape))
+    }
+}
+
 // Register layout from the accepted 27B engine PR #649 (MIT lineage).
 private enum Qwen35FusedQKNorm {
     private static let invScale = pow(Float(128), -0.5)
@@ -854,12 +908,12 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
-            return (
-                inProjQKV(inputs),
-                inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
-            )
+            let qkv = inProjQKV(inputs)
+            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+            if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
+                return (qkv, z, ba.0, ba.1)
+            }
+            return (qkv, z, inProjB(inputs), inProjA(inputs))
         }
         let outFused = fusedInProj(inputs)
         let qkvDim = keyDim * 2 + valueDim
