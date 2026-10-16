@@ -1791,6 +1791,72 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    /// The single kernels' first lines. The grouped kernels replace them: 2
+    /// or 3 projections that share one activation run in one dispatch, the
+    /// threadgroups laid out member after member, and threadgroup `tile` of
+    /// member `mb` computes column block `n0` of that member with the single
+    /// kernel's own body, so each member gets the single kernel's bits.
+    private static let singleHead = """
+        const int K = ksz[0]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        """
+
+    private static func groupKernel(nax: Bool, members: Int) -> MLXFast.MLXFastKernel {
+        func pick(_ name: String) -> String {
+            members == 2
+                ? "mb == 0 ? \(name)0 : \(name)1"
+                : "mb == 0 ? \(name)0 : (mb == 1 ? \(name)1 : \(name)2)"
+        }
+        let head = """
+            const int K = ksz[0];
+            const int tile = int(threadgroup_position_in_grid.x);
+            const int t1 = ksz[2] / 32;
+            const int t2 = t1 + ksz[3] / 32;
+            const int mb = \(members == 2 ? "tile < t1 ? 0 : 1" : "tile < t1 ? 0 : (tile < t2 ? 1 : 2)");
+            const int N = ksz[2 + mb];
+            const int n0 = (tile - (\(members == 2 ? "mb == 0 ? 0 : t1" : "mb == 0 ? 0 : (mb == 1 ? t1 : t2)"))) * 32;
+            const auto w = \(pick("w"));
+            const auto scalesT = \(pick("scalesT"));
+            const auto biasesT = \(pick("biasesT"));
+            const auto out = \(pick("out"));
+            const int Kg = K / 128;
+            const int KW = K / 16;
+            """
+        let single = nax ? naxSource : plainSource
+        precondition(single.contains(singleHead))
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_\(nax ? "nax" : "plain")_g\(members)",
+            inputNames: ["xq"] + (0 ..< members).flatMap { ["w\($0)", "scalesT\($0)", "biasesT\($0)"] }
+                + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< members).map { "out\($0)" },
+            source: single.replacingOccurrences(of: singleHead, with: head),
+            header: nax ? PromptInt8Matmul.naxHeader : "",
+            ensureRowContiguous: true)
+    }
+
+    private static let groupKernels = [
+        groupKernel(nax: false, members: 2), groupKernel(nax: false, members: 3),
+        groupKernel(nax: true, members: 2), groupKernel(nax: true, members: 3),
+    ]
+
+    typealias Operands = (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)
+
+    private static func runGroup(
+        _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, members: [Operands],
+        m: Int, k: Int
+    ) -> [MLXArray] {
+        let ns = members.map { $0.weight.dim(0) }
+        let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
+        let inputs: [MLXArray] = [codes] + members.flatMap { [$0.weight, $0.scalesT, $0.biasesT] }
+            + [ascale, rsb, dims]
+        return groupKernels[(route == .nax ? 2 : 0) + members.count - 2](
+            inputs, template: [("ROWS", m)],
+            grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int
@@ -1862,6 +1928,74 @@ enum VerifyInt8Matmul {
                 .data(using: .utf8)!)
         return chosen
     }()
+
+    nonisolated(unsafe) private static var groupFailed = false
+    nonisolated(unsafe) private static var groupNote = "not run"
+
+    /// Runs the grouped kernels of `route` on fixed 3-member (N 64, 32, 96)
+    /// and 2-member (N 96, 64) problems and compares each member's output bit
+    /// for bit with the single kernel of `route` on that member alone.
+    private static func groupMatchesSingle(_ route: Route) -> Bool {
+        groupFailed = false
+        let m = 4, k = 1024, kg = k / 128
+        let codes = MLXArray(
+            (0 ..< tileRows * k).map { $0 < m * k ? Int8(truncatingIfNeeded: ($0 * 53 + 7) % 255 - 127) : 0 },
+            [tileRows, k])
+        let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
+        let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+        func member(_ n: Int, _ seed: Int) -> Operands {
+            (MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + seed) &* 2_654_435_761) }, [n, k / 16]),
+             MLXArray((0 ..< kg * n).map { Float16(Float(1 + ($0 + seed) % 13) / 1024) }, [kg, n]),
+             MLXArray((0 ..< kg * n).map { Float16(-Float(($0 + seed) % 7) / 512) }, [kg, n]))
+        }
+        let groups = [[member(64, 1), member(32, 2), member(96, 3)], [member(96, 4), member(64, 5)]]
+        var same = false
+        withErrorHandler({ message in
+            if !VerifyInt8Matmul.groupFailed { VerifyInt8Matmul.groupNote = String(message.prefix(160)) }
+            VerifyInt8Matmul.groupFailed = true
+        }) {
+            var equal = MLXArray(true)
+            for members in groups {
+                let outputs = runGroup(route, codes: codes, ascale: ascale, rsb: rsb, members: members, m: m, k: k)
+                for (operands, output) in zip(members, outputs) {
+                    let single = run(
+                        route, codes: codes, ascale: ascale, rsb: rsb, weight: operands.weight,
+                        scalesT: operands.scalesT, biasesT: operands.biasesT, m: m, k: k,
+                        n: operands.weight.dim(0))
+                    equal = equal .&& MLX.all(single .== output)
+                }
+            }
+            eval(equal)
+            if !groupFailed { same = equal.item(Bool.self) }
+        }
+        if !groupFailed { groupNote = same ? "bit-identical" : "outputs differ" }
+        return !groupFailed && same
+    }
+
+    /// Decided once, after `route`. Sibling projections that share one
+    /// activation take one grouped dispatch when the grouped kernels of
+    /// `route` match its single kernel bit for bit on the device; otherwise
+    /// one dispatch each. `DARKBLOOM_BONSAI_INT8_VERIFY_GROUP=0` keeps one
+    /// dispatch each.
+    static let grouped: Bool = {
+        guard route != .off else { return false }
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_GROUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let chosen = !["0", "false", "no", "off"].contains(value ?? "") && groupMatchesSingle(route)
+        FileHandle.standardError.write(
+            "int8 verify group: \(chosen ? "on" : "off") (\(route); check: \(groupNote))\n"
+                .data(using: .utf8)!)
+        return chosen
+    }()
+
+    /// One dispatch for 2 or 3 projections that share `activation`, outputs
+    /// in member order; nil when grouping is off.
+    static func matmulGroup(_ activation: PromptInt8Activation, members: [Operands]) -> [MLXArray]? {
+        guard grouped, (2 ... 3).contains(members.count) else { return nil }
+        return runGroup(
+            route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+            members: members, m: activation.rows, k: activation.k)
+    }
 
     static func matmul(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray
@@ -1938,6 +2072,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            _ = VerifyInt8Matmul.grouped
         }
     }
 
@@ -1945,6 +2080,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     let readsFloat16ConstantsInPlace: Bool
 
     private let promptConstants = PromptInt8Constants()
+
+    private var verifyOperands: VerifyInt8Matmul.Operands {
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        return (weight, scalesT, biasesT)
+    }
+
+    /// Each member's output in `x`'s leading shape, plus its bias.
+    private static func memberOutputs(
+        _ outputs: [MLXArray], _ packed: [HadamardQuantizedLinear], like x: MLXArray
+    ) -> [MLXArray] {
+        zip(packed, outputs).map { layer, output in
+            let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+            return layer.bias.map { reshaped + $0 } ?? reshaped
+        }
+    }
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
     /// input, the packing or the device does not take it.
@@ -1990,6 +2140,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify, let grouped = VerifyInt8Matmul.matmulGroup(
+            PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+            members: packed.map { $0.verifyOperands })
+        {
+            return (activation.last!, memberOutputs(grouped, packed, like: x))
+        }
         let outputs = packed.map { layer in
             if verify {
                 let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
@@ -2093,6 +2250,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
+        if let grouped = VerifyInt8Matmul.matmulGroup(
+            boundary.activation, members: packed.map { $0.verifyOperands })
+        {
+            return memberOutputs(grouped, packed, like: boundary.normalized)
+        }
         var outputs: [MLXArray] = []
         for layer in packed {
             let (scalesT, biasesT) = layer.promptConstants.get(
@@ -2125,6 +2287,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             packed.allSatisfy({ $0.weight.dim(0) % 32 == 0 }),
             let activation = first.transform.quantizedForVerify(x)
         {
+            if let grouped = VerifyInt8Matmul.matmulGroup(
+                activation, members: packed.map { $0.verifyOperands })
+            {
+                return memberOutputs(grouped, packed, like: x)
+            }
             return packed.map { layer in
                 let (scalesT, biasesT) = layer.promptConstants.get(
                     scales: layer.scales, biases: layer.biases!)
