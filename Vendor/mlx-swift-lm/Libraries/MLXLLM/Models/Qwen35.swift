@@ -530,6 +530,27 @@ final class Qwen35GatedDeltaNet: Module {
         return contiguous(tail)
     }
 
+    /// Fold FP32 post-normalization scales into the native RMSNorm weight
+    /// load. Keep the original two-stage path for lower-precision activations.
+    private func normalizedQueriesAndKeys(
+        _ q: MLXArray, _ k: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qScale = MLXArray(pow(invScale, 2)).asType(dtype)
+        let kScale = MLXArray(invScale).asType(dtype)
+        if dtype == .float32, k.dtype == .float32 {
+            return (
+                MLXFast.rmsNorm(q, weight: broadcast(qScale, to: [headKDim]), eps: 1e-6),
+                MLXFast.rmsNorm(k, weight: broadcast(kScale, to: [headKDim]), eps: 1e-6)
+            )
+        }
+        return (
+            qScale * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+            kScale * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        )
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -569,14 +590,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQueriesAndKeys(q, k)
 
         let (out, newSsmState) = gatedDeltaUpdate(
             q: qNormed,
@@ -618,14 +632,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQueriesAndKeys(q, k)
 
         let recurrence = gatedDeltaUpdate(
             q: qNormed,
@@ -962,14 +969,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizedQueriesAndKeys(q, k)
 
         let out: MLXArray
         if S >= 3 {
