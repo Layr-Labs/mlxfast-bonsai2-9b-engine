@@ -2032,6 +2032,11 @@ extension Qwen3NextMLP {
         {
             return qwen35ProjectedGateUp(shared[0], shared[1])
         }
+        if !exact,
+            let shared = HadamardQuantizedLinear.sharedShortProjections(x, [gateProj, upProj])
+        {
+            return qwen35ProjectedGateUp(shared[0], shared[1])
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)

@@ -5,6 +5,6 @@
   "spec": {
     "decoder": "mtp",
     "enabled": true,
-    "num_speculative_tokens": 3
+    "num_speculative_tokens": 6
   }
 }

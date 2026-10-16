@@ -407,6 +407,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// completes it with `commitLookupRound` instead of `finalizeRound`.
     /// Default nil.
     var lookupDraftNgram: Int? { get }
+    /// Chain depth for a round whose lookup misses, when it is below the
+    /// declared depth: lookup rounds propose the declared depth, drafted
+    /// rounds this shallower one. Default nil (drafted rounds keep the
+    /// declared depth).
+    var lookupMissDraftDepth: Int? { get }
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -426,6 +431,7 @@ extension CBv2MTPRequestStatefulDrafter {
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
     ) throws {}
     public var lookupDraftNgram: Int? { nil }
+    public var lookupMissDraftDepth: Int? { nil }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,

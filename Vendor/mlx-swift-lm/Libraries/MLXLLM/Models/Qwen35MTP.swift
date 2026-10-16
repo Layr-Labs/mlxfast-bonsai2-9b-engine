@@ -465,7 +465,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         target: any LanguageModel,
         verificationMode: CBv2MTPVerificationMode? = nil
     ) throws -> Qwen35InlineMTPAssistant {
-        let serving = target
         let target = try qwen35TextTarget(target)
         let resolvedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
@@ -523,15 +522,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
         requantizeHeadLinears(in: assistant.mtp)
-        // Warm after re-quantization, so the warm round compiles the
-        // kernels of the head geometry the scored rounds run.
-        assistant.warmEngineRound(serving: serving)
-        // Once more at the resident's boot warm, after the runner has adopted
-        // the model (27b 76841fed: a load-time round alone left part of the
-        // first timed round's cost in place in some processes).
-        CBv2DeferredLoadWarm.register { [weak assistant] in
-            assistant?.warmEngineRound(serving: serving)
-        }
         return assistant
     }
 
@@ -1045,6 +1035,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupDraftNgram: Int? { Self.promptLookupNgram }
 
+    /// The head's chain depth on rounds whose prompt lookup misses, when the
+    /// declared depth is deeper: lookup rounds propose the declared depth.
+    /// Default 3. Local experiments override it with
+    /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
+    static let promptLookupMissDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
+            return 3
+        }
+        guard let value = Int(raw), value > 0 else { return nil }
+        return value
+    }()
+
+    public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
+
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
@@ -1447,101 +1451,5 @@ final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
         else { return nil }
         self.head = head
         self.ids = ids
-    }
-}
-
-// MARK: - Load-time engine round warm
-
-extension Qwen35InlineMTPAssistant {
-    /// `MLXFAST_MTP_ROUND_WARM=0` skips `warmEngineRound`.
-    static let engineRoundWarmEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_MTP_ROUND_WARM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// The declared depth of this track's chain (mtp-head.manifest.json) and
-    /// the scored seed width.
-    static let warmDepth = 3
-    static let warmPromptRows = 512
-
-    /// Runs one short request through a real `EngineV2` on throwaway state:
-    /// the seed prefill seam, the seed step and a few depth-3 rounds (draft
-    /// chain, draft head, rectangular verify, top-two, finalize, rollback).
-    ///
-    /// Nothing before the timed decode window runs the engine's MTP round:
-    /// the warmup and timed prefills go through the teacher-forced stepper.
-    /// So a process paid each first-use cost (Metal pipeline builds, lazily
-    /// widened head constants, allocator growth) inside the window's first
-    /// round, and the window is only 128 tokens. The prompt is the resident
-    /// warm's fixed token pattern, greedy, so nothing depends on any
-    /// request's input; the engine, its caches and the request state are
-    /// released and the buffer cache is drained before anything is served.
-    func warmEngineRound(serving: any LanguageModel) {
-        guard Self.engineRoundWarmEnabled else { return }
-        let layerKinds: [CBv2LayerKind]
-        let caches: [any CBv2AttendingLayerCache]
-        let make: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache = {
-            index, kind in CBv2LayerCache(layerIndex: index, kind: kind)
-        }
-        if let model = serving as? Qwen35Model, let built = try? model.newCacheV2(makeLayerCache: make) {
-            (layerKinds, caches) = (model.cbv2LayerKinds, built)
-        } else if let model = serving as? Qwen35TextModel,
-            let built = try? model.newCacheV2(makeLayerCache: make)
-        {
-            (layerKinds, caches) = (model.cbv2LayerKinds, built)
-        } else {
-            return
-        }
-        let depth = Self.warmDepth
-        let rows = Self.warmPromptRows
-        weak var released: EngineV2?
-        do {
-            let engine = EngineV2(
-                model: CBv2SteppableLanguageModelAdapter(serving),
-                layerKinds: layerKinds,
-                backend: CBv2ContiguousKVBackend(
-                    config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30)),
-                cacheProvider: CBv2LayerCacheBank(caches: caches),
-                sampler: CBv2DefaultSampler(),
-                schedulerConfig: CBv2SchedulerConfig(
-                    maxConcurrentRequests: 1,
-                    prefillChunkSize: max(CBv2SchedulerConfig().prefillChunkSize, rows),
-                    maxWaiting: 1,
-                    enablePrefixCache: false),
-                mtpDrafter: self,
-                mtpConfig: CBv2MTPConfig(
-                    enabled: true,
-                    maxDraftTokens: depth,
-                    maxSpeculativeBatch: 1,
-                    fixedDraftTokens: depth,
-                    verificationMode: .automatic,
-                    maxAutomaticRectangularTokens: 1 + depth,
-                    draftTokenCeiling: CBv2MTPConfig.testedMaxDraftTokens))
-            released = engine
-            var request = CBv2Request(
-                id: CBv2RequestID(1),
-                promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
-                maxTokens: 2 + 4 * (1 + depth))
-            request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
-            request.stopTokens = []
-            let warmRequest = request
-            let done = DispatchSemaphore(value: 0)
-            Task.detached {
-                if let events = try? engine.submit(warmRequest) {
-                    for await _ in events {}
-                }
-                await engine.shutdown()
-                done.signal()
-            }
-            done.wait()
-        }
-        var waited = 0
-        while released != nil, waited < 500 {
-            usleep(1_000)
-            waited += 1
-        }
-        Stream().synchronize()
-        Memory.clearCache()
     }
 }

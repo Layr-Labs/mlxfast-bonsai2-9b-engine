@@ -263,6 +263,8 @@ final class CBv2MTPRoundDriver {
     let targetPrefixAcceptance: Bool
     /// Prompt-lookup n-gram length, or nil when lookup drafting is off.
     let lookupNgram: Int?
+    /// Depth of a round whose lookup misses, or nil to keep the declared one.
+    let lookupMissDepth: Int?
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -368,6 +370,11 @@ final class CBv2MTPRoundDriver {
             (config.fixedDraftTokens ?? 0) > 0 && !(drafter is any CBv2MTPBlockDrafter)
             ? (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupDraftNgram : nil
         self.lookupNgram = lookupNgram.flatMap { $0 > 0 ? $0 : nil }
+        self.lookupMissDepth =
+            (lookupNgram ?? 0) <= 0
+            ? nil
+            : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissDraftDepth
+                .flatMap { $0 > 0 && $0 < (config.fixedDraftTokens ?? 0) ? $0 : nil }
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
         self.config = config
         self.drafter = drafter
