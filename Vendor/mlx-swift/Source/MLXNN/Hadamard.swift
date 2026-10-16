@@ -1790,6 +1790,135 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    /// One launch for 2 or 3 projections that share the activation codes:
+    /// threadgroup tiles `[0, N0/32)` run projection 0, the next `N1/32`
+    /// tiles projection 1, and so on. Each tile runs exactly the
+    /// single-projection kernel's statements on its own weights, constants
+    /// and output, so every output is bit-identical to a separate launch.
+    private static func multiSource(_ base: String, count: Int) -> String {
+        func pick(_ name: String) -> String {
+            count == 2
+                ? "sel == 0 ? \(name)0 : \(name)1"
+                : "sel == 0 ? \(name)0 : (sel == 1 ? \(name)1 : \(name)2)"
+        }
+        let prologue = """
+            const uint mt = threadgroup_position_in_grid.x;
+            const uint mt1 = uint(ksz[2]) / 32u;
+            const uint mt2 = mt1 + uint(ksz[3]) / 32u;
+            const int sel = mt < mt1 ? 0 : (mt < mt2 ? 1 : 2);
+            const uint tile = mt - (sel == 0 ? 0u : (sel == 1 ? mt1 : mt2));
+            const int N_sel = sel == 0 ? ksz[2] : (sel == 1 ? ksz[3] : ksz[4]);
+            const device uint32_t* w = \(pick("w"));
+            const device float16_t* scalesT = \(pick("scalesT"));
+            const device float16_t* biasesT = \(pick("biasesT"));
+            device float* out = \(pick("out"));
+
+            """
+        let body = base
+            .replacingOccurrences(
+                of: "const int K = ksz[0]; const int N = ksz[2];",
+                with: "const int K = ksz[0]; const int N = N_sel;")
+            .replacingOccurrences(
+                of: "int(threadgroup_position_in_grid.x) * 32", with: "int(tile) * 32")
+        precondition(body.contains("N_sel") && body.contains("int(tile) * 32"))
+        return body.replacingOccurrences(
+            of: "#pragma clang fp reassociate(off)\n",
+            with: "#pragma clang fp reassociate(off)\n" + prologue)
+    }
+
+    private static func multiKernel(nax: Bool, count: Int) -> MLXFast.MLXFastKernel {
+        let sets = (0 ..< count).flatMap { ["w\($0)", "scalesT\($0)", "biasesT\($0)"] }
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_\(nax ? "nax" : "plain")_x\(count)",
+            inputNames: ["xq"] + sets + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< count).map { "out\($0)" },
+            source: multiSource(nax ? naxSource : plainSource, count: count),
+            header: nax ? PromptInt8Matmul.naxHeader : "",
+            ensureRowContiguous: true)
+    }
+
+    private static let multiKernels: [String: MLXFast.MLXFastKernel] = [
+        "plain2": multiKernel(nax: false, count: 2), "plain3": multiKernel(nax: false, count: 3),
+        "nax2": multiKernel(nax: true, count: 2), "nax3": multiKernel(nax: true, count: 3),
+    ]
+
+    typealias ProjectionSet = (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)
+
+    private static func runMany(
+        _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        sets: [ProjectionSet], m: Int, k: Int
+    ) -> [MLXArray] {
+        let ns = sets.map { $0.weight.dim(0) }
+        let dims = MLXArray([Int32(k), Int32(m)] + (ns + [0, 0, 0]).prefix(3).map { Int32($0) })
+        let kernel = multiKernels[(route == .nax ? "nax" : "plain") + "\(sets.count)"]!
+        return kernel(
+            [codes] + sets.flatMap { [$0.weight, $0.scalesT, $0.biasesT] } + [ascale, rsb, dims],
+            template: [("ROWS", m)],
+            grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    /// The projections of `sets` from one set of activation codes, in one
+    /// launch when there are two or three (see `multiSource`) and that launch
+    /// passed its load-time check; otherwise one launch each.
+    static func matmulMany(_ activation: PromptInt8Activation, sets: [ProjectionSet]) -> [MLXArray]? {
+        guard route != .off, !sets.isEmpty else { return nil }
+        if sets.count == 1 || sets.count > 3 || !multiChecked {
+            return sets.map {
+                run(route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                    weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT,
+                    m: activation.rows, k: activation.k, n: $0.weight.dim(0))
+            }
+        }
+        return runMany(
+            route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+            sets: sets, m: activation.rows, k: activation.k)
+    }
+
+    /// The multi-projection launch is used only after it reproduced separate
+    /// plain launches bit for bit on this device (compile errors caught).
+    nonisolated(unsafe) private static var multiChecked = false
+    nonisolated(unsafe) private static var multiFailed = false
+
+    /// Runs the 2- and 3-projection launches of the chosen kernel on a fixed,
+    /// input-independent problem and compares every output with separate
+    /// plain launches.
+    private static func multiMatches(nax: Bool) {
+        let m = 4, k = 1024, kg = k / 128
+        let ns = [64, 32, 96]
+        let codes = MLXArray(
+            (0 ..< tileRows * k).map { $0 < m * k ? Int8(truncatingIfNeeded: ($0 * 29 + 5) % 255 - 127) : 0 },
+            [tileRows, k])
+        let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
+        let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+        let sets: [ProjectionSet] = ns.enumerated().map { (i, n) in
+            (weight: MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 7 * i + 1) &* 2_654_435_761) },
+                [n, k / 16]),
+             scalesT: MLXArray((0 ..< kg * n).map { Float16(Float(1 + ($0 + i) % 13) / 1024) }, [kg, n]),
+             biasesT: MLXArray((0 ..< kg * n).map { Float16(-Float(($0 + i) % 7) / 512) }, [kg, n]))
+        }
+        multiFailed = false
+        var same = true
+        withErrorHandler({ _ in VerifyInt8Matmul.multiFailed = true }) {
+            let separate = sets.map {
+                run(.plain, codes: codes, ascale: ascale, rsb: rsb, weight: $0.weight,
+                    scalesT: $0.scalesT, biasesT: $0.biasesT, m: m, k: k, n: $0.weight.dim(0))
+            }
+            for count in [2, 3] {
+                let many = runMany(
+                    nax ? .nax : .plain, codes: codes, ascale: ascale, rsb: rsb,
+                    sets: Array(sets.prefix(count)), m: m, k: k)
+                for (a, b) in zip(many, separate) {
+                    let equal = MLX.all(a .== b)
+                    eval(equal)
+                    if multiFailed || !equal.item(Bool.self) { same = false }
+                }
+            }
+        }
+        multiChecked = !multiFailed && same
+    }
+
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int
@@ -1856,8 +1985,9 @@ enum VerifyInt8Matmul {
         } else {
             chosen = .plain
         }
+        if chosen != .off { multiMatches(nax: chosen == .nax) }
         FileHandle.standardError.write(
-            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote))\n"
+            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote); multi: \(multiChecked))\n"
                 .data(using: .utf8)!)
         return chosen
     }()
@@ -1989,6 +2119,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify {
+            let codes = PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
+            let sets: [VerifyInt8Matmul.ProjectionSet] = packed.map { layer in
+                let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
+                return (weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+            }
+            let many = VerifyInt8Matmul.matmulMany(codes, sets: sets)!
+            return (activation.last!, zip(many, packed).map { output, layer in
+                let shaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { shaped + $0 } ?? shaped
+            })
+        }
         let outputs = packed.map { layer in
             if verify {
                 let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
@@ -2092,17 +2235,16 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
-        var outputs: [MLXArray] = []
-        for layer in packed {
+        let sets: [VerifyInt8Matmul.ProjectionSet] = packed.map { layer in
             let (scalesT, biasesT) = layer.promptConstants.get(
                 scales: layer.scales, biases: layer.biases!)
-            guard let output = VerifyInt8Matmul.matmul(
-                boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
-            else { return nil }
-            outputs.append(
-                output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)]))
+            return (weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
         }
-        return outputs
+        guard let outputs = VerifyInt8Matmul.matmulMany(boundary.activation, sets: sets)
+        else { return nil }
+        return zip(outputs, packed).map { output, layer in
+            output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
+        }
     }
 
     public static func sharedShortProjections(
@@ -2124,15 +2266,18 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             packed.allSatisfy({ $0.weight.dim(0) % 32 == 0 }),
             let activation = first.transform.quantizedForVerify(x)
         {
-            return packed.map { layer in
+            let sets: [VerifyInt8Matmul.ProjectionSet] = packed.map { layer in
                 let (scalesT, biasesT) = layer.promptConstants.get(
                     scales: layer.scales, biases: layer.biases!)
-                guard let output = VerifyInt8Matmul.matmul(
-                    activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
-                else { return layer(x) }
-                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
-                return layer.bias.map { reshaped + $0 } ?? reshaped
+                return (weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
             }
+            if let outputs = VerifyInt8Matmul.matmulMany(activation, sets: sets) {
+                return zip(outputs, packed).map { output, layer in
+                    let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                    return layer.bias.map { reshaped + $0 } ?? reshaped
+                }
+            }
+            return packed.map { $0(x) }
         }
 
         // Route 2: Shared Hadamard rotation for Float16ConstantQMV (1 ... 16 rows)

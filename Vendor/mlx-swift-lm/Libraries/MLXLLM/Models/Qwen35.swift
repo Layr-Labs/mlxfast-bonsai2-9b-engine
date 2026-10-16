@@ -342,10 +342,13 @@ private enum Qwen35FusedQKNorm {
 /// bits of `concatenated`, `conv1d` and `silu`.
 private enum Qwen35FusedConvSilu {
     private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_conv_silu",
-        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["conv_in", "conv_out"],
+        name: "qwen35_gdn_verify_conv_silu_qknorm",
+        inputNames: ["state", "qkv", "conv_weight"],
+        outputNames: ["conv_in", "conv_out", "q_out", "k_out"],
         source: """
             #pragma clang fp reassociate(off)
+            threadgroup float part[32];
+            threadgroup float inv[1];
             const uint c = thread_position_in_grid.x;
             const uint t = thread_position_in_grid.y;
             const uint C = uint(CONV_DIM);
@@ -360,24 +363,68 @@ private enum Qwen35FusedConvSilu {
               }
               const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
               const float sig = acc < 0.0f ? e : 1.0f - e;
-              conv_out[p * C + c] = acc * sig;
+              const float y = acc * sig;
+              conv_out[p * C + c] = y;
+              // q and k heads: Qwen35FusedQKNorm's arithmetic. Lane l of a
+              // head sums elements 4l..4l+3 in order; the 32 lane partials
+              // take MLX's lane positions for one simd_sum.
+              if (c < 2u * HEADS * 128u) {
+                const uint d = c & 127u;
+                const uint lane = thread_index_in_simdgroup;
+                const float y1 = simd_shuffle_down(y, ushort(1));
+                const float y2 = simd_shuffle_down(y, ushort(2));
+                const float y3 = simd_shuffle_down(y, ushort(3));
+                if ((lane & 3u) == 0u) {
+                  float sq = 0.0f;
+                  sq += y * y;
+                  sq += y1 * y1;
+                  sq += y2 * y2;
+                  sq += y3 * y3;
+                  part[d >> 2] = sq;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simdgroup_index_in_threadgroup == 0) {
+                  const float eps = as_type<float>(uint(EPS_BITS));
+                  const float total = simd_sum(part[lane]);
+                  if (lane == 0) inv[0] = metal::precise::rsqrt(total / 128.0f + eps);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const bool is_q = c < HEADS * 128u;
+                const uint head = (is_q ? c : c - HEADS * 128u) >> 7;
+                const float scale = as_type<float>(uint(is_q ? Q_SCALE_BITS : K_SCALE_BITS));
+                device float* dst = is_q ? q_out : k_out;
+                dst[(p * HEADS + head) * 128u + d] = scale * (y * inv[0]);
+              }
             }
             """,
         ensureRowContiguous: true)
 
-    static func apply(state: MLXArray, qkv: MLXArray, weight: MLXArray) -> (MLXArray, MLXArray)? {
+    /// Verify-width GDN convolution, silu and q/k RMSNorm in one kernel:
+    /// returns (conv input, silu(conv), normalized q, normalized k) with the
+    /// bits of `concatenated`, `conv1d`, `silu` and `Qwen35FusedQKNorm`.
+    static func apply(
+        state: MLXArray, qkv: MLXArray, weight: MLXArray, heads: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         guard state.ndim == 3, state.dim(0) == 1, state.dim(1) == 3, qkv.ndim == 3,
             qkv.dim(0) == 1, (1 ... 16).contains(qkv.dim(1)), qkv.dim(2) == state.dim(2),
             state.dtype == .float32, qkv.dtype == .float32, weight.dtype == .float32,
-            weight.shape == [state.dim(2), 4, 1], StreamOrDevice.default == StreamOrDevice.gpu
+            weight.shape == [state.dim(2), 4, 1], state.dim(2) % 128 == 0,
+            state.dim(2) >= 2 * heads * 128, StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let C = state.dim(2)
         let S = qkv.dim(1)
+        let invScale = pow(Float(128), -0.5)
+        let shape = [1, S, heads, 128]
         let outputs = kernel(
-            [state, qkv, weight], template: [("CONV_DIM", C)],
-            grid: (C, S + 3, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, C]], outputDTypes: [.float32, .float32])
-        return (outputs[0], outputs[1])
+            [state, qkv, weight],
+            template: [("CONV_DIM", C), ("HEADS", heads),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (C, S + 3, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, S + 3, C], [1, S, C], shape, shape],
+            outputDTypes: [.float32, .float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
     }
 }
 
@@ -1484,7 +1531,9 @@ final class Qwen35GatedDeltaNet: Module {
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
         let fusedConv = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
-            ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
+            || headKDim != 128
+            ? nil : Qwen35FusedConvSilu.apply(
+                state: convState, qkv: qkv, weight: conv1d.weight, heads: numKHeads)
         let convInput = fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
         let convOut: MLXArray
         if let fusedConv {
@@ -1499,7 +1548,7 @@ final class Qwen35GatedDeltaNet: Module {
             convOut = silu(conv1d(convInput))
         }
 
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
+        let (qNormed, kNormed) = fusedConv.map { ($0.2, $0.3) } ?? normalizedQK(convOut, B: B, S: S)
         let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let out: MLXArray
