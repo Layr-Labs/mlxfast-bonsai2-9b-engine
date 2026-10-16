@@ -386,7 +386,7 @@ private enum Qwen35RegisterGDN {
         """
         const uint T = q_shape[1];
         constexpr int R = 16;
-        constexpr int DVPL = 2;
+        constexpr int DVPL = DVPL_ROWS;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
         constexpr int DVPT = DVPS * 4;
@@ -521,14 +521,21 @@ private enum Qwen35RegisterGDN {
             """))
 
 
+    /// Value rows per lane (`DVPL` in the kernel source). Each value row's
+    /// state update and reductions are independent of the others, so the
+    /// mapping never changes a result. Four rows per lane amortize each
+    /// step's k/q loads over more state and run the 512-step prompt
+    /// recurrence about 40% faster than two on Apple GPUs measured locally.
+    static let dvpl = 4
+
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
                     beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
         let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
         let Hv = v.dim(2), Dv = v.dim(3)
         let result = kernel(
             [q, k, v, g, beta, state],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("DVPL_ROWS", dvpl)],
+            grid: (128, Dv / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -539,8 +546,8 @@ private enum Qwen35RegisterGDN {
         let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
         let result = valueKernel(
             [q, k, input, g, beta, state, weight],
-            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
+            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv), ("DVPL_ROWS", dvpl)],
+            grid: (128, 128 / (16 * dvpl), B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
