@@ -495,6 +495,16 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            if let shared = qwen35SharedRotationQuad(
+                inputs, inProjQKV, inProjZ, inProjB, inProjA)
+            {
+                return (
+                    shared.0,
+                    shared.1.reshaped(B, S, numVHeads, headVDim),
+                    shared.2,
+                    shared.3
+                )
+            }
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
@@ -1175,13 +1185,14 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let shared = qwen35SharedRotationTriple(x, qProj, kProj, vProj)
+        let qProjOutput = shared?.0 ?? qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = shared?.1 ?? kProj(x)
+        var values = shared?.2 ?? vProj(x)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -1212,17 +1223,19 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
+        let shared = exactTargetVerify
+            ? nil : qwen35SharedRotationTriple(x, qProj, kProj, vProj)
         let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?.0 ?? qProj(x))
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?.1 ?? kProj(x))
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?.2 ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1461,9 +1474,66 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+/// True when both modules are packed Hadamard linears with no GDN layout and
+/// the same rotation object. Kept as a free function so call sites stay tiny.
+@inline(__always)
+func qwen35SameHadamardRotation(_ a: Linear, _ b: Linear) -> (
+    HadamardQuantizedLinear, HadamardQuantizedLinear
+)? {
+    guard let ha = a as? HadamardQuantizedLinear, let hb = b as? HadamardQuantizedLinear,
+        ha.gdnLayout == nil, hb.gdnLayout == nil,
+        ha.transform.sharesRotation(with: hb.transform)
+    else { return nil }
+    return (ha, hb)
+}
+
+/// Two same-input packed projections: one Hadamard, two matmuls. No heap arrays.
+@inline(__always)
+func qwen35SharedRotationPair(_ x: MLXArray, _ a: Linear, _ b: Linear) -> (MLXArray, MLXArray)? {
+    guard let (ha, hb) = qwen35SameHadamardRotation(a, b) else { return nil }
+    let rotated = ha.transform(x)
+    return (ha(rotated: rotated), hb(rotated: rotated))
+}
+
+/// Three same-input packed projections (attention q/k/v).
+@inline(__always)
+func qwen35SharedRotationTriple(
+    _ x: MLXArray, _ a: Linear, _ b: Linear, _ c: Linear
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard let (ha, hb) = qwen35SameHadamardRotation(a, b),
+        let hc = c as? HadamardQuantizedLinear, hc.gdnLayout == nil,
+        hc.transform.sharesRotation(with: ha.transform)
+    else { return nil }
+    let rotated = ha.transform(x)
+    return (ha(rotated: rotated), hb(rotated: rotated), hc(rotated: rotated))
+}
+
+/// Four same-input packed projections (GDN in_proj_qkv/z/b/a when unfused).
+@inline(__always)
+func qwen35SharedRotationQuad(
+    _ x: MLXArray, _ a: Linear, _ b: Linear, _ c: Linear, _ d: Linear
+) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+    guard let (ha, hb) = qwen35SameHadamardRotation(a, b),
+        let hc = c as? HadamardQuantizedLinear, let hd = d as? HadamardQuantizedLinear,
+        hc.gdnLayout == nil, hd.gdnLayout == nil,
+        hc.transform.sharesRotation(with: ha.transform),
+        hd.transform.sharesRotation(with: ha.transform)
+    else { return nil }
+    let rotated = ha.transform(x)
+    return (
+        ha(rotated: rotated), hb(rotated: rotated),
+        hc(rotated: rotated), hd(rotated: rotated)
+    )
+}
+
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return self(x) }
+        guard exact else {
+            if let shared = qwen35SharedRotationPair(x, gateProj, upProj) {
+                return downProj(silu(shared.0) * shared.1)
+            }
+            return self(x)
+        }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)

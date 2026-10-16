@@ -38,9 +38,20 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// True when both transforms are the same rotation: one block size and the
+    /// same sign tensor object, so one rotated activation serves both.
+    public func sharesRotation(with other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width && signs === other.signs
+    }
+
     /// Transform activations before multiplication by folded weights.
+    /// When the input is already FP32 (the packed decode/verify path), skip the
+    /// identity casts that would otherwise allocate around the Hadamard.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if x.dtype == .float32 {
+            return hadamardTransform((x * signs).reshaped([-1, blockSize])).reshaped(x.shape)
+        }
         return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
             .reshaped(x.shape).asType(x.dtype)
     }
@@ -48,6 +59,9 @@ public struct SignedBlockHadamard {
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
+        if x.dtype == .float32 {
+            return (hadamardTransform(x.reshaped([-1, blockSize])).reshaped(x.shape) * signs)
+        }
         return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
             * signs).asType(x.dtype)
     }
@@ -393,7 +407,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     let readsFloat16ConstantsInPlace: Bool
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        self(rotated: transform(gdnLayout.map { $0(x) } ?? x))
+    }
+
+    /// The packed matmul on activations that `transform` (after `gdnLayout`)
+    /// already rotated. Callers that feed one input to several projections
+    /// with a shared rotation compute it once; the result is bit-identical.
+    public func callAsFunction(rotated: MLXArray) -> MLXArray {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
