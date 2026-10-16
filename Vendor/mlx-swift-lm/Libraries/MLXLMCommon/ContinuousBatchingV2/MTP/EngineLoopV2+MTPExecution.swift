@@ -478,7 +478,7 @@ extension EngineLoopV2 {
         var assistantOwnersTransferred = false
         defer {
             if !assistantOwnersTransferred {
-                // Draft column zero may already be evaluating. Restore its
+                // Assistant work may already be evaluating. Restore each
                 // owner before unwinding; request retirement synchronizes and
                 // calls releaseRequestState before returning capacity.
                 for row in rowMetadata {
@@ -628,6 +628,12 @@ extension EngineLoopV2 {
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
+            }
+            // Submit the completed chain while the host constructs target
+            // verification. Existing owners and the finalize fence retain it.
+            if k > 1, StreamOrDevice.default == StreamOrDevice.gpu {
+                asyncEval(assistantEvalTargets)
+                mtp.recordEarlyDraftSubmission()
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
