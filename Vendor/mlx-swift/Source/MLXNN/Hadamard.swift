@@ -351,6 +351,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     private static let reuseFloat16Constants = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"] == "1"
 
+    private static let useM5MatrixTiles: Bool = {
+        #if canImport(Metal)
+            guard #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) else {
+                return false
+            }
+            let architecture = GPU.deviceInfo().architecture
+            return architecture.hasPrefix("applegpu_g17") && !architecture.hasSuffix("p")
+        #else
+            return false
+        #endif
+    }()
+
+    private static let announceM5MatrixTiles: Void = {
+        FileHandle.standardError.write(Data(
+            "HadamardQuantizedLinear: native M5 matrix path selected; physical_rows=16 input_width=4096\n".utf8))
+    }()
+
     /// Qualification witness; this selects reuse, never a different precision
     /// or packed-matmul kernel. The process-wide generic cache kill switch also
     /// remains effective. No cached arrays enter the module parameter tree.
@@ -394,6 +411,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        let rows = rotated.size / rotated.dim(-1)
+        if Self.useM5MatrixTiles, readsFloat16ConstantsInPlace,
+            transform.blockSize == 4096, rotated.dtype == .float32,
+            rotated.dim(-1) == 4096, weight.dim(0) >= 12288,
+            (1 ... Float16ConstantQMV.maximumRows).contains(rows),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        {
+            _ = Self.announceM5MatrixTiles
+            let tiled = padded(
+                rotated.reshaped(rows, 4096), widths: [.init((0, 16 - rows)), 0])
+            let output = super.callAsFunction(tiled)[0 ..< rows]
+            return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+        }
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
