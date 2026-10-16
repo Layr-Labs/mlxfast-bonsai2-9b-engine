@@ -977,7 +977,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BK_padded = sizeof(T) == 4 && group_size == 128 &&
+          bits == 2 && BK == 64 && BN == 64 && WM == 2 && WN == 2
+      ? BK : BK + 16 / sizeof(T);
 
   using loader_w_t = QuantizedBlockLoader<
       T,
@@ -1252,7 +1254,9 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BK_padded = sizeof(T) == 4 && group_size == 128 &&
+          bits == 2 && BK == 64 && BN == 64 && WM == 2 && WN == 2
+      ? BK : BK + 16 / sizeof(T);
 
   threadgroup T Ws[BN * BK_padded];
 
@@ -1377,7 +1381,9 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)lid;
 
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BK_padded = sizeof(T) == 4 && group_size == 128 &&
+          bits == 2 && BK == 64 && BN == 64 && WM == 2 && WN == 2
+      ? BK : BK + 16 / sizeof(T);
 
   threadgroup T Ws[BN * BK_padded];
 
