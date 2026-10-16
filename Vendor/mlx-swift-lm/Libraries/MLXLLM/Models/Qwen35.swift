@@ -411,6 +411,172 @@ private enum Qwen35RegisterGDN {
     }
 }
 
+/// Register GDN with the scalar gating chain folded into the round loop.
+///
+/// The recurrence consumed `g` and `beta` produced by separate host graphs
+/// (`softplus(a + dt_bias)`, `-exp(A_log) *`, `exp`, `sigmoid(b)`, casts)
+/// — several small launches per layer per round feeding a kernel that
+/// re-reads their single scalars. This variant reproduces each MLX element
+/// of that chain in place, op-for-op and precision-for-precision: the
+/// `LogAddExp` softplus with the vendored `log1p` (fast `metal::exp`
+/// inside, per `binary_ops.h`), the `Exp` struct's `metal::precise::exp`
+/// for the decay and its outer exponent, and the `Sigmoid` struct's
+/// abs-branch with fast `metal::exp`. `a`, `b`, `A_log` and `dt_bias`
+/// arrive fp32 with the strides the host chain read them with. The
+/// recurrence arithmetic, reductions and state layout are
+/// `qwen35_gdn_register_v3` verbatim; outputs are bit-identical, so the
+/// folded launches vanish and nothing else moves.
+private enum Qwen35RegisterGatedGDN {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_v3_gated",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: """
+        const uint T = q_shape[1];
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        const device float* a_ = a + b_idx * T * Hv + hv_idx;
+        const device float* bb_ = b + b_idx * T * Hv + hv_idx;
+        const float a_log_v = a_log[hv_idx];
+        const float dt_bias_v = dt_bias[hv_idx];
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          }
+        }
+        float kr[R];
+        float qr[R];
+        for (int t = 0; t < T; ++t) {
+          // Exact fold of softplus(a + dt_bias) -> exp(-exp(A_log) * sp)
+          // and sigmoid(b), op-for-op with the MLX host chain.
+          float x = a_[0] + dt_bias_v;
+          float sp;
+          if (metal::isnan(x)) {
+            sp = metal::numeric_limits<float>::quiet_NaN();
+          } else {
+            const float maxv = metal::max(x, 0.0f);
+            const float minv = metal::min(x, 0.0f);
+            constexpr float inf = metal::numeric_limits<float>::infinity();
+            if (minv == -inf || maxv == inf) {
+              sp = maxv;
+            } else {
+              const float z = metal::exp(minv - maxv);
+              const float xp1 = 1.0f + z;
+              const float l = (xp1 == metal::numeric_limits<float>::max())
+                  ? metal::numeric_limits<float>::max()
+                  : ((xp1 == 1.0f) ? z : z * (metal::log(xp1) / (xp1 - 1.0f)));
+              sp = maxv + l;
+            }
+          }
+          const float gt = metal::precise::exp((-metal::precise::exp(a_log_v)) * sp);
+          const float xb = bb_[0];
+          const float ysig = 1.0f / (1.0f + metal::exp(metal::abs(xb)));
+          const float bt = (xb < 0.0f) ? ysig : 1.0f - ysig;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((const device float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            vt[d] = v_[d];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              kv[d] += simd_shuffle_xor(kv[d], o);
+            }
+          }
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              out[d] += simd_shuffle_xor(out[d], o);
+            }
+          }
+          if (lane % LPD == 0) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              y_[d] = out[d];
+            }
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          }
+        }
+        """)
+
+    static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
+                    b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                    state: MLXArray) -> (MLXArray, MLXArray) {
+        let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let result = kernel(
+            [q, k, v, a, b, aLog, dtBias, state],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -744,11 +910,17 @@ final class Qwen35GatedDeltaNet: Module {
                 q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
                 state: state, mask: mask)
         }
-        let beta = sigmoid(b).asType(.float32)
-        let g = computeGatedDeltaG(aLog, a, dtBias)
         let initial = state ?? MLXArray.zeros(
             [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
         let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+        if a.dtype == .float32, b.dtype == .float32,
+            aLog.dtype == .float32, dtBias.dtype == .float32 {
+            return Qwen35RegisterGatedGDN.run(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: floatState)
+        }
+        let beta = sigmoid(b).asType(.float32)
+        let g = computeGatedDeltaG(aLog, a, dtBias)
         return Qwen35RegisterGDN.run(
             q: q, k: k, v: v, g: g, beta: beta, state: floatState)
     }
