@@ -364,24 +364,38 @@ private enum Float16ConstantQMV {
             for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
             for (int k = 0; k < K; k += 512) {
               float s4[outputs][4], b[outputs];
+              float4 levels[outputs];
               uint packed[outputs];
               for (int r = 0; r < outputs; r++) {
                 const float s = float(sc[r * in_g]);
-                s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
-                b[r] = float(bi[r * in_g]);
+                if constexpr (table_levels) {
+                  const float offset = float(bi[r * in_g]);
+                  levels[r] = float4(fma(s, 0.0f, offset), fma(s, 1.0f, offset),
+                                     fma(s, 2.0f, offset), fma(s, 3.0f, offset));
+                } else {
+                  s4[r][0] = s;
+                  s4[r][1] = s / 4.0f;
+                  s4[r][2] = s / 16.0f;
+                  s4[r][3] = s / 64.0f;
+                  b[r] = float(bi[r * in_g]);
+                }
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
               for (int i = 0; i < 4; i++) {
                 float wd[outputs][4];
                 for (int r = 0; r < outputs; r++) {
                   const uint q = packed[r] >> (8 * i);
-                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
-                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
-                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
-                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  if constexpr (table_levels) {
+                    wd[r][0] = levels[r][q & 3u];
+                    wd[r][1] = levels[r][(q >> 2) & 3u];
+                    wd[r][2] = levels[r][(q >> 4) & 3u];
+                    wd[r][3] = levels[r][(q >> 6) & 3u];
+                  } else {
+                    wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
+                    wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
+                    wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
+                    wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  }
                 }
                 for (int v = 0; v < rows; v++) {
                   const float4 xv = xp[v * (K / 4) + i];
@@ -427,8 +441,12 @@ private enum Float16ConstantQMV {
         // Shape metadata supplies K and N without allocating scalar tensor inputs.
         let inputs = [x.reshaped([rows, K]), weight, scales, biases]
         let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
+        // Reuse the four decoded levels in the long-K, four-row down projection.
+        let tableLevels = rows == 4 && K == 12_288 && N == 4_096
         let output = (rows == 1 ? fast : Self.rows)(
-            inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
+            inputs, template: rows == 1 ? [] : [
+                ("rows", rows), ("outputs", outputs), ("table_levels", tableLevels ? 1 : 0),
+            ],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
         return output.reshaped(Array(x.shape.dropLast()) + [N])
