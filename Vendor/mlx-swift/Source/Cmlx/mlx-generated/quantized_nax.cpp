@@ -1274,6 +1274,17 @@ template <
         b_strides,
         tid);
   }
+  // A single 16-row block uses all four SIMD groups across N. The host's
+  // 32-row grid also has one M block for this shape.
+  if constexpr (sizeof(T) == 4 && group_size == 128 && bits == 2 &&
+                aligned_N && !batched && BM == 32 && BK == 64 && BN == 64 &&
+                WM == 2 && WN == 2) {
+    if (M == 16 && K == 4096 && N >= 12288) {
+      qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, 16, BK, BN, 1, 4>(
+          w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      return;
+    }
+  }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
