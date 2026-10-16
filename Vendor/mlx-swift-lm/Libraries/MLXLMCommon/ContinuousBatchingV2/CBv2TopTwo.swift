@@ -77,34 +77,9 @@ private let cbv2TopTwoHeader = """
             state.count = 2;
         }
     }
-
-    inline darkbloom_qwen35_mtp_top2_state darkbloom_qwen35_mtp_top2_simd_reduce(
-        darkbloom_qwen35_mtp_top2_state local,
-        uint lane
-    ) {
-        for (uint stride = 16; stride > 0; stride >>= 1) {
-            darkbloom_qwen35_mtp_top2_state other;
-            other.first_value = simd_shuffle_down(local.first_value, stride);
-            other.second_value = simd_shuffle_down(local.second_value, stride);
-            other.first_id = simd_shuffle_down(local.first_id, stride);
-            other.second_id = simd_shuffle_down(local.second_id, stride);
-            other.count = simd_shuffle_down(local.count, stride);
-            if (lane < stride) {
-                if (other.count > 0) {
-                    darkbloom_qwen35_mtp_top2_insert(
-                        local, other.first_value, other.first_id);
-                }
-                if (other.count > 1) {
-                    darkbloom_qwen35_mtp_top2_insert(
-                        local, other.second_value, other.second_id);
-                }
-            }
-        }
-        return local;
-    }
 """
 
-/// Stage one: SIMD reductions, then one shared-memory exchange per stripe.
+/// Stage one: 32 threadgroups per row reduce disjoint vocabulary stripes.
 private let cbv2TopTwoPartialKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_partial",
     inputNames: ["logits"],
@@ -117,53 +92,54 @@ private let cbv2TopTwoPartialKernel = MLXFast.metalKernel(
         uint vocab = uint(logits_shape[2]);
         darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
 
-        const ulong row_offset = ulong(row) * ulong(logits_strides[1]);
-        const ulong stride2 = ulong(logits_strides[2]);
-
         for (uint index = group * 256 + lane;
              index < vocab;
              index += 32 * 256) {
-            ulong offset = row_offset + ulong(index) * stride2;
-            float val = float(logits[offset]);
-            if (local.count == 2 && val <= local.second_value) {
-                continue;
-            }
-            darkbloom_qwen35_mtp_top2_insert(local, val, index);
+            ulong offset = ulong(row) * ulong(logits_strides[1])
+                + ulong(index) * ulong(logits_strides[2]);
+            darkbloom_qwen35_mtp_top2_insert(local, float(logits[offset]), index);
         }
 
-        const uint simd_lane = thread_index_in_simdgroup;
-        const uint simd_group = simdgroup_index_in_threadgroup;
-        local = darkbloom_qwen35_mtp_top2_simd_reduce(local, simd_lane);
-        threadgroup darkbloom_qwen35_mtp_top2_state scratch[8];
-        if (simd_lane == 0) {
-            scratch[simd_group] = local;
-        }
+        threadgroup darkbloom_qwen35_mtp_top2_state scratch[256];
+        scratch[lane] = local;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (simd_group == 0) {
-            local = simd_lane < 8
-                ? scratch[simd_lane] : darkbloom_qwen35_mtp_top2_empty();
-            local = darkbloom_qwen35_mtp_top2_simd_reduce(local, simd_lane);
-            if (simd_lane == 0) {
-                uint base = (row * 32 + group) * 2;
-                uint sentinel_id = vocab + group * 2;
-                float sentinel_value = as_type<float>(0x7fc00000u);
-                partial_ids[base] = local.count > 0
-                    ? int(local.first_id) : int(sentinel_id);
-                partial_ids[base + 1] = local.count > 1
-                    ? int(local.second_id) : int(sentinel_id + 1);
-                partial_values[base] = local.count > 0
-                    ? local.first_value : sentinel_value;
-                partial_values[base + 1] = local.count > 1
-                    ? local.second_value : sentinel_value;
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
+                darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
+                if (other.count > 0) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    darkbloom_qwen35_mtp_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                scratch[lane] = merged;
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint base = (row * 32 + group) * 2;
+            uint sentinel_id = vocab + group * 2;
+            float sentinel_value = as_type<float>(0x7fc00000u);
+            partial_ids[base] = scratch[0].count > 0
+                ? int(scratch[0].first_id) : int(sentinel_id);
+            partial_ids[base + 1] = scratch[0].count > 1
+                ? int(scratch[0].second_id) : int(sentinel_id + 1);
+            partial_values[base] = scratch[0].count > 0
+                ? scratch[0].first_value : sentinel_value;
+            partial_values[base + 1] = scratch[0].count > 1
+                ? scratch[0].second_value : sentinel_value;
         }
     """,
     header: cbv2TopTwoHeader,
     ensureRowContiguous: false
 )
 
-/// Stage two: one SIMD group per row merges the partial pairs in registers.
+/// Stage two: one 32-lane threadgroup per row merges the partial pairs.
 private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_finalize",
     inputNames: ["partial_ids", "partial_values"],
@@ -178,13 +154,29 @@ private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
         darkbloom_qwen35_mtp_top2_insert(
             local, partial_values[base + 1], uint(partial_ids[base + 1]));
 
-        local = darkbloom_qwen35_mtp_top2_simd_reduce(local, lane);
+        threadgroup darkbloom_qwen35_mtp_top2_state scratch[32];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 16; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
+                darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
+                darkbloom_qwen35_mtp_top2_insert(
+                    merged, other.first_value, other.first_id);
+                darkbloom_qwen35_mtp_top2_insert(
+                    merged, other.second_value, other.second_id);
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         if (lane == 0) {
             uint output_base = row * 2;
-            top_ids[output_base] = int(local.first_id);
-            top_ids[output_base + 1] = int(local.second_id);
-            top_values[output_base] = local.first_value;
-            top_values[output_base + 1] = local.second_value;
+            top_ids[output_base] = int(scratch[0].first_id);
+            top_ids[output_base + 1] = int(scratch[0].second_id);
+            top_values[output_base] = scratch[0].first_value;
+            top_values[output_base + 1] = scratch[0].second_value;
         }
     """,
     header: cbv2TopTwoHeader,

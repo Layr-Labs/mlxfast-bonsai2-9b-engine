@@ -287,7 +287,7 @@ extension EngineLoopV2 {
                 }
                 blockContextColumns.append(context)
             }
-            if mtp.usesRequestStatefulDrafter {
+            if (mtp.usesMarginalPolicy || logitDiagnostic != nil), mtp.usesRequestStatefulDrafter {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                     preconditionFailure(
                         "CBv2 request-stateful rectangular MTP target lacks top-two provider")
