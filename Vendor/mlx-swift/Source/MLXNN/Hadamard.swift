@@ -1853,6 +1853,15 @@ extension HadamardQuantizedLinear {
     /// module or shape has no fused path.
     public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
+        // When the verify-width integer route takes this module, the caller's
+        // logits come from it; nil sends the top-2 to those logits, so the
+        // token choice and the stored logits are one computation.
+        if transform.blockSize == 4096, transform.width % 512 == 0, weight.dim(0) % 32 == 0,
+            x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(x.size / x.dim(-1)),
+            VerifyInt8Matmul.route != .off
+        {
+            return nil
+        }
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
         guard rotated.dtype == .float32 else { return nil }
         return Float16ConstantQMV.topTwo(
