@@ -38,6 +38,13 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// Structural identity: equal block size and equal explicit sign pattern.
+    /// Two transforms that report identical produce bit-identical outputs for
+    /// bit-identical inputs, so one rotated activation may feed both.
+    public func isIdentical(to other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && (signs === other.signs || signValues == other.signValues)
+    }
+
     // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
     private static let fused4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_4096",
@@ -488,6 +495,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        return forward(rotated: rotated)
+    }
+
+    /// Forward on a pre-rotated activation. Exact remainder of
+    /// `callAsFunction` with the input-side transform hoisted to the caller.
+    /// Bit-exact by construction: `rotated` here is the identical array the
+    /// per-projection path would have computed when two projections share one
+    /// transform, and the dispatch below is unchanged.
+    public func forward(rotated: MLXArray) -> MLXArray {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
