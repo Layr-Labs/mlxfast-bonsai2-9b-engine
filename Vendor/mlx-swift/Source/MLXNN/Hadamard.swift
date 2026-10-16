@@ -661,9 +661,9 @@ private enum Float16ConstantQMV {
                 const float4 xv = xp4[i];
                 sum += float(xv.x) + float(xv.y) + float(xv.z) + float(xv.w);
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
@@ -729,9 +729,9 @@ private enum Float16ConstantQMV {
               for (int r = 0; r < outputs; r++) {
                 const float s = float(sc[r * in_g]);
                 s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
+                s4[r][1] = s * 0.25f;
+                s4[r][2] = s * 0.0625f;
+                s4[r][3] = s * 0.015625f;
                 b[r] = float(bi[r * in_g]);
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
@@ -745,7 +745,7 @@ private enum Float16ConstantQMV {
                   wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
                 }
                 for (int v = 0; v < rows; v++) {
-                  const float4 xv = xp[v * (K / 4) + i];
+                  const float4 xv = xp[v * in_w + i];
                   for (int r = 0; r < outputs; r++) {
                     result[v][r] = fma(xv.x, wd[r][0], result[v][r]);
                     result[v][r] = fma(xv.y, wd[r][1], result[v][r]);
@@ -1766,6 +1766,46 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
+    }
+
+    /// Share verify-width integer or float rotations across a group of projections.
+    public static func sharedShortProjections(
+        _ x: MLXArray, _ projections: [Linear]
+    ) -> [MLXArray]? {
+        guard x.ndim >= 2, x.dtype == .float32 else { return nil }
+        let rows = x.size / x.dim(-1)
+        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
+        guard packed.count == projections.count, let first = packed.first,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
+                    && $0.transform.blockSize == 4096
+                    && $0.transform.isIdentical(to: first.transform)
+            })
+        else { return nil }
+
+        // Route 1: VerifyInt8Matmul when rows in 2 ... 8 and route != .off
+        if VerifyInt8Matmul.rowRange.contains(rows), VerifyInt8Matmul.route != .off,
+            packed.allSatisfy({ $0.weight.dim(0) % 32 == 0 }),
+            let activation = first.transform.quantizedForVerify(x)
+        {
+            return packed.map { layer in
+                let (scalesT, biasesT) = layer.promptConstants.get(
+                    scales: layer.scales, biases: layer.biases!)
+                guard let output = VerifyInt8Matmul.matmul(
+                    activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+                else { return layer(x) }
+                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { reshaped + $0 } ?? reshaped
+            }
+        }
+
+        // Route 2: Shared Hadamard rotation for Float16ConstantQMV (1 ... 16 rows)
+        if (1 ... Float16ConstantQMV.maximumRows).contains(rows) {
+            let rotated = first.transform(x)
+            return packed.map { $0.forwardRotated(rotated) }
+        }
+
+        return nil
     }
 
     /// The verify-width integer route (`VerifyInt8Matmul`); nil when the

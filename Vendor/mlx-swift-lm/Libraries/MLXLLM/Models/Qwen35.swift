@@ -462,12 +462,13 @@ private enum Qwen35RegisterGDN {
         outputNames: ["y", "state_out"],
         source: source(valueRead: """
             const uint channel = 2u * Hk * Dk + hv_idx * Dv + dvbase + d;
-            float cv = 0.0f;
-            #pragma clang loop unroll(full)
-            for (uint tap = 0; tap < 4; ++tap) {
-              cv = fma(v[(b_idx * (T + 3u) + t + tap) * v_shape[2] + channel],
-                  conv_weight[channel * 4u + tap], cv);
-            }
+            const float4 cw4 = *((const device float4*)(conv_weight + channel * 4u));
+            const uint v_base = (b_idx * (T + 3u) + t) * v_shape[2] + channel;
+            const uint v_stride = v_shape[2];
+            float cv = fma(v[v_base], cw4.x, 0.0f);
+            cv = fma(v[v_base + v_stride], cw4.y, cv);
+            cv = fma(v[v_base + 2u * v_stride], cw4.z, cv);
+            cv = fma(v[v_base + 3u * v_stride], cw4.w, cv);
             const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
             vt[d] = cv * (cv < 0.0f ? sig : 1.0f - sig);
             """))
@@ -943,7 +944,8 @@ final class Qwen35GatedDeltaNet: Module {
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
             let shared = S >= 128
-                ? HadamardQuantizedLinear.sharedPromptProjections(inputs, [inProjQKV, inProjZ]) : nil
+                ? HadamardQuantizedLinear.sharedPromptProjections(inputs, [inProjQKV, inProjZ])
+                : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjQKV, inProjZ])
             let qkv = shared?[0] ?? inProjQKV(inputs)
             let z = (shared?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
             if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
@@ -1648,7 +1650,8 @@ final class Qwen35Attention: Module {
         let L = x.dim(1)
 
         let shared = L >= 128
-            ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj]) : nil
+            ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj])
+            : HadamardQuantizedLinear.sharedShortProjections(x, [qProj, kProj, vProj])
         let qProjOutput = shared?[0] ?? qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
@@ -1686,8 +1689,11 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let shared = !exactTargetVerify && L >= 128
-            ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj]) : nil
+        let shared = !exactTargetVerify
+            ? (L >= 128
+                ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj])
+                : HadamardQuantizedLinear.sharedShortProjections(x, [qProj, kProj, vProj]))
+            : nil
         let qProjOutput = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
