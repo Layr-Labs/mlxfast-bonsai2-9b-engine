@@ -1000,6 +1000,165 @@ final class PromptInt8Constants {
     }
 }
 
+/// The packed 2-bit, group-128 matmul for a 4 to 7 row MTP verify, flat in
+/// rows. Each lane turns two weight codes into exact halves inside a
+/// simdgroup matrix fragment, and one 8x8x8 multiply covers 8 output rows
+/// against every verify row, so a weight is dequantized once for all rows
+/// and no activation is reloaded per output row. Scales and biases apply
+/// once per group to the FP32 partial sums, the bias through the group's
+/// activation sum. The simdgroups of a threadgroup split K and add their
+/// partials through threadgroup memory in a fixed order, so the split costs
+/// no second launch. A row's result does not depend on the other rows.
+enum FewRowPackedMatmul {
+    static let rows = 4 ... 7
+    static let rowBlocks = 4
+    static let occupancy = 2048
+
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_FEW_ROW_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let warmed = NSLock()
+    nonisolated(unsafe) private static var warmedShapes = Set<[Int]>()
+
+    static func supports(k: Int, n: Int) -> Bool {
+        enabled && k % 128 == 0 && n % (8 * rowBlocks) == 0
+    }
+
+    /// Simdgroups per threadgroup: the fewest that reach `occupancy`
+    /// simdgroups in the grid, each taking whole groups of K.
+    static func split(k: Int, n: Int) -> Int {
+        let groups = k / 128
+        let tiles = n / (8 * rowBlocks)
+        let options = [1, 2, 4, 8, 16].filter { groups % $0 == 0 }
+        return options.first { tiles * $0 >= occupancy } ?? options.last!
+    }
+
+    /// Compiles the kernel for one weight shape before the first verify, so
+    /// no speculative round pays a Metal library build.
+    static func warm(k: Int, n: Int) {
+        guard supports(k: k, n: n) else { return }
+        warmed.lock()
+        let fresh = warmedShapes.insert([k, n]).inserted
+        warmed.unlock()
+        guard fresh else { return }
+        let y = matmul(
+            MLXArray.zeros([rows.lowerBound, k], dtype: .float32),
+            weight: MLXArray.zeros([n, k / 16], dtype: .uint32),
+            scales: MLXArray.zeros([n, k / 128], dtype: .float16),
+            biases: MLXArray.zeros([n, k / 128], dtype: .float16))
+        eval(y)
+    }
+
+    static func matmul(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+    ) -> MLXArray {
+        let K = x.dim(-1)
+        let m = x.size / K
+        let N = weight.dim(0)
+        let S = split(k: K, n: N)
+        let y = kernel(
+            [x.reshaped([m, K]), weight, scales, biases],
+            template: [("K", K), ("N", N), ("RB", rowBlocks), ("S", S)],
+            grid: (N / (8 * rowBlocks) * 32 * S, 1, 1), threadGroup: (32 * S, 1, 1),
+            outputShapes: [[m, N]], outputDTypes: [.float32])[0]
+        return y.reshaped(Array(x.shape.dropLast()) + [N])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "hadamard_few_row_flat_f16_constants",
+        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: """
+            constexpr uint CH = 32;
+            constexpr uint TK = 128;
+            constexpr uint row_bytes = K / 4;
+            constexpr uint G = K / 128;
+            constexpr uint KS = K / S;
+            const uint M = x_shape[0];
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint qid = lane / 4;
+            const uint fm = (qid & 4) + ((lane / 2) % 4);
+            const uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+            const uint row_base = threadgroup_position_in_grid.x * 8 * RB;
+            threadgroup float red[S * RB * 64];
+            simdgroup_float8x8 acc[RB];
+            simdgroup_float8x8 part[RB];
+            UNROLL for (uint b = 0; b < RB; ++b) {
+              acc[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+              part[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            const device uchar* wb = (const device uchar*)w;
+            const uint kl = (fn / 2) * CH;
+            const uint kb = (fm / 2) * CH + (fm % 2) * 8;
+            const device float* x0 = x + min(fn, M - 1) * K;
+            const device float* x1 = x + min(fn + 1, M - 1) * K;
+            for (uint k0 = sg * KS; k0 < (sg + 1) * KS; k0 += TK) {
+              uint words[RB][2];
+              UNROLL for (uint b = 0; b < RB; ++b) {
+                const device uint* p =
+                    (const device uint*)(wb + (row_base + b * 8 + fm) * row_bytes + (k0 + kl) / 4);
+                words[b][0] = p[0];
+                words[b][1] = p[1];
+              }
+              float sum0 = 0.0f, sum1 = 0.0f;
+              UNROLL for (uint j = 0; j < CH / 2; ++j) {
+                const uint k = k0 + kb + (j % 8) + 16 * (j / 8);
+                const float v0 = x0[k];
+                const float v1 = x1[k];
+                sum0 += v0;
+                sum1 += v1;
+                simdgroup_float8x8 bx;
+                bx.thread_elements()[0] = v0;
+                bx.thread_elements()[1] = v1;
+                UNROLL for (uint b = 0; b < RB; ++b) {
+                  const uint bitsv = (words[b][j / 8] >> (2 * (j % 8))) & 0x00030003u;
+                  const half2 q = as_type<half2>(bitsv | 0x64006400u) - half2(1024.0h);
+                  simdgroup_half8x8 a;
+                  a.thread_elements()[0] = q.x;
+                  a.thread_elements()[1] = q.y;
+                  simdgroup_multiply_accumulate(part[b], a, bx, part[b]);
+                }
+              }
+              float s0 = sum0 + simd_shuffle_xor(sum0, 2);
+              s0 += simd_shuffle_xor(s0, 4);
+              s0 += simd_shuffle_xor(s0, 16);
+              float s1 = sum1 + simd_shuffle_xor(sum1, 2);
+              s1 += simd_shuffle_xor(s1, 4);
+              s1 += simd_shuffle_xor(s1, 16);
+              const uint g = k0 / TK;
+              UNROLL for (uint b = 0; b < RB; ++b) {
+                const uint gi = (row_base + b * 8 + fm) * G + g;
+                const float sc = float(scales[gi]);
+                const float bi = float(biases[gi]);
+                acc[b].thread_elements()[0] += sc * part[b].thread_elements()[0] + bi * s0;
+                acc[b].thread_elements()[1] += sc * part[b].thread_elements()[1] + bi * s1;
+                part[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+              }
+            }
+            UNROLL for (uint b = 0; b < RB; ++b) {
+              red[(sg * RB + b) * 64 + fm * 8 + fn] = acc[b].thread_elements()[0];
+              red[(sg * RB + b) * 64 + fm * 8 + fn + 1] = acc[b].thread_elements()[1];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = sg * 32 + lane; e < RB * 64; e += S * 32) {
+              const uint r = e % 8;
+              if (r < M) {
+                float total = red[e];
+                for (uint s = 1; s < S; ++s) total += red[s * RB * 64 + e];
+                y[r * N + row_base + e / 8] = total;
+              }
+            }
+            """,
+        header: """
+            #include <metal_simdgroup_matrix>
+            #define UNROLL _Pragma("clang loop unroll(full)")
+
+            """)
+}
+
 /// Affine packed linear weights with a signed Hadamard input transform.
 ///
 /// Pass weights already folded and packed in MLX format. The initializer does
@@ -1050,6 +1209,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
         }
+        if readsFloat16ConstantsInPlace {
+            FewRowPackedMatmul.warm(k: weight.dim(1) * 16, n: weight.dim(0))
+        }
     }
 
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
@@ -1080,8 +1242,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
-            let output = Float16ConstantQMV.matmul(
-                rotated, weight: weight, scales: scales, biases: biases!)
+            let rows = rotated.size / rotated.dim(-1)
+            let output =
+                FewRowPackedMatmul.rows.contains(rows)
+                    && FewRowPackedMatmul.supports(k: rotated.dim(-1), n: weight.dim(0))
+                ? FewRowPackedMatmul.matmul(
+                    rotated, weight: weight, scales: scales, biases: biases!)
+                : Float16ConstantQMV.matmul(
+                    rotated, weight: weight, scales: scales, biases: biases!)
             return bias.map { output + $0 } ?? output
         }
         if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
