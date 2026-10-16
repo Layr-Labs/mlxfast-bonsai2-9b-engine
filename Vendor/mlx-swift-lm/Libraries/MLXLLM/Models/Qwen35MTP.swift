@@ -521,47 +521,34 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         try assistant.mtp.update(
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
-        requantizeHeadLinears(in: assistant.mtp)
+        assistant.warmDraftLane()
         return assistant
     }
 
-    /// On-load head re-encoding, permitted by the head re-quantization
-    /// exception (participant contract section 4.4): in memory only, within
-    /// the declaration cap, after the export's tensors were bound at their
-    /// own geometry. The export on disk and every target tensor — the shared
-    /// embedding, the lm_head, and the draft-vocabulary copy of its rows —
-    /// stay untouched. The head only proposes; re-encoding can move draft
-    /// choices and therefore acceptance, never bypass target verification.
-    static let headRequantGeometry: (groupSize: Int, bits: Int)? = (128, 4)
-
-    private static func requantizeHeadLinears(in head: Qwen35MTPModule) {
-        guard let geometry = headRequantGeometry else { return }
-        quantize(
-            model: head,
-            filter: { _, module in
-                guard let linear = module as? Qwen35MTPQuantizedLinear,
-                    linear.mode == .affine,
-                    linear.groupSize != geometry.groupSize || linear.bits != geometry.bits,
-                    (linear.weight.dim(1) * 32 / linear.bits) % geometry.groupSize == 0
-                else { return nil }
-                return (geometry.groupSize, geometry.bits, QuantizationMode.affine)
-            },
-            apply: { module, groupSize, bits, mode in
-                guard let linear = module as? Qwen35MTPQuantizedLinear else { return nil }
-                let dense = dequantized(
-                    linear.weight, scales: linear.scales, biases: linear.biases,
-                    groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode,
-                    dtype: .float16)
-                let (weight, scales, biases) = quantized(
-                    dense, groupSize: groupSize, bits: bits, mode: mode)
-                let replacement = Qwen35MTPQuantizedLinear(
-                    weight: weight, bias: linear.bias, scales: scales, biases: biases,
-                    groupSize: groupSize, bits: bits, mode: mode)
-                // Materialize the packed replacement now so the dense FP16
-                // intermediate frees before the next module dequantizes.
-                eval(replacement)
-                return replacement
-            })
+    /// Prime the draft-only vocabulary head outside the timed window. The
+    /// subset head is a freshly-allocated ~114 MB copy (0302eff): its first
+    /// real use page-faults every weight byte, compiles its Hadamard transform
+    /// and few-row QMV kernels, and cold-dispatches argmax plus the id-map
+    /// gather — sealed paired legs show every candidate's pair-1 at +0.6..0.7
+    /// ms/token over its own warm pairs. This replicates exactly that hot
+    /// sequence (head matmul -> last-row argMax -> ids gather) on scratch
+    /// inputs at load time, before any engine request state exists. No caches,
+    /// no request state, no draftStep state machine, no numerics that can
+    /// reach a timed leg: only page mapping, kernel compilation and allocator
+    /// warming move earlier. Guard miss skips silently — warmup never fails a
+    /// load.
+    func warmDraftLane() {
+        guard ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_NO_WARMUP"] == nil,
+            let draftVocabulary
+        else { return }
+        let hiddenSize = target.configuration.hiddenSize
+        var h = MLXArray.zeros([1, 1, hiddenSize], dtype: .float32)
+        eval(h)
+        for _ in 0 ..< 3 {
+            let logits = draftVocabulary.head(h)
+            let local = argMax(logits[0..., -1, 0...], axis: -1)
+            eval(draftVocabulary.ids[local])
+        }
     }
 
     private static func qwen35TextTarget(

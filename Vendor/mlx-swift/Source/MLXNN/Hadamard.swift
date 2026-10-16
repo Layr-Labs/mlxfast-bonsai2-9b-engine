@@ -38,49 +38,12 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
-    func isIdentical(to other: SignedBlockHadamard) -> Bool {
-        blockSize == other.blockSize && width == other.width && signValues == other.signValues
-    }
-
     // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
-    private static let residualNormSource = """
-
-            threadgroup float norm_sums[32];
-            threadgroup float norm_inv[1];
-            const uint norm_lane = thread_index_in_simdgroup;
-            const uint norm_sg = simdgroup_index_in_threadgroup;
-            for (uint part = 0; part < 4; ++part) {
-              const uint at = batch_idx + (uint(i) + part * 256u) * 4u;
-              const float4 value = *((const device float4*)(x + at))
-                  + *((const device float4*)(residual + at));
-              float square_sum = 0.0f;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 4; ++j) square_sum += value[j] * value[j];
-              square_sum = simd_sum(square_sum);
-              if (norm_lane == 0) norm_sums[norm_sg + part * 8u] = square_sum;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (norm_sg == 0) {
-              const float total = simd_sum(norm_sums[norm_lane]);
-              if (norm_lane == 0) norm_inv[0] = metal::precise::rsqrt(total / 4096.0f + epsilon[0]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            """
-
-    private static func fused4096Source(residualNorm: Bool) -> String {
-        let prefix = residualNorm ? residualNormSource : ""
-        let valueRead = residualNorm ? """
-            const float4 raw = in4[v] + *((const device float4*)(residual + in_offset) + v);
-            *((device float4*)(residual_out + in_offset) + v) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + v);
-            float4 val = (weight * (raw * norm_inv[0])) * s4[v];
-            """ : """
-            float4 val = in4[v];
-            if (!INVERSE) {
-              val *= s4[v];
-            }
-            """
-        return """
+    private static let fused4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096",
+        inputNames: ["x", "signs"],
+        outputNames: ["y"],
+        source: """
             #pragma clang fp reassociate(off)
             const short i = short(thread_position_in_threadgroup.x);
             const uint block_idx = threadgroup_position_in_grid.y;
@@ -88,7 +51,6 @@ public struct SignedBlockHadamard {
             const uint sign_offset = (BLOCKS_PER_ROW == 1)
                 ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
 
-            \(prefix)
             threadgroup float buf[256 * 17];
             float x_reg[16];
 
@@ -100,7 +62,10 @@ public struct SignedBlockHadamard {
               const device float4* s4 = (const device float4*)(signs + s_offset);
               #pragma clang loop unroll(full)
               for (short v = 0; v < 4; v++) {
-                \(valueRead)
+                float4 val = in4[v];
+                if (!INVERSE) {
+                  val *= s4[v];
+                }
                 x_reg[4 * v + 0] = val.x;
                 x_reg[4 * v + 1] = val.y;
                 x_reg[4 * v + 2] = val.z;
@@ -152,10 +117,8 @@ public struct SignedBlockHadamard {
               }
               y[batch_idx + idx] = T(val);
             }
-            """
-    }
-
-    private static let fused4096Header = """
+            """,
+        header: """
             using namespace metal;
             METAL_FUNC void hadamard_radix16(thread float* x) {
               #pragma clang loop unroll(full)
@@ -185,17 +148,7 @@ public struct SignedBlockHadamard {
                 x[k] = a + b; x[k+8] = a - b;
               }
             }
-            """
-
-    private static let fused4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096", inputNames: ["x", "signs"], outputNames: ["y"],
-        source: fused4096Source(residualNorm: false), header: fused4096Header)
-
-    private static let residualNorm4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_residual_norm_4096",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
-        outputNames: ["y", "residual_out"],
-        source: fused4096Source(residualNorm: true), header: fused4096Header)
+            """)
 
     private func fused4096(_ x: MLXArray, inverse: Bool) -> MLXArray? {
         guard blockSize == 4096, x.size > 0, x.size <= Int(UInt32.max),
@@ -219,22 +172,11 @@ public struct SignedBlockHadamard {
     /// single IEEE rounding (sign multiply, butterfly adds in a fixed order, a
     /// power-of-two scale, max, a precise divide, rint, an integer sum), so the
     /// codes and constants do not depend on the GPU that computes them.
-    private static func quantized4096Source(swiglu: Bool, residualNorm: Bool = false) -> String {
-        let valueRead = swiglu ? """
-            const float4 g = in4[w];
-            const float4 u = *((const device float4*)(up + in_offset) + w);
-            const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
-            const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
-            float4 val = ((g * sigmoid_g) * u) * s4[w];
-            """ : "float4 val = in4[w] * s4[w];"
-        let prefix = residualNorm ? residualNormSource : ""
-        let inputRead = residualNorm ? """
-            const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
-            *((device float4*)(residual_out + in_offset) + w) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            float4 val = (weight * (raw * norm_inv[0])) * s4[w];
-            """ : valueRead
-        return """
+    private static let quantized4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096_q8",
+        inputNames: ["x", "signs"],
+        outputNames: ["codes", "ascale", "rsb"],
+        source: """
             #pragma clang fp reassociate(off)
             const short i = short(thread_position_in_threadgroup.x);
             const uint block_idx = threadgroup_position_in_grid.y;
@@ -242,7 +184,6 @@ public struct SignedBlockHadamard {
             const uint sign_offset = (BLOCKS_PER_ROW == 1)
                 ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
 
-            \(prefix)
             threadgroup float buf[256 * 17];
             float x_reg[16];
 
@@ -255,7 +196,7 @@ public struct SignedBlockHadamard {
             const device float4* s4 = (const device float4*)(signs + s_offset);
             #pragma clang loop unroll(full)
             for (short w = 0; w < 4; w++) {
-              \(inputRead)
+              float4 val = in4[w] * s4[w];
               x_reg[4 * w + 0] = val.x;
               x_reg[4 * w + 1] = val.y;
               x_reg[4 * w + 2] = val.z;
@@ -331,10 +272,8 @@ public struct SignedBlockHadamard {
               ascale[qidx] = qs;
               rsb[qidx] = qs * part;
             }
-            """
-    }
-
-    private static let quantized4096Header = """
+            """,
+        header: """
             using namespace metal;
             METAL_FUNC void hadamard_radix16_q8(thread float* x) {
               #pragma clang loop unroll(full)
@@ -364,65 +303,21 @@ public struct SignedBlockHadamard {
                 x[k] = a + b; x[k+8] = a - b;
               }
             }
-            """
-
-    private static let quantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096_q8",
-        inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false), header: quantized4096Header,
+            """,
         ensureRowContiguous: true)
-
-    private static let quantizedSwiGLU4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_swiglu_4096_q8",
-        inputNames: ["x", "up", "signs"], outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: true), header: quantized4096Header,
-        ensureRowContiguous: true)
-
-    private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_residual_norm_4096_q8",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb", "residual_out"],
-        source: quantized4096Source(swiglu: false, residualNorm: true),
-        header: quantized4096Header, ensureRowContiguous: true)
-
-    func residualNorm(
-        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float, quantized: Bool
-    ) -> [MLXArray]? {
-        guard blockSize == 4096, width == 4096, x.dtype == .float32,
-            residual.dtype == .float32, residual.shape == x.shape,
-            weight.dtype == .float32, weight.shape == [4096], x.size > 0,
-            x.size <= Int(UInt32.max), StreamOrDevice.default == StreamOrDevice.gpu
-        else { return nil }
-        let rows = x.size / width
-        let inputs = [x, residual, weight, MLXArray([eps]), signs]
-        if quantized {
-            return Self.residualNormQuantized4096Kernel(
-                inputs, template: [("BLOCKS_PER_ROW", 1)],
-                grid: (256, rows, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape],
-                outputDTypes: [.int8, .float32, .float32, .float32])
-        }
-        return Self.residualNorm4096Kernel(
-            inputs, template: [("T", DType.float32), ("BLOCKS_PER_ROW", 1), ("INVERSE", false)],
-            grid: (256, rows, 1), threadGroup: (256, 1, 1),
-            outputShapes: [x.shape, x.shape], outputDTypes: [.float32, .float32])
-    }
 
     /// `forward(x)` quantized for `PromptInt8Matmul`: int8 codes `[rows,
     /// width]` and the FP32 group constants `[rows * width / 128]`. Nil when
     /// the shape is not a prompt-width FP32 block-4096 input.
-    func quantizedForPrompt(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
+    func quantizedForPrompt(_ x: MLXArray) -> PromptInt8Activation? {
         validate(x)
         let rows = x.size / width
         guard blockSize == 4096, x.dtype == .float32, rows % 64 == 0, rows > 0,
             x.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        if let up, up.shape != x.shape || up.dtype != x.dtype { return nil }
         let groups = rows * (width / 128)
-        let kernel = up == nil ? Self.quantized4096Kernel : Self.quantizedSwiGLU4096Kernel
-        let inputs = up.map { [x, $0, signs] } ?? [x, signs]
-        let outputs = kernel(
-            inputs,
+        let outputs = Self.quantized4096Kernel(
+            [x.reshaped([rows, width]), signs],
             template: [("BLOCKS_PER_ROW", width / 4096)],
             grid: (256, rows * (width / 4096), 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
@@ -1164,11 +1059,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
     /// input, the packing or the device does not take it.
-    private func promptInt8Forward(_ x: MLXArray, up: MLXArray? = nil) -> MLXArray? {
+    private func promptInt8Forward(_ x: MLXArray) -> MLXArray? {
         guard readsFloat16ConstantsInPlace, transform.blockSize == 4096, x.dtype == .float32,
             x.ndim >= 2, PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
             weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
-            let activation = transform.quantizedForPrompt(gdnLayout.map { $0(x) } ?? x, up: up)
+            let activation = transform.quantizedForPrompt(gdnLayout.map { $0(x) } ?? x)
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = PromptInt8Matmul.matmul(
@@ -1177,79 +1072,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
     }
 
-    /// Form prompt SwiGLU values inside the existing quantizing transform.
-    public func callAfterSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
-        guard gdnLayout == nil, let output = promptInt8Forward(gate, up: up)
-        else { return nil }
-        return bias.map { output + $0 } ?? output
-    }
-
-    /// Share the residual, RMSNorm and rotation for an eligible projection group.
-    public static func sharedResidualNormProjections(
-        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear]
-    ) -> (residual: MLXArray, projections: [MLXArray])? {
-        guard x.ndim >= 2, x.dim(-1) == 4096 else { return nil }
-        let rows = x.size / 4096
-        let quantized = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
-        guard (1 ... 16).contains(rows) || quantized else { return nil }
-        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
-        guard packed.count == projections.count, let first = packed.first,
-            packed.allSatisfy({
-                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
-                    && $0.weight.dim(0) % 64 == 0 && $0.transform.isIdentical(to: first.transform)
-            }),
-            let activation = first.transform.residualNorm(
-                x, residual: residual, weight: weight, eps: eps, quantized: quantized)
-        else { return nil }
-        let outputs = packed.map { layer in
-            if !quantized { return layer.forwardRotated(activation[0]) }
-            let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
-            let codes = PromptInt8Activation(
-                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
-            let output = PromptInt8Matmul.matmul(
-                codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
-                .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
-            return layer.bias.map { output + $0 } ?? output
-        }
-        return (activation.last!, outputs)
-    }
-
-    /// Reuse prompt codes within this forward when all input transforms match.
-    public static func sharedPromptProjections(
-        _ x: MLXArray, _ projections: [Linear]
-    ) -> [MLXArray]? {
-        guard x.ndim >= 2, x.dtype == .float32,
-            PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
-            PromptInt8Matmul.route != .off
-        else { return nil }
-        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
-        guard packed.count == projections.count, let first = packed.first,
-            packed.allSatisfy({
-                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
-                    && $0.transform.isIdentical(to: first.transform)
-            }),
-            let activation = first.transform.quantizedForPrompt(x)
-        else { return nil }
-        return packed.map { layer in
-            let (scalesT, biasesT) = layer.promptConstants.get(
-                scales: layer.scales, biases: layer.biases!)
-            let output = PromptInt8Matmul.matmul(
-                activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
-                .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
-            return layer.bias.map { output + $0 } ?? output
-        }
-    }
-
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let output = promptInt8Forward(x) {
             return bias.map { output + $0 } ?? output
         }
-        return forwardRotated(transform(gdnLayout.map { $0(x) } ?? x))
-    }
-
-    private func forwardRotated(_ rotated: MLXArray) -> MLXArray {
+        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
