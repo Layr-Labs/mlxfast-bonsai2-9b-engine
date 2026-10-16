@@ -224,6 +224,86 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+private enum Qwen35PrefillConvQKV {
+    private static let invScale = pow(Float(128), -0.5)
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prefill_conv_qkv128",
+        inputNames: ["x", "weight"], outputNames: ["q_out", "k_out", "v_out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint token = row / (K_HEADS + V_HEADS);
+            const uint head = row % (K_HEADS + V_HEADS);
+            const uint length = x_shape[1] - 3;
+            const uint input_base = (token / length * x_shape[1] + token % length) * CHANNELS;
+            if (head < K_HEADS) {
+              float q[4], k[4];
+              float q_sum = 0.0f, k_sum = 0.0f;
+              for (int i = 0; i < 4; ++i) {
+                const uint channel = head * 128 + lane * 4 + i;
+                float q_value = 0.0f, k_value = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                  q_value += x[input_base + j * CHANNELS + channel] * weight[channel * 4 + j];
+                  k_value += x[input_base + j * CHANNELS + K_HEADS * 128 + channel]
+                    * weight[(K_HEADS * 128 + channel) * 4 + j];
+                }
+                const float q_t = 1.0f / (1.0f + metal::exp(metal::abs(q_value)));
+                const float k_t = 1.0f / (1.0f + metal::exp(metal::abs(k_value)));
+                q[i] = q_value * ((q_value < 0.0f) ? q_t : 1.0f - q_t);
+                k[i] = k_value * ((k_value < 0.0f) ? k_t : 1.0f - k_t);
+                q_sum += q[i] * q[i];
+                k_sum += k[i] * k[i];
+              }
+              const float eps = as_type<float>(uint(EPS_BITS));
+              const float q_inv = metal::precise::rsqrt(simd_sum(q_sum) / 128.0f + eps);
+              const float k_inv = metal::precise::rsqrt(simd_sum(k_sum) / 128.0f + eps);
+              const uint output_offset = (token * K_HEADS + head) * 128 + lane * 4;
+              for (int i = 0; i < 4; ++i) {
+                q_out[output_offset + i] = as_type<float>(uint(Q_SCALE_BITS)) * (q[i] * q_inv);
+                k_out[output_offset + i] = as_type<float>(uint(K_SCALE_BITS)) * (k[i] * k_inv);
+              }
+            } else {
+              const uint v_head = head - K_HEADS;
+              for (int i = 0; i < 4; ++i) {
+                const uint channel = (2 * K_HEADS + v_head) * 128 + lane * 4 + i;
+                float value = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                  value += x[input_base + j * CHANNELS + channel] * weight[channel * 4 + j];
+                }
+                const float t = 1.0f / (1.0f + metal::exp(metal::abs(value)));
+                v_out[(token * V_HEADS + v_head) * 128 + lane * 4 + i]
+                  = value * ((value < 0.0f) ? t : 1.0f - t);
+              }
+            }
+            """)
+
+    static func apply(
+        _ x: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard x.dtype == .float32, weight.dtype == .float32, x.ndim == 3,
+            x.dim(1) >= 67, keyHeads > 0, valueHeads > 0,
+            x.dim(2) == (2 * keyHeads + valueHeads) * 128,
+            weight.shape == [x.dim(2), 4, 1], x.size > 0, x.size <= Int(UInt32.max),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let length = x.dim(1) - 3
+        let qShape = [x.dim(0), length, keyHeads, 128]
+        let vShape = [x.dim(0), length, valueHeads, 128]
+        let outputs = kernel(
+            [x, weight], template: [("K_HEADS", keyHeads), ("V_HEADS", valueHeads),
+                ("CHANNELS", x.dim(2)), ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (32, x.dim(0) * length * (keyHeads + valueHeads), 1),
+            threadGroup: (32, 1, 1), outputShapes: [qShape, qShape, vShape],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+}
+
 // Register layout from the accepted 27B engine PR #649 (MIT lineage).
 private enum Qwen35FusedQKNorm {
     private static let invScale = pow(Float(128), -0.5)
@@ -785,10 +865,23 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
-
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        let v: MLXArray
+        if S >= 64, headKDim == 128, headVDim == 128,
+            let fused = Qwen35PrefillConvQKV.apply(
+                convInput, weight: conv1d.weight, keyHeads: numKHeads, valueHeads: numVHeads)
+        {
+            qNormed = fused.0
+            kNormed = fused.1
+            v = fused.2
+        } else {
+            let convOut = silu(conv1d(convInput))
+            let normalized = normalizedQK(convOut, B: B, S: S)
+            qNormed = normalized.0
+            kNormed = normalized.1
+            v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        }
 
         let (out, newSsmState) = updateRecurrence(
             q: qNormed,
