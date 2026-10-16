@@ -1543,8 +1543,7 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        exactTargetVerify: Bool = false,
-        lastPositionOnly: Bool = false
+        exactTargetVerify: Bool = false
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
@@ -1567,9 +1566,7 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: exactTargetVerify)
         }
-        let residual = x + r
-        let h = lastPositionOnly && residual.dim(1) > 1
-            ? residual[0..., (residual.dim(1) - 1)..., 0...] : residual
+        let h = x + r
         let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
@@ -1731,8 +1728,7 @@ public class Qwen35TextModelInner: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
-        captureRecurrentWindow: Bool = false,
-        lastPositionOnly: Bool = false
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -1766,10 +1762,7 @@ public class Qwen35TextModelInner: Module {
                 recurrentState: recurrentState,
                 positionIds: positionIds,
                 captureRecurrentWindow: captureRecurrentWindow,
-                exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
-                lastPositionOnly: lastPositionOnly && !captureRecurrentWindow
-                    && modelLayerIndex == layers.count - 1
-                    && !(tapLayerIds?.contains(modelLayerIndex) ?? false))
+                exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
@@ -1954,11 +1947,9 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        // The unpositioned seam serves the stepper and plain decode. Both read
-        // the final position only. Keep every cache write whole.
         positionedForward(
             tokens, inputEmbedding: nil, cache: caches,
-            recurrentState: recurrentState, positionIds: nil, lastPositionOnly: true)
+            recurrentState: recurrentState, positionIds: nil)
     }
 
     public func cbv2Forward(
@@ -1994,8 +1985,7 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
 
     private func positionedForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
-        lastPositionOnly: Bool = false
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> MLXArray {
         let caches = cache ?? []
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
@@ -2006,11 +1996,8 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         }
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds,
-            lastPositionOnly: lastPositionOnly)
-        let headInput = lastPositionOnly && hidden.dim(1) > 1
-            ? hidden[0..., (hidden.dim(1) - 1)..., 0...] : hidden
-        let normalized = model.norm(headInput)
+            recurrentState: recurrentState, positionIds: positionIds)
+        let normalized = model.norm(hidden)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 }
