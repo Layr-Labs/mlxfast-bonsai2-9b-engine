@@ -335,11 +335,8 @@ private enum Qwen35FusedQKNorm {
 }
 
 private enum Qwen35RegisterGDN {
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_register_v3",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
-        outputNames: ["y", "state_out"],
-        source: """
+    private static func source(valueRead: String) -> String {
+        """
         const uint T = q_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -389,7 +386,7 @@ private enum Qwen35RegisterGDN {
           float vt[DVPL];
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
-            vt[d] = v_[d];
+            \(valueRead)
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
             #pragma clang loop unroll(full)
             for (int j = 0; j < R / 4; ++j) {
@@ -450,7 +447,31 @@ private enum Qwen35RegisterGDN {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """)
+        """
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_v3",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: source(valueRead: "vt[d] = v_[d];"))
+
+    private static let valueKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_value_conv",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "conv_weight"],
+        outputNames: ["y", "state_out"],
+        source: source(valueRead: """
+            const uint channel = 2u * Hk * Dk + hv_idx * Dv + dvbase + d;
+            float cv = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint tap = 0; tap < 4; ++tap) {
+              cv = fma(v[(b_idx * (T + 3u) + t + tap) * v_shape[2] + channel],
+                  conv_weight[channel * 4u + tap], cv);
+            }
+            const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
+            vt[d] = cv * (cv < 0.0f ? sig : 1.0f - sig);
+            """))
+
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
                     beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
@@ -463,6 +484,19 @@ private enum Qwen35RegisterGDN {
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
+    static func runConvolvedValue(
+        q: MLXArray, k: MLXArray, input: MLXArray, weight: MLXArray,
+        g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
+        let result = valueKernel(
+            [q, k, input, g, beta, state, weight],
+            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
 }
 
 private enum Qwen35RegisterGatedSIMD {
@@ -908,8 +942,10 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
-            let qkv = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+            let shared = S >= 128
+                ? HadamardQuantizedLinear.sharedPromptProjections(inputs, [inProjQKV, inProjZ]) : nil
+            let qkv = shared?[0] ?? inProjQKV(inputs)
+            let z = (shared?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
             if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
                 return (qkv, z, ba.0, ba.1)
             }
@@ -1021,22 +1057,32 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let convOut = silu(conv1d(convInput))
-
+        let foldValue = mask == nil && S >= 64 && headKDim == 128 && headVDim == 128
+            && convKernelSize == 4 && convInput.dtype == .float32
+            && conv1d.weight.dtype == .float32 && conv1d.weight.shape == [convDim, 4, 1]
+            && conv1d.bias == nil && aLog.dtype == .float32 && dtBias.dtype == .float32
+        let convOut = foldValue
+            ? silu(MLX.conv1d(
+                convInput[0..., 0..., 0 ..< (2 * keyDim)],
+                conv1d.weight[0 ..< (2 * keyDim), 0..., 0...], groups: 2 * keyDim))
+            : silu(conv1d(convInput))
         let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
-
-        let (out, newSsmState) = updateRecurrence(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: ssmState,
-            mask: mask
-        )
+        let out: MLXArray
+        let newSsmState: MLXArray
+        if foldValue {
+            let beta = sigmoid(b).asType(.float32)
+            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let initial = ssmState ?? MLXArray.zeros(
+                [B, numVHeads, headVDim, headKDim], dtype: .float32)
+            (out, newSsmState) = Qwen35RegisterGDN.runConvolvedValue(
+                q: qNormed, k: kNormed, input: convInput, weight: conv1d.weight,
+                g: g, beta: beta, state: initial.asType(.float32))
+        } else {
+            let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+            (out, newSsmState) = updateRecurrence(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: ssmState, mask: mask)
+        }
         return (out, newConvState, newSsmState)
     }
 
@@ -1601,13 +1647,15 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let shared = L >= 128
+            ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj]) : nil
+        let qProjOutput = shared?[0] ?? qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = shared?[1] ?? kProj(x)
+        var values = shared?[2] ?? vProj(x)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -1638,17 +1686,19 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
+        let shared = !exactTargetVerify && L >= 128
+            ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj]) : nil
         let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[1] ?? kProj(x))
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[2] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1888,7 +1938,21 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen3NextMLP {
+    func qwen35ProjectedGateUp(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+        if let down = downProj as? HadamardQuantizedLinear,
+            let output = down.callAfterSwiGLU(gate: gate, up: up)
+        {
+            return output
+        }
+        return downProj(silu(gate) * up)
+    }
+
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
+        if !exact, x.ndim >= 2, x.dim(-2) >= 128,
+            let shared = HadamardQuantizedLinear.sharedPromptProjections(x, [gateProj, upProj])
+        {
+            return qwen35ProjectedGateUp(shared[0], shared[1])
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
@@ -1992,6 +2056,14 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: exactTargetVerify)
+        }
+        if (!lastPositionOnly || x.dim(1) == 1), let dense = mlp as? Qwen3NextMLP,
+            let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
+                x, residual: r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
+                projections: [dense.gateProj, dense.upProj])
+        {
+            return boundary.residual + dense.qwen35ProjectedGateUp(
+                boundary.projections[0], boundary.projections[1])
         }
         let residual = x + r
         let h = lastPositionOnly && residual.dim(1) > 1
@@ -2516,6 +2588,27 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     }
 }
 
+extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { $0 as! any CBv2AttendingLayerCache }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        switch requirement {
+        case .evaluationOnly:
+            return (hidden[0..., (hidden.dim(1) - 1)..., 0 ..< 1], hidden)
+        case .lastPositionLogits:
+            let last = model.norm(hidden[0..., (hidden.dim(1) - 1)..., 0...])
+            let logits = lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
+            return (logits, hidden)
+        }
+    }
+}
+
 extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
     /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
     /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
@@ -2801,6 +2894,18 @@ extension Qwen35Model: CBv2RecurrentLanguageModelPrefillForwardable {
             inputs, inputEmbedding: inputEmbedding, cache: cache,
             recurrentState: recurrentState, positionIds: positionIds,
             requirement: requirement)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
     }
 }
 
