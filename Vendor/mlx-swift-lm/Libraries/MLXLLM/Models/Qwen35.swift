@@ -280,6 +280,86 @@ private enum Qwen35FusedQKNorm {
     }
 }
 
+/// GDN gated output norm dispatch: one fused launch when the promoted
+/// 128-wide fp32 lane qualifies; the untouched vendored graph otherwise.
+private func qwen35GatedNorm128(
+    _ norm: Qwen3NextRMSNormGated, _ x: MLXArray, gate z: MLXArray
+) -> MLXArray {
+    if let fused = Qwen35GatedRMSNorm128.apply(
+        x: x, gate: z, weight: norm.weight, eps: norm.eps) {
+        return fused
+    }
+    return norm(x, gate: z)
+}
+
+private enum Qwen35GatedRMSNorm128 {
+    /// One-row-per-simdgroup fused gated RMSNorm for the 128-wide GDN
+    /// output, folding the vendored `Qwen3NextRMSNormGated` graph
+    /// (`rmsNorm(x) -> silu(gate) -> multiply -> cast`) into a single
+    /// launch. Structure copied from the promoted `qwen35_gdn_qk_norm128`:
+    /// float4 row loads, per-lane sequential sum-of-squares, `simd_sum`,
+    /// `metal::precise::rsqrt(mean + eps)`, `w * (x * inv)` output order,
+    /// `reassociate(off)`. The sigmoid replicates the vendored `Sigmoid`
+    /// op struct verbatim (abs-branch, fast `metal::exp`); `silu` is the
+    /// vendored compiled trace `x * sigmoid(x)`; the final multiply order
+    /// matches `g * x_normed`. Bit-exact by construction against the
+    /// `rms_single_row<float, 4>` path the elementwise graph dispatches at
+    /// axis size 128; every guard miss falls back to the untouched graph.
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_gated_norm128",
+        inputNames: ["x", "gate", "weight"], outputNames: ["y"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint offset = row * 128 + lane * 4;
+            const float4 x4 = ((const device float4*)(x + offset))[0];
+            const float4 z4 = ((const device float4*)(gate + offset))[0];
+            const float4 w4 = ((const device float4*)(weight + lane * 4))[0];
+            const float xv[4] = {x4.x, x4.y, x4.z, x4.w};
+            const float zv[4] = {z4.x, z4.y, z4.z, z4.w};
+            const float wv[4] = {w4.x, w4.y, w4.z, w4.w};
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              sum += xv[i] * xv[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+            float o[4];
+            for (int i = 0; i < 4; ++i) {
+              // vendored Sigmoid: y = 1/(1+exp(|z|)); z<0 ? y : 1-y
+              const float y = 1.0f / (1.0f + metal::exp(metal::abs(zv[i])));
+              const float s = (zv[i] < 0.0f) ? y : 1.0f - y;
+              // vendored compiled silu trace: z * sigmoid(z)
+              const float g = zv[i] * s;
+              // vendored rms output order: w * (x * inv)
+              const float xn = wv[i] * (xv[i] * inv);
+              // vendored final multiply: g * x_normed
+              o[i] = g * xn;
+            }
+            ((device float4*)(y + offset))[0] = float4(o[0], o[1], o[2], o[3]);
+            """)
+
+    static func apply(
+        x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard x.dtype == .float32, gate.dtype == .float32,
+            weight.dtype == .float32, x.ndim == 4,
+            x.dim(3) == 128, gate.shape == x.shape,
+            weight.shape == [128], x.size > 0,
+            x.size <= Int(UInt32.max)
+        else { return nil }
+        let rows = x.size / 128
+        guard rows <= Int(UInt32.max) else { return nil }
+        let outputs = kernel(
+            [x.reshaped([rows, 128]), gate.reshaped([rows, 128]), weight],
+            template: [("EPS_BITS", Int(eps.bitPattern))],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 128]], outputDTypes: [.float32])
+        return outputs[0].reshaped(x.shape)
+    }
+}
+
 private enum Qwen35RegisterGDN {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_v3",
@@ -1221,7 +1301,7 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = qwen35GatedNorm128(norm, out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -1273,7 +1353,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = qwen35GatedNorm128(norm, out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -1484,7 +1564,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = norm(out, gate: z)
+        let normedOut = qwen35GatedNorm128(norm, out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(outProj, projectionInput)
