@@ -294,9 +294,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
     private let installedVerificationMode: CBv2MTPVerificationMode
-    /// Draft-only output head over a fixed slice of the target vocabulary.
-    /// nil (small fixtures, tied or unpacked heads) keeps the full head.
-    private let draftVocabulary: Qwen35MTPDraftVocabulary?
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -315,7 +312,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
         self.target = target
-        self.draftVocabulary = Qwen35MTPDraftVocabulary(target: target)
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -1172,10 +1168,6 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return shortlist[argMax(logits[0..., -1, 0...], axis: -1)]
                 .asType(.int32)
         }
-        if let draftVocabulary {
-            let local = argMax(draftVocabulary.head(hidden)[0..., -1, 0...], axis: -1)
-            return draftVocabulary.ids[local]
-        }
         return argMax(headLogits(hidden)[0..., -1, 0...], axis: -1)
             .asType(.int32)
     }
@@ -1284,50 +1276,5 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return
         }
         state.clearAll()
-    }
-}
-
-/// The draft chain proposes tokens only; the pinned target verifies and
-/// decides every emitted token. So the draft head may score a fixed subset of
-/// the vocabulary: a draft outside the subset is a rejected proposal, never a
-/// wrong output. Byte-level BPE ids follow merge order, so the leading rows
-/// hold the most frequent tokens, and added/special tokens sit at the tail.
-/// The subset is fixed at load from the head's geometry alone (input- and
-/// prompt-independent): the leading `leadingRows` rows plus the trailing
-/// `trailingRows` rows of the target's own packed `lm_head`, copied once,
-/// byte-identical, into one contiguous draft-only head. The target's head and
-/// quantization are untouched; each draft step reads only the subset rows.
-final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
-    static let leadingRows = 98_304
-    static let trailingRows = 512
-
-    let head: HadamardQuantizedLinear
-    /// Target token id of each draft-head row (int32).
-    let ids: MLXArray
-
-    init?(target: Qwen35TextModel) {
-        guard !target.configuration.tieWordEmbeddings,
-            let full = target.lmHead as? HadamardQuantizedLinear,
-            full.bias == nil, let biases = full.biases
-        else { return nil }
-        let vocabulary = full.weight.dim(0)
-        let leading = Self.leadingRows
-        let tailStart = vocabulary - Self.trailingRows
-        guard leading < tailStart, (leading + Self.trailingRows) % 8 == 0 else { return nil }
-        func rows(_ array: MLXArray) -> MLXArray {
-            concatenated([array[0 ..< leading], array[tailStart ..< vocabulary]], axis: 0)
-        }
-        let (weight, scales, offsets) = (rows(full.weight), rows(full.scales), rows(biases))
-        var tokenIds = [Int32](0 ..< Int32(leading))
-        tokenIds.append(contentsOf: Int32(tailStart) ..< Int32(vocabulary))
-        let ids = MLXArray(tokenIds)
-        eval(weight, scales, offsets, ids)
-        guard
-            let head = try? HadamardQuantizedLinear(
-                weight: weight, scales: scales, biases: offsets,
-                groupSize: full.groupSize, bits: full.bits, transform: full.transform)
-        else { return nil }
-        self.head = head
-        self.ids = ids
     }
 }
