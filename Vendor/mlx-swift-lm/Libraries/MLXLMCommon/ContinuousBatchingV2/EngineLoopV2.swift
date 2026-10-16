@@ -628,8 +628,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
 
+    /// User-interactive keeps the host half of every round (graph build,
+    /// acceptance readback, finalize) on a performance core.
     private let engineQueue = DispatchQueue(
-        label: "com.eigen.cbv2.engine", qos: .userInitiated)
+        label: "com.eigen.cbv2.engine", qos: .userInteractive)
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
