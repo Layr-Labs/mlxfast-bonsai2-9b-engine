@@ -624,7 +624,7 @@ extension EngineLoopV2 {
                     mtp.recordEarlyDraftSubmission()
                 }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
-                let stepTokens = concatenated(nextRows, axis: 0)
+                let stepTokens = nextRows.count == 1 ? nextRows[0] : concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
