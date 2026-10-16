@@ -386,7 +386,7 @@ private enum Qwen35RegisterGDN {
         """
         const uint T = q_shape[1];
         constexpr int R = 16;
-        constexpr int DVPL = 2;
+        constexpr int DVPL = 1;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
         constexpr int DVPT = DVPS * 4;
@@ -419,15 +419,32 @@ private enum Qwen35RegisterGDN {
         }
         float kr[R];
         float qr[R];
+        // Step t + 1's k, q, g and beta are loaded while step t runs.
+        float4 nk4[R / 4], nq4[R / 4];
+        float ng = g_[0], nb = beta_[0];
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < R / 4; ++j) {
+          nk4[j] = ((const device float4*)k_)[j];
+          nq4[j] = ((const device float4*)q_)[j];
+        }
         for (int t = 0; t < T; ++t) {
-          const float gt = g_[0];
-          const float bt = beta_[0];
+          const float gt = ng;
+          const float bt = nb;
           #pragma clang loop unroll(full)
           for (int j = 0; j < R / 4; ++j) {
-            const float4 k4 = ((const device float4*)k_)[j];
+            const float4 k4 = nk4[j];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
+            const float4 q4 = nq4[j];
             qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          if (t + 1 < int(T)) {
+            ng = g_[Hv];
+            nb = beta_[Hv];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              nk4[j] = ((const device float4*)(k_ + Hk * Dk))[j];
+              nq4[j] = ((const device float4*)(q_ + Hk * Dk))[j];
+            }
           }
           float kv[DVPL];
           float vt[DVPL];
@@ -528,7 +545,7 @@ private enum Qwen35RegisterGDN {
         let result = kernel(
             [q, k, v, g, beta, state],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / 16, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -540,7 +557,7 @@ private enum Qwen35RegisterGDN {
         let result = valueKernel(
             [q, k, input, g, beta, state, weight],
             template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, 8, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -555,7 +572,7 @@ private enum Qwen35RegisterGatedSIMD {
         source: """
         const uint T = q_shape[1];
         constexpr int R = 16;
-        constexpr int DVPL = 2;
+        constexpr int DVPL = 1;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
         constexpr int DVPT = DVPS * 4;
@@ -611,8 +628,8 @@ private enum Qwen35RegisterGatedSIMD {
           }
           float kv[DVPL];
           float vt[DVPL];
-          const float2 v2 = *((const device float2*)v_);
-          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) { vt[d] = v_[d]; }
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
@@ -627,12 +644,11 @@ private enum Qwen35RegisterGatedSIMD {
             }
             kv[d] = (a0 + a1) + (a2 + a3);
           }
-          kv[0] += simd_shuffle_xor(kv[0], 4);
-          kv[1] += simd_shuffle_xor(kv[1], 4);
-          kv[0] += simd_shuffle_xor(kv[0], 2);
-          kv[1] += simd_shuffle_xor(kv[1], 2);
-          kv[0] += simd_shuffle_xor(kv[0], 1);
-          kv[1] += simd_shuffle_xor(kv[1], 1);
+          #pragma clang loop unroll(full)
+          for (int o = 4; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) { kv[d] += simd_shuffle_xor(kv[d], o); }
+          }
           float out[DVPL];
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
@@ -651,14 +667,14 @@ private enum Qwen35RegisterGatedSIMD {
             }
             out[d] = (o0 + o1) + (o2 + o3);
           }
-          out[0] += simd_shuffle_xor(out[0], 4);
-          out[1] += simd_shuffle_xor(out[1], 4);
-          out[0] += simd_shuffle_xor(out[0], 2);
-          out[1] += simd_shuffle_xor(out[1], 2);
-          out[0] += simd_shuffle_xor(out[0], 1);
-          out[1] += simd_shuffle_xor(out[1], 1);
+          #pragma clang loop unroll(full)
+          for (int o = 4; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) { out[d] += simd_shuffle_xor(out[d], o); }
+          }
           if (lane % LPD == 0) {
-            *((device float2*)y_) = float2(out[0], out[1]);
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) { y_[d] = out[d]; }
           }
           q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
         }
@@ -713,7 +729,7 @@ private enum Qwen35RegisterGatedSIMD {
         let result = kernel(
             [q, k, v, a, b, aLog, dtBias, state],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            grid: (128, Dv / 16, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -2394,6 +2410,14 @@ public class Qwen35TextModelInner: Module {
     /// Layers per early verify submission.
     static let verifySubmitEvery = 4
 
+    /// Verify: submit after the first layer, so the GPU starts on the round
+    /// while the host builds the rest, then after every `verifySubmitEvery`
+    /// layers. Submission points change only when encoded work is
+    /// committed; the graph and its kernels are the same.
+    static func submitsVerify(after layerIndex: Int, of count: Int) -> Bool {
+        layerIndex + 1 < count && (layerIndex == 0 || (layerIndex + 1) % verifySubmitEvery == 0)
+    }
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2442,9 +2466,7 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds)
             {
                 (hiddenStates, pendingDelta) = (fused.residual, fused.delta)
-                if (modelLayerIndex + 1) % Self.verifySubmitEvery == 0,
-                    modelLayerIndex + 1 < layers.count
-                {
+                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
                     asyncEval(hiddenStates, fused.delta)
                 }
                 continue
@@ -2460,7 +2482,7 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds)
             {
                 (hiddenStates, pendingDelta) = (split.residual, split.delta)
-                if (modelLayerIndex + 1) % Self.verifySubmitEvery == 0 {
+                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
                     asyncEval(hiddenStates, split.delta)
                 }
                 continue
@@ -2485,8 +2507,7 @@ public class Qwen35TextModelInner: Module {
             // Verify: hand finished layers to the GPU while the rest of the
             // graph is still being built. Same graph and same kernels.
             if captureRecurrentWindow,
-                (modelLayerIndex + 1) % Self.verifySubmitEvery == 0,
-                modelLayerIndex + 1 < layers.count
+                Self.submitsVerify(after: modelLayerIndex, of: layers.count)
             {
                 asyncEval(hiddenStates)
             }
