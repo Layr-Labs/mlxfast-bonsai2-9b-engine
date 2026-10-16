@@ -235,11 +235,12 @@ private enum Qwen35FusedQKNorm {
             const uint row = threadgroup_position_in_grid.y;
             const uint lane = thread_index_in_simdgroup;
             const uint offset = (row / HEADS) * CONV_DIM + (row % HEADS) * 128 + lane * 4;
-            float q[4], k[4];
+            const float4 q4 = ((const device float4*)(x + offset))[0];
+            const float4 k4 = ((const device float4*)(x + offset + HEADS * 128))[0];
+            const float q[4] = {q4.x, q4.y, q4.z, q4.w};
+            const float k[4] = {k4.x, k4.y, k4.z, k4.w};
             float q_sum = 0.0f, k_sum = 0.0f;
             for (int i = 0; i < 4; ++i) {
-              q[i] = x[offset + i];
-              k[i] = x[offset + HEADS * 128 + i];
               q_sum += q[i] * q[i];
               k_sum += k[i] * k[i];
             }
@@ -247,10 +248,20 @@ private enum Qwen35FusedQKNorm {
             const float q_inv = metal::precise::rsqrt(simd_sum(q_sum) / 128.0f + eps);
             const float k_inv = metal::precise::rsqrt(simd_sum(k_sum) / 128.0f + eps);
             const uint output_offset = row * 128 + lane * 4;
-            for (int i = 0; i < 4; ++i) {
-              q_out[output_offset + i] = as_type<float>(uint(Q_SCALE_BITS)) * (q[i] * q_inv);
-              k_out[output_offset + i] = as_type<float>(uint(K_SCALE_BITS)) * (k[i] * k_inv);
-            }
+            const float q_scale = as_type<float>(uint(Q_SCALE_BITS));
+            const float k_scale = as_type<float>(uint(K_SCALE_BITS));
+            ((device float4*)(q_out + output_offset))[0] = float4(
+              q_scale * (q[0] * q_inv),
+              q_scale * (q[1] * q_inv),
+              q_scale * (q[2] * q_inv),
+              q_scale * (q[3] * q_inv)
+            );
+            ((device float4*)(k_out + output_offset))[0] = float4(
+              k_scale * (k[0] * k_inv),
+              k_scale * (k[1] * k_inv),
+              k_scale * (k[2] * k_inv),
+              k_scale * (k[3] * k_inv)
+            );
             """)
 
     static func apply(_ x: MLXArray, heads: Int, dimensions: Int) -> (MLXArray, MLXArray)? {
@@ -298,9 +309,14 @@ private enum Qwen35RegisterGDN {
         float state[DVPL][R];
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
           }
         }
         float kr[R];
@@ -374,9 +390,10 @@ private enum Qwen35RegisterGDN {
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
           #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
         """)

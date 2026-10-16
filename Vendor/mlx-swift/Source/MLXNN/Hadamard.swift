@@ -212,33 +212,35 @@ private enum Float16ConstantQMV {
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
             const device half* bi = biases + out_row * in_g + simd_lid / 8;
-            const device float* xp = x + simd_lid * 16;
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
             for (int k = 0; k < K; k += 512) {
               float sum = 0;
-              for (int i = 0; i < 16; i += 4) {
-                sum += float(xp[i]) + float(xp[i + 1]) + float(xp[i + 2]) + float(xp[i + 3]);
-                x_thread[i] = xp[i];
-                x_thread[i + 1] = xp[i + 1] / 4.0f;
-                x_thread[i + 2] = xp[i + 2] / 16.0f;
-                x_thread[i + 3] = xp[i + 3] / 64.0f;
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += float(xv.x) + float(xv.y) + float(xv.z) + float(xv.w);
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y / 4.0f;
+                x_thread[4 * i + 2] = xv.z / 16.0f;
+                x_thread[4 * i + 3] = xv.w / 64.0f;
               }
               for (int r = 0; r < 4; r++) {
-                const device uint8_t* wl = ws + r * in_w;
+                const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
                 const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
-                  accum += (x_thread[4 * i] * (wl[i] & 0x03) + x_thread[4 * i + 1] * (wl[i] & 0x0c)
-                      + x_thread[4 * i + 2] * (wl[i] & 0x30) + x_thread[4 * i + 3] * (wl[i] & 0xc0));
+                  const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
+                  accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
+                      + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
                 }
                 result[r] += s * accum + sum * b;
               }
               ws += 128;
               sc += 4;
               bi += 4;
-              xp += 512;
+              xp4 += 128;
             }
             for (int r = 0; r < 4; r++) {
               const float total = simd_sum(result[r]);
