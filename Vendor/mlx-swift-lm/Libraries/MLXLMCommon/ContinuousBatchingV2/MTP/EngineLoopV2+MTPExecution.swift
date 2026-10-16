@@ -478,7 +478,7 @@ extension EngineLoopV2 {
         var assistantOwnersTransferred = false
         defer {
             if !assistantOwnersTransferred {
-                // Assistant work may already be evaluating. Restore each
+                // Draft column zero may already be evaluating. Restore its
                 // owner before unwinding; request retirement synchronizes and
                 // calls releaseRequestState before returning capacity.
                 for row in rowMetadata {
@@ -622,23 +622,19 @@ extension EngineLoopV2 {
                 if draftIndex == 0 {
                     asyncEval(stepEvalTargets)
                     mtp.recordEarlyDraftSubmission()
+                } else {
+                    asyncEval(stepEvalTargets)
                 }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
-                let stepTokens = concatenated(nextRows, axis: 0)
+                let stepTokens = nextRows.count == 1 ? nextRows[0] : concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
             }
-            // Submit the completed chain while the host constructs target
-            // verification. Existing owners and the finalize fence retain it.
-            if k > 1, StreamOrDevice.default == StreamOrDevice.gpu {
-                asyncEval(assistantEvalTargets)
-                mtp.recordEarlyDraftSubmission()
-            }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
             var draftInput = seedColumn
-            var draftHidden = concatenated(carryHiddens, axis: 0)
+            var draftHidden = carryHiddens.count == 1 ? carryHiddens[0] : concatenated(carryHiddens, axis: 0)
             for draftIndex in 0 ..< k {
                 let (next, nextHidden) = mtp.drafter.draftStep(
                     tokens: draftInput, hidden: draftHidden, prepared: prepared)
@@ -649,13 +645,15 @@ extension EngineLoopV2 {
                 if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
                     asyncEval(next)
                     mtp.recordEarlyDraftSubmission()
+                } else if mtp.drafter.supportsEarlyDraftSubmission {
+                    asyncEval(next)
                 }
                 draftSteps.append(next)
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = (k == 1 && draftSteps[0].ndim == 2) ? draftSteps[0] : stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
