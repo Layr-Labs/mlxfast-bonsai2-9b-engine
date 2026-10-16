@@ -2108,6 +2108,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
+        // A decode step (every row past its prompt, nobody waiting) encodes
+        // with the GPU's stock command-buffer caps, for its finalize and its
+        // launch alike; everything else keeps the large prefill caps.
+        let decodeStep = scheduler.waitingCount == 0 && scheduler.runningCount > 0
+            && scheduler.running.allSatisfy { $0.numComputedTokens >= $0.request.promptTokens.count }
+        if decodeStep { CBv2CommandBufferCaps.select(decode: true) }
+        defer { if decodeStep { CBv2CommandBufferCaps.select(decode: false) } }
         let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         markStepStarted()
         // Instruments-only step interval: both ends gated on `isEnabled`, so

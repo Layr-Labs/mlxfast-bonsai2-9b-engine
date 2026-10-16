@@ -11,3 +11,9 @@ import MLXLMCommon
 public func qwen35MTPTopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
     cbv2TopTwoRows(logits)
 }
+
+/// Holds one captured verify forward's fused output-head top-two until the
+/// engine takes it. A plain class, so the module tree never sees the arrays.
+public final class Qwen35VerifyHeadTopTwoSlot {
+    var value: (ids: MLXArray, values: MLXArray)?
+}

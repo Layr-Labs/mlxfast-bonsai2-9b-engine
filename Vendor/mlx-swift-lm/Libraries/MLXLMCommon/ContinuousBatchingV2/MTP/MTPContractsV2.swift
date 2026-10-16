@@ -37,6 +37,14 @@ import MLX
 /// from logits without forcing device evaluation.
 public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
     func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
+    /// Top-two of the last captured verify forward's logits, computed inside
+    /// its output head so the logits need never be written. Each call clears
+    /// it; nil when that forward had no fused head.
+    func cbv2MTPTakeVerifyHeadTopTwo() -> (ids: MLXArray, values: MLXArray)?
+}
+
+extension CBv2MTPPolicyTopTwoProviding {
+    public func cbv2MTPTakeVerifyHeadTopTwo() -> (ids: MLXArray, values: MLXArray)? { nil }
 }
 
 /// Runtime availability for type-erased model adapters whose static wrapper

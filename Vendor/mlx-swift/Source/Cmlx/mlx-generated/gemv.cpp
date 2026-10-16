@@ -2354,16 +2354,80 @@ template <typename T, const int vecs_per_tg, const int k_lanes>
 // Command-buffer commit caps for this engine, set at image load, before any
 // code can construct the Metal device (it reads them once, in Device()).
 // Stock on a Max-class GPU is 50 ops / 50 MB per buffer, which commits about
-// once per decoder layer (59.8 MB of packed weights each). The verify forward
-// already submits every 4 layers via asyncEval; 640 MB covers the largest
-// slice (embedding + 4 layers, ~515 MB) so each slice is one command buffer,
-// and prefill still commits every ~6-10 layers. The op cap is set high so the
-// byte cap decides. Commit points never change kernels or their order, so
-// outputs are bit-identical. An explicit environment value still wins.
+// once per decoder layer (59.8 MB of packed weights each). Prefill runs with
+// 640 MB / 2000 ops so a long forward commits every ~6-10 layers. Decode
+// rounds go back to the stock caps: the engine calls
+// mlxfast_command_buffer_caps(1) at the start of each decode step and (0)
+// when it ends. Commit points never change kernels, their inputs or their
+// order, so outputs are bit-identical. An explicit environment value wins
+// and turns the switch off.
 #include <stdlib.h>
+#include "mlx/backend/metal/device.h"
 namespace {
+bool g_caps_from_environment = false;
 __attribute__((constructor)) void mlxfast_set_command_buffer_caps() {
+  g_caps_from_environment = getenv("MLX_MAX_OPS_PER_BUFFER") != nullptr ||
+      getenv("MLX_MAX_MB_PER_BUFFER") != nullptr;
   setenv("MLX_MAX_OPS_PER_BUFFER", "2000", 0);
   setenv("MLX_MAX_MB_PER_BUFFER", "640", 0);
 }
+
+// Named access to the two cap fields of the Metal device (an explicit
+// instantiation may name private members).
+using CapField = int mlx::core::metal::Device::*;
+struct OpsCap {
+  friend CapField cap_field(OpsCap);
+};
+struct MbCap {
+  friend CapField cap_field(MbCap);
+};
+template <typename Tag, CapField F>
+struct CapFieldAccess {
+  friend CapField cap_field(Tag) {
+    return F;
+  }
+};
+template struct CapFieldAccess<OpsCap, &mlx::core::metal::Device::max_ops_per_buffer_>;
+template struct CapFieldAccess<MbCap, &mlx::core::metal::Device::max_mb_per_buffer_>;
 } // namespace
+
+// decode != 0: the stock caps Device() picks for this GPU's architecture
+// letter (same table as device.cpp); decode == 0: the prefill caps above.
+// Returns 1 when applied, 0 when an environment value pins the caps.
+extern "C" __attribute__((used, visibility("default"))) int
+mlxfast_command_buffer_caps(int decode) {
+  if (g_caps_from_environment) {
+    return 0;
+  }
+  auto& d = mlx::core::metal::device(mlx::core::Device::gpu);
+  int ops = 2000;
+  int mb = 640;
+  if (decode) {
+    const std::string& arch = d.get_architecture();
+    switch (arch.empty() ? '\0' : arch.back()) {
+      case 'p': // phone
+        ops = 20;
+        mb = 40;
+        break;
+      case 'g': // base, pro
+        ops = 40;
+        mb = 40;
+        break;
+      case 's': // max
+        ops = 50;
+        mb = 50;
+        break;
+      case 'd': // ultra
+        ops = 50;
+        mb = 50;
+        break;
+      default: // default to medium
+        ops = 40;
+        mb = 40;
+        break;
+    }
+  }
+  d.*cap_field(OpsCap{}) = ops;
+  d.*cap_field(MbCap{}) = mb;
+  return 1;
+}

@@ -659,6 +659,19 @@ private enum Float16ConstantQMV {
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * (2 * outputs) + simd_gid * outputs;
+            """ + rowsAccumulate + """
+            for (int v = 0; v < rows; v++) {
+              for (int r = 0; r < outputs; r++) {
+                const float total = simd_sum(result[v][r]);
+                if (simd_lid == 0) y[v * N + out_row + r] = total;
+              }
+            }
+            """)
+
+    /// One simdgroup's `result[rows][outputs]` for the output rows starting at
+    /// `out_row`. `rows` and `topTwoPartial` share this text, so a fused top-2
+    /// sees the very values `rows` would store.
+    static let rowsAccumulate = """
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
             const device half* bi = biases + out_row * in_g + simd_lid / 8;
@@ -701,13 +714,7 @@ private enum Float16ConstantQMV {
               bi += 4;
               xp += 128;
             }
-            for (int v = 0; v < rows; v++) {
-              for (int r = 0; r < outputs; r++) {
-                const float total = simd_sum(result[v][r]);
-                if (simd_lid == 0) y[v * N + out_row + r] = total;
-              }
-            }
-            """)
+            """
 
     /// The widest MTP verify: a draft chain of at most six tokens (the Qwen
     /// 3.5 drafter's cap) plus its seed.
@@ -720,6 +727,181 @@ private enum Float16ConstantQMV {
     /// and seven rows, one output row per simdgroup runs 1.9x slower than
     /// two, and two beats `quantizedMM` by 20 % per verify.
     static func outputsPerSimdgroup(rows: Int) -> Int { rows <= 4 ? 4 : 2 }
+
+    /// Top-2 order: value descending, token id ascending on exact ties, NaNs
+    /// last. The same order as the CBv2 top-2 reduction over stored logits.
+    static let topTwoHeader = """
+        struct hadamard_top2 {
+          float first_value;
+          float second_value;
+          uint first_id;
+          uint second_id;
+          uint count;
+        };
+
+        inline hadamard_top2 hadamard_top2_empty() {
+          hadamard_top2 state;
+          state.first_value = 0.0f;
+          state.second_value = 0.0f;
+          state.first_id = 0;
+          state.second_id = 0;
+          state.count = 0;
+          return state;
+        }
+
+        inline bool hadamard_top2_better(float value, uint id, float current_value, uint current_id) {
+          bool nan = isnan(value);
+          bool current_nan = isnan(current_value);
+          if (nan != current_nan) return !nan;
+          if (value > current_value) return true;
+          if (value < current_value) return false;
+          return id < current_id;
+        }
+
+        inline void hadamard_top2_insert(thread hadamard_top2 &state, float value, uint id) {
+          if (state.count > 0 && state.first_id == id) return;
+          if (state.count > 1 && state.second_id == id) return;
+          if (state.count == 0
+              || hadamard_top2_better(value, id, state.first_value, state.first_id)) {
+            if (state.count > 0) {
+              state.second_value = state.first_value;
+              state.second_id = state.first_id;
+            }
+            state.first_value = value;
+            state.first_id = id;
+            state.count = min(state.count + 1, 2u);
+            return;
+          }
+          if (state.count == 1
+              || hadamard_top2_better(value, id, state.second_value, state.second_id)) {
+            state.second_value = value;
+            state.second_id = id;
+            state.count = 2;
+          }
+        }
+
+        inline void hadamard_top2_merge(thread hadamard_top2 &state, hadamard_top2 other) {
+          if (other.count > 0) hadamard_top2_insert(state, other.first_value, other.first_id);
+          if (other.count > 1) hadamard_top2_insert(state, other.second_value, other.second_id);
+        }
+        """
+
+    /// `rows` with the store replaced by a running top-2 per activation row.
+    /// A threadgroup covers `blocks` consecutive spans of `2 * outputs` output
+    /// rows and writes one partial pair per activation row, so the
+    /// `rows x N` logits are never written.
+    static let topTwoPartial = MLXFast.metalKernel(
+        name: "hadamard_qmv_rows_f16_constants_top2",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[1];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            hadamard_top2 best[rows];
+            for (int v = 0; v < rows; v++) best[v] = hadamard_top2_empty();
+            for (int block = 0; block < blocks; block++) {
+            const int out_row = (tid.y * blocks + block) * (2 * outputs) + simd_gid * outputs;
+            """ + rowsAccumulate + """
+              for (int v = 0; v < rows; v++) {
+                for (int r = 0; r < outputs; r++) {
+                  const float total = simd_sum(result[v][r]);
+                  hadamard_top2_insert(best[v], total, uint(out_row + r));
+                }
+              }
+            }
+            threadgroup hadamard_top2 scratch[rows];
+            if (simd_gid == 1 && simd_lid == 0) {
+              for (int v = 0; v < rows; v++) scratch[v] = best[v];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0 && simd_lid == 0) {
+              for (int v = 0; v < rows; v++) {
+                hadamard_top2_merge(best[v], scratch[v]);
+                const uint base = (uint(v) * uint(groups) + tid.y) * 2;
+                partial_ids[base] = int(best[v].first_id);
+                partial_ids[base + 1] = int(best[v].second_id);
+                partial_values[base] = best[v].first_value;
+                partial_values[base + 1] = best[v].second_value;
+              }
+            }
+            """,
+        header: topTwoHeader)
+
+    /// One threadgroup per activation row merges its partial pairs.
+    static let topTwoFinalize = MLXFast.metalKernel(
+        name: "hadamard_qmv_top2_finalize",
+        inputNames: ["partial_ids", "partial_values"],
+        outputNames: ["top_ids", "top_values"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint groups = partial_ids_shape[1];
+            hadamard_top2 local = hadamard_top2_empty();
+            for (uint g = lane; g < groups; g += 256) {
+              const uint base = (row * groups + g) * 2;
+              hadamard_top2_insert(local, partial_values[base], uint(partial_ids[base]));
+              hadamard_top2_insert(local, partial_values[base + 1], uint(partial_ids[base + 1]));
+            }
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+              hadamard_top2 other;
+              other.first_value = simd_shuffle_down(local.first_value, stride);
+              other.second_value = simd_shuffle_down(local.second_value, stride);
+              other.first_id = simd_shuffle_down(local.first_id, stride);
+              other.second_id = simd_shuffle_down(local.second_id, stride);
+              other.count = simd_shuffle_down(local.count, stride);
+              if (simd_lid < stride) hadamard_top2_merge(local, other);
+            }
+            threadgroup hadamard_top2 scratch[8];
+            if (simd_lid == 0) scratch[simd_gid] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              for (uint s = 1; s < 8; s++) hadamard_top2_merge(local, scratch[s]);
+              top_ids[row * 2] = int(local.first_id);
+              top_ids[row * 2 + 1] = int(local.second_id);
+              top_values[row * 2] = local.first_value;
+              top_values[row * 2 + 1] = local.second_value;
+            }
+            """,
+        header: topTwoHeader)
+
+    /// Output spans of `2 * outputs` rows per top-2 threadgroup.
+    static let topTwoBlocks = 8
+
+    /// Exact top-2 of `x @ dequantized(w).T` for 2 to 4 activation rows,
+    /// equal in ids and values to running `rows` and reducing its output; nil
+    /// when the shape has no fused path.
+    static func topTwo(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        let N = weight.dim(0)
+        let outputs = 4
+        let span = 2 * outputs * topTwoBlocks
+        guard (2 ... 4).contains(rows), outputsPerSimdgroup(rows: rows) == outputs,
+            N % span == 0
+        else { return nil }
+        let groups = N / span
+        let partials = topTwoPartial(
+            [x.reshaped([rows, K]), weight, scales, biases],
+            template: [
+                ("rows", rows), ("outputs", outputs), ("blocks", topTwoBlocks),
+                ("groups", groups),
+            ],
+            grid: (32, groups * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, groups, 2], [rows, groups, 2]],
+            outputDTypes: [.int32, .float32])
+        let top = topTwoFinalize(
+            partials, grid: (rows * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2]], outputDTypes: [.int32, .float32])
+        return (top[0], top[1])
+    }
 
     static func matmul(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
@@ -1261,6 +1443,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return constantCachedForward(rotated, allowFloat16: true)
         }
         return super.callAsFunction(rotated)
+    }
+}
+
+extension HadamardQuantizedLinear {
+    /// Exact top-2 output ids and values per activation row, ordered by value
+    /// descending and id ascending on ties, without writing the `rows x N`
+    /// outputs: the same values `callAsFunction` returns for 2 to 4 FP32 rows.
+    /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
+    /// module or shape has no fused path.
+    public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
+        guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
+        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        guard rotated.dtype == .float32 else { return nil }
+        return Float16ConstantQMV.topTwo(
+            rotated, weight: weight, scales: scales, biases: biases!)
     }
 }
 

@@ -398,6 +398,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
         }
         return provider.cbv2MTPTopTwo(logits)
     }
+
+    public func cbv2MTPTakeVerifyHeadTopTwo() -> (ids: MLXArray, values: MLXArray)? {
+        (model as? any CBv2MTPPolicyTopTwoProviding)?.cbv2MTPTakeVerifyHeadTopTwo()
+    }
 }
 
 extension CBv2SteppableLanguageModelAdapter:

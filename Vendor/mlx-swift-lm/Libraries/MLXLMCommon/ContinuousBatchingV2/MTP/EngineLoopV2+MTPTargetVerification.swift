@@ -295,8 +295,10 @@ extension EngineLoopV2 {
                 let batch = output.logits.dim(0)
                 let width = output.logits.dim(1)
                 let vocabulary = output.logits.dim(2)
-                let flat = output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo = provider.cbv2MTPTopTwo(flat)
+                let fused = provider.cbv2MTPTakeVerifyHeadTopTwo()
+                let topTwo = (recurrentModel == nil ? nil : fused)
+                    ?? provider.cbv2MTPTopTwo(
+                        output.logits.reshaped([1, batch * width, vocabulary]))
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
                     topTwo.values.reshaped([batch, width, 2]).asType(.float32))

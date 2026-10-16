@@ -2304,6 +2304,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// The fused output-head top-two of the last captured verify forward.
+    let verifyHeadTopTwo = Qwen35VerifyHeadTopTwoSlot()
+
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -2630,10 +2633,14 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             captureRecurrentWindow: true)
         let normalized = model.norm(hidden)
         let logits: MLXArray
+        verifyHeadTopTwo.value = nil
         if let lmHead {
             logits = model.exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(lmHead, normalized)
                 : lmHead(normalized)
+            if !model.exactTargetVerify, let head = lmHead as? HadamardQuantizedLinear {
+                verifyHeadTopTwo.value = head.topTwoRows(normalized)
+            }
         } else if model.exactTargetVerify, normalized.dim(1) > 1 {
             logits = qwen35A3BTimewiseProjection(normalized) {
                 model.embedTokens.asLinear($0)
@@ -2694,6 +2701,11 @@ extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
         return (
             topTwo.ids.reshaped([batch, length, 2]),
             topTwo.values.reshaped([batch, length, 2]))
+    }
+
+    public func cbv2MTPTakeVerifyHeadTopTwo() -> (ids: MLXArray, values: MLXArray)? {
+        defer { verifyHeadTopTwo.value = nil }
+        return verifyHeadTopTwo.value
     }
 }
 
@@ -2961,6 +2973,10 @@ extension Qwen35Model: CBv2MTPPolicyTopTwoProviding {
         _ logits: MLXArray
     ) -> (ids: MLXArray, values: MLXArray) {
         languageModel.cbv2MTPTopTwo(logits)
+    }
+
+    public func cbv2MTPTakeVerifyHeadTopTwo() -> (ids: MLXArray, values: MLXArray)? {
+        languageModel.cbv2MTPTakeVerifyHeadTopTwo()
     }
 }
 
