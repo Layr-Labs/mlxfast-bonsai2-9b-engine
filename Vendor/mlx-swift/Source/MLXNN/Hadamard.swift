@@ -38,110 +38,30 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
-    // Fused transform from Yukon 9727ebfe (9B PR #35); native MLX radix order.
-    private static let fused4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096",
-        inputNames: ["x", "signs"],
-        outputNames: ["y"],
-        source: """
-            #pragma clang fp reassociate(off)
-            const short i = short(thread_position_in_threadgroup.x);
-            const uint block_idx = threadgroup_position_in_grid.y;
-            const uint batch_idx = block_idx * 4096u;
-            const uint sign_offset = (BLOCKS_PER_ROW == 1)
-                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
-
-            threadgroup float buf[4096];
-            float x_reg[16];
-
-            const short base0 = i << 4;
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              float val = float(x[batch_idx + uint(base0 + r)]);
-              if (!INVERSE) {
-                val *= signs[sign_offset + uint(base0 + r)];
-              }
-              x_reg[r] = val;
-            }
-            hadamard_radix16(x_reg);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              buf[base0 + r] = x_reg[r];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const short k1 = i & 15;
-            const short j1 = ((i - k1) << 4) + k1;
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[j1 + 16 * r];
-            }
-            hadamard_radix16(x_reg);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              buf[j1 + 16 * r] = x_reg[r];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[i + 256 * r];
-            }
-            hadamard_radix16(x_reg);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              const uint idx = uint(i + 256 * r);
-              float val = x_reg[r] * 0.015625f;
-              if (INVERSE) {
-                val *= signs[sign_offset + idx];
-              }
-              y[batch_idx + idx] = T(val);
-            }
-            """,
-        header: """
-            using namespace metal;
-            METAL_FUNC void hadamard_radix16(thread float* x) {
-              short h = 1;
-              #pragma clang loop unroll(full)
-              for (short s = 0; s < 4; s++) {
-                #pragma clang loop unroll(full)
-                for (short i = 0; i < 8; i++) {
-                  short k = i & (h - 1);
-                  short j = ((i - k) << 1) + k;
-                  float a = x[j];
-                  float b = x[j + h];
-                  x[j] = a + b;
-                  x[j + h] = a - b;
-                }
-                h <<= 1;
-              }
-            }
-            """)
-
-    private func fused4096(_ x: MLXArray, inverse: Bool) -> MLXArray? {
-        guard blockSize == 4096, x.size > 0, x.size <= Int(UInt32.max),
-            StreamOrDevice.default == StreamOrDevice.gpu
-        else { return nil }
-        return Self.fused4096Kernel(
-            [x, signs], template: [("T", x.dtype), ("BLOCKS_PER_ROW", width / 4096),
-                ("INVERSE", inverse)], grid: (256, x.size / 4096, 1),
-            threadGroup: (256, 1, 1), outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
-    }
-
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
-        if let fused = fused4096(x, inverse: false) { return fused }
-        return hadamardTransform((x.asType(.float32) * signs).reshaped([-1, blockSize]))
-            .reshaped(x.shape).asType(x.dtype)
+        let xF32 = (x.dtype == .float32) ? x : x.asType(.float32)
+        let signed = xF32 * signs
+        let hIn = (signed.ndim == 2 && signed.dim(-1) == blockSize)
+            ? signed
+            : signed.reshaped([-1, blockSize])
+        let hOut = hadamardTransform(hIn)
+        let reshaped = (x.shape == hOut.shape) ? hOut : hOut.reshaped(x.shape)
+        return (x.dtype == .float32) ? reshaped : reshaped.asType(x.dtype)
     }
 
     /// Recover the original basis after looking up folded embedding rows.
     public func inverse(_ x: MLXArray) -> MLXArray {
         validate(x)
-        if let fused = fused4096(x, inverse: true) { return fused }
-        return (hadamardTransform(x.asType(.float32).reshaped([-1, blockSize])).reshaped(x.shape)
-            * signs).asType(x.dtype)
+        let xF32 = (x.dtype == .float32) ? x : x.asType(.float32)
+        let hIn = (xF32.ndim == 2 && xF32.dim(-1) == blockSize)
+            ? xF32
+            : xF32.reshaped([-1, blockSize])
+        let hOut = hadamardTransform(hIn)
+        let reshaped = (x.shape == hOut.shape) ? hOut : hOut.reshaped(x.shape)
+        let result = reshaped * signs
+        return (x.dtype == .float32) ? result : result.asType(x.dtype)
     }
 
     private func validate(_ x: MLXArray) {
@@ -292,47 +212,46 @@ private enum Float16ConstantQMV {
     /// simdgroup, 2 simdgroups per threadgroup.
     static let fast = MLXFast.metalKernel(
         name: "hadamard_qmv_fast_f16_constants",
-        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        inputNames: ["x", "w", "scales", "biases", "K", "N"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[1];
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * 8 + simd_gid * 4;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
             const device half* bi = biases + out_row * in_g + simd_lid / 8;
-            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            const device float4* xp = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
             for (int k = 0; k < K; k += 512) {
               float sum = 0;
-              for (int i = 0; i < 4; ++i) {
-                const float4 xv = xp4[i];
-                sum += float(xv.x) + float(xv.y) + float(xv.z) + float(xv.w);
+              for (int i = 0; i < 4; i++) {
+                const float4 xv = xp[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               for (int r = 0; r < 4; r++) {
-                const uint packed_w = *(const device uint*)(ws + r * in_w);
+                const uint packed = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
                 const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
-                  const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
-                  accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
-                      + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
+                  const uint q = packed >> (8 * i);
+                  accum += (x_thread[4 * i] * (q & 0x03u) + x_thread[4 * i + 1] * (q & 0x0cu)
+                      + x_thread[4 * i + 2] * (q & 0x30u) + x_thread[4 * i + 3] * (q & 0xc0u));
                 }
                 result[r] += s * accum + sum * b;
               }
               ws += 128;
               sc += 4;
               bi += 4;
-              xp4 += 128;
+              xp += 128;
             }
             for (int r = 0; r < 4; r++) {
               const float total = simd_sum(result[r]);
@@ -346,13 +265,11 @@ private enum Float16ConstantQMV {
     /// all `rows` results.
     static let rows = MLXFast.metalKernel(
         name: "hadamard_qmv_rows_f16_constants",
-        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        inputNames: ["x", "w", "scales", "biases", "K", "N"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[1];
-            const int N = w_shape[0];
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * (2 * outputs) + simd_gid * outputs;
@@ -368,9 +285,9 @@ private enum Float16ConstantQMV {
               for (int r = 0; r < outputs; r++) {
                 const float s = float(sc[r * in_g]);
                 s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
+                s4[r][1] = s * 0.25f;
+                s4[r][2] = s * 0.0625f;
+                s4[r][3] = s * 0.015625f;
                 b[r] = float(bi[r * in_g]);
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
@@ -418,19 +335,37 @@ private enum Float16ConstantQMV {
     /// two, and two beats `quantizedMM` by 20 % per verify.
     static func outputsPerSimdgroup(rows: Int) -> Int { rows <= 4 ? 4 : 2 }
 
+    private nonisolated(unsafe) static var dimCache: [Int32: MLXArray] = [:]
+
+    @inline(__always)
+    private static func dimArray(_ value: Int) -> MLXArray {
+        let v = Int32(value)
+        if let cached = dimCache[v] {
+            return cached
+        }
+        let arr = MLXArray(v)
+        dimCache[v] = arr
+        return arr
+    }
+
     static func matmul(
-        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        outputLimit: Int? = nil
     ) -> MLXArray {
         let K = x.dim(-1)
         let rows = x.size / K
-        let N = weight.dim(0)
-        // Shape metadata supplies K and N without allocating scalar tensor inputs.
-        let inputs = [x.reshaped([rows, K]), weight, scales, biases]
+        let N = outputLimit ?? weight.dim(0)
+        let x2d = (x.ndim == 2) ? x : x.reshaped([rows, K])
+        let inputs = [x2d, weight, scales, biases,
+                      dimArray(K), dimArray(N)]
         let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
         let output = (rows == 1 ? fast : Self.rows)(
             inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        if x.ndim == 2 {
+            return output
+        }
         return output.reshaped(Array(x.shape.dropLast()) + [N])
     }
 }
@@ -449,9 +384,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// or packed-matmul kernel. The process-wide generic cache kill switch also
     /// remains effective. No cached arrays enter the module parameter tree.
     var permitsFloat16ConstantReuse: Bool {
-        bits == 2 && groupSize == 128 && scales.dtype == .float16
-            && (transform.blockSize == 4096
-                || (Self.reuseFloat16Constants && transform.blockSize == 1024))
+        Self.reuseFloat16Constants && bits == 2 && groupSize == 128
+            && transform.blockSize == 1024 && scales.dtype == .float16
     }
 
     public init(
@@ -487,19 +421,54 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
     let readsFloat16ConstantsInPlace: Bool
 
+    public func forwardPreRotated(_ rotated: MLXArray, outputLimit: Int? = nil) -> MLXArray {
+        let r = rotated.dtype == .float32 ? rotated : rotated.asType(.float32)
+        let totalRows = r.size / r.dim(-1)
+        if readsFloat16ConstantsInPlace, totalRows >= 1 {
+            if (1 ... Float16ConstantQMV.maximumRows).contains(totalRows) {
+                let output = Float16ConstantQMV.matmul(
+                    r, weight: weight, scales: scales, biases: biases!,
+                    outputLimit: outputLimit)
+                let result = bias.map { b in
+                    let bSlice = outputLimit.map { b[..<$0] } ?? b
+                    return output + bSlice
+                } ?? output
+                return rotated.dtype == .float32 ? result : result.asType(rotated.dtype)
+            } else if totalRows <= 32 && r.ndim >= 2 {
+                let chunkSize = 4
+                let flat = (r.ndim == 2) ? r : r.reshaped([totalRows, r.dim(-1)])
+                var slices = [MLXArray]()
+                slices.reserveCapacity((totalRows + chunkSize - 1) / chunkSize)
+                var start = 0
+                while start < totalRows {
+                    let end = min(start + chunkSize, totalRows)
+                    let chunk = flat[start ..< end]
+                    let chunkOut = Float16ConstantQMV.matmul(
+                        chunk, weight: weight, scales: scales, biases: biases!,
+                        outputLimit: outputLimit)
+                    slices.append(chunkOut)
+                    start = end
+                }
+                let output = (slices.count == 1) ? slices[0] : concatenated(slices, axis: 0)
+                let shaped = (r.ndim == 2) ? output : output.reshaped(Array(r.shape.dropLast()) + [output.dim(-1)])
+                let result = bias.map { b in
+                    let bSlice = outputLimit.map { b[..<$0] } ?? b
+                    return shaped + bSlice
+                } ?? shaped
+                return rotated.dtype == .float32 ? result : result.asType(rotated.dtype)
+            }
+        }
+        if permitsFloat16ConstantReuse && r.dtype == .float32 {
+            let full = constantCachedForward(r, allowFloat16: true)
+            return outputLimit.map { full[.ellipsis, ..<$0] } ?? full
+        }
+        let full = super.callAsFunction(rotated)
+        return outputLimit.map { full[.ellipsis, ..<$0] } ?? full
+    }
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
-        if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
-            (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
-        {
-            let output = Float16ConstantQMV.matmul(
-                rotated, weight: weight, scales: scales, biases: biases!)
-            return bias.map { output + $0 } ?? output
-        }
-        if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
-            return constantCachedForward(rotated, allowFloat16: true)
-        }
-        return super.callAsFunction(rotated)
+        return forwardPreRotated(rotated)
     }
 }
 
