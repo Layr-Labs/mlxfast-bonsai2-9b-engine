@@ -803,6 +803,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
+        /// Request-local prompt continuation; nil uses the pinned MTP head.
+        var promptDraft: [Int32]?
 
         /// Trusted target transitions not yet appended to the persistent head KV.
         /// Each hidden row at position t is paired with the token at t+1.
@@ -839,7 +841,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         private var backlogInputCount: Int {
-            backlogTokens.reduce(0) { total, tokens in
+            let pending = roundInFlight && promptDraft != nil ? roundTrustedTokens : backlogTokens
+            return pending.reduce(0) { total, tokens in
                 let (next, overflow) = total.addingReportingOverflow(tokens.dim(1))
                 return overflow ? Int.max : next
             }
@@ -873,6 +876,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         init(caches: [any KVCache]) { self.caches = caches }
 
         func clearRound() {
+            promptDraft = nil
             roundBaseOffset = cacheOffset
             roundValidHistoryOffset = cacheOffset
             roundDraftSteps = 0
@@ -883,6 +887,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         func clearAll() {
+            promptDraft = nil
             caches.removeAll(keepingCapacity: false)
             backlogHidden.removeAll(keepingCapacity: false)
             backlogTokens.removeAll(keepingCapacity: false)
@@ -1075,6 +1080,19 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             normalizedHidden[0..., (count - 1) ..< count, 0...]
     }
 
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased && !state.roundInFlight)
+        state.promptDraft = Self.forceDoubleForward || Self.shortlistSize != nil
+            ? nil : Qwen35MTPPromptLookup.continuation(
+                history: history, promptLength: promptLength, depth: depth)
+    }
+
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         UnusedPreparedCapture()
     }
@@ -1112,6 +1130,14 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
                 state.roundDraftSteps < Self.maximumDepth,
                 "inline Qwen MTP exceeded its \(Self.maximumDepth)-step draft chain")
             feed = (tokens, hidden)
+        }
+
+        if let promptDraft = state.promptDraft {
+            precondition(state.roundDraftSteps < promptDraft.count)
+            let draft = MLXArray([promptDraft[state.roundDraftSteps]])
+            state.roundRoots.append(draft)
+            state.roundDraftSteps += 1
+            return (draft, hidden)
         }
 
         let output =
@@ -1245,6 +1271,12 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             "inline Qwen MTP committed drafts exceed confirmed target inputs")
 
         trim(state: state, to: state.roundValidHistoryOffset)
+        if state.promptDraft != nil {
+            // No head KV was written. Keep every trusted transition for the
+            // next head call, which flushes it through the K/V-only path.
+            state.backlogHidden = state.roundTrustedHidden + state.backlogHidden
+            state.backlogTokens = state.roundTrustedTokens + state.backlogTokens
+        }
         if committedDraftCount > 0 {
             // These are pre-final-norm target verify hiddens, never speculative
             // assistant hiddens. Normalize exactly once, retain lazily, and
@@ -1329,5 +1361,41 @@ final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
         else { return nil }
         self.head = head
         self.ids = ids
+    }
+}
+
+/// Match only the current request's prompt; the target verifies every proposal.
+/// A longest match of at least 16 tokens must have an unambiguous continuation.
+private enum Qwen35MTPPromptLookup {
+    static func continuation(history: [Int], promptLength: Int, depth: Int) -> [Int32]? {
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard depth >= 1, prompt >= 16 + depth, count >= 16 else { return nil }
+        let longest = min(64, count - depth, prompt - depth)
+        guard longest >= 16 else { return nil }
+        var best = 15
+        var chosenEnd: Int?
+        var ambiguous = false
+        for end in 16 ... (prompt - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
+            }
+            guard length >= 16, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
+            }
+        }
+        guard let chosenEnd, !ambiguous else { return nil }
+        return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
     }
 }

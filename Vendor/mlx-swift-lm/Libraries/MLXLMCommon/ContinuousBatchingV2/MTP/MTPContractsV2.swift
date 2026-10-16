@@ -359,6 +359,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         _ observation: CBv2MTPCommittedTargetObservation,
         requestState: any CBv2MTPRequestState)
 
+    /// Prepare a proposal from the current request's host token history.
+    func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState)
+
     /// Draft-head shortlist opt-in. Non-nil K asks target verification to
     /// additionally surface each verify position's top-K token ids and
     /// their probability mass; finalize threads the accepted position's ids
@@ -395,6 +400,10 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 
 extension CBv2MTPRequestStatefulDrafter {
     public var draftShortlistSize: Int? { nil }
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
     ) throws {}
