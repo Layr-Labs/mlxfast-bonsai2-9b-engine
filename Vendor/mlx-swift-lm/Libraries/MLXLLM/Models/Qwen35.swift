@@ -224,176 +224,6 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
-// Register layout from the accepted 27B engine PR #649 (MIT lineage).
-private enum Qwen35FusedQKNorm {
-    private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_qk_norm128",
-        inputNames: ["x"], outputNames: ["q_out", "k_out"],
-        source: """
-            #pragma clang fp reassociate(off)
-            const uint row = threadgroup_position_in_grid.y;
-            const uint lane = thread_index_in_simdgroup;
-            const uint offset = (row / HEADS) * CONV_DIM + (row % HEADS) * 128 + lane * 4;
-            float q[4], k[4];
-            float q_sum = 0.0f, k_sum = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-              q[i] = x[offset + i];
-              k[i] = x[offset + HEADS * 128 + i];
-              q_sum += q[i] * q[i];
-              k_sum += k[i] * k[i];
-            }
-            const float eps = as_type<float>(uint(EPS_BITS));
-            const float q_inv = metal::precise::rsqrt(simd_sum(q_sum) / 128.0f + eps);
-            const float k_inv = metal::precise::rsqrt(simd_sum(k_sum) / 128.0f + eps);
-            const uint output_offset = row * 128 + lane * 4;
-            for (int i = 0; i < 4; ++i) {
-              q_out[output_offset + i] = as_type<float>(uint(Q_SCALE_BITS)) * (q[i] * q_inv);
-              k_out[output_offset + i] = as_type<float>(uint(K_SCALE_BITS)) * (k[i] * k_inv);
-            }
-            """)
-
-    static func apply(_ x: MLXArray, heads: Int, dimensions: Int) -> (MLXArray, MLXArray)? {
-        guard x.dtype == .float32, x.ndim == 3, dimensions == 128,
-            x.dim(2) >= 2 * heads * dimensions, x.size > 0, x.size <= Int(UInt32.max)
-        else { return nil }
-        let shape = [x.dim(0), x.dim(1), heads, dimensions]
-        let outputs = kernel(
-            [x], template: [("HEADS", heads), ("CONV_DIM", x.dim(2)),
-                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
-                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
-                ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (32, x.dim(0) * x.dim(1) * heads, 1), threadGroup: (32, 1, 1),
-            outputShapes: [shape, shape], outputDTypes: [.float32, .float32])
-        return (outputs[0], outputs[1])
-    }
-}
-
-private enum Qwen35RegisterGDN {
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_register_v3",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
-        outputNames: ["y", "state_out"],
-        source: """
-        const uint T = q_shape[1];
-        constexpr int R = 16;
-        constexpr int DVPL = 2;
-        constexpr int LPD = Dk / R;
-        constexpr int DVPS = (32 / LPD) * DVPL;
-        constexpr int DVPT = DVPS * 4;
-        const uint n = threadgroup_position_in_grid.z;
-        const uint b_idx = n / Hv;
-        const uint hv_idx = n % Hv;
-        const uint hk_idx = hv_idx / (Hv / Hk);
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint dk0 = (lane % LPD) * R;
-        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
-        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
-        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
-        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-        auto g_ = g + b_idx * T * Hv + hv_idx;
-        auto beta_ = beta + b_idx * T * Hv + hv_idx;
-        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-        float state[DVPL][R];
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
-          }
-        }
-        float kr[R];
-        float qr[R];
-        for (int t = 0; t < T; ++t) {
-          const float gt = g_[0];
-          const float bt = beta_[0];
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < R / 4; ++j) {
-            const float4 k4 = ((const device float4*)k_)[j];
-            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
-            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
-          }
-          float kv[DVPL];
-          float vt[DVPL];
-          #pragma clang loop unroll(full)
-          for (int d = 0; d < DVPL; ++d) {
-            vt[d] = v_[d];
-            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < R / 4; ++j) {
-              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
-              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
-              a0 = fma(state[d][4 * j], kr[4 * j], a0);
-              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
-              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
-              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
-            }
-            kv[d] = (a0 + a1) + (a2 + a3);
-          }
-          #pragma clang loop unroll(full)
-          for (int o = LPD / 2; o > 0; o >>= 1) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              kv[d] += simd_shuffle_xor(kv[d], o);
-            }
-          }
-          float out[DVPL];
-          #pragma clang loop unroll(full)
-          for (int d = 0; d < DVPL; ++d) {
-            const float delta = (vt[d] - kv[d]) * bt;
-            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < R / 4; ++j) {
-              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
-              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
-              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
-              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              o0 = fma(state[d][4 * j], qr[4 * j], o0);
-              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
-            }
-            out[d] = (o0 + o1) + (o2 + o3);
-          }
-          #pragma clang loop unroll(full)
-          for (int o = LPD / 2; o > 0; o >>= 1) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              out[d] += simd_shuffle_xor(out[d], o);
-            }
-          }
-          if (lane % LPD == 0) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              y_[d] = out[d];
-            }
-          }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
-        }
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < R; ++i) {
-            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
-          }
-        }
-        """)
-
-    static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
-                    beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
-        let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
-        let Hv = v.dim(2), Dv = v.dim(3)
-        let result = kernel(
-            [q, k, v, g, beta, state],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
-        return (result[0], result[1])
-    }
-}
-
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -416,6 +246,21 @@ final class Qwen35GatedDeltaNet: Module {
     private var fusedInProj: Linear?
     private var fusedInputSourceSignature: [MLXArray]?
     private var fusedInputPermanentlyIneligible = false
+
+    private final class FusedHadamardGDNInputCache {
+        var fusedQKVZ: HadamardQuantizedLinear?
+        var fusedBA: Linear?
+        var sourceSignature: [MLXArray]?
+        var permanentlyIneligible = false
+
+        func invalidate() {
+            fusedQKVZ = nil
+            fusedBA = nil
+            sourceSignature = nil
+            permanentlyIneligible = false
+        }
+    }
+    private let _hadamardInputCache = FusedHadamardGDNInputCache()
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -505,6 +350,7 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            _hadamardInputCache.invalidate()
         }
         return result
     }
@@ -517,6 +363,7 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
+            _hadamardInputCache.invalidate()
         }
     }
 
@@ -661,28 +508,185 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
+    private func hadamardInputProjectionSourceSignature(
+        _ projections: (
+            qkv: HadamardQuantizedLinear, z: HadamardQuantizedLinear,
+            b: Linear, a: Linear
+        )
+    ) -> [MLXArray] {
+        [
+            projections.qkv.weight, projections.qkv.scales,
+            projections.z.weight, projections.z.scales,
+            projections.b.weight, projections.a.weight,
+        ] + [
+            projections.qkv.biases, projections.z.biases,
+        ].compactMap { $0 }
+    }
+
+    private func exactFrozenHadamardInputProjections() -> (
+        qkv: HadamardQuantizedLinear, z: HadamardQuantizedLinear,
+        b: Linear, a: Linear
+    )? {
+        guard let qkv = inProjQKV as? HadamardQuantizedLinear,
+            let z = inProjZ as? HadamardQuantizedLinear,
+            ObjectIdentifier(type(of: qkv)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: z)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: inProjB)) == ObjectIdentifier(Linear.self),
+            ObjectIdentifier(type(of: inProjA)) == ObjectIdentifier(Linear.self),
+            qkv.gdnLayout == nil, z.gdnLayout == nil,
+            qkv.bias == nil, z.bias == nil, inProjB.bias == nil, inProjA.bias == nil,
+            qkv.bits == z.bits,
+            qkv.groupSize == z.groupSize,
+            qkv.mode == z.mode,
+            qkv.transform.isCompatible(with: z.transform)
+        else {
+            _hadamardInputCache.permanentlyIneligible = true
+            return nil
+        }
+        let qkvFrozen = qkv.noGrad()
+        let zFrozen = z.noGrad()
+        guard qkvFrozen.contains("weight"), qkvFrozen.contains("scales"),
+            qkv.biases == nil || qkvFrozen.contains("biases"),
+            zFrozen.contains("weight"), zFrozen.contains("scales"),
+            z.biases == nil || zFrozen.contains("biases")
+        else { return nil }
+        return (qkv, z, inProjB, inProjA)
+    }
+
+    @discardableResult
+    private func prepareFusedHadamardInputProjections() -> Bool {
+        if _hadamardInputCache.permanentlyIneligible { return false }
+        if let cachedSig = _hadamardInputCache.sourceSignature {
+            guard let projections = exactFrozenHadamardInputProjections(),
+                sourceSignatureMatches(
+                    hadamardInputProjectionSourceSignature(projections), cachedSig)
+            else {
+                _hadamardInputCache.invalidate()
+                return false
+            }
+            return _hadamardInputCache.fusedQKVZ != nil && _hadamardInputCache.fusedBA != nil
+        }
+        guard let projections = exactFrozenHadamardInputProjections() else { return false }
+        guard projections.qkv.transform.hasIdenticalSigns(to: projections.z.transform) else {
+            _hadamardInputCache.permanentlyIneligible = true
+            return false
+        }
+        let fusedBiases: MLXArray?
+        switch (projections.qkv.biases, projections.z.biases) {
+        case let (.some(qkv), .some(z)):
+            fusedBiases = concatenated([qkv, z], axis: 0)
+        case (nil, nil):
+            fusedBiases = nil
+        default:
+            return false
+        }
+        let fusedWeight = concatenated([
+            projections.qkv.weight, projections.z.weight,
+        ], axis: 0)
+        let fusedScales = concatenated([
+            projections.qkv.scales, projections.z.scales,
+        ], axis: 0)
+        let fusedBAWeight = concatenated([
+            projections.b.weight, projections.a.weight,
+        ], axis: 0)
+        eval(fusedWeight, fusedScales, fusedBAWeight)
+        if let fusedBiases { eval(fusedBiases) }
+
+        guard let fusedQKVZ = try? HadamardQuantizedLinear(
+            weight: fusedWeight, bias: nil,
+            scales: fusedScales, biases: fusedBiases,
+            groupSize: projections.qkv.groupSize,
+            bits: projections.qkv.bits,
+            transform: projections.qkv.transform)
+        else {
+            _hadamardInputCache.permanentlyIneligible = true
+            return false
+        }
+        let fusedBA = Linear(weight: fusedBAWeight, bias: nil)
+
+        let qkvRows = keyDim * 2 + valueDim
+        let zRows = valueDim
+        let bRows = numVHeads
+        guard let qkvView = try? HadamardQuantizedLinear(
+            weight: fusedWeight[0 ..< qkvRows], bias: nil,
+            scales: fusedScales[0 ..< qkvRows],
+            biases: fusedBiases.map { $0[0 ..< qkvRows] },
+            groupSize: projections.qkv.groupSize,
+            bits: projections.qkv.bits,
+            transform: projections.qkv.transform),
+            let zView = try? HadamardQuantizedLinear(
+                weight: fusedWeight[qkvRows ..< (qkvRows + zRows)], bias: nil,
+                scales: fusedScales[qkvRows ..< (qkvRows + zRows)],
+                biases: fusedBiases.map { $0[qkvRows ..< (qkvRows + zRows)] },
+                groupSize: projections.qkv.groupSize,
+                bits: projections.qkv.bits,
+                transform: projections.qkv.transform)
+        else {
+            _hadamardInputCache.permanentlyIneligible = true
+            return false
+        }
+        let bView = Linear(weight: fusedBAWeight[0 ..< bRows], bias: nil)
+        if projections.b.noGrad().contains("weight") { bView.freeze() }
+        let aView = Linear(weight: fusedBAWeight[bRows ..< (2 * bRows)], bias: nil)
+        if projections.a.noGrad().contains("weight") { aView.freeze() }
+
+        try! update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(qkvView),
+                "in_proj_z": .value(zView),
+                "in_proj_b": .value(bView),
+                "in_proj_a": .value(aView),
+            ]), verify: [])
+
+        _hadamardInputCache.fusedQKVZ = fusedQKVZ
+        _hadamardInputCache.fusedBA = fusedBA
+        guard let current = exactFrozenHadamardInputProjections() else {
+            _hadamardInputCache.invalidate()
+            return false
+        }
+        _hadamardInputCache.sourceSignature = hadamardInputProjectionSourceSignature(current)
+        return true
+    }
+
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        guard prepareFusedInputProjection(), let fusedInProj else {
+        if prepareFusedInputProjection(), let fusedInProj {
+            let outFused = fusedInProj(inputs)
+            let qkvDim = keyDim * 2 + valueDim
+            let zDim = valueDim
+            let bDim = numVHeads
+            let total = qkvDim + zDim + 2 * bDim
             return (
-                inProjQKV(inputs),
-                inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
+                outFused[0..., 0..., 0 ..< qkvDim],
+                outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
+                    B, S, numVHeads, headVDim),
+                outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
+                outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
             )
         }
-        let outFused = fusedInProj(inputs)
-        let qkvDim = keyDim * 2 + valueDim
-        let zDim = valueDim
-        let bDim = numVHeads
-        let total = qkvDim + zDim + 2 * bDim
+        if prepareFusedHadamardInputProjections(),
+            let fusedQKVZ = _hadamardInputCache.fusedQKVZ,
+            let fusedBA = _hadamardInputCache.fusedBA
+        {
+            let outQKVZ = fusedQKVZ(inputs)
+            let outBA = fusedBA(inputs)
+            let qkvDim = keyDim * 2 + valueDim
+            let zDim = valueDim
+            let bDim = numVHeads
+            return (
+                outQKVZ[0..., 0..., 0 ..< qkvDim],
+                outQKVZ[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
+                    B, S, numVHeads, headVDim),
+                outBA[0..., 0..., 0 ..< bDim],
+                outBA[0..., 0..., bDim ..< (2 * bDim)]
+            )
+        }
         return (
-            outFused[0..., 0..., 0 ..< qkvDim],
-            outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
-                B, S, numVHeads, headVDim),
-            outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
-            outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
+            inProjQKV(inputs),
+            inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
+            inProjB(inputs),
+            inProjA(inputs)
         )
     }
 
@@ -698,42 +702,6 @@ final class Qwen35GatedDeltaNet: Module {
         let tail = convInput[0..., (convInput.dim(1) - nKeep)...]
         guard chunkWidth > 1, inProjQKV is HadamardQuantizedLinear else { return tail }
         return contiguous(tail)
-    }
-
-    private func normalizedQK(_ convOut: MLXArray, B: Int, S: Int) -> (MLXArray, MLXArray) {
-        if let fused = Qwen35FusedQKNorm.apply(
-            convOut, heads: numKHeads, dimensions: headKDim)
-        {
-            return fused
-        }
-        let q = convOut[0..., 0..., 0 ..< keyDim].reshaped(B, S, numKHeads, headKDim)
-        let k = convOut[0..., 0..., keyDim ..< (2 * keyDim)].reshaped(B, S, numKHeads, headKDim)
-        let invScale = pow(Float(headKDim), -0.5)
-        return (
-            MLXArray(pow(invScale, 2)).asType(q.dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
-            MLXArray(invScale).asType(k.dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6))
-    }
-
-    private func updateRecurrence(
-        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
-    ) -> (MLXArray, MLXArray) {
-        guard mask == nil, headKDim == 128, headVDim == 128, q.dim(1) >= 4,
-            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32
-        else {
-            return gatedDeltaUpdate(
-                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-                state: state, mask: mask)
-        }
-        let beta = sigmoid(b).asType(.float32)
-        let g = computeGatedDeltaG(aLog, a, dtBias)
-        let initial = state ?? MLXArray.zeros(
-            [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
-        let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
-        return Qwen35RegisterGDN.run(
-            q: q, k: k, v: v, g: g, beta: beta, state: floatState)
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -770,10 +738,21 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let (out, newSsmState) = updateRecurrence(
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newSsmState) = gatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -808,10 +787,21 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
         let convOut = silu(conv1d(convInput))
 
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let recurrence = updateRecurrence(
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let recurrence = gatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -888,7 +878,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = updateRecurrence(
+        let boundarySsm = gatedDeltaUpdate(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -1141,12 +1131,23 @@ final class Qwen35GatedDeltaNet: Module {
             convOut = silu(conv1d(convInput))
         }
 
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = updateRecurrence(
+            let recurrence = gatedDeltaUpdate(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1247,7 +1248,7 @@ final class Qwen35GatedDeltaNet: Module {
             ssmStates.reserveCapacity(S)
             var state = ssmState
             for s in 0 ..< S {
-                let (stepOut, next) = updateRecurrence(
+                let (stepOut, next) = gatedDeltaUpdate(
                     q: qNormed[0..., s ..< (s + 1)],
                     k: kNormed[0..., s ..< (s + 1)],
                     v: v[0..., s ..< (s + 1)],
@@ -1308,6 +1309,27 @@ final class Qwen35Attention: Module {
     let rope: RoPELayer
     let mrope: Qwen35MRoPE
 
+    private final class FusedAttentionProjectionCache {
+        var fusedQKV: Linear?
+        var fusedKV: Linear?
+        var qRows: Int = 0
+        var kRows: Int = 0
+        var vRows: Int = 0
+        var sourceSignature: [MLXArray]?
+        var permanentlyIneligible = false
+
+        func invalidate() {
+            fusedQKV = nil
+            fusedKV = nil
+            qRows = 0
+            kRows = 0
+            vRows = 0
+            sourceSignature = nil
+            permanentlyIneligible = false
+        }
+    }
+    private let _fusedProjectionCache = FusedAttentionProjectionCache()
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1342,19 +1364,311 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let prefixes = ["q_proj.", "k_proj.", "v_proj."]
+        let replacesProjection = parameters.flattened().contains { key, _ in
+            prefixes.contains(where: key.hasPrefix)
+        }
+        let result = try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
+        if replacesProjection {
+            _fusedProjectionCache.invalidate()
+        }
+        return result
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        try super.updateModule(key: key, value)
+        if key == "q_proj" || key == "k_proj" || key == "v_proj" {
+            _fusedProjectionCache.invalidate()
+        }
+    }
+
+    private func qkvSourceSignature(
+        _ q: QuantizedLinear, _ k: QuantizedLinear, _ v: QuantizedLinear
+    ) -> [MLXArray] {
+        [
+            q.weight, q.scales,
+            k.weight, k.scales,
+            v.weight, v.scales,
+        ] + [q.biases, k.biases, v.biases].compactMap { $0 }
+    }
+
+    private func isFrozenQuantized(_ proj: QuantizedLinear) -> Bool {
+        let frozen = proj.noGrad()
+        return frozen.contains("weight") && frozen.contains("scales")
+            && (proj.biases == nil || frozen.contains("biases"))
+    }
+
+    private func exactFrozenAttentionProjections() -> (
+        q: QuantizedLinear, k: QuantizedLinear, v: QuantizedLinear,
+        transform: SignedBlockHadamard?
+    )? {
+        guard let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear,
+            q.bias == nil, k.bias == nil, v.bias == nil,
+            q.bits == k.bits, q.bits == v.bits,
+            q.groupSize == k.groupSize, q.groupSize == v.groupSize,
+            q.mode == k.mode, q.mode == v.mode
+        else {
+            _fusedProjectionCache.permanentlyIneligible = true
+            return nil
+        }
+        let transform: SignedBlockHadamard?
+        if let hq = q as? HadamardQuantizedLinear,
+            let hk = k as? HadamardQuantizedLinear,
+            let hv = v as? HadamardQuantizedLinear,
+            ObjectIdentifier(type(of: hq)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: hk)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: hv)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            hq.gdnLayout == nil, hk.gdnLayout == nil, hv.gdnLayout == nil,
+            hq.transform.isCompatible(with: hk.transform),
+            hq.transform.isCompatible(with: hv.transform)
+        {
+            transform = hq.transform
+        } else if ObjectIdentifier(type(of: q)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: k)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: v)) == ObjectIdentifier(QuantizedLinear.self)
+        {
+            transform = nil
+        } else {
+            _fusedProjectionCache.permanentlyIneligible = true
+            return nil
+        }
+        guard isFrozenQuantized(q), isFrozenQuantized(k), isFrozenQuantized(v) else {
+            return nil
+        }
+        return (q, k, v, transform)
+    }
+
+    @discardableResult
+    private func prepareFusedQKVProjection() -> Bool {
+        if _fusedProjectionCache.permanentlyIneligible { return false }
+        if let cachedSig = _fusedProjectionCache.sourceSignature {
+            guard let projections = exactFrozenAttentionProjections(),
+                let currentSig: [MLXArray] = Optional(
+                    qkvSourceSignature(projections.q, projections.k, projections.v)),
+                currentSig.count == cachedSig.count,
+                zip(currentSig, cachedSig).allSatisfy({ $0 === $1 })
+            else {
+                _fusedProjectionCache.invalidate()
+                return false
+            }
+            return _fusedProjectionCache.fusedQKV != nil && _fusedProjectionCache.fusedKV != nil
+        }
+        guard let projections = exactFrozenAttentionProjections() else { return false }
+        if let hq = projections.q as? HadamardQuantizedLinear,
+            let hk = projections.k as? HadamardQuantizedLinear,
+            let hv = projections.v as? HadamardQuantizedLinear
+        {
+            let signsMatch =
+                hq.transform.hasIdenticalSigns(to: hk.transform)
+                && hq.transform.hasIdenticalSigns(to: hv.transform)
+            guard signsMatch else {
+                _fusedProjectionCache.permanentlyIneligible = true
+                return false
+            }
+        }
+        let fusedBiases: MLXArray?
+        switch (projections.q.biases, projections.k.biases, projections.v.biases) {
+        case let (.some(qb), .some(kb), .some(vb)):
+            fusedBiases = concatenated([qb, kb, vb], axis: 0)
+        case (nil, nil, nil):
+            fusedBiases = nil
+        default:
+            return false
+        }
+        let fusedWeight = concatenated([
+            projections.q.weight, projections.k.weight, projections.v.weight,
+        ], axis: 0)
+        let fusedScales = concatenated([
+            projections.q.scales, projections.k.scales, projections.v.scales,
+        ], axis: 0)
+        eval(fusedWeight, fusedScales)
+        if let fusedBiases { eval(fusedBiases) }
+
+        let qRows = projections.q.weight.dim(0)
+        let kRows = projections.k.weight.dim(0)
+        let vRows = projections.v.weight.dim(0)
+        let totalRows = qRows + kRows + vRows
+        let qRange = 0 ..< qRows
+        let kRange = qRows ..< (qRows + kRows)
+        let vRange = (qRows + kRows) ..< totalRows
+        let kvRange = qRows ..< totalRows
+
+        let fusedQKV: Linear
+        let fusedKV: Linear
+        let qView: Linear
+        let kView: Linear
+        let vView: Linear
+
+        if let transform = projections.transform {
+            guard let fQKV = try? HadamardQuantizedLinear(
+                weight: fusedWeight, bias: nil,
+                scales: fusedScales, biases: fusedBiases,
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                transform: transform),
+                let fKV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[kvRange], bias: nil,
+                    scales: fusedScales[kvRange],
+                    biases: fusedBiases.map { $0[kvRange] },
+                    groupSize: projections.q.groupSize,
+                    bits: projections.q.bits,
+                    transform: transform),
+                let qV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[qRange], bias: nil,
+                    scales: fusedScales[qRange],
+                    biases: fusedBiases.map { $0[qRange] },
+                    groupSize: projections.q.groupSize,
+                    bits: projections.q.bits,
+                    transform: transform),
+                let kV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[kRange], bias: nil,
+                    scales: fusedScales[kRange],
+                    biases: fusedBiases.map { $0[kRange] },
+                    groupSize: projections.q.groupSize,
+                    bits: projections.q.bits,
+                    transform: transform),
+                let vV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[vRange], bias: nil,
+                    scales: fusedScales[vRange],
+                    biases: fusedBiases.map { $0[vRange] },
+                    groupSize: projections.q.groupSize,
+                    bits: projections.q.bits,
+                    transform: transform)
+            else {
+                _fusedProjectionCache.permanentlyIneligible = true
+                return false
+            }
+            fusedQKV = fQKV
+            fusedKV = fKV
+            qView = qV
+            kView = kV
+            vView = vV
+        } else {
+            let fQKV = QuantizedLinear(
+                weight: fusedWeight, bias: nil,
+                scales: fusedScales, biases: fusedBiases,
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                mode: projections.q.mode)
+            fQKV.freeze()
+            let fKV = QuantizedLinear(
+                weight: fusedWeight[kvRange], bias: nil,
+                scales: fusedScales[kvRange],
+                biases: fusedBiases.map { $0[kvRange] },
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                mode: projections.q.mode)
+            fKV.freeze()
+            let qV = QuantizedLinear(
+                weight: fusedWeight[qRange], bias: nil,
+                scales: fusedScales[qRange],
+                biases: fusedBiases.map { $0[qRange] },
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                mode: projections.q.mode)
+            qV.freeze()
+            let kV = QuantizedLinear(
+                weight: fusedWeight[kRange], bias: nil,
+                scales: fusedScales[kRange],
+                biases: fusedBiases.map { $0[kRange] },
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                mode: projections.q.mode)
+            kV.freeze()
+            let vV = QuantizedLinear(
+                weight: fusedWeight[vRange], bias: nil,
+                scales: fusedScales[vRange],
+                biases: fusedBiases.map { $0[vRange] },
+                groupSize: projections.q.groupSize,
+                bits: projections.q.bits,
+                mode: projections.q.mode)
+            vV.freeze()
+            fusedQKV = fQKV
+            fusedKV = fKV
+            qView = qV
+            kView = kV
+            vView = vV
+        }
+
+        try! update(
+            modules: ModuleChildren(values: [
+                "q_proj": .value(qView),
+                "k_proj": .value(kView),
+                "v_proj": .value(vView),
+            ]), verify: [])
+
+        _fusedProjectionCache.fusedQKV = fusedQKV
+        _fusedProjectionCache.fusedKV = fusedKV
+        _fusedProjectionCache.qRows = qRows
+        _fusedProjectionCache.kRows = kRows
+        _fusedProjectionCache.vRows = vRows
+        guard let current = exactFrozenAttentionProjections() else {
+            _fusedProjectionCache.invalidate()
+            return false
+        }
+        _fusedProjectionCache.sourceSignature = qkvSourceSignature(
+            current.q, current.k, current.v)
+        return true
+    }
+
+    @inline(__always)
+    private func callLinear(_ proj: Linear, _ x: MLXArray) -> MLXArray {
+        if let hq = proj as? HadamardQuantizedLinear {
+            return hq(x)
+        }
+        if let q = proj as? QuantizedLinear {
+            return q.callWithFloat16ConstantReuse(x)
+        }
+        return proj(x)
+    }
+
+    func projectKV(_ x: MLXArray) -> (keys: MLXArray, values: MLXArray) {
+        if prepareFusedQKVProjection(), let fusedKV = _fusedProjectionCache.fusedKV {
+            let kvOut = callLinear(fusedKV, x)
+            let kRows = _fusedProjectionCache.kRows
+            let vRows = _fusedProjectionCache.vRows
+            return (
+                kvOut[0..., 0..., 0 ..< kRows],
+                kvOut[0..., 0..., kRows ..< (kRows + vRows)]
+            )
+        }
+        return (callLinear(kProj, x), callLinear(vProj, x))
+    }
+
+    func projectQKV(_ x: MLXArray) -> (qProjOutput: MLXArray, keys: MLXArray, values: MLXArray) {
+        if prepareFusedQKVProjection(), let fusedQKV = _fusedProjectionCache.fusedQKV {
+            let qkvOut = callLinear(fusedQKV, x)
+            let qRows = _fusedProjectionCache.qRows
+            let kRows = _fusedProjectionCache.kRows
+            let vRows = _fusedProjectionCache.vRows
+            return (
+                qkvOut[0..., 0..., 0 ..< qRows],
+                qkvOut[0..., 0..., qRows ..< (qRows + kRows)],
+                qkvOut[0..., 0..., (qRows + kRows) ..< (qRows + kRows + vRows)]
+            )
+        }
+        return (callLinear(qProj, x), callLinear(kProj, x), callLinear(vProj, x))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        var (qProjOutput, keys, values) = projectQKV(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
-
-        var keys = kProj(x)
-        var values = vProj(x)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -1374,7 +1688,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return callLinear(oProj, sigmoidMultiply(output, gate))
     }
 
     func cbv2Forward(
@@ -1385,17 +1699,21 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+        let qProjOutput: MLXArray
+        let kProjection: MLXArray
+        let vProjection: MLXArray
+        if exactTargetVerify {
+            qProjOutput = qwen35A3BExactW4G64Projection(qProj, x)
+            kProjection = qwen35A3BExactW4G64Projection(kProj, x)
+            vProjection = qwen35A3BExactW4G64Projection(vProj, x)
+        } else {
+            (qProjOutput, kProjection, vProjection) = projectQKV(x)
+        }
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
-        let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1419,7 +1737,7 @@ final class Qwen35Attention: Module {
         let projectionInput = sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+            : callLinear(oProj, projectionInput)
     }
 }
 
@@ -1643,6 +1961,230 @@ extension Qwen3NextMLP {
     }
 }
 
+final class Qwen35FusedDenseMLPCache {
+    private var fusedGateUp: Linear?
+    private var gateRows: Int = 0
+    private var upRows: Int = 0
+    private var sourceSignature: [MLXArray]?
+    private var permanentlyIneligible = false
+
+    func invalidate() {
+        fusedGateUp = nil
+        gateRows = 0
+        upRows = 0
+        sourceSignature = nil
+        permanentlyIneligible = false
+    }
+
+    private func gateUpSourceSignature(_ gate: QuantizedLinear, _ up: QuantizedLinear) -> [MLXArray] {
+        [
+            gate.weight, gate.scales,
+            up.weight, up.scales,
+        ] + [gate.biases, up.biases].compactMap { $0 }
+    }
+
+    private func isFrozenQuantized(_ proj: QuantizedLinear) -> Bool {
+        let frozen = proj.noGrad()
+        return frozen.contains("weight") && frozen.contains("scales")
+            && (proj.biases == nil || frozen.contains("biases"))
+    }
+
+    private func exactFrozenGateUpProjections(_ mlp: Qwen3NextMLP) -> (
+        gate: QuantizedLinear, up: QuantizedLinear, transform: SignedBlockHadamard?
+    )? {
+        guard let gate = mlp.gateProj as? QuantizedLinear,
+            let up = mlp.upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.bits == up.bits,
+            gate.groupSize == up.groupSize,
+            gate.mode == up.mode
+        else {
+            permanentlyIneligible = true
+            return nil
+        }
+        let transform: SignedBlockHadamard?
+        if let hGate = gate as? HadamardQuantizedLinear,
+            let hUp = up as? HadamardQuantizedLinear,
+            ObjectIdentifier(type(of: hGate)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            ObjectIdentifier(type(of: hUp)) == ObjectIdentifier(HadamardQuantizedLinear.self),
+            hGate.gdnLayout == nil, hUp.gdnLayout == nil,
+            hGate.transform.isCompatible(with: hUp.transform)
+        {
+            transform = hGate.transform
+        } else if ObjectIdentifier(type(of: gate)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: up)) == ObjectIdentifier(QuantizedLinear.self)
+        {
+            transform = nil
+        } else {
+            permanentlyIneligible = true
+            return nil
+        }
+        guard isFrozenQuantized(gate), isFrozenQuantized(up) else {
+            return nil
+        }
+        return (gate, up, transform)
+    }
+
+    @discardableResult
+    private func prepare(_ mlp: Qwen3NextMLP) -> Bool {
+        if permanentlyIneligible { return false }
+        if let cachedSig = sourceSignature {
+            guard let projections = exactFrozenGateUpProjections(mlp),
+                let currentSig: [MLXArray] = Optional(
+                    gateUpSourceSignature(projections.gate, projections.up)),
+                currentSig.count == cachedSig.count,
+                zip(currentSig, cachedSig).allSatisfy({ $0 === $1 })
+            else {
+                invalidate()
+                return false
+            }
+            return fusedGateUp != nil
+        }
+        guard let projections = exactFrozenGateUpProjections(mlp) else { return false }
+        if let hGate = projections.gate as? HadamardQuantizedLinear,
+            let hUp = projections.up as? HadamardQuantizedLinear
+        {
+            guard hGate.transform.hasIdenticalSigns(to: hUp.transform) else {
+                permanentlyIneligible = true
+                return false
+            }
+        }
+        let fusedBiases: MLXArray?
+        switch (projections.gate.biases, projections.up.biases) {
+        case let (.some(gb), .some(ub)):
+            fusedBiases = concatenated([gb, ub], axis: 0)
+        case (nil, nil):
+            fusedBiases = nil
+        default:
+            return false
+        }
+        let fusedWeight = concatenated([projections.gate.weight, projections.up.weight], axis: 0)
+        let fusedScales = concatenated([projections.gate.scales, projections.up.scales], axis: 0)
+        eval(fusedWeight, fusedScales)
+        if let fusedBiases { eval(fusedBiases) }
+
+        let gRows = projections.gate.weight.dim(0)
+        let uRows = projections.up.weight.dim(0)
+        let gRange = 0 ..< gRows
+        let uRange = gRows ..< (gRows + uRows)
+
+        let fGateUp: Linear
+        let gView: Linear
+        let uView: Linear
+
+        if let transform = projections.transform {
+            guard let fGU = try? HadamardQuantizedLinear(
+                weight: fusedWeight, bias: nil,
+                scales: fusedScales, biases: fusedBiases,
+                groupSize: projections.gate.groupSize,
+                bits: projections.gate.bits,
+                transform: transform),
+                let gV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[gRange], bias: nil,
+                    scales: fusedScales[gRange],
+                    biases: fusedBiases.map { $0[gRange] },
+                    groupSize: projections.gate.groupSize,
+                    bits: projections.gate.bits,
+                    transform: transform),
+                let uV = try? HadamardQuantizedLinear(
+                    weight: fusedWeight[uRange], bias: nil,
+                    scales: fusedScales[uRange],
+                    biases: fusedBiases.map { $0[uRange] },
+                    groupSize: projections.gate.groupSize,
+                    bits: projections.gate.bits,
+                    transform: transform)
+            else {
+                permanentlyIneligible = true
+                return false
+            }
+            fGateUp = fGU
+            gView = gV
+            uView = uV
+        } else {
+            let fGU = QuantizedLinear(
+                weight: fusedWeight, bias: nil,
+                scales: fusedScales, biases: fusedBiases,
+                groupSize: projections.gate.groupSize,
+                bits: projections.gate.bits,
+                mode: projections.gate.mode)
+            fGU.freeze()
+            let gV = QuantizedLinear(
+                weight: fusedWeight[gRange], bias: nil,
+                scales: fusedScales[gRange],
+                biases: fusedBiases.map { $0[gRange] },
+                groupSize: projections.gate.groupSize,
+                bits: projections.gate.bits,
+                mode: projections.gate.mode)
+            gV.freeze()
+            let uV = QuantizedLinear(
+                weight: fusedWeight[uRange], bias: nil,
+                scales: fusedScales[uRange],
+                biases: fusedBiases.map { $0[uRange] },
+                groupSize: projections.gate.groupSize,
+                bits: projections.gate.bits,
+                mode: projections.gate.mode)
+            uV.freeze()
+            fGateUp = fGU
+            gView = gV
+            uView = uV
+        }
+
+        try! mlp.update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(gView),
+                "up_proj": .value(uView),
+            ]), verify: [])
+
+        fusedGateUp = fGateUp
+        gateRows = gRows
+        upRows = uRows
+        guard let current = exactFrozenGateUpProjections(mlp) else {
+            invalidate()
+            return false
+        }
+        sourceSignature = gateUpSourceSignature(current.gate, current.up)
+        return true
+    }
+
+    func forward(
+        _ mlp: Qwen3NextMLP, _ x: MLXArray, exactTargetVerify: Bool = false
+    ) -> MLXArray {
+        if exactTargetVerify {
+            return mlp.qwen35TargetVerify(x, exact: true)
+        }
+        if prepare(mlp), let fusedGateUp {
+            let gateUp: MLXArray
+            if let hq = fusedGateUp as? HadamardQuantizedLinear {
+                gateUp = hq(x)
+            } else if let q = fusedGateUp as? QuantizedLinear {
+                gateUp = q.callWithFloat16ConstantReuse(x)
+            } else {
+                gateUp = fusedGateUp(x)
+            }
+            let gate = gateUp[0..., 0..., 0 ..< gateRows]
+            let up = gateUp[0..., 0..., gateRows ..< (gateRows + upRows)]
+            let activated = silu(gate) * up
+            if let hqDown = mlp.downProj as? HadamardQuantizedLinear {
+                return hqDown(activated)
+            }
+            if let qDown = mlp.downProj as? QuantizedLinear {
+                return qDown.callWithFloat16ConstantReuse(activated)
+            }
+            return mlp.downProj(activated)
+        }
+        if let qGate = mlp.gateProj as? QuantizedLinear,
+            let qUp = mlp.upProj as? QuantizedLinear,
+            let qDown = mlp.downProj as? QuantizedLinear,
+            !(qGate is HadamardQuantizedLinear)
+        {
+            return qDown.callWithFloat16ConstantReuse(
+                silu(qGate.callWithFloat16ConstantReuse(x))
+                    * qUp.callWithFloat16ConstantReuse(x))
+        }
+        return mlp(x)
+    }
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -1655,6 +2197,8 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    private let _denseMLPCache = Qwen35FusedDenseMLPCache()
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
         self.isLinear = (layerIdx + 1) % args.fullAttentionInterval != 0
@@ -1686,6 +2230,30 @@ final class Qwen35DecoderLayer: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let replacesMLP = parameters.flattened().contains { key, _ in
+            key.hasPrefix("mlp.")
+        }
+        let result = try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
+        if replacesMLP {
+            _denseMLPCache.invalidate()
+        }
+        return result
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        try super.updateModule(key: key, value)
+        if key == "mlp" {
+            _denseMLPCache.invalidate()
+        }
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -1706,7 +2274,11 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let normalized = postAttentionLayerNorm(h)
+        if let dense = mlp as? Qwen3NextMLP {
+            return h + _denseMLPCache.forward(dense, normalized)
+        }
+        return h + (mlp as! UnaryLayer)(normalized)
     }
 
     func cbv2Forward(
@@ -1716,8 +2288,7 @@ final class Qwen35DecoderLayer: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
-        exactTargetVerify: Bool = false,
-        lastPositionOnly: Bool = false
+        exactTargetVerify: Bool = false
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
@@ -1740,17 +2311,15 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: exactTargetVerify)
         }
-        let residual = x + r
-        let h = lastPositionOnly && residual.dim(1) > 1
-            ? residual[0..., (residual.dim(1) - 1)..., 0...] : residual
+        let h = x + r
         let normalized = postAttentionLayerNorm(h)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
             feedForward = sparse(
                 normalized, exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
-            feedForward = dense.qwen35TargetVerify(
-                normalized, exact: exactTargetVerify)
+            feedForward = _denseMLPCache.forward(
+                dense, normalized, exactTargetVerify: exactTargetVerify)
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
@@ -1904,8 +2473,7 @@ public class Qwen35TextModelInner: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
-        captureRecurrentWindow: Bool = false,
-        lastPositionOnly: Bool = false
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -1939,10 +2507,7 @@ public class Qwen35TextModelInner: Module {
                 recurrentState: recurrentState,
                 positionIds: positionIds,
                 captureRecurrentWindow: captureRecurrentWindow,
-                exactTargetVerify: captureRecurrentWindow && exactTargetVerify,
-                lastPositionOnly: lastPositionOnly && !captureRecurrentWindow
-                    && modelLayerIndex == layers.count - 1
-                    && !(tapLayerIds?.contains(modelLayerIndex) ?? false))
+                exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
             // `hiddenStates` here IS the OUTPUT hidden state of this layer,
             // which is what the reference taps (`_LayerHook` wraps the layer and
             // keeps what it returned).
@@ -2127,11 +2692,9 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        // The unpositioned seam serves the stepper and plain decode. Both read
-        // the final position only. Keep every cache write whole.
         positionedForward(
             tokens, inputEmbedding: nil, cache: caches,
-            recurrentState: recurrentState, positionIds: nil, lastPositionOnly: true)
+            recurrentState: recurrentState, positionIds: nil)
     }
 
     public func cbv2Forward(
@@ -2167,8 +2730,7 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
 
     private func positionedForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
-        lastPositionOnly: Bool = false
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> MLXArray {
         let caches = cache ?? []
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
@@ -2179,11 +2741,8 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         }
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds,
-            lastPositionOnly: lastPositionOnly)
-        let headInput = lastPositionOnly && hidden.dim(1) > 1
-            ? hidden[0..., (hidden.dim(1) - 1)..., 0...] : hidden
-        let normalized = model.norm(headInput)
+            recurrentState: recurrentState, positionIds: positionIds)
+        let normalized = model.norm(hidden)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 }

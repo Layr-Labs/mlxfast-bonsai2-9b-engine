@@ -6,47 +6,9 @@
 
 import CoreFoundation
 import Foundation
-@_spi(QuantizedConstantCache) import MLX
+import MLX
 import MLXLMCommon
 import MLXNN
-
-// The pinned MTP head carries FP16 affine metadata while the target feeds it
-// FP32 activations. Reuse only the exact constant widening that quantizedMM
-// would otherwise repeat at every draft step. This cache is input-independent;
-// the packed weights and the module's original parameter tree remain unchanged.
-final class Qwen35MTPQuantizedLinear: QuantizedLinear {
-    private let mtpScaleCastCache = ConstantArrayCastCache()
-    private let mtpOffsetCastCache = ConstantArrayCastCache()
-
-    @discardableResult
-    override func update(
-        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
-        modulePath: [String] = []
-    ) throws -> Self {
-        defer {
-            mtpScaleCastCache.clear()
-            mtpOffsetCastCache.clear()
-        }
-        return try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
-    override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        guard mode == .affine, x.dtype == .float32, scales.dtype == .float16 else {
-            return super.callAsFunction(x)
-        }
-        let widenedScales = mtpScaleCastCache.cachedCast(
-            scales, to: x.dtype, allowFloat16: true) ?? scales
-        let widenedOffsets = biases.map {
-            mtpOffsetCastCache.cachedCast($0, to: x.dtype, allowFloat16: true) ?? $0
-        }
-        var output = quantizedMM(
-            x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
-            groupSize: groupSize, bits: bits, mode: mode)
-        if let bias { output = output + bias }
-        return output
-    }
-}
 
 // MARK: - Module-level MTP flag
 
@@ -111,9 +73,10 @@ extension Qwen35Attention {
     func appendMTPHistoryKV(_ x: MLXArray, cache: any KVCache) {
         let batch = x.dim(0)
         let length = x.dim(1)
-        var keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1))
+        let (kProjection, vProjection) = projectKV(x)
+        var keys = kNorm(kProjection.reshaped(batch, length, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(batch, length, kvHeads, -1)
+        let values = vProjection.reshaped(batch, length, kvHeads, -1)
             .transposed(0, 2, 1, 3)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
@@ -131,6 +94,8 @@ final class Qwen35MTPDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
     @ModuleInfo(key: "mlp") var mlp: Module
+
+    private let _denseMLPCache = Qwen35FusedDenseMLPCache()
 
     init(_ args: Qwen35TextConfiguration) {
         _selfAttn.wrappedValue = Qwen35Attention(args)
@@ -153,6 +118,30 @@ final class Qwen35MTPDecoderLayer: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let replacesMLP = parameters.flattened().contains { key, _ in
+            key.hasPrefix("mlp.")
+        }
+        let result = try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
+        if replacesMLP {
+            _denseMLPCache.invalidate()
+        }
+        return result
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        try super.updateModule(key: key, value)
+        if key == "mlp" {
+            _denseMLPCache.invalidate()
+        }
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -161,13 +150,39 @@ final class Qwen35MTPDecoderLayer: Module {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let normalized = postAttentionLayerNorm(h)
+        if let dense = mlp as? Qwen3NextMLP {
+            return h + _denseMLPCache.forward(dense, normalized)
+        }
+        return h + (mlp as! UnaryLayer)(normalized)
     }
 
     /// Populate this layer's K/V history without computing a dead decoder
     /// output. Only valid when no later MTP layer consumes that output.
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
         selfAttn.appendMTPHistoryKV(inputLayerNorm(x), cache: cache)
+    }
+
+    /// Normalize all rows once, append K/V history for the leading rows, and
+    /// run full attention + MLP only for the final proposal row.
+    func forwardLastTokenWithHistoryKV(
+        _ x: MLXArray,
+        cache: any KVCache
+    ) -> MLXArray {
+        let historyCount = x.dim(1) - 1
+        let normed = inputLayerNorm(x)
+        selfAttn.appendMTPHistoryKV(
+            normed[0..., 0 ..< historyCount, 0...], cache: cache)
+        let current = x[0..., historyCount..., 0...]
+        let currentNormed = normed[0..., historyCount..., 0...]
+        let mask = createAttentionMask(h: current, cache: cache)
+        let r = selfAttn(currentNormed, mask: mask, cache: cache)
+        let h = current + r
+        let postNormed = postAttentionLayerNorm(h)
+        if let dense = mlp as? Qwen3NextMLP {
+            return h + _denseMLPCache.forward(dense, postNormed)
+        }
+        return h + (mlp as! UnaryLayer)(postNormed)
     }
 }
 
@@ -219,6 +234,14 @@ final class Qwen35MTPModule: Module {
         return x.asType(fc.weight.dtype)
     }
 
+    @inline(__always)
+    private func projectFC(_ x: MLXArray) -> MLXArray {
+        if let q = fc as? QuantizedLinear, !(q is HadamardQuantizedLinear) {
+            return q.callWithFloat16ConstantReuse(x)
+        }
+        return fc(x)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -230,7 +253,7 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(entering(embeds))
         let h = preFcNormHidden(entering(hidden))
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = projectFC(concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -264,14 +287,8 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(entering(embeds))
         let h = preFcNormHidden(entering(hidden))
-        let fused = fc(concatenated([e, h], axis: -1))
-        let historyCount = fused.dim(1) - 1
-        layers[0].appendHistoryKV(
-            fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
-
-        let current = fused[0..., historyCount..., 0...]
-        let mask = createAttentionMask(h: current, cache: cache[0])
-        return norm(layers[0](current, mask: mask, cache: cache[0]))
+        let fused = projectFC(concatenated([e, h], axis: -1))
+        return norm(layers[0].forwardLastTokenWithHistoryKV(fused, cache: cache[0]))
     }
 }
 
@@ -497,21 +514,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             target: target,
             verificationMode: verificationMode)
         if !scaledPaths.isEmpty {
-            quantize(
-                model: assistant.mtp,
-                filter: { path, _ in
-                    guard scaledPaths.contains(path) else { return nil }
-                    return metadata.resolvedQuantization(for: path)?.asTuple
-                },
-                apply: { module, groupSize, bits, mode in
-                    guard let linear = module as? Linear, !(linear is QuantizedLinear) else {
-                        return quantizeSingle(
-                            layer: module, groupSize: groupSize, bits: bits, mode: mode)
-                    }
-                    return Qwen35MTPQuantizedLinear(
-                        weight: linear.weight, bias: linear.bias,
-                        groupSize: groupSize, bits: bits, mode: mode)
-                })
+            quantize(model: assistant.mtp) { path, _ in
+                guard scaledPaths.contains(path) else { return nil }
+                return metadata.resolvedQuantization(for: path)?.asTuple
+            }
         }
 
         try assistant.mtp.update(
