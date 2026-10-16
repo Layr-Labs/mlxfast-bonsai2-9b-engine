@@ -51,41 +51,61 @@ public struct SignedBlockHadamard {
             const uint sign_offset = (BLOCKS_PER_ROW == 1)
                 ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
 
-            threadgroup float buf[4096];
+            threadgroup float buf[256 * 17];
             float x_reg[16];
 
             const short base0 = i << 4;
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              float val = float(x[batch_idx + uint(base0 + r)]);
-              if (!INVERSE) {
-                val *= signs[sign_offset + uint(base0 + r)];
+            const uint in_offset = batch_idx + uint(base0);
+            const uint s_offset = sign_offset + uint(base0);
+            if (sizeof(T) == 4) {
+              const device float4* in4 = (const device float4*)(x + in_offset);
+              const device float4* s4 = (const device float4*)(signs + s_offset);
+              #pragma clang loop unroll(full)
+              for (short v = 0; v < 4; v++) {
+                float4 val = in4[v];
+                if (!INVERSE) {
+                  val *= s4[v];
+                }
+                x_reg[4 * v + 0] = val.x;
+                x_reg[4 * v + 1] = val.y;
+                x_reg[4 * v + 2] = val.z;
+                x_reg[4 * v + 3] = val.w;
               }
-              x_reg[r] = val;
+            } else {
+              #pragma clang loop unroll(full)
+              for (short r = 0; r < 16; r++) {
+                float val = float(x[in_offset + r]);
+                if (!INVERSE) {
+                  val *= signs[s_offset + r];
+                }
+                x_reg[r] = val;
+              }
             }
             hadamard_radix16(x_reg);
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
-              buf[base0 + r] = x_reg[r];
+              buf[i * 17 + r] = x_reg[r];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const short k1 = i & 15;
-            const short j1 = ((i - k1) << 4) + k1;
+            const short r_base2 = (i - k1);
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[j1 + 16 * r];
+              x_reg[r] = buf[(r_base2 + r) * 17 + k1];
             }
             hadamard_radix16(x_reg);
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
-              buf[j1 + 16 * r] = x_reg[r];
+              buf[(r_base2 + r) * 17 + k1] = x_reg[r];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            const short i_hi = i >> 4;
+            const short i_lo = i & 15;
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[i + 256 * r];
+              x_reg[r] = buf[(i_hi + 16 * r) * 17 + i_lo];
             }
             hadamard_radix16(x_reg);
             #pragma clang loop unroll(full)
@@ -101,19 +121,31 @@ public struct SignedBlockHadamard {
         header: """
             using namespace metal;
             METAL_FUNC void hadamard_radix16(thread float* x) {
-              short h = 1;
               #pragma clang loop unroll(full)
-              for (short s = 0; s < 4; s++) {
+              for (short j = 0; j < 16; j += 2) {
+                float a = x[j], b = x[j+1];
+                x[j] = a + b; x[j+1] = a - b;
+              }
+              #pragma clang loop unroll(full)
+              for (short j = 0; j < 16; j += 4) {
                 #pragma clang loop unroll(full)
-                for (short i = 0; i < 8; i++) {
-                  short k = i & (h - 1);
-                  short j = ((i - k) << 1) + k;
-                  float a = x[j];
-                  float b = x[j + h];
-                  x[j] = a + b;
-                  x[j + h] = a - b;
+                for (short k = 0; k < 2; k++) {
+                  float a = x[j+k], b = x[j+k+2];
+                  x[j+k] = a + b; x[j+k+2] = a - b;
                 }
-                h <<= 1;
+              }
+              #pragma clang loop unroll(full)
+              for (short j = 0; j < 16; j += 8) {
+                #pragma clang loop unroll(full)
+                for (short k = 0; k < 4; k++) {
+                  float a = x[j+k], b = x[j+k+4];
+                  x[j+k] = a + b; x[j+k+4] = a - b;
+                }
+              }
+              #pragma clang loop unroll(full)
+              for (short k = 0; k < 8; k++) {
+                float a = x[k], b = x[k+8];
+                x[k] = a + b; x[k+8] = a - b;
               }
             }
             """)
