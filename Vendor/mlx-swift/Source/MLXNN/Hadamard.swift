@@ -38,6 +38,12 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
+    /// Transforms decoded for one width share their immutable sign array.
+    public func isIdentical(to other: SignedBlockHadamard) -> Bool {
+        blockSize == other.blockSize && width == other.width
+            && (signs === other.signs || signValues == other.signValues)
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -393,7 +399,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     let readsFloat16ConstantsInPlace: Bool
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        applyRotated(rotate(x))
+    }
+
+    public func rotate(_ x: MLXArray) -> MLXArray {
+        transform(gdnLayout.map { $0(x) } ?? x)
+    }
+
+    /// Keep the original packed matmul dispatch for an already rotated input.
+    public func applyRotated(_ rotated: MLXArray) -> MLXArray {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
@@ -406,6 +420,27 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         }
         return super.callAsFunction(rotated)
     }
+
+    public func sharesInputTransform(with other: HadamardQuantizedLinear) -> Bool {
+        gdnLayout == nil && other.gdnLayout == nil
+            && transform.isIdentical(to: other.transform)
+    }
+}
+
+/// Reuse one transform within this forward only. Each projection retains its
+/// original matmul, output dtype, and bias. Other layouts use the normal path.
+public func sharedHadamardProjections(_ x: MLXArray, _ projections: [Linear]) -> [MLXArray]? {
+    guard let first = projections.first as? HadamardQuantizedLinear else { return nil }
+    var packed = [HadamardQuantizedLinear]()
+    packed.reserveCapacity(projections.count)
+    for projection in projections {
+        guard let layer = projection as? HadamardQuantizedLinear,
+            layer.sharesInputTransform(with: first)
+        else { return nil }
+        packed.append(layer)
+    }
+    let rotated = first.rotate(x)
+    return packed.map { $0.applyRotated(rotated) }
 }
 
 /// Packed folded embeddings with an inverse transform after lookup.
