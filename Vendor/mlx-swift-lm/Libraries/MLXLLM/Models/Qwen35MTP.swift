@@ -1035,6 +1035,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupDraftNgram: Int? { Self.promptLookupNgram }
 
+    /// The head's chain depth on rounds whose prompt lookup misses, when the
+    /// declared depth is deeper: lookup rounds propose the declared depth.
+    /// Default 3. Local experiments override it with
+    /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
+    static let promptLookupMissDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
+            return 3
+        }
+        guard let value = Int(raw), value > 0 else { return nil }
+        return value
+    }()
+
+    public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
+
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
