@@ -224,6 +224,46 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// The 128-wide FP32 norm and SiLU gate in one launch. Each lane keeps the
+/// same four values and reduction order as MLX's single-row RMSNorm.
+private enum Qwen35FusedGatedNorm {
+    static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_gated_rms128",
+        inputNames: ["x", "gate", "weight"], outputNames: ["y"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint offset = row * 128 + lane * 4;
+            float values[4];
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              values[i] = x[offset + i];
+              sum += values[i] * values[i];
+            }
+            const float inv = metal::precise::rsqrt(
+                simd_sum(sum) / 128.0f + as_type<float>(uint(EPS_BITS)));
+            for (int i = 0; i < 4; ++i) {
+              const float g = gate[offset + i];
+              const float t = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+              const float s = g * ((g < 0.0f) ? t : 1.0f - t);
+              const float n = weight[lane * 4 + i] * (values[i] * inv);
+              y[offset + i] = s * n;
+            }
+            """)
+
+    static func apply(_ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float) -> MLXArray? {
+        guard x.dtype == .float32, gate.dtype == .float32, weight.dtype == .float32,
+            x.ndim > 0, x.dim(-1) == 128, x.shape == gate.shape, weight.shape == [128],
+            x.size > 0, x.size <= Int(UInt32.max)
+        else { return nil }
+        return kernel(
+            [x, gate, weight], template: [("EPS_BITS", Int(eps.bitPattern))],
+            grid: (32, x.size / 128, 1), threadGroup: (32, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.float32])[0]
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -834,7 +874,8 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = Qwen35FusedGatedNorm.apply(out, gate: z, weight: norm.weight, eps: norm.eps)
+            ?? norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -886,7 +927,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut = Qwen35FusedGatedNorm.apply(out, gate: z, weight: norm.weight, eps: norm.eps)
+            ?? norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
@@ -1108,7 +1150,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
-        let normedOut = norm(out, gate: z)
+        let normedOut = Qwen35FusedGatedNorm.apply(out, gate: z, weight: norm.weight, eps: norm.eps)
+            ?? norm(out, gate: z)
         let projectionInput = normedOut.reshaped(B, S, -1)
         if exactTargetVerify {
             return qwen35A3BExactW4G64Projection(outProj, projectionInput)
@@ -1947,9 +1990,11 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
+        // The unpositioned seam serves the stepper and plain decode. Both read
+        // the final position only. Keep the trunk and every cache write whole.
         positionedForward(
             tokens, inputEmbedding: nil, cache: caches,
-            recurrentState: recurrentState, positionIds: nil)
+            recurrentState: recurrentState, positionIds: nil, lastPositionOnly: true)
     }
 
     public func cbv2Forward(
@@ -1985,7 +2030,8 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
 
     private func positionedForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        lastPositionOnly: Bool = false
     ) -> MLXArray {
         let caches = cache ?? []
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
@@ -1997,7 +2043,9 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
         let hidden = model.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
+        let headInput = lastPositionOnly && hidden.dim(1) > 1
+            ? hidden[0..., (hidden.dim(1) - 1)..., 0...] : hidden
+        let normalized = model.norm(headInput)
         return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
     }
 }
