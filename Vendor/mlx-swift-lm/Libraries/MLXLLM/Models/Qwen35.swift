@@ -1397,10 +1397,46 @@ final class Qwen35Attention: Module {
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
-        exactTargetVerify: Bool = false
+        exactTargetVerify: Bool = false,
+        lastPositionOnly: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
+
+        if lastPositionOnly, L > 1, positionIds == nil,
+            let lastCache = cache as? any CBv2LastQueryPrefillLayerCache,
+            lastCache.kind.attention == .full, lastCache.kind.sharesKVWithLayer == nil
+        {
+            let kProjection = exactTargetVerify
+                ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
+                .transposed(0, 2, 1, 3)
+            let vProjection = exactTargetVerify
+                ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            let values = vProjection.reshaped(B, L, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+
+            let xLast = x[0..., (L - 1)..., 0...]
+            let qProjOutput = exactTargetVerify
+                ? qwen35A3BExactW4G64Projection(qProj, xLast) : qProj(xLast)
+            let qSplit = qProjOutput.reshaped(B, 1, attentionHeads, -1).split(parts: 2, axis: -1)
+            var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            let gate = qSplit[1].reshaped(B, 1, -1)
+
+            let offsets = cache.positionOffsets + 0
+            queries = rope(queries, offset: offsets + Int32(L - 1))
+            keys = rope(keys, offset: offsets)
+
+            let output = lastCache.updateAndAttendLastQuery(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: nil)
+                .transposed(0, 2, 1, 3)
+                .reshaped(B, 1, -1)
+            let projectionInput = sigmoidMultiply(output, gate)
+            return exactTargetVerify
+                ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
+                : oProj(projectionInput)
+        }
 
         let qProjOutput = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
@@ -1755,9 +1791,15 @@ final class Qwen35DecoderLayer: Module {
             }
             r = selfAttn!.cbv2Forward(
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: exactTargetVerify)
+                exactTargetVerify: exactTargetVerify,
+                lastPositionOnly: lastPositionOnly)
         }
-        let residual = x + r
+        let residual: MLXArray
+        if r.dim(1) == 1, x.dim(1) > 1 {
+            residual = x[0..., (x.dim(1) - 1)..., 0...] + r
+        } else {
+            residual = x + r
+        }
         let h = lastPositionOnly && residual.dim(1) > 1
             ? residual[0..., (residual.dim(1) - 1)..., 0...] : residual
         let normalized = postAttentionLayerNorm(h)
