@@ -117,12 +117,18 @@ private let cbv2TopTwoPartialKernel = MLXFast.metalKernel(
         uint vocab = uint(logits_shape[2]);
         darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
 
+        const ulong row_offset = ulong(row) * ulong(logits_strides[1]);
+        const ulong stride2 = ulong(logits_strides[2]);
+
         for (uint index = group * 256 + lane;
              index < vocab;
              index += 32 * 256) {
-            ulong offset = ulong(row) * ulong(logits_strides[1])
-                + ulong(index) * ulong(logits_strides[2]);
-            darkbloom_qwen35_mtp_top2_insert(local, float(logits[offset]), index);
+            ulong offset = row_offset + ulong(index) * stride2;
+            float val = float(logits[offset]);
+            if (local.count == 2 && val <= local.second_value) {
+                continue;
+            }
+            darkbloom_qwen35_mtp_top2_insert(local, val, index);
         }
 
         const uint simd_lane = thread_index_in_simdgroup;
