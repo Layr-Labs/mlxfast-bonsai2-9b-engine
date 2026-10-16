@@ -20,6 +20,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -688,6 +689,116 @@ private final class DFlash2DecoderLayer: Module {
 
 // MARK: - The candidate selector
 
+// Exact top-16 for the inference selector. Metal ArgPartition currently
+// sorts the full vocabulary. Keep each tile's best 16, then repeat on those
+// survivors. Reverse the descending winners to preserve stable ascending order.
+enum DFlash2TopCandidates {
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_top16_stable",
+        inputNames: ["logits", "ids"], outputNames: ["selected"],
+        source: """
+        const uint row = threadgroup_position_in_grid.z;
+        const uint tile = threadgroup_position_in_grid.y;
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint N = logits_shape[1];
+        const uint M = Indirect ? ids_shape[1] : N;
+        const uint tiles = (M + 511) / 512;
+        uint keys[4];
+        uint tokens[4];
+        for (uint j = 0; j < 4; ++j) {
+            const uint p = tile * 512 + tid + j * 128;
+            uint id = 0xffffffffu;
+            if (p < M) {
+                id = Indirect ? ids[row * M + p] : p;
+            }
+            uint key = 0;
+            if (id < N) {
+                const float value = logits[row * N + id];
+                const uint bits = as_type<uint>(value);
+                key = isnan(value) ? 0xffffffffu :
+                    ((value == 0.0f) ? 0x80000000u :
+                        ((bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u)));
+            }
+            keys[j] = key;
+            tokens[j] = id;
+        }
+        threadgroup uint group_keys[4];
+        threadgroup uint group_ids[4];
+        for (uint rank = 0; rank < 16; ++rank) {
+            uint best_key = 0;
+            uint best_id = 0;
+            for (uint j = 0; j < 4; ++j) {
+                if (keys[j] > best_key ||
+                    (keys[j] == best_key && tokens[j] > best_id)) {
+                    best_key = keys[j];
+                    best_id = tokens[j];
+                }
+            }
+            const uint simd_key = simd_max(best_key);
+            const uint simd_id = simd_max(best_key == simd_key ? best_id : 0u);
+            if (lane == 0) {
+                group_keys[sg] = simd_key;
+                group_ids[sg] = simd_id;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                const uint key = lane < 4 ? group_keys[lane] : 0u;
+                const uint id = lane < 4 ? group_ids[lane] : 0u;
+                const uint win_key = simd_max(key);
+                const uint win_id = simd_max(key == win_key ? id : 0u);
+                if (lane == 0) {
+                    group_ids[0] = win_key == 0 ? 0xffffffffu : win_id;
+                    selected[(row * tiles + tile) * 16 + 15 - rank] = group_ids[0];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint winner = group_ids[0];
+            for (uint j = 0; j < 4; ++j) {
+                if (tokens[j] == winner) {
+                    keys[j] = 0;
+                    tokens[j] = 0;
+                }
+            }
+            // No next-iteration writer may overwrite the broadcast winner
+            // while another SIMD group is still consuming it.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """)
+
+    static func select(_ logits: MLXArray, topK: Int) -> MLXArray {
+        let vocabulary = logits.dim(-1)
+        guard (1...16).contains(topK), logits.ndim == 3,
+            logits.dtype == .float32, vocabulary >= topK,
+            logits.size > 0, logits.size < Int(UInt32.max),
+            logits.dim(0) * logits.dim(1) <= 65535,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else {
+            return argPartition(logits, kth: vocabulary - topK, axis: -1)[
+                0..., 0..., (vocabulary - topK)...]
+        }
+        let rows = logits.dim(0) * logits.dim(1)
+        let flat = logits.reshaped(rows, vocabulary)
+        var indices = MLXArray([UInt32(0)]).reshaped(1, 1)
+        var count = vocabulary
+        var indirect = false
+        repeat {
+            let tiles = (count + 511) / 512
+            indices = kernel(
+                [flat, indices], template: [("Indirect", indirect)],
+                grid: (128, tiles, rows), threadGroup: (128, 1, 1),
+                outputShapes: [[rows, tiles * 16]], outputDTypes: [.uint32])[0]
+            count = tiles * 16
+            indirect = true
+        } while count > 16
+        // Partial tiles put invalid padding before the real ascending winners.
+        // Thus the suffix also handles vocabularies and topK smaller than 16.
+        return indices.reshaped(logits.dim(0), logits.dim(1), 16)[
+            0..., 0..., (16 - topK)...]
+    }
+}
+
 /// The low-rank edge-scored greedy path over the per-position candidate lists.
 ///
 /// The track is greedy, so only the temperature-0 path of the reference
@@ -721,9 +832,7 @@ final class DFlash2CandidateSelector: Module {
     ///   - anchor: the token each path starts from, `[B]`.
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
-        let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates = DFlash2TopCandidates.select(logits, topK: topK)
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
