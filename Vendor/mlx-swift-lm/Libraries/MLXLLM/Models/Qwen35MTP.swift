@@ -1008,6 +1008,33 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return value
     }()
 
+    /// Screened draft argmax (`HadamardQuantizedLinear.screenedArgMax`):
+    /// the leading `width` rotated inputs of every draft-vocabulary row, then
+    /// the full width for the best row of each `chunk`-row block. Local
+    /// experiments override it with `QWEN35_DRAFT_SCREEN=<width>,<chunk>` or
+    /// `off`.
+    static let draftScreen: (Int, Int)? = {
+        guard let raw = ProcessInfo.processInfo.environment["QWEN35_DRAFT_SCREEN"] else {
+            return (1536, 32)
+        }
+        let parts = raw.split(separator: ",").compactMap { Int($0) }
+        return parts.count == 2 ? (parts[0], parts[1]) : nil
+    }()
+
+    /// Prompt-lookup drafting: the n-gram the engine matches against the
+    /// request's own prompt and committed tokens to propose a round's chain
+    /// without running this head. Default 6. Local experiments override it
+    /// with `QWEN35_PLD_NGRAM=<n>`; `0` or `off` disables it.
+    static let promptLookupNgram: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_NGRAM"] else {
+            return 6
+        }
+        guard let value = Int(raw), value > 0 else { return nil }
+        return value
+    }()
+
+    public var lookupDraftNgram: Int? { Self.promptLookupNgram }
+
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
@@ -1213,6 +1240,11 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
                 .asType(.int32)
         }
         if let draftVocabulary {
+            if let (width, chunk) = Self.draftScreen,
+                let local = draftVocabulary.head.screenedArgMax(hidden, width: width, chunk: chunk)
+            {
+                return draftVocabulary.ids[local]
+            }
             let local = argMax(draftVocabulary.head(hidden)[0..., -1, 0...], axis: -1)
             return draftVocabulary.ids[local]
         }
@@ -1293,6 +1325,42 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             state.backlogHidden.append(targetFinalNorm(committedTargetHidden))
         }
         state.clearRound()
+    }
+
+    public func commitLookupRound(
+        requestState: any CBv2MTPRequestState,
+        seedToken: MLXArray,
+        seedHidden: MLXArray,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP committed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP lookup round met a staged round")
+        precondition(
+            seedToken.ndim == 2 && seedHidden.ndim == 3
+                && seedToken.dim(0) == 1 && seedToken.dim(1) == 1
+                && seedHidden.dim(0) == 1 && seedHidden.dim(1) == 1
+                && committedDraftTokens.ndim == 2 && committedTargetHidden.ndim == 3
+                && committedDraftTokens.dim(0) == 1
+                && committedTargetHidden.dim(0) == 1
+                && committedDraftTokens.dim(1) == committedTargetHidden.dim(1),
+            "inline Qwen MTP lookup round rows mismatch")
+
+        // The history `beginRound` + `finalizeRound` would leave, minus the
+        // head forward: the carry transition completes the frontier (which
+        // therefore never enters history itself), then the accepted drafts
+        // with their target verify hiddens. Everything stays queued for the
+        // next drafted round's trusted flush, each row exactly once.
+        state.backlogHidden.append(targetFinalNorm(seedHidden))
+        state.backlogTokens.append(seedToken)
+        state.targetHiddenFrontier = nil
+        if committedDraftTokens.dim(1) > 0 {
+            state.backlogTokens.append(committedDraftTokens)
+            state.backlogHidden.append(targetFinalNorm(committedTargetHidden))
+        }
     }
 
     public func discardRound(requestState: any CBv2MTPRequestState) {

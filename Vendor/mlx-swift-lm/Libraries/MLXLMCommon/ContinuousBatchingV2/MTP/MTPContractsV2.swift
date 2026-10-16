@@ -399,6 +399,25 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     func discardRound(requestState: any CBv2MTPRequestState)
     /// Explicitly sever device-array ownership on finish/cancel/preemption.
     func releaseRequestState(_ requestState: any CBv2MTPRequestState)
+
+    /// Prompt-lookup drafting opt-in. Non-nil n lets the engine replace a
+    /// fixed-depth round's draft chain with the tokens that followed the most
+    /// recent earlier occurrence of the row's newest n committed tokens in
+    /// its own prompt and output. Such a round runs no `draftStep`; the engine
+    /// completes it with `commitLookupRound` instead of `finalizeRound`.
+    /// Default nil.
+    var lookupDraftNgram: Int? { get }
+    /// Complete a round whose drafts came from prompt lookup. Nothing was
+    /// staged, so queue the carry transition the round's first draft step
+    /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
+    /// `seedHidden` [1, 1, H] before it), then the accepted drafts and their
+    /// target hidden rows exactly as `finalizeRound` queues them.
+    func commitLookupRound(
+        requestState: any CBv2MTPRequestState,
+        seedToken: MLXArray,
+        seedHidden: MLXArray,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray)
 }
 
 extension CBv2MTPRequestStatefulDrafter {
@@ -406,6 +425,16 @@ extension CBv2MTPRequestStatefulDrafter {
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
     ) throws {}
+    public var lookupDraftNgram: Int? { nil }
+    public func commitLookupRound(
+        requestState: any CBv2MTPRequestState,
+        seedToken: MLXArray,
+        seedHidden: MLXArray,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray
+    ) {
+        preconditionFailure("CBv2 MTP: this drafter does not take prompt-lookup rounds")
+    }
 }
 
 // MARK: - Block drafter seam
@@ -653,6 +682,13 @@ public struct CBv2MTPMetrics: Sendable {
     public var acceptedTokens: Int = 0
     /// Total tokens emitted by MTP rounds (accepted + bonus/correction).
     public var emittedTokens: Int = 0
+    /// Rounds whose draft chain came from prompt lookup instead of the
+    /// drafter. Each is also counted in `rounds`, the totals above and
+    /// `roundAudits`, exactly like a drafted round.
+    public var lookupRounds: Int = 0
+    /// Draft tokens accepted in prompt-lookup rounds (included in
+    /// `acceptedTokens`).
+    public var lookupAcceptedTokens: Int = 0
     /// perPositionAccepted[i] = rounds in which draft position i (0-based)
     /// was accepted. Monotonically non-increasing over i within a run.
     public var perPositionAccepted: [Int] = []

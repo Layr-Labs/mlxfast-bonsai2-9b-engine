@@ -99,6 +99,10 @@ final class CBv2MTPRoundInFlight {
         /// driver for the duration of this in-flight round. This fences its
         /// release behind target/assistant evaluation on cancellation.
         let assistantState: (any CBv2MTPRequestState)?
+        /// Non-nil when this row's drafts came from prompt lookup: the
+        /// consumed carry. No draft step fed it to the assistant, so finalize
+        /// hands it over through `commitLookupRound`.
+        let lookupCarry: CBv2MTPCarry?
     }
 
     struct CommittedObservationRow {
@@ -257,6 +261,8 @@ final class CBv2MTPRoundDriver {
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
     let targetPrefixAcceptance: Bool
+    /// Prompt-lookup n-gram length, or nil when lookup drafting is off.
+    let lookupNgram: Int?
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -273,6 +279,9 @@ final class CBv2MTPRoundDriver {
     /// only within a compatible decode-row bucket.
     private var requestAcceptance: [CBv2RequestID: CBv2MTPRequestAcceptanceState] = [:]
     private var rawCostEstimators: [Int: CBv2MTPRawCostEstimator] = [:]
+    /// Host token history is append-only, so an index outlives carries and
+    /// preemption; it goes only with the request (ids are reusable).
+    private var lookupIndexes: [CBv2RequestID: CBv2MTPPromptLookupIndex] = [:]
 
     /// Plan-scoped: rows the planner offered a 1+k round this plan.
     private(set) var roundMarks: [CBv2RequestID: Int] = [:]
@@ -352,6 +361,13 @@ final class CBv2MTPRoundDriver {
                 config.maxSpeculativeBatch = 1
             }
         }
+        // Prompt lookup stands in for a CHAIN drafter at a fixed declared
+        // depth only. The adaptive controller and the marginal policy never
+        // run there, so lookup rounds cannot skew what they learn.
+        let lookupNgram =
+            (config.fixedDraftTokens ?? 0) > 0 && !(drafter is any CBv2MTPBlockDrafter)
+            ? (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupDraftNgram : nil
+        self.lookupNgram = lookupNgram.flatMap { $0 > 0 ? $0 : nil }
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
         self.config = config
         self.drafter = drafter
@@ -773,6 +789,31 @@ final class CBv2MTPRoundDriver {
         return context
     }
 
+    // MARK: Prompt lookup
+
+    /// The `depth` tokens that followed the most recent earlier occurrence of
+    /// the row's newest `lookupNgram` committed tokens, or nil. Only the
+    /// declared depth looks up; a clamped tail or budget round keeps the
+    /// drafter's chain.
+    func lookupDraft(for rec: CBv2ScheduledRequest, depth: Int) -> [Int]? {
+        guard depth > 0, depth == config.fixedDraftTokens else { return nil }
+        return lookupIndex(for: rec)?.draft(rec.tokens)
+    }
+
+    /// Index the row's committed history while a launched step runs, so the
+    /// next round's lookup hashes only the tokens that step commits.
+    func indexLookupHistory(for rec: CBv2ScheduledRequest) {
+        lookupIndex(for: rec)?.catchUp(rec.tokens)
+    }
+
+    private func lookupIndex(for rec: CBv2ScheduledRequest) -> CBv2MTPPromptLookupIndex? {
+        guard let ngram = lookupNgram, let depth = config.fixedDraftTokens else { return nil }
+        if let index = lookupIndexes[rec.id] { return index }
+        let index = CBv2MTPPromptLookupIndex(ngram: ngram, depth: depth)
+        lookupIndexes[rec.id] = index
+        return index
+    }
+
     private func releaseAssistantState(_ id: CBv2RequestID) {
         guard let state = assistantStates.removeValue(forKey: id),
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
@@ -800,6 +841,7 @@ final class CBv2MTPRoundDriver {
         seedMarks.remove(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
+        lookupIndexes.removeValue(forKey: id)
     }
 
     /// Invalidate only adaptive stateless learning. Other live rows retain
@@ -837,11 +879,13 @@ final class CBv2MTPRoundDriver {
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
+        lookupIndexes.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
         carries.count + assistantStates.count + requestAcceptance.count
             + roundMarks.count + seedMarks.count + pendingSeedCosts.count
+            + lookupIndexes.count
     }
 
     // MARK: Metrics (lock-protected; polled cross-thread)
@@ -873,7 +917,7 @@ final class CBv2MTPRoundDriver {
     }
 
     func recordRound(
-        drafted: Int, accepted: Int, emitted: Int,
+        drafted: Int, accepted: Int, emitted: Int, lookup: Bool = false,
         audit: CBv2MTPRoundAuditRecord? = nil
     ) {
         metricsLock.lock()
@@ -881,6 +925,10 @@ final class CBv2MTPRoundDriver {
         metrics.draftedTokens += drafted
         metrics.acceptedTokens += accepted
         metrics.emittedTokens += emitted
+        if lookup {
+            metrics.lookupRounds += 1
+            metrics.lookupAcceptedTokens += accepted
+        }
         if let audit {
             metrics.roundAudits.append(audit)
             if metrics.roundAudits.count > CBv2MTPRoundAuditRecord.retainedRecordCap {

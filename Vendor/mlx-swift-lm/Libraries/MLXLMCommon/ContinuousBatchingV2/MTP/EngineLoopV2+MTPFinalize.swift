@@ -264,13 +264,26 @@ extension EngineLoopV2 {
                         0 ..< committedDraftCount,
                         0...]
                 }
-                stateful.finalizeRound(
-                    requestState: state,
-                    confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
-                    committedTargetHidden: committedHidden)
+                let committedDraftTokens = verify.draftIDs[
+                    batchIndex ..< batchIndex + 1,
+                    0 ..< committedDraftCount]
+                if let carry = metadata.lookupCarry {
+                    // A lookup round staged nothing. The carry transition
+                    // its skipped first draft step would have consumed joins
+                    // trusted history ahead of the same accepted rows.
+                    stateful.commitLookupRound(
+                        requestState: state,
+                        seedToken: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
+                        seedHidden: carry.hidden,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                } else {
+                    stateful.finalizeRound(
+                        requestState: state,
+                        confirmedInputTokens: 1 + committedDraftCount,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                }
             }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
@@ -318,6 +331,7 @@ extension EngineLoopV2 {
             // `numComputedAfter == tokensCountAfter - 1`.
             mtp.recordRound(
                 drafted: k, accepted: observedAccepted, emitted: confirmed,
+                lookup: metadata.lookupCarry != nil,
                 audit: CBv2MTPRoundAuditRecord(
                     requestID: id.raw,
                     k: k,

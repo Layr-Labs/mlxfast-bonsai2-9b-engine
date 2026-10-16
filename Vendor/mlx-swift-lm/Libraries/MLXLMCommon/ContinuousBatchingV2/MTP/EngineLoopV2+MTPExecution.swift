@@ -473,6 +473,14 @@ extension EngineLoopV2 {
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
+        // Prompt lookup: when every row's newest committed n-gram recurs in
+        // its own history, the k tokens that followed it are the chain and
+        // the drafter does not run. One draft source per verify batch.
+        var lookupDrafts: [[Int]]?
+        if mtp.lookupNgram != nil {
+            let drafts = verifyRows.compactMap { mtp.lookupDraft(for: $0.rec, depth: k) }
+            if drafts.count == batch { lookupDrafts = drafts }
+        }
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
         var assistantOwnersTransferred = false
@@ -530,7 +538,8 @@ extension EngineLoopV2 {
                     id: row.rec.id, storageRows: state.compactMap { $0 },
                     assistantState:
                         mtp.usesRequestStatefulDrafter
-                        ? mtp.takeAssistantState(for: row.rec.id) : nil))
+                        ? mtp.takeAssistantState(for: row.rec.id) : nil,
+                    lookupCarry: lookupDrafts == nil ? nil : carry))
             if let assistantState = rowMetadata.last?.assistantState,
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
@@ -551,7 +560,22 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        if let block = mtp.blockDrafter {
+        if let lookupDrafts {
+            // Host ids in the drafted chain's [B] int32 per-position shape.
+            // The assistant stages nothing. Its queued trusted history (lazy
+            // final-norm rows over earlier verify hiddens) still rides this
+            // round's fence, so a lookup streak retains no verify outputs.
+            for position in 0 ..< k {
+                draftSteps.append(MLXArray(lookupDrafts.map { Int32($0[position]) }))
+            }
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+                for metadata in rowMetadata {
+                    guard let state = metadata.assistantState else { continue }
+                    assistantEvalTargets.append(
+                        contentsOf: stateful.evaluationTargets(for: state))
+                }
+            }
+        } else if let block = mtp.blockDrafter {
             // ONE propose per round. The block is the row's last committed
             // token followed by k mask tokens, and the drafter's single
             // forward reads the mask positions; there is no chain to step, so

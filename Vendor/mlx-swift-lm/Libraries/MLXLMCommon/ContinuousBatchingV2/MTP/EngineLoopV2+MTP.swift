@@ -66,6 +66,14 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
         }
+        // Prompt lookup hashes confirmed history while this step runs (the
+        // whole prompt on the first prefill step), leaving a round's own
+        // lookup only the tokens its predecessor committed.
+        if mtp.lookupNgram != nil {
+            for row in work where mtpBasicEligible(row.rec) {
+                mtp.indexLookupHistory(for: row.rec)
+            }
+        }
 
         let step = CBv2InFlightStep(
             assignments: work.map { (id: $0.rec.id, numTokens: $0.count) },
