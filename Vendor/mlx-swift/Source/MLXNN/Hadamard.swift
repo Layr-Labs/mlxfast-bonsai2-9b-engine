@@ -340,12 +340,18 @@ private enum Float16ConstantQMV {
             }
             """)
 
-    /// `rows` activation rows against `outputs` output rows per simdgroup, 2
-    /// simdgroups per threadgroup. Each lane dequantizes its 16 values of a
-    /// 512-wide step for every output row once, then accumulates them into
-    /// all `rows` results.
+    /// `rows` activation rows against `outputs` output rows per simdgroup,
+    /// `sgs` simdgroups per threadgroup. Each lane dequantizes its 16 values
+    /// of a 512-wide step for every output row once, then accumulates them
+    /// into all `rows` results. The threadgroup stages each `chunk`-wide
+    /// slice of the activations in threadgroup memory once: read from device
+    /// memory by every simdgroup, the activations cost 16 x rows / outputs
+    /// times the weight bytes and made four rows ~10x one row on an M2. The
+    /// staged layout puts lane l's float4 i of a 512-wide step at i * 32 + l,
+    /// so a simdgroup's reads are contiguous. Each output's arithmetic and
+    /// order are unchanged, so results do not depend on `sgs` or `chunk`.
     static let rows = MLXFast.metalKernel(
-        name: "hadamard_qmv_rows_f16_constants",
+        name: "hadamard_qmv_rows_staged_f16_constants",
         inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
@@ -355,48 +361,58 @@ private enum Float16ConstantQMV {
             const int N = w_shape[0];
             const int in_w = K / 4;
             const int in_g = K / 128;
-            const int out_row = tid.y * (2 * outputs) + simd_gid * outputs;
+            const int out_row = tid.y * (sgs * outputs) + simd_gid * outputs;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
             const device half* bi = biases + out_row * in_g + simd_lid / 8;
-            const device float4* xp = (const device float4*)(x + simd_lid * 16);
+            threadgroup float4 xs[rows * chunk / 4];
             float result[rows][outputs];
             for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
-            for (int k = 0; k < K; k += 512) {
-              float s4[outputs][4], b[outputs];
-              uint packed[outputs];
-              for (int r = 0; r < outputs; r++) {
-                const float s = float(sc[r * in_g]);
-                s4[r][0] = s;
-                s4[r][1] = s / 4.0f;
-                s4[r][2] = s / 16.0f;
-                s4[r][3] = s / 64.0f;
-                b[r] = float(bi[r * in_g]);
-                packed[r] = *(const device uint*)(ws + r * in_w);
+            const int t = simd_gid * 32 + simd_lid;
+            for (int k0 = 0; k0 < K; k0 += chunk) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int e = t; e < rows * chunk / 4; e += sgs * 32) {
+                const int v = e / (chunk / 4);
+                const int g = e % (chunk / 4);
+                xs[v * (chunk / 4) + (g & ~127) + (g & 3) * 32 + ((g >> 2) & 31)] =
+                    ((const device float4*)(x + v * K + k0))[g];
               }
-              for (int i = 0; i < 4; i++) {
-                float wd[outputs][4];
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int blk = 0; blk < chunk / 512; blk++) {
+                float s4[outputs][4], b[outputs];
+                uint packed[outputs];
                 for (int r = 0; r < outputs; r++) {
-                  const uint q = packed[r] >> (8 * i);
-                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
-                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
-                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
-                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  const float s = float(sc[r * in_g]);
+                  s4[r][0] = s;
+                  s4[r][1] = s / 4.0f;
+                  s4[r][2] = s / 16.0f;
+                  s4[r][3] = s / 64.0f;
+                  b[r] = float(bi[r * in_g]);
+                  packed[r] = *(const device uint*)(ws + r * in_w);
                 }
-                for (int v = 0; v < rows; v++) {
-                  const float4 xv = xp[v * (K / 4) + i];
+                for (int i = 0; i < 4; i++) {
+                  float wd[outputs][4];
                   for (int r = 0; r < outputs; r++) {
-                    result[v][r] = fma(xv.x, wd[r][0], result[v][r]);
-                    result[v][r] = fma(xv.y, wd[r][1], result[v][r]);
-                    result[v][r] = fma(xv.z, wd[r][2], result[v][r]);
-                    result[v][r] = fma(xv.w, wd[r][3], result[v][r]);
+                    const uint q = packed[r] >> (8 * i);
+                    wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
+                    wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
+                    wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
+                    wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  }
+                  for (int v = 0; v < rows; v++) {
+                    const float4 xv = xs[v * (chunk / 4) + blk * 128 + i * 32 + simd_lid];
+                    for (int r = 0; r < outputs; r++) {
+                      result[v][r] = fma(xv.x, wd[r][0], result[v][r]);
+                      result[v][r] = fma(xv.y, wd[r][1], result[v][r]);
+                      result[v][r] = fma(xv.z, wd[r][2], result[v][r]);
+                      result[v][r] = fma(xv.w, wd[r][3], result[v][r]);
+                    }
                   }
                 }
+                ws += 128;
+                sc += 4;
+                bi += 4;
               }
-              ws += 128;
-              sc += 4;
-              bi += 4;
-              xp += 128;
             }
             for (int v = 0; v < rows; v++) {
               for (int r = 0; r < outputs; r++) {
@@ -418,6 +434,18 @@ private enum Float16ConstantQMV {
     /// two, and two beats `quantizedMM` by 20 % per verify.
     static func outputsPerSimdgroup(rows: Int) -> Int { rows <= 4 ? 4 : 2 }
 
+    /// Simdgroups per threadgroup sharing one staged activation slice: eight
+    /// when the output rows divide evenly, else fewer.
+    static func simdgroupsPerThreadgroup(outputRows: Int, outputs: Int) -> Int {
+        [8, 4, 2].first { outputRows % ($0 * outputs) == 0 } ?? 1
+    }
+
+    /// The widest staged slice that divides `K` and keeps `rows` of it within
+    /// 16 KB of threadgroup memory.
+    static func stagedChunk(rows: Int, K: Int) -> Int {
+        [2048, 1024].first { K % $0 == 0 && rows * $0 <= 4096 } ?? 512
+    }
+
     static func matmul(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
     ) -> MLXArray {
@@ -426,11 +454,23 @@ private enum Float16ConstantQMV {
         let N = weight.dim(0)
         // Shape metadata supplies K and N without allocating scalar tensor inputs.
         let inputs = [x.reshaped([rows, K]), weight, scales, biases]
-        let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
-        let output = (rows == 1 ? fast : Self.rows)(
-            inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
-            grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        let output: MLXArray
+        if rows == 1 {
+            output = fast(
+                inputs, template: [], grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        } else {
+            let outputs = outputsPerSimdgroup(rows: rows)
+            let sgs = simdgroupsPerThreadgroup(outputRows: N, outputs: outputs)
+            output = Self.rows(
+                inputs,
+                template: [
+                    ("rows", rows), ("outputs", outputs), ("sgs", sgs),
+                    ("chunk", stagedChunk(rows: rows, K: K)),
+                ],
+                grid: (32, N / outputs, 1), threadGroup: (32, sgs, 1),
+                outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        }
         return output.reshaped(Array(x.shape.dropLast()) + [N])
     }
 }
