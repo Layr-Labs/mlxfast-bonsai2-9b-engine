@@ -428,9 +428,22 @@ enum CBv2AttentionV1 {
                 kind: kind, queries: queries, keys: cachedKeys, values: cachedValues,
                 sinks: sinks, softcap: softcap, keepMask: keepMask)
         {
-            return attend(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: nil, sinks: nil, softcap: nil)
+            if L <= 8 {
+                return attend(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    L: L, kL: cachedKeys.dim(2), window: nil, sinks: nil, softcap: nil)
+            }
+            var outputs: [MLXArray] = []
+            for offset in stride(from: 0, to: L, by: 8) {
+                let count = min(8, L - offset)
+                let visibleEnd = cachedKeys.dim(2) - L + offset + count
+                outputs.append(attend(
+                    queries: queries[0..., 0..., offset ..< (offset + count), 0...],
+                    keys: cachedKeys[0..., 0..., 0 ..< visibleEnd, 0...],
+                    values: cachedValues[0..., 0..., 0 ..< visibleEnd, 0...], scale: scale,
+                    L: count, kL: visibleEnd, window: nil, sinks: nil, softcap: nil))
+            }
+            return concatenated(outputs, axis: 2)
         }
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
@@ -438,8 +451,9 @@ enum CBv2AttentionV1 {
             sinks: sinks, softcap: softcap, keepMask: keepMask)
     }
 
-    /// The one-pass vector kernel visits each query's visible keys in the
-    /// same SIMD-lane order as the serial prefix calls. Keep the total cached
+    /// Blocks of up to eight queries use the same one-pass vector reduction
+    /// as serial prefix calls. Each block sees only its visible KV prefix.
+    /// Keep the total cached
     /// length below every Metal architecture's two-pass selection threshold.
     private static func canBatchSerialQueriesWithNativeVector(
         kind: CBv2LayerKind, queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -450,7 +464,7 @@ enum CBv2AttentionV1 {
             queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
             queries.dim(0) == 1, queries.dim(1) == 16, queries.dim(3) == 256,
-            (2...7).contains(queries.dim(2)),
+            (2...16).contains(queries.dim(2)),
             keys.dim(0) == 1, keys.dim(1) == 4, keys.dim(3) == 256,
             values.shape == keys.shape,
             keys.dim(2) >= queries.dim(2), keys.dim(2) < 1024,
