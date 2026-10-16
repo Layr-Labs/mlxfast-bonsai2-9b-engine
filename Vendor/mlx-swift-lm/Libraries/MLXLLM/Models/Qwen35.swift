@@ -224,6 +224,132 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+// Register layout from the accepted 27B engine PR #649 (MIT lineage).
+private enum Qwen35RegisterGDN {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_v3",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: """
+        const uint T = q_shape[1];
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        auto g_ = g + b_idx * T * Hv + hv_idx;
+        auto beta_ = beta + b_idx * T * Hv + hv_idx;
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state[d][i] = state_in[(n * Dv + dvbase + d) * Dk + dk0 + i];
+          }
+        }
+        float kr[R];
+        float qr[R];
+        for (int t = 0; t < T; ++t) {
+          const float gt = g_[0];
+          const float bt = beta_[0];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((const device float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            vt[d] = v_[d];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              kv[d] += simd_shuffle_xor(kv[d], o);
+            }
+          }
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              out[d] += simd_shuffle_xor(out[d], o);
+            }
+          }
+          if (lane % LPD == 0) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              y_[d] = out[d];
+            }
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < R; ++i) {
+            state_out[(n * Dv + dvbase + d) * Dk + dk0 + i] = state[d][i];
+          }
+        }
+        """)
+
+    static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
+                    beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
+        let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let result = kernel(
+            [q, k, v, g, beta, state],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -530,6 +656,26 @@ final class Qwen35GatedDeltaNet: Module {
         return contiguous(tail)
     }
 
+    private func updateRecurrence(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        guard mask == nil, headKDim == 128, headVDim == 128, q.dim(1) >= 4,
+            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32
+        else {
+            return gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: state, mask: mask)
+        }
+        let beta = sigmoid(b).asType(.float32)
+        let g = computeGatedDeltaG(aLog, a, dtBias)
+        let initial = state ?? MLXArray.zeros(
+            [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
+        let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+        return Qwen35RegisterGDN.run(
+            q: q, k: k, v: v, g: g, beta: beta, state: floatState)
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -578,7 +724,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = updateRecurrence(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -627,7 +773,7 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let recurrence = gatedDeltaUpdate(
+        let recurrence = updateRecurrence(
             q: qNormed,
             k: kNormed,
             v: v,
@@ -704,7 +850,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = gatedDeltaUpdate(
+        let boundarySsm = updateRecurrence(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -973,7 +1119,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = gatedDeltaUpdate(
+            let recurrence = updateRecurrence(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1074,7 +1220,7 @@ final class Qwen35GatedDeltaNet: Module {
             ssmStates.reserveCapacity(S)
             var state = ssmState
             for s in 0 ..< S {
-                let (stepOut, next) = gatedDeltaUpdate(
+                let (stepOut, next) = updateRecurrence(
                     q: qNormed[0..., s ..< (s + 1)],
                     k: kNormed[0..., s ..< (s + 1)],
                     v: v[0..., s ..< (s + 1)],
