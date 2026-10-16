@@ -435,6 +435,108 @@ private enum Float16ConstantQMV {
     }
 }
 
+/// Eight to twelve activation rows (a DFlash verify at draft depth 7 to 11)
+/// fall between the tuned per-row kernel above (at most 7 rows) and MLX's
+/// quantized matrix path, which `get_qmv_batch_limit` only engages at 13 rows
+/// for these shapes; in between, `quantizedMM` runs the per-row matvec. This
+/// kernel covers that band with simdgroup matrices: per 32-wide K chunk, the
+/// threadgroup stages the activations once, each simdgroup dequantizes its 8
+/// output rows (`fma(s, q, b)`, the same arithmetic as the kernels above)
+/// into a threadgroup tile, and four 8x8 multiply-accumulates consume them —
+/// one dequantization per weight instead of one FMA per weight per row.
+/// Accumulation is FP32 throughout; the reduction order differs from
+/// `quantizedMM` the way `rows` above already differs from `qmv_fast`.
+private enum Float16ConstantWideQMM {
+    /// Verify widths this kernel serves: above the tuned kernel's 7, below
+    /// MLX's matrix-path threshold of 13.
+    static let rowRange = 8 ... 12
+    /// Simdgroups per threadgroup; each owns 8 output rows, so N % 32 == 0.
+    static let simdgroups = 4
+
+    static let wide = MLXFast.metalKernel(
+        name: "hadamard_qmm_wide_f16_constants",
+        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: """
+            const uint sgid = simdgroup_index_in_threadgroup;
+            const uint lid = thread_index_in_simdgroup;
+            const uint3 tgid = threadgroup_position_in_grid;
+            const int K = x_shape[1];
+            const int N = w_shape[0];
+            const int in_b = K / 4;
+            const int in_g = K / 128;
+            constexpr int ROWT = ((ROWS + 7) / 8) * 8;
+            constexpr int RT = ROWT / 8;
+            const int out0 = int(tgid.y) * (8 * NSG) + int(sgid) * 8;
+            threadgroup float Atg[ROWT * 32];
+            threadgroup float Btg[NSG * 256];
+            threadgroup float* Bmine = Btg + sgid * 256;
+            simdgroup_float8x8 C[RT];
+            for (int t = 0; t < RT; t++) C[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            const uint tl = sgid * 32 + lid;
+            const int nthreads = NSG * 32;
+            for (int kc = 0; kc < K; kc += 32) {
+              for (int e = int(tl); e < ROWT * 32; e += nthreads) {
+                const int v = e / 32, k = e & 31;
+                Atg[(k / 8) * (ROWT * 8) + v * 8 + (k & 7)] =
+                    (v < ROWS) ? x[v * K + kc + k] : 0.0f;
+              }
+              const int g = kc / 128;
+              {
+                const int nl = int(lid) / 4;
+                const int kq = (int(lid) & 3) * 8;
+                const int n = out0 + nl;
+                const float s = float(scales[n * in_g + g]);
+                const float b = float(biases[n * in_g + g]);
+                const uint16_t two = ((const device uint16_t*)w)[n * (in_b / 2) + (kc + kq) / 8];
+                #pragma clang loop unroll(full)
+                for (int t = 0; t < 8; t++) {
+                  const uint q = (two >> (2 * t)) & 0x3u;
+                  const int k = kq + t;
+                  Bmine[(k / 8) * 64 + (k & 7) * 8 + nl] = fma(s, float(q), b);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              #pragma clang loop unroll(full)
+              for (int kk = 0; kk < 4; kk++) {
+                simdgroup_float8x8 B;
+                simdgroup_load(B, Bmine + kk * 64, 8);
+                for (int t = 0; t < RT; t++) {
+                  simdgroup_float8x8 A;
+                  simdgroup_load(A, Atg + kk * (ROWT * 8) + t * 64, 8);
+                  simdgroup_multiply_accumulate(C[t], A, B, C[t]);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup float Ctg[NSG * 64];
+            threadgroup float* Cmine = Ctg + sgid * 64;
+            for (int t = 0; t < RT; t++) {
+              simdgroup_store(C[t], Cmine, 8);
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              for (int c = int(lid); c < 64; c += 32) {
+                const int v = t * 8 + c / 8, nl = c & 7;
+                if (v < ROWS) y[v * N + out0 + nl] = Cmine[c];
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """,
+        header: "#include <metal_simdgroup_matrix>\nusing namespace metal;\n")
+
+    static func matmul(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+    ) -> MLXArray {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        let N = weight.dim(0)
+        let inputs = [x.reshaped([rows, K]), weight, scales, biases]
+        let output = wide(
+            inputs, template: [("ROWS", rows), ("NSG", simdgroups)],
+            grid: (32, N / 8, 1), threadGroup: (32, simdgroups, 1),
+            outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        return output.reshaped(Array(x.shape.dropLast()) + [N])
+    }
+}
+
 /// Affine packed linear weights with a signed Hadamard input transform.
 ///
 /// Pass weights already folded and packed in MLX format. The initializer does
@@ -493,6 +595,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
             let output = Float16ConstantQMV.matmul(
+                rotated, weight: weight, scales: scales, biases: biases!)
+            return bias.map { output + $0 } ?? output
+        }
+        if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
+            Float16ConstantWideQMM.rowRange.contains(rotated.size / rotated.dim(-1)),
+            weight.dim(0) % (8 * Float16ConstantWideQMM.simdgroups) == 0,
+            rotated.dim(-1) % 32 == 0
+        {
+            let output = Float16ConstantWideQMM.matmul(
                 rotated, weight: weight, scales: scales, biases: biases!)
             return bias.map { output + $0 } ?? output
         }
