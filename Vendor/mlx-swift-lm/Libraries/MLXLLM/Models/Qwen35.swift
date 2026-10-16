@@ -495,6 +495,16 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            if let shared = qwen35SharedRotationProjections(
+                inputs, [inProjQKV, inProjZ, inProjB, inProjA])
+            {
+                return (
+                    shared[0],
+                    shared[1].reshaped(B, S, numVHeads, headVDim),
+                    shared[2],
+                    shared[3]
+                )
+            }
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
@@ -1212,17 +1222,19 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
+        let shared = exactTargetVerify
+            ? nil : qwen35SharedRotationProjections(x, [qProj, kProj, vProj])
         let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[1] ?? kProj(x))
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[2] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1461,9 +1473,35 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+/// Packed Hadamard projections that read the same input and share one
+/// rotation (no GDN layout, same block size and sign tensor) rotate it once:
+/// each module would otherwise run the identical sign multiply and block
+/// Walsh-Hadamard transform on that input. Returns nil, so the caller takes
+/// its ordinary per-module path, for any other module mix.
+func qwen35SharedRotationProjections(_ x: MLXArray, _ linears: [Linear]) -> [MLXArray]? {
+    guard linears.count > 1, let first = linears[0] as? HadamardQuantizedLinear,
+        first.gdnLayout == nil
+    else { return nil }
+    var packed = [HadamardQuantizedLinear]()
+    packed.reserveCapacity(linears.count)
+    for linear in linears {
+        guard let module = linear as? HadamardQuantizedLinear, module.gdnLayout == nil,
+            module.transform.sharesRotation(with: first.transform)
+        else { return nil }
+        packed.append(module)
+    }
+    let rotated = first.transform(x)
+    return packed.map { $0(rotated: rotated) }
+}
+
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
-        guard exact else { return self(x) }
+        guard exact else {
+            if let shared = qwen35SharedRotationProjections(x, [gateProj, upProj]) {
+                return downProj(silu(shared[0]) * shared[1])
+            }
+            return self(x)
+        }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
