@@ -563,6 +563,10 @@ extension EngineLoopV2 {
                     preconditionFailure(
                         "CBv2 block MTP assistant state missing for \(row.rec.id)")
                 }
+                block.prepareDraft(
+                    history: row.rec.tokens,
+                    promptLength: row.rec.request.promptTokens.count,
+                    depth: k, requestState: requestState)
                 let proposal = try block.proposeBlock(
                     anchor: row.carry!.token, depth: k, requestState: requestState)
                 proposals.append(proposal)
@@ -602,6 +606,12 @@ extension EngineLoopV2 {
                     guard let requestState = rowMetadata[index].assistantState else {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
+                    }
+                    if draftIndex == 0 {
+                        stateful.prepareDraft(
+                            history: row.rec.tokens,
+                            promptLength: row.rec.request.promptTokens.count,
+                            depth: k, requestState: requestState)
                     }
                     let result = stateful.draftStep(
                         tokens: currentTokens[index],

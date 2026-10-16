@@ -143,6 +143,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// absorbed yet.
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
+        var promptDraft: [Int32]?
         /// Committed context rows the next block will consume, oldest first.
         var pending: [MLXArray] = []
         var pendingRows = 0
@@ -201,6 +202,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
 
         func clearAll() {
+            promptDraft = nil
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
@@ -252,11 +254,31 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     // MARK: - Proposing
 
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {
+        let state = self.state(requestState)
+        precondition(!state.isReleased)
+        if let limit = contextRowLimit, state.pendingRows > limit - (depth + 1) {
+            state.promptDraft = nil
+        } else {
+            state.promptDraft = CBv2PromptLookupDraft.continuation(
+                history: history, promptLength: promptLength, depth: depth)
+        }
+    }
+
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
         guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
+        if let ids = state.promptDraft {
+            precondition(ids.count == depth)
+            let tokens = MLXArray(ids).reshaped([1, depth])
+            state.roots.append(tokens)
+            return tokens
+        }
         let context =
             state.pending.count == 1
             ? state.pending[0] : concatenated(state.pending, axis: 1)
@@ -290,6 +312,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
         return state.caches.flatMap { $0.innerState() } + state.roots
+            + (state.promptDraft == nil ? [] : state.pending)
     }
 
     /// A round's confirmed columns become the next block's context.
@@ -306,6 +329,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         committedTargetHidden: MLXArray
     ) {
         let state = self.state(requestState)
+        state.promptDraft = nil
         state.roots.removeAll(keepingCapacity: true)
         append(committedTargetHidden, to: requestState)
     }
@@ -314,6 +338,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// the proposal absorbed were committed before it ran, and the proposal
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        state(requestState).roots.removeAll(keepingCapacity: true)
+        let state = self.state(requestState)
+        state.promptDraft = nil
+        state.roots.removeAll(keepingCapacity: true)
     }
 }

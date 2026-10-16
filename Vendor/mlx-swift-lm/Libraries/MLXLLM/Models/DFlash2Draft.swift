@@ -499,11 +499,11 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        var queries = dflash2Linear(qProj, x)
+        var contextKeys = dflash2Linear(kProj, context)
+        var contextValues = dflash2Linear(vProj, context)
+        var blockKeys = dflash2Linear(kProj, x)
+        var blockValues = dflash2Linear(vProj, x)
 
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
@@ -540,8 +540,28 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return dflash2Linear(oProj, output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
+}
+
+private let dflash2GroupedProjectionAnnouncement: Void = {
+    FileHandle.standardError.write(Data("DFlash2: sorted 16-row grouped projection selected\n".utf8))
+}()
+
+private func dflash2Linear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    guard let packed = layer as? QuantizedLinear,
+        packed.bits == 8, packed.groupSize == 32, packed.scales.dtype == .float32,
+        packed.biases?.dtype == .float32, packed.weight.dim(0) <= 8192,
+        x.size / x.dim(-1) == 16, StreamOrDevice.default == StreamOrDevice.gpu
+    else { return layer(x) }
+    _ = dflash2GroupedProjectionAnnouncement
+    let output = gatherQuantizedMM(
+        x.reshaped([16, 1, x.dim(-1)]), packed.weight,
+        scales: packed.scales, biases: packed.biases,
+        rhsIndices: MLXArray(Array(repeating: UInt32(0), count: 16)),
+        transpose: true, groupSize: packed.groupSize, bits: packed.bits, sortedIndices: true)
+        .reshaped(Array(x.shape.dropLast()) + [packed.weight.dim(0)])
+    return packed.bias.map { output + $0 } ?? output
 }
 
 // MARK: - The grouped dynamic causal convolution
@@ -608,7 +628,7 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic taps the
     /// matching ``finish(_:dynamic:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let dynamic = kernelProjection(hidden)
+        let dynamic = dflash2Linear(kernelProjection, hidden)
             .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
         return (
             Self.convolve(
@@ -642,7 +662,7 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        dflash2Linear(down, silu(gate(x)) * up(x))
     }
 }
 
@@ -722,8 +742,24 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates: MLXArray
+        if topK == 16 && vocabularySize % 512 == 0 {
+            let blocks = vocabularySize / 512
+            let tiled = logits.reshaped([-1, blocks, 512])
+            let local = argPartition(tiled, kth: 512 - topK, axis: -1)[
+                0..., 0..., (512 - topK)...]
+            let offsets = MLXArray((0 ..< blocks).map { UInt32($0 * 512) })
+                .reshaped([1, blocks, 1])
+            let ids = (local + offsets).reshaped([-1, blocks * topK])
+            let values = takeAlong(tiled, local, axis: -1).reshaped([-1, blocks * topK])
+            let selected = argPartition(values, kth: blocks * topK - topK, axis: -1)[
+                0..., (blocks * topK - topK)...]
+            candidates = takeAlong(ids, selected, axis: -1)
+                .reshaped(Array(logits.shape.dropLast()) + [topK])
+        } else {
+            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
 
@@ -876,7 +912,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = hiddenNorm(dflash2Linear(fc, targetHidden.asType(dtype)))
 
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index])
