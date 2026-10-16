@@ -340,10 +340,10 @@ private enum Float16ConstantQMV {
             }
             """)
 
-    /// `rows` activation rows against `outputs` output rows per simdgroup, 2
-    /// simdgroups per threadgroup. Each lane dequantizes its 16 values of a
-    /// 512-wide step for every output row once, then accumulates them into
-    /// all `rows` results.
+    /// `rows` activation rows against `outputs` output rows per simdgroup,
+    /// `SG` simdgroups per threadgroup. Each lane dequantizes its 16 values
+    /// of a 512-wide step for every output row once, then accumulates them
+    /// into all `rows` results.
     static let rows = MLXFast.metalKernel(
         name: "hadamard_qmv_rows_f16_constants",
         inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
@@ -355,7 +355,7 @@ private enum Float16ConstantQMV {
             const int N = w_shape[0];
             const int in_w = K / 4;
             const int in_g = K / 128;
-            const int out_row = tid.y * (2 * outputs) + simd_gid * outputs;
+            const int out_row = tid.y * (SG * outputs) + simd_gid * outputs;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
             const device half* bi = biases + out_row * in_g + simd_lid / 8;
@@ -418,6 +418,31 @@ private enum Float16ConstantQMV {
     /// two, and two beats `quantizedMM` by 20 % per verify.
     static func outputsPerSimdgroup(rows: Int) -> Int { rows <= 4 ? 4 : 2 }
 
+    /// Geometry for the `rows` kernel: outputs per simdgroup and simdgroups
+    /// per threadgroup. `outputs` and the simdgroup count only regroup which
+    /// simdgroup computes which output row; each row's lane-local K order and
+    /// final `simd_sum` are unchanged, so every geometry is bit-identical.
+    /// At four rows (the declared depth-3 verify), interleaved A/B on an M4
+    /// measured ~30 % lower execution time with 2 outputs at K >= 8192 (the
+    /// down projection) and ~32 % lower with 2 outputs across 4 simdgroups at
+    /// N >= 65536 (the output head), bit-identical outputs. Other row counts
+    /// keep the stock choice. Any geometry that does not divide N falls back
+    /// to stock, which always divides (N % 8 == 0).
+    static func geometry(rows: Int, K: Int, N: Int) -> (outputs: Int, simdgroups: Int) {
+        var outputs = outputsPerSimdgroup(rows: rows)
+        var simdgroups = 2
+        if rows == 4 {
+            if N >= 65536 {
+                outputs = 2
+                simdgroups = 4
+            } else if K >= 8192 {
+                outputs = 2
+            }
+        }
+        if N % (simdgroups * outputs) != 0 { return (outputsPerSimdgroup(rows: rows), 2) }
+        return (outputs, simdgroups)
+    }
+
     static func matmul(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
     ) -> MLXArray {
@@ -426,10 +451,13 @@ private enum Float16ConstantQMV {
         let N = weight.dim(0)
         // Shape metadata supplies K and N without allocating scalar tensor inputs.
         let inputs = [x.reshaped([rows, K]), weight, scales, biases]
-        let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
+        let (outputs, simdgroups) = rows == 1 ? (4, 2) : geometry(rows: rows, K: K, N: N)
         let output = (rows == 1 ? fast : Self.rows)(
-            inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
-            grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
+            inputs,
+            template: rows == 1
+                ? [] : [("rows", rows), ("outputs", outputs), ("SG", simdgroups)],
+            grid: (32, N / (simdgroups * outputs) * simdgroups, 1),
+            threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
         return output.reshaped(Array(x.shape.dropLast()) + [N])
     }
