@@ -1083,20 +1083,20 @@ private enum Float16ConstantQMV {
     /// Output spans of `2 * outputs` rows per top-2 threadgroup.
     static let topTwoBlocks = 8
 
-    /// Exact top-2 of `x @ dequantized(w).T` for 2 to 4 activation rows,
-    /// equal in ids and values to running `rows` and reducing its output; nil
-    /// when the shape has no fused path.
+    /// Exact top-2 of `x @ dequantized(w).T` for 2 to `maximumRows`
+    /// activation rows, equal in ids and values to running `rows` and reducing
+    /// its output; nil when the shape has no fused path. Each row's
+    /// accumulation order is the same at every row count and output width, so
+    /// a row's values do not depend on how many rows share the call.
     static func topTwo(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
     ) -> (ids: MLXArray, values: MLXArray)? {
         let K = x.dim(-1)
         let rows = x.size / K
         let N = weight.dim(0)
-        let outputs = 4
+        let outputs = outputsPerSimdgroup(rows: rows)
         let span = 2 * outputs * topTwoBlocks
-        guard (2 ... 4).contains(rows), outputsPerSimdgroup(rows: rows) == outputs,
-            N % span == 0
-        else { return nil }
+        guard (2 ... maximumRows).contains(rows), N % span == 0 else { return nil }
         let groups = N / span
         let partials = topTwoPartial(
             [x.reshaped([rows, K]), weight, scales, biases],
@@ -2251,7 +2251,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 extension HadamardQuantizedLinear {
     /// Exact top-2 output ids and values per activation row, ordered by value
     /// descending and id ascending on ties, without writing the `rows x N`
-    /// outputs: the same values `callAsFunction` returns for 2 to 4 FP32 rows.
+    /// outputs: the values `Float16ConstantQMV.rows` gives for 2 to 7 FP32 rows.
     /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
     /// module or shape has no fused path.
     public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
