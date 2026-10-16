@@ -1091,6 +1091,252 @@ enum PromptInt8Matmul {
     }
 }
 
+
+private struct VerifyInt16Activation {
+    let high: MLXArray
+    let low: MLXArray
+    let scale: MLXArray
+    let sums: MLXArray
+    let rows: Int
+    let k: Int
+}
+
+/// Two signed int8 products retain sixteen activation bits per 128-group.
+private enum VerifyInt16Matmul {
+    private static let quantizeKernel = MLXFast.metalKernel(
+        name: "bonsai_verify_q16_codes", inputNames: ["x", "ksz"],
+        outputNames: ["high", "low", "ascale", "rsb"], source: """
+            const uint rows=uint(ksz[0]),K=uint(ksz[1]),Kg=K/128u;
+            const uint row=threadgroup_position_in_grid.y,lane=thread_index_in_simdgroup;
+            const uint g=threadgroup_position_in_grid.x*4u+simdgroup_index_in_threadgroup;
+            const uint at=row*K+g*128u+lane*4u;
+            if(row>=rows) {
+              #pragma clang loop unroll(full)
+              for(uint j=0;j<4;++j){high[at+j]=0;low[at+j]=-128;}
+              return;
+            }
+            const float4 value=*((const device float4*)(x+at));
+            float amax=max(max(fabs(value.x),fabs(value.y)),max(fabs(value.z),fabs(value.w)));
+            amax=simd_max(amax);
+            const float scale=amax>0.0f ? amax*(1.0f/32767.0f):1.0f;
+            const float inv=amax>0.0f ? metal::precise::divide(32767.0f,amax):0.0f;
+            float part=0.0f;
+            #pragma clang loop unroll(full)
+            for(uint j=0;j<4;++j) {
+              const uint p=lane*4u+j;
+              const int q=int(rint(value[j]*inv));
+              const uint dst=row*K+g*128u+(p&~15u)+4u*(p&3u)+((p&15u)>>2);
+              high[dst]=char(q>>8);low[dst]=char((q&255)-128);part+=float(q);
+            }
+            part=simd_sum(part);
+            if(lane==0) {
+              const size_t ci=bonsai_q8_cidx(int(row),int(g),int(Kg));
+              ascale[ci]=scale;rsb[ci]=scale*part;
+            }
+            """, header: PromptInt8Matmul.constantIndexSource, ensureRowContiguous: true)
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "bonsai_q16_verify_matmul_16x32",
+        inputNames: ["xhi", "xlo", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"], source: """
+            const int K=ksz[0],M=ksz[1],N=ksz[2],ROWS=ksz[3],Kg=K/128;
+            const uint tid=thread_position_in_threadgroup.x;
+            const int n0=int(threadgroup_position_in_grid.x)*32;
+            constexpr auto desc=mpp::tensor_ops::matmul2d_descriptor(16,32,128,false,true,false,mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc,metal::execution_simdgroups<2>> op;
+            tensor<device int8_t,dextents<int,2>,tensor_inline> AH((device int8_t*)xhi,dextents<int,2>(K,M));
+            tensor<device int8_t,dextents<int,2>,tensor_inline> AL((device int8_t*)xlo,dextents<int,2>(K,M));
+            threadgroup uint32_t bs[2][32*128/4];
+            threadgroup uint ws[2][32];
+            tensor<threadgroup int8_t,dextents<int,2>,tensor_inline> B0((threadgroup int8_t*)bs[0],dextents<int,2>(128,32));
+            tensor<threadgroup int8_t,dextents<int,2>,tensor_inline> B1((threadgroup int8_t*)bs[1],dextents<int,2>(128,32));
+            auto tA0=AH.template slice<128,16>(0,0);
+            auto cHi=op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>,metal::remove_addrspace_t<decltype(B0)>,int32_t>();
+            auto cLo=op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>,metal::remove_addrspace_t<decltype(B0)>,int32_t>();
+            const int E=int(cHi.get_capacity());
+            if(E>32)return;
+            float acc[32];int row[32],col[32];bool valid[32];
+            #pragma clang loop unroll(full)
+            for(int i=0;i<32;++i) {
+             acc[i]=0;
+             if(i<E) {
+              auto at=cHi.get_multidimensional_index(i);
+              col[i]=int(at[0])+n0;row[i]=int(at[1]);
+              valid[i]=cHi.is_valid_element(i)&&row[i]>=0&&row[i]<16&&col[i]>=n0&&col[i]<n0+32&&row[i]<ROWS;
+             }
+            }
+            const int sc=int(tid>>1),sh=int(tid&1);
+            const device uint32_t* wrow=w+uint(n0+sc)*uint(K/16)+uint(sh*4);
+            auto stage=[&](int g,int b) {
+             const uint4 v=*((const device uint4*)(wrow+g*8));
+             threadgroup uint32_t* dst=bs[b]+sc*32+sh*16;
+             uint weight_sum=0;
+             #pragma clang loop unroll(full)
+             for(int j=0;j<4;++j) {
+              const uint32_t word=v[j];
+              weight_sum+=popcount(word&0x55555555u)+2u*popcount((word>>1)&0x55555555u);
+              dst[4*j+0]=word&0x03030303u;
+              dst[4*j+1]=(word>>2)&0x03030303u;
+              dst[4*j+2]=(word>>4)&0x03030303u;
+              dst[4*j+3]=(word>>6)&0x03030303u;
+             }
+             weight_sum+=simd_shuffle_xor(weight_sum,ushort(1));
+             if(sh==0)ws[b][sc]=weight_sum;
+            };
+            stage(0,0);threadgroup_barrier(mem_flags::mem_threadgroup);
+            for(int g=0;g<Kg;++g) {
+             const int cur=g&1;if(g+1<Kg)stage(g+1,cur^1);
+             auto tH=AH.template slice<128,16>(g*128,0);
+             auto tL=AL.template slice<128,16>(g*128,0);
+             if(cur==0){op.run(tH,B0,cHi);op.run(tL,B0,cLo);}
+             else{op.run(tH,B1,cHi);op.run(tL,B1,cLo);}
+             #pragma clang loop unroll(full)
+             for(int i=0;i<32;++i)if(i<E&&valid[i]) {
+              const uint wi=uint(g)*uint(N)+uint(col[i]);
+              const size_t ci=bonsai_q8_cidx(row[i],g,Kg);
+              const int dot=256*cHi[i]+cLo[i]+128*int(ws[cur][col[i]-n0]);
+              const float t=float(scalesT[wi])*float(dot);
+              acc[i]=fma(float(biasesT[wi]),rsb[ci],fma(ascale[ci],t,acc[i]));
+             }
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            #pragma clang loop unroll(full)
+            for(int i=0;i<32;++i)if(i<E&&valid[i]&&row[i]<ROWS)out[uint(row[i])*uint(N)+uint(col[i])]=acc[i];
+            """, header: """
+            #include <metal_tensor>
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+            """ + "\n" + PromptInt8Matmul.constantIndexSource, ensureRowContiguous: true)
+
+    private static let referenceKernel = MLXFast.metalKernel(
+        name: "bonsai_verify_q16_reference",
+        inputNames: ["xhi", "xlo", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"], source: """
+            const uint K=uint(ksz[0]),N=uint(ksz[2]),R=uint(ksz[3]);
+            const uint id=thread_position_in_grid.x;if(id>=R*N)return;
+            const uint row=id/N,n=id%N,Kg=K/128u;float acc=0.0f;
+            for(uint g=0;g<Kg;++g) {
+              int dot=0;
+              for(uint e=0;e<128;++e) {
+                const uint at=row*K+g*128u+(e & ~15u)+4u*(e&3u)+((e&15u)>>2);
+                const int q=256*int(xhi[at])+int(xlo[at])+128;
+                const uint word=w[n*(K/16u)+g*8u+e/16u];
+                const int code=int((word>>(2u*(e&15u)))&3u);dot+=q*code;
+              }
+              const size_t ci=bonsai_q8_cidx(int(row),int(g),int(Kg));
+              const float t=float(scalesT[g*N+n])*float(dot);
+              acc=fma(float(biasesT[g*N+n]),rsb[ci],fma(ascale[ci],t,acc));
+            }
+            out[id]=acc;
+            """, header: PromptInt8Matmul.constantIndexSource, ensureRowContiguous: true)
+
+    private static func quantize(_ x: MLXArray) -> VerifyInt16Activation {
+        let k=x.dim(-1),rows=x.size/k,groups=k/128
+        let values=quantizeKernel([x,MLXArray([Int32(rows),Int32(k)])],
+            grid:(groups/4*128,16,1),threadGroup:(128,1,1),
+            outputShapes:[[16,k],[16,k],[64*groups],[64*groups]],
+            outputDTypes:[.int8,.int8,.float32,.float32])
+        return VerifyInt16Activation(high:values[0],low:values[1],scale:values[2],sums:values[3],rows:rows,k:k)
+    }
+
+    private static func run(
+        _ activation: VerifyInt16Activation, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, reference: Bool = false, initialize: Bool = false
+    ) -> MLXArray {
+        let n=weight.dim(0)
+        return (reference ? referenceKernel:kernel)(
+            [activation.high,activation.low,weight,scalesT,biasesT,activation.scale,activation.sums,
+             MLXArray([Int32(activation.k),Int32(activation.high.dim(0)),Int32(n),Int32(activation.rows)])],
+            grid:reference ? (activation.rows*n,1,1):(n/32*64,1,1),
+            threadGroup:reference ? (128,1,1):(64,1,1),
+            outputShapes:[[activation.rows,n]],outputDTypes:[.float32],initValue:initialize ? 0:nil)[0]
+    }
+
+    private static func matchesReference() -> Bool {
+        do {
+            let n=128,k=512,kg=k/128
+            let hi=MLXArray((0..<16*k).map{Int8(truncatingIfNeeded:$0*37+11)},[16,k])
+            let lo=MLXArray((0..<16*k).map{Int8(truncatingIfNeeded:$0*19+7)},[16,k])
+            let weight=MLXArray((0..<n*k/16).map{UInt32(truncatingIfNeeded:UInt64($0+1)&*2654435761)},[n,k/16])
+            let scales=MLXArray((0..<kg*n).map{Float16(Float(1+$0%13)/1024)},[kg,n])
+            let biases=MLXArray((0..<kg*n).map{Float16(-Float($0%7)/512)},[kg,n])
+            let a=MLXArray((0..<64*kg).map{Float(1+$0%11)/256},[64*kg])
+            let r=MLXArray((0..<64*kg).map{Float($0%17-8)/64},[64*kg])
+            var checks=[MLXArray]()
+            for rows in [4,16] {
+                let activation=VerifyInt16Activation(high:hi,low:lo,scale:a,sums:r,rows:rows,k:k)
+                let expected=run(activation,weight:weight,scalesT:scales,biasesT:biases,reference:true)
+                let actual=run(activation,weight:weight,scalesT:scales,biasesT:biases,initialize:true)
+                checks.append(MLX.all(expected.view(dtype:.uint32) .== actual.view(dtype:.uint32)))
+            }
+            for (rows,width) in [(4,4096),(16,12288)] {
+                let transform=try SignedBlockHadamard(blockSize:4096,signs:(0..<width).map{$0%3==0 ? -1:1})
+                for amplitude:Float in [0,1] {
+                    let x=(sin(MLXArray(0..<(rows*width)).asType(.float32)*0.0137)*amplitude).reshaped([rows,width])
+                    let rotated=transform(x);try withError {eval(rotated)}
+                    let input=rotated.asArray(Float.self),groups=width/128
+                    var high=[Int8](repeating:0,count:rows*width),low=high,scale=[Float](),sums=[Float](),indices=[Int32]()
+                    for g in 0..<groups {
+                        for row in 0..<rows {
+                            let start=row*width+g*128
+                            let amax=input[start..<(start+128)].map{abs($0)}.max()!
+                            let qs:Float=amax>0 ? amax*(1/Float(32767)):1
+                            let inv:Float=amax>0 ? Float(32767)/amax:0
+                            var sum:Int32=0
+                            for e in 0..<128 {
+                                let q=Int32((input[start+e]*inv).rounded(.toNearestOrEven))
+                                let at=start+(e & ~15)+4*(e&3)+((e&15)>>2)
+                                high[at]=Int8(truncatingIfNeeded:q>>8);low[at]=Int8(truncatingIfNeeded:(q&255)-128);sum+=q
+                            }
+                            scale.append(qs);sums.append(qs*Float(sum))
+                            indices.append(Int32(g*64+((row>>4)&1)*32+(row&7)*4+((row>>5)&1)*2+((row>>3)&1)))
+                        }
+                    }
+                    let actual=quantize(rotated),index=MLXArray(indices)
+                    checks.append(MLX.all(actual.high[0..<rows] .== MLXArray(high,[rows,width])))
+                    checks.append(MLX.all(actual.low[0..<rows] .== MLXArray(low,[rows,width])))
+                    checks.append(MLX.all(actual.scale[index].view(dtype:.uint32) .== MLXArray(scale).view(dtype:.uint32)))
+                    checks.append(MLX.all(actual.sums[index].view(dtype:.uint32) .== MLXArray(sums).view(dtype:.uint32)))
+                }
+            }
+            try withError {eval(checks)}
+            let failed=checks.indices.filter{!checks[$0].item(Bool.self)}
+            if !failed.isEmpty {FileHandle.standardError.write(Data("int16 verify failed check indices: \(failed)\n".utf8))}
+            return failed.isEmpty
+        } catch {
+            FileHandle.standardError.write(Data("int16 verify self-check error: \(error)\n".utf8));return false
+        }
+    }
+
+    static let enabled: Bool = {
+        let value=ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT16_VERIFY"]?.lowercased()
+        let architecture=GPU.deviceInfo().architecture
+        let requested=value.map{["1","true","yes","on"].contains($0)}
+            ?? PromptInt8Matmul.architectureHasNAX(architecture)
+        guard requested else {return false}
+        let selected=matchesReference()
+        FileHandle.standardError.write(Data("int16 verify matmul: \(selected ? "on":"off") (\(architecture); matrix and quantization bit-check: \(selected))\n".utf8))
+        return selected
+    }()
+
+    static func canUse(weight: MLXArray, rows: Int) -> Bool {
+        (4...16).contains(rows) && weight.dim(0)%32==0
+            && weight.size<=Int(UInt32.max) && rows<=Int(UInt32.max)/weight.dim(0)
+    }
+
+    static func activation(_ x: MLXArray) -> VerifyInt16Activation? {
+        guard enabled,x.ndim>=2,x.dtype == .float32 else {return nil}
+        let k=x.dim(-1),rows=x.size/k
+        guard (4...16).contains(rows),k%512==0,k<=Int(Int32.max)/16 else {return nil}
+        return quantize(x)
+    }
+
+    static func matmul(_ activation: VerifyInt16Activation, weight: MLXArray,
+                       scalesT: MLXArray, biasesT: MLXArray) -> MLXArray {
+        run(activation,weight:weight,scalesT:scalesT,biasesT:biasesT)
+    }
+}
+
+
 /// Group-major copies of a packed module's F16 scales and offsets for
 /// `PromptInt8Matmul`, made on first use. A plain class, so nothing enters the
 /// module parameter tree.
@@ -1154,6 +1400,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         freeze()
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
+            _ = VerifyInt16Matmul.enabled
         }
     }
 
@@ -1175,6 +1422,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+    }
+
+    private func verifyIntegerForward(_ activation: VerifyInt16Activation, shape: [Int]) -> MLXArray {
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        let output = VerifyInt16Matmul.matmul(
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            .reshaped(Array(shape.dropLast()) + [weight.dim(0)])
+        return bias.map { output + $0 } ?? output
     }
 
     /// Form prompt SwiGLU values inside the existing quantizing transform.
@@ -1202,7 +1457,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let activation = first.transform.residualNorm(
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized)
         else { return nil }
+        let narrow = !quantized && packed.allSatisfy({ VerifyInt16Matmul.canUse(weight: $0.weight, rows: rows) })
+            ? VerifyInt16Matmul.activation(activation[0]) : nil
         let outputs = packed.map { layer in
+            if let narrow { return layer.verifyIntegerForward(narrow, shape: x.shape) }
             if !quantized { return layer.forwardRotated(activation[0]) }
             let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
             let codes = PromptInt8Activation(
@@ -1250,6 +1508,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     private func forwardRotated(_ rotated: MLXArray) -> MLXArray {
+        if readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            VerifyInt16Matmul.canUse(weight: weight, rows: rotated.size / rotated.dim(-1)),
+            let activation = VerifyInt16Matmul.activation(rotated)
+        {
+            return verifyIntegerForward(activation, shape: rotated.shape)
+        }
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
