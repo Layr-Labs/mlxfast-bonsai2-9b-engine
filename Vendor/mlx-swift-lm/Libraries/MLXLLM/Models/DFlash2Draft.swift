@@ -2057,10 +2057,11 @@ enum DF2Fast {
             return nil
         }
         let G = K / group
+        let quantThreads = min(128, G)
         let q = quantG(
             [x, up ?? x, MLXArray([Int32(K), Int32(rows)])],
             template: [("SWIGLU", up == nil ? 0 : 1), ("KG", group), ("HEAD_MAJOR", headMajor ? 1 : 0)],
-            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            grid: (quantThreads, 16, 1), threadGroup: (quantThreads, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
             outputDTypes: [.int8, .float32, .float32])
         return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
@@ -2106,10 +2107,11 @@ enum DF2Fast {
         let ops = layers.compactMap { w4Operands($0, group: group) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
         let G = K / group
+        let quantThreads = min(128, G)
         let q = quantGConv0(
             [h.reshaped([rows, K]), dyn, base, MLXArray([Int32(K), Int32(rows)])],
             template: [("KG", group)],
-            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            grid: (quantThreads, 16, 1), threadGroup: (quantThreads, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
             outputDTypes: [.int8, .float32, .float32])
         let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
