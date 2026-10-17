@@ -1419,34 +1419,35 @@ enum DF2Fast {
     /// x [R, K] (or silu(x) * x2) -> int8 codes per row and per KG-column group, with the group's
     /// scale and its unquantized sum (for the offset term).
     static let quantG = MLXFast.metalKernel(
-        name: "df2_act_q8g", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
+        name: "df2_act_q8g_simd", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
         source: """
             const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
             const int m = int(threadgroup_position_in_grid.y);
-            for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
-              const size_t base = (size_t)m * K + g * KG;
-              float amax = 0.0f, sum = 0.0f;
+            const int lane = int(thread_index_in_simdgroup);
+            const int g = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            if (g >= G) return;
+            const size_t base = (size_t)m * K + g * KG;
+            float values[KG / 32];
+            float amax = 0.0f, sum = 0.0f;
+            for (int u = 0; u < KG / 32; u++) {
+              float v = 0.0f;
               if (m < R) {
-                for (int u = 0; u < KG; u++) {
-                  float a = float(x[base + u]);
-                  if (SWIGLU) { const float b = float(x2[base + u]); a = a / (1.0f + metal::exp(-a)) * b; }
-                  amax = max(amax, fabs(a)); sum += a;
-                }
+                const size_t i = base + lane + u * 32;
+                v = float(x[i]);
+                if (SWIGLU) { const float b = float(x2[i]); v = v / (1.0f + metal::exp(-v)) * b; }
               }
-              const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
-              const float ia = 1.0f / a;
-              device char4* dst = (device char4*)(xq + base);
-              for (int u = 0; u < KG / 4; u++) {
-                float4 v = float4(0.0f);
-                if (m < R) {
-                  for (int j = 0; j < 4; j++) {
-                    float t = float(x[base + 4 * u + j]);
-                    if (SWIGLU) { const float b = float(x2[base + 4 * u + j]); t = t / (1.0f + metal::exp(-t)) * b; }
-                    v[j] = t;
-                  }
-                }
-                dst[u] = char4(int4(rint(v * ia)));
-              }
+              values[u] = v;
+              amax = max(amax, fabs(v));
+              sum += v;
+            }
+            amax = simd_max(amax);
+            sum = simd_sum(sum);
+            const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
+            const float ia = 1.0f / a;
+            for (int u = 0; u < KG / 32; u++) {
+              xq[base + lane + u * 32] = char(int(rint(values[u] * ia)));
+            }
+            if (lane == 0) {
               ascale[m * G + g] = m < R ? a : 0.0f;
               xs[m * G + g] = sum;
             }
@@ -1569,7 +1570,7 @@ enum DF2Fast {
         let q = quantG(
             [x.reshaped([rows, K]), (up ?? x).reshaped([rows, K]), MLXArray([Int32(K), Int32(rows)])],
             template: [("SWIGLU", up == nil ? 0 : 1), ("KG", group)],
-            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            grid: ((G + 3) / 4 * 128, 16, 1), threadGroup: (128, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
             outputDTypes: [.int8, .float32, .float32])
         let ns = ops.map(\.n)
