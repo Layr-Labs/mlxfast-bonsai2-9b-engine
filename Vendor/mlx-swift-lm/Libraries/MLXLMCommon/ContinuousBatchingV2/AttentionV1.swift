@@ -428,6 +428,11 @@ enum CBv2AttentionV1 {
                 kind: kind, queries: queries, keys: cachedKeys, values: cachedValues,
                 sinks: sinks, softcap: softcap, keepMask: keepMask)
         {
+            if let shared = CBv2VerifyVectorAttention.attend(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale)
+            {
+                return shared
+            }
             return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: nil, sinks: nil, softcap: nil)
@@ -942,5 +947,171 @@ enum CBv2AttentionV1 {
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
             boolMask: mask, sinks: sinks, softcap: softcap)
+    }
+}
+
+/// Bit-exact stand-in for MLX's one-pass `sdpa_vector` (float32, D = V = 256,
+/// causal, no mask, sinks or softcap) on the MTP verify batch: 2 ... 7 queries,
+/// 16 query heads over 4 KV heads, fewer than 1024 keys.
+///
+/// MLX runs one 1024-thread threadgroup per (head, query); its simdgroup g
+/// scans keys g, g + 32, ... with an online softmax and the 32 partial states
+/// are then combined across simdgroups. Each threadgroup reads the whole KV
+/// of its head, so the 4 heads × L queries that share a KV head read it
+/// 4L times. Here simdgroup (class g, query t) scans the same keys in the
+/// same order for all 4 heads of a KV head, with the per-key arithmetic of
+/// MLX's kernel as compiled in `mlx.metallib` (FMA dot product, `fma(o,
+/// factor, exp·v)`, `fma(sum, factor, exp)`), and the queries of a class
+/// share its keys through one threadgroup. The 32 partial states per (head,
+/// query) go to memory and a second kernel combines them with MLX's
+/// cross-simdgroup code (lane l = class l). Outputs are the bits of
+/// `MLXFast.scaledDotProductAttention(..., mask: .causal)`.
+enum CBv2VerifyVectorAttention {
+    /// Key classes per partial threadgroup.
+    private static let classesPerGroup = 2
+
+    private static let partial = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_partial",
+        inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
+        outputNames: ["part_o", "part_m", "part_s"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int D = 256;
+            constexpr int G = 4;
+            const uint L = uint(N_QUERIES);
+            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint kvh = threadgroup_position_in_grid.z;
+            const uint h0 = kvh * G;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int c = int(threadgroup_position_in_grid.x * uint(CPT)
+                + simdgroup_index_in_threadgroup % uint(CPT));
+            const int N = n_keys[0];
+            const float scale = scale_in[0];
+            const int limit = N - int(L) + int(t);
+            float q[G][8];
+            float o[G][8];
+            float max_score[G];
+            float sum_exp_score[G];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const device float* qp = queries + (h0 + h) * queries_strides[1]
+                  + t * queries_strides[2] + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                q[h][j] = static_cast<float>(scale) * qp[j];
+                o[h][j] = 0;
+              }
+              max_score[h] = -metal::numeric_limits<float>::max();
+              sum_exp_score[h] = 0;
+            }
+            const device float* kp = keys + kvh * keys_strides[1] + simd_lid * 8;
+            const device float* vp = values + kvh * values_strides[1] + simd_lid * 8;
+            const int64_t ks = keys_strides[2];
+            const int64_t vs = values_strides[2];
+            for (int i = c; i <= limit; i += 32) {
+              float k[8];
+              float v[8];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                k[j] = kp[i * ks + j];
+                v[j] = vp[i * vs + j];
+              }
+              #pragma clang loop unroll(full)
+              for (int h = 0; h < G; h++) {
+                float score = 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  score = metal::fma(q[h][j], k[j], score);
+                }
+                score = simd_sum(score);
+                float new_max = max(max_score[h], score);
+                float factor = fast::exp(max_score[h] - new_max);
+                float exp_score = fast::exp(score - new_max);
+                max_score[h] = new_max;
+                sum_exp_score[h] = metal::fma(sum_exp_score[h], factor, exp_score);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  o[h][j] = metal::fma(o[h][j], factor, exp_score * v[j]);
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
+              device float* op = part_o + slot * D + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) op[j] = o[h][j];
+              if (simd_lid == 0) {
+                part_m[slot] = max_score[h];
+                part_s[slot] = sum_exp_score[h];
+              }
+            }
+            """,
+        ensureRowContiguous: false)
+
+    /// One threadgroup per (head, query, half of the output dims); the 32
+    /// partials pass through threadgroup memory so lane l holds partial l.
+    private static let combine = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_combine",
+        inputNames: ["part_o", "part_m", "part_s"],
+        outputNames: ["out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int v_per_thread = 8;
+            threadgroup float staged[32 * 129];
+            const uint head = threadgroup_position_in_grid.x / 2u;
+            const uint half_ = threadgroup_position_in_grid.x % 2u;
+            const uint t = threadgroup_position_in_grid.y;
+            const uint L = threadgroups_per_grid.y;
+            const uint tid = thread_index_in_threadgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint base = (head * L + t) * 32u;
+            for (uint idx = tid; idx < 32u * 128u; idx += 512u) {
+              const uint c = idx / 128u, x = idx % 128u;
+              staged[c * 129u + x] = part_o[(base + c) * 256u + half_ * 128u + x];
+            }
+            float max_score = part_m[base + simd_lid];
+            float new_max = simd_max(max_score);
+            float factor = fast::exp(max_score - new_max);
+            float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float o[v_per_thread];
+            for (int i = 0; i < v_per_thread; i++) {
+              o[i] = simd_sum(staged[simd_lid * 129u + simd_gid * v_per_thread + i] * factor);
+              o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
+            }
+            if (simd_lid == 0) {
+              device float* op = out + (head * L + t) * 256u + half_ * 128u
+                  + simd_gid * v_per_thread;
+              for (int i = 0; i < v_per_thread; i++) op[i] = o[i];
+            }
+            """)
+
+    /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
+    ) -> MLXArray? {
+        guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            queries.dim(0) == 1, queries.dim(1) == 16, queries.dim(3) == 256,
+            (2 ... 7).contains(queries.dim(2)),
+            keys.dim(0) == 1, keys.dim(1) == 4, keys.dim(3) == 256, values.shape == keys.shape,
+            keys.dim(2) >= queries.dim(2), keys.dim(2) < 1024,
+            queries.strides[3] == 1, keys.strides[3] == 1, values.strides[3] == 1,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let L = queries.dim(2)
+        let parts = partial(
+            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
+            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
+            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+            outputDTypes: [.float32, .float32, .float32])
+        return combine(
+            parts, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
 }

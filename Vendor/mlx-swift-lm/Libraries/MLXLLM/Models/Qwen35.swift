@@ -520,213 +520,6 @@ private enum Qwen35RegisterGDN {
             vt[d] = cv * (cv < 0.0f ? sig : 1.0f - sig);
             """))
 
-    /// The prompt recurrence of `valueKernel` with the depthwise conv + SiLU
-    /// value computed once per channel and step: every 32 steps the
-    /// threadgroup fills a 32-step x 32-channel tile in parallel (each value
-    /// by one thread, the same fma chain, exp and divide as `valueKernel`),
-    /// instead of 8 lanes recomputing each value inside the serial step.
-    /// The recurrence itself is `valueKernel`'s, op for op, so y and the
-    /// state are bit-identical (custom kernels compile in Safe math mode).
-    private static let stagedValueKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_value_conv_staged",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in", "conv_weight"],
-        outputNames: ["y", "state_out"],
-        source: """
-        const uint T = q_shape[1];
-        constexpr int R = 16;
-        constexpr int DVPL = 2;
-        constexpr int LPD = Dk / R;
-        constexpr int DVPS = (32 / LPD) * DVPL;
-        constexpr int DVPT = DVPS * 4;
-        const uint n = threadgroup_position_in_grid.z;
-        const uint b_idx = n / Hv;
-        const uint hv_idx = n % Hv;
-        const uint hk_idx = hv_idx / (Hv / Hk);
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint dk0 = (lane % LPD) * R;
-        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
-        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
-        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
-        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-        auto g_ = g + b_idx * T * Hv + hv_idx;
-        auto beta_ = beta + b_idx * T * Hv + hv_idx;
-        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
-        float state[DVPL][R];
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < R / 4; ++j) {
-            const float4 s4 = s_in4[j];
-            state[d][4 * j + 0] = s4.x;
-            state[d][4 * j + 1] = s4.y;
-            state[d][4 * j + 2] = s4.z;
-            state[d][4 * j + 3] = s4.w;
-          }
-        }
-        float kr[R];
-        float qr[R];
-        constexpr int TS = 32;
-        threadgroup float vts[TS][32];
-        const uint ltid = sg * 32u + lane;
-        const uint vloc = sg * DVPS + (lane / LPD) * DVPL;
-        const uint ch_tg = 2u * Hk * Dk + hv_idx * Dv + threadgroup_position_in_grid.y * DVPT;
-        const uint v_stride = v_shape[2];
-        for (int t = 0; t < T; ++t) {
-          const int s = t % TS;
-          if (s == 0) {
-            const int tn = min(TS, int(T) - t);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint idx = ltid; idx < uint(tn) * 32u; idx += 128u) {
-              const uint ss = idx / 32u, c = idx % 32u;
-              const uint channel = ch_tg + c;
-              const float4 cw4 = *((const device float4*)(conv_weight + channel * 4u));
-              const uint v_base = (b_idx * (T + 3u) + uint(t) + ss) * v_stride + channel;
-              float cv = fma(v[v_base], cw4.x, 0.0f);
-              cv = fma(v[v_base + v_stride], cw4.y, cv);
-              cv = fma(v[v_base + 2u * v_stride], cw4.z, cv);
-              cv = fma(v[v_base + 3u * v_stride], cw4.w, cv);
-              const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
-              vts[ss][c] = cv * (cv < 0.0f ? sig : 1.0f - sig);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-          }
-          const float gt = g_[0];
-          const float bt = beta_[0];
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < R / 4; ++j) {
-            const float4 k4 = ((const device float4*)k_)[j];
-            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
-            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
-          }
-          float kv[DVPL];
-          float vt[DVPL];
-          #pragma clang loop unroll(full)
-          for (int d = 0; d < DVPL; ++d) {
-            vt[d] = vts[s][vloc + d];
-
-
-            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < R / 4; ++j) {
-              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
-              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
-              a0 = fma(state[d][4 * j], kr[4 * j], a0);
-              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
-              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
-              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
-            }
-            kv[d] = (a0 + a1) + (a2 + a3);
-          }
-          #pragma clang loop unroll(full)
-          for (int o = LPD / 2; o > 0; o >>= 1) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              kv[d] += simd_shuffle_xor(kv[d], o);
-            }
-          }
-          float out[DVPL];
-          #pragma clang loop unroll(full)
-          for (int d = 0; d < DVPL; ++d) {
-            const float delta = (vt[d] - kv[d]) * bt;
-            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
-            #pragma clang loop unroll(full)
-            for (int j = 0; j < R / 4; ++j) {
-              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
-              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
-              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
-              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              o0 = fma(state[d][4 * j], qr[4 * j], o0);
-              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
-            }
-            out[d] = (o0 + o1) + (o2 + o3);
-          }
-          #pragma clang loop unroll(full)
-          for (int o = LPD / 2; o > 0; o >>= 1) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              out[d] += simd_shuffle_xor(out[d], o);
-            }
-          }
-          if (lane % LPD == 0) {
-            #pragma clang loop unroll(full)
-            for (int d = 0; d < DVPL; ++d) {
-              y_[d] = out[d];
-            }
-          }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
-        }
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < R / 4; ++j) {
-            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
-          }
-        }
-        """)
-
-    private static func dispatchValue(
-        _ k: MLXFast.MLXFastKernel, q: MLXArray, kk: MLXArray, input: MLXArray,
-        weight: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
-        let result = k(
-            [q, kk, input, g, beta, state, weight],
-            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
-        return (result[0], result[1])
-    }
-
-    /// Load-time check, once per process per shape: the pipelined kernel must
-    /// reproduce `valueKernel`'s y and state bit for bit on a synthetic
-    /// input of the served shape (first call is the unmeasured warm prefill).
-    /// Any mismatch keeps `valueKernel`. `MLXFAST_GDN_PIPELINED=0` disables it.
-    nonisolated(unsafe) private static var pipelinedVerdict: [String: Bool] = [:]
-    private static let pipelinedLock = NSLock()
-    private static let pipelinedEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_PIPELINED"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static func pipelinedMatches(Hk: Int, Hv: Int, convDim: Int) -> Bool {
-        guard pipelinedEnabled else { return false }
-        let key = "\(Hk)x\(Hv)x\(convDim)"
-        pipelinedLock.lock()
-        defer { pipelinedLock.unlock() }
-        if let verdict = pipelinedVerdict[key] { return verdict }
-        let T = 67
-        let key0 = MLXRandom.key(0x6d6e)
-        let parts = MLXRandom.split(key: key0, into: 7)
-        let q = MLXRandom.uniform(low: -0.2, high: 0.2, [1, T, Hk, 128], key: parts[0])
-        let kk = MLXRandom.uniform(low: -0.2, high: 0.2, [1, T, Hk, 128], key: parts[1])
-        let input = MLXRandom.uniform(low: -3, high: 3, [1, T + 3, convDim], key: parts[2])
-        let weight = MLXRandom.uniform(low: -0.7, high: 0.7, [convDim, 4, 1], key: parts[3])
-        let g = MLXRandom.uniform(low: 0.6, high: 1.0, [1, T, Hv], key: parts[4])
-        let beta = MLXRandom.uniform(low: 0.0, high: 1.0, [1, T, Hv], key: parts[5])
-        let state = MLXRandom.uniform(low: -1, high: 1, [1, Hv, 128, 128], key: parts[6])
-        let (y0, s0) = dispatchValue(
-            valueKernel, q: q, kk: kk, input: input, weight: weight, g: g, beta: beta, state: state)
-        let (y1, s1) = dispatchValue(
-            stagedValueKernel, q: q, kk: kk, input: input, weight: weight, g: g, beta: beta,
-            state: state)
-        let same = MLX.all(y0.view(dtype: .uint32) .== y1.view(dtype: .uint32))
-            .&& MLX.all(s0.view(dtype: .uint32) .== s1.view(dtype: .uint32))
-        let verdict = same.item(Bool.self)
-        pipelinedVerdict[key] = verdict
-        if !verdict {
-            FileHandle.standardError.write(
-                Data("qwen35 gdn: pipelined prompt recurrence mismatch, using value_conv\n".utf8))
-        }
-        return verdict
-    }
-
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
                     beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
@@ -743,15 +536,52 @@ private enum Qwen35RegisterGDN {
         q: MLXArray, k: MLXArray, input: MLXArray, weight: MLXArray,
         g: MLXArray, beta: MLXArray, state: MLXArray
     ) -> (MLXArray, MLXArray) {
-        let kernel = pipelinedMatches(Hk: q.dim(2), Hv: g.dim(2), convDim: input.dim(2))
-            ? stagedValueKernel : valueKernel
-        return dispatchValue(
-            kernel, q: q, kk: k, input: input, weight: weight, g: g, beta: beta, state: state)
+        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
+        let result = valueKernel(
+            [q, k, input, g, beta, state, weight],
+            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
     }
 
 }
 
 enum Qwen35RegisterGatedSIMD {
+    static let gateHeader = """
+        inline float qwen35_simd_gate_decay(float a, float bias, float negative_a) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const float x = a + bias;
+            float sp;
+            if (metal::isnan(x)) {
+                sp = metal::numeric_limits<float>::quiet_NaN();
+            } else {
+                const float maximum = metal::max(x, 0.0f);
+                const float minimum = metal::min(x, 0.0f);
+                constexpr float infinity = metal::numeric_limits<float>::infinity();
+                if (minimum == -infinity || maximum == infinity) {
+                    sp = maximum;
+                } else {
+                    const float z = metal::exp(minimum - maximum);
+                    const float xp1 = 1.0f + z;
+                    const float logarithm = xp1 == metal::numeric_limits<float>::max()
+                        ? metal::numeric_limits<float>::max()
+                        : (xp1 == 1.0f ? z : z * (metal::log(xp1) / (xp1 - 1.0f)));
+                    sp = maximum + logarithm;
+                }
+            }
+            return metal::precise::exp(negative_a * sp);
+        }
+
+        inline float qwen35_simd_gate_beta(float b) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const float y = 1.0f / (1.0f + metal::exp(metal::abs(b)));
+            return b < 0.0f ? y : 1.0f - y;
+        }
+        """
+
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_gate_simd",
         inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
@@ -885,39 +715,7 @@ enum Qwen35RegisterGatedSIMD {
           }
         }
         """,
-        header: """
-        inline float qwen35_simd_gate_decay(float a, float bias, float negative_a) {
-            #pragma clang fp reassociate(off)
-            #pragma clang fp contract(off)
-            const float x = a + bias;
-            float sp;
-            if (metal::isnan(x)) {
-                sp = metal::numeric_limits<float>::quiet_NaN();
-            } else {
-                const float maximum = metal::max(x, 0.0f);
-                const float minimum = metal::min(x, 0.0f);
-                constexpr float infinity = metal::numeric_limits<float>::infinity();
-                if (minimum == -infinity || maximum == infinity) {
-                    sp = maximum;
-                } else {
-                    const float z = metal::exp(minimum - maximum);
-                    const float xp1 = 1.0f + z;
-                    const float logarithm = xp1 == metal::numeric_limits<float>::max()
-                        ? metal::numeric_limits<float>::max()
-                        : (xp1 == 1.0f ? z : z * (metal::log(xp1) / (xp1 - 1.0f)));
-                    sp = maximum + logarithm;
-                }
-            }
-            return metal::precise::exp(negative_a * sp);
-        }
-
-        inline float qwen35_simd_gate_beta(float b) {
-            #pragma clang fp reassociate(off)
-            #pragma clang fp contract(off)
-            const float y = 1.0f / (1.0f + metal::exp(metal::abs(b)));
-            return b < 0.0f ? y : 1.0f - y;
-        }
-        """)
+        header: gateHeader)
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                     b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
@@ -943,6 +741,277 @@ enum Qwen35RegisterGatedSIMD {
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[1], state.shape], outputDTypes: [.float32, .float32])
         return result[1]
+    }
+}
+
+/// Verify-width GDN middle in one kernel: `Qwen35FusedConvSilu`,
+/// `Qwen35FusedQKNorm`, the contiguous copy of the value slice and
+/// `Qwen35RegisterGatedSIMD`. Each threadgroup of the recurrence (one value
+/// head, 32 value columns) first forms, with the same code, the conv and
+/// SiLU of its key head's q/k channels and of its 32 value channels, then
+/// the q/k RMSNorm, and keeps them in threadgroup memory for the scan.
+/// Every output (conv input and output, normalized q/k, y, final state) is
+/// the bits of the four-kernel graph; each element is written by exactly
+/// one threadgroup.
+enum Qwen35FusedGDNVerify {
+    static let maximumRows = 8
+    private static let invScale = pow(Float(128), -0.5)
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out"],
+        source: """
+        const uint T = qkv_shape[1];
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        constexpr uint C = uint(CONV_DIM);
+        threadgroup float qk_raw[2 * MAX_T * Dk];
+        threadgroup float v_tile[MAX_T * DVPT];
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_index_in_threadgroup;
+        const uint dvblock = threadgroup_position_in_grid.y;
+        const bool owns_qk = (hv_idx % (Hv / Hk)) == 0 && dvblock == 0;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvlocal = sg * DVPS + (lane / LPD) * DVPL;
+        const uint dvbase = dvblock * DVPT + dvlocal;
+        // The scan state loads first, so they overlap the conv and norm below.
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
+        {
+          #pragma clang fp reassociate(off)
+          // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
+          #pragma clang loop unroll(full)
+          for (uint part = 0; part < 2; ++part) {
+            const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + tid;
+            // All loads first; the taps then run in Qwen35FusedConvSilu's order.
+            float xin[3 + MAX_T];
+            #pragma clang loop unroll(full)
+            for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+              if (t < 3u + T) xin[t] = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+            }
+            const float4 w4 = ((const device float4*)conv_weight)[c];
+            const float w[4] = {w4.x, w4.y, w4.z, w4.w};
+            if (owns_qk) {
+              #pragma clang loop unroll(full)
+              for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+                if (t < 3u + T) conv_in[t * C + c] = xin[t];
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (uint p = 0; p < uint(MAX_T); ++p) {
+              if (p < T) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint tap = 0; tap < 4u; ++tap) {
+                  acc = fma(xin[p + tap], w[tap], acc);
+                }
+                const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+                const float sig = acc < 0.0f ? e : 1.0f - e;
+                const float out = acc * sig;
+                qk_raw[(part * MAX_T + p) * Dk + tid] = out;
+                if (owns_qk) conv_out[p * C + c] = out;
+              }
+            }
+          }
+          // The same for this threadgroup's 32 value channels.
+          {
+            const uint col = tid % uint(DVPT);
+            const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
+            for (uint t = tid / uint(DVPT); t < 3u + T; t += 128u / uint(DVPT)) {
+              conv_in[t * C + c] = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+            }
+            for (uint p = tid / uint(DVPT); p < T; p += 128u / uint(DVPT)) {
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = p + tap;
+                const float v = r < 3u ? conv_state[r * C + c] : qkv[(r - 3u) * C + c];
+                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              const float out = acc * sig;
+              v_tile[p * DVPT + col] = out;
+              conv_out[p * C + c] = out;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          #pragma clang fp reassociate(off)
+          // q/k RMSNorm (Qwen35FusedQKNorm): one simdgroup per (row, q or k).
+          for (uint job = sg; job < 2u * T; job += 4u) {
+            const uint part = job % 2u;
+            const uint t = job / 2u;
+            threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
+            const float4 x4 = ((threadgroup const float4*)(row + lane * 4u))[0];
+            const float x[4] = {x4.x, x4.y, x4.z, x4.w};
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              sum += x[i] * x[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+            const float scale = as_type<float>(uint(part == 0u ? Q_SCALE_BITS : K_SCALE_BITS));
+            const float4 normed = float4(
+              scale * (x[0] * inv),
+              scale * (x[1] * inv),
+              scale * (x[2] * inv),
+              scale * (x[3] * inv)
+            );
+            ((threadgroup float4*)(row + lane * 4u))[0] = normed;
+            if (owns_qk) {
+              device float* dst = (part == 0u ? q_out : k_out) + (t * uint(Hk) + hk_idx) * uint(Dk) + lane * 4u;
+              ((device float4*)dst)[0] = normed;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Qwen35RegisterGatedSIMD with q/k/v read from threadgroup memory.
+        threadgroup const float* q_ = qk_raw + dk0;
+        threadgroup const float* k_ = qk_raw + MAX_T * Dk + dk0;
+        threadgroup const float* v_ = v_tile + dvlocal;
+        const device float* a_ = a + b_idx * T * Hv + hv_idx;
+        const device float* bb_ = b + b_idx * T * Hv + hv_idx;
+        float negative_a = 0.0f;
+        float bias = 0.0f;
+        if (lane == 0) {
+          negative_a = -metal::precise::exp(a_log[hv_idx]);
+          bias = dt_bias[hv_idx];
+        }
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float kr[R];
+        float qr[R];
+        for (int t = 0; t < int(T); ++t) {
+          float local_g = 0.0f, local_beta = 0.0f;
+          if (lane == 0) {
+            local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);
+            local_beta = qwen35_simd_gate_beta(bb_[0]);
+          }
+          const float gt = simd_broadcast(local_g, 0);
+          const float bt = simd_broadcast(local_beta, 0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((threadgroup const float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((threadgroup const float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          const float2 v2 = *((threadgroup const float2*)v_);
+          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          kv[0] += simd_shuffle_xor(kv[0], 4);
+          kv[1] += simd_shuffle_xor(kv[1], 4);
+          kv[0] += simd_shuffle_xor(kv[0], 2);
+          kv[1] += simd_shuffle_xor(kv[1], 2);
+          kv[0] += simd_shuffle_xor(kv[0], 1);
+          kv[1] += simd_shuffle_xor(kv[1], 1);
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          out[0] += simd_shuffle_xor(out[0], 4);
+          out[1] += simd_shuffle_xor(out[1], 4);
+          out[0] += simd_shuffle_xor(out[0], 2);
+          out[1] += simd_shuffle_xor(out[1], 2);
+          out[0] += simd_shuffle_xor(out[0], 1);
+          out[1] += simd_shuffle_xor(out[1], 1);
+          if (lane % LPD == 0) {
+            *((device float2*)y_) = float2(out[0], out[1]);
+          }
+          q_ += Dk;
+          y_ += Hv * Dv;
+          k_ += Dk; v_ += DVPT; a_ += Hv; bb_ += Hv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+          }
+        }
+        """,
+        header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `(convIn, convOut, q, k, y, finalState)` of the verify window, or nil
+    /// when the shapes do not take the fused path.
+    static func apply(
+        convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+        let C = qkv.dim(-1)
+        guard convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
+            qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
+            convState.dim(2) == C, C == 2 * keyHeads * 128 + valueHeads * 128,
+            valueHeads % keyHeads == 0, convState.dtype == .float32, qkv.dtype == .float32,
+            convWeight.dtype == .float32, convWeight.shape == [C, 4, 1],
+            a.dtype == .float32, b.dtype == .float32, aLog.dtype == .float32,
+            dtBias.dtype == .float32, state.dtype == .float32,
+            a.shape == [1, qkv.dim(1), valueHeads], b.shape == a.shape,
+            state.shape == [1, valueHeads, 128, 128],
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let S = qkv.dim(1)
+        let outputs = kernel(
+            [convState, qkv, convWeight, a, b, aLog, dtBias, state],
+            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+            outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                [1, S, valueHeads, 128], state.shape],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5])
     }
 }
 
@@ -1731,11 +1800,22 @@ final class Qwen35GatedDeltaNet: Module {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
-        let fusedConv = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
+        // Verify windows of 3 ... 8 rows: conv, SiLU, q/k norm and the scan
+        // in one kernel (`Qwen35FusedGDNVerify`), the same bits.
+        let fusedMiddle = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
+            || headKDim != 128 || headVDim != 128
+            ? nil : Qwen35FusedGDNVerify.apply(
+                convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: ssmState,
+                keyHeads: numKHeads, valueHeads: numVHeads)
+        let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
+            || convKernelSize != 4
             ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
-        let convInput = fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
+        let convInput = fusedMiddle?.0 ?? fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
         let convOut: MLXArray
-        if let fusedConv {
+        if let fusedMiddle {
+            convOut = fusedMiddle.1
+        } else if let fusedConv {
             convOut = fusedConv.1
         } else if exactTargetVerify, S > 1 {
             convOut = silu(concatenated(
@@ -1747,12 +1827,13 @@ final class Qwen35GatedDeltaNet: Module {
             convOut = silu(conv1d(convInput))
         }
 
-        let (qNormed, kNormed) = normalizedQK(convOut, B: B, S: S)
+        let (qNormed, kNormed) = fusedMiddle.map { ($0.2, $0.3) }
+            ?? normalizedQK(convOut, B: B, S: S)
         let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = updateRecurrence(
+            let recurrence = fusedMiddle.map { ($0.4, $0.5) } ?? updateRecurrence(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -1905,6 +1986,103 @@ final class Qwen35GatedDeltaNet: Module {
 
 // MARK: - Attention
 
+/// Verify-width attention q/k preparation in one kernel: MLX `RMSNorm` of
+/// each 256-wide q head (read in place from the gated query projection) and
+/// k head, then MLX `RoPE` (non-traditional, `ROPE_DIMS` leading dims, array
+/// offset) into the `[1, heads, L, 256]` layout the attention takes. One
+/// simdgroup per (head, row): lane l holds dims 4l ... 4l + 3 of each half,
+/// the layout of MLX's `rms_single_row` (64 threads × 4 reads, two simdgroup
+/// sums), and the rotation partner of dim p < ROPE_DIMS / 2 is in lane
+/// l ^ (ROPE_DIMS / 8). Outputs are the bits of `rmsNorm` + `transposed` +
+/// `RoPE` as MLX's compiled kernels form them.
+enum Qwen35VerifyQKNormRoPE {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_verify_qk_norm_rope",
+        inputNames: ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base"],
+        outputNames: ["q_out", "k_out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr uint D = 256;
+            constexpr uint HALF_ROT = uint(ROPE_DIMS) / 2u;
+            const uint lane = thread_index_in_simdgroup;
+            const uint head = threadgroup_position_in_grid.y;
+            const uint t = threadgroup_position_in_grid.z;
+            const uint L = threadgroups_per_grid.z;
+            const bool is_q = head < uint(Q_HEADS);
+            const uint h = is_q ? head : head - uint(Q_HEADS);
+            const device float* src = is_q
+                ? q_proj + (t * uint(Q_HEADS) + h) * (2u * D)
+                : k_proj + (t * uint(KV_HEADS) + h) * D;
+            const device float* w = is_q ? q_weight : k_weight;
+            const float epsilon = eps[is_q ? 0 : 1];
+            float x[2][4];
+            float acc[2] = {0.0f, 0.0f};
+            for (uint part = 0; part < 2u; ++part) {
+              for (uint j = 0; j < 4u; ++j) {
+                x[part][j] = src[part * 128u + lane * 4u + j];
+                acc[part] = metal::fma(x[part][j], x[part][j], acc[part]);
+              }
+            }
+            const float total = simd_sum(acc[0]) + simd_sum(acc[1]);
+            const float inv = metal::precise::rsqrt(total / float(D) + epsilon);
+            float y[2][4];
+            for (uint part = 0; part < 2u; ++part) {
+              for (uint j = 0; j < 4u; ++j) {
+                y[part][j] = w[part * 128u + lane * 4u + j] * (x[part][j] * inv);
+              }
+            }
+            const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
+            const float base = rope_base[0];
+            for (uint j = 0; j < 4u; ++j) {
+              const float partner = simd_shuffle_xor(y[0][j], ushort(HALF_ROT / 4u));
+              const uint dim = lane * 4u + j;
+              if (dim < uint(ROPE_DIMS)) {
+                const uint p = dim < HALF_ROT ? dim : dim - HALF_ROT;
+                const float d = static_cast<float>(p) / static_cast<float>(HALF_ROT);
+                const float inv_freq = metal::exp2(-d * base);
+                const float theta = position * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                y[0][j] = dim < HALF_ROT
+                    ? metal::fma(y[0][j], costheta, -(partner * sintheta))
+                    : metal::fma(partner, sintheta, y[0][j] * costheta);
+              }
+            }
+            device float* dst = (is_q ? q_out : k_out) + (h * L + t) * D;
+            for (uint part = 0; part < 2u; ++part) {
+              for (uint j = 0; j < 4u; ++j) dst[part * 128u + lane * 4u + j] = y[part][j];
+            }
+            """)
+
+    /// `(queries [1, qHeads, L, 256], keys [1, kvHeads, L, 256])` or nil.
+    static func apply(
+        queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
+        keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
+        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
+            (2 ... 8).contains(queryProjection.dim(1)),
+            queryProjection.dim(2) == queryHeads * 512, keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
+            queryProjection.dtype == .float32, keyProjection.dtype == .float32,
+            queryWeight.dtype == .float32, keyWeight.dtype == .float32,
+            queryWeight.shape == [256], keyWeight.shape == [256],
+            offsets.size == 1, offsets.dtype == .int32,
+            ropeDims % 8 == 0, (8 ... 128).contains(ropeDims),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let L = queryProjection.dim(1)
+        let outputs = kernel(
+            [queryProjection, keyProjection, queryWeight, keyWeight,
+                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
+            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims)],
+            grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
+            outputShapes: [[1, queryHeads, L, 256], [1, keyHeads, L, 256]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+}
+
 final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
@@ -1920,6 +2098,9 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
     let mrope: Qwen35MRoPE
+    /// RoPE dims and base when `rope` is a plain unscaled `RoPE`, for the
+    /// fused verify q/k kernel; nil otherwise.
+    let plainRope: (dims: Int, base: Float)?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1951,6 +2132,8 @@ final class Qwen35Attention: Module {
             rope: self.rope, dim: max(1, ropeDims), base: args.ropeTheta,
             scalingConfig: args.ropeScaling,
             sections: args.mropeSection)
+        self.plainRope = self.rope is RoPE && args.ropeScaling?["factor"] == nil
+            ? (max(1, ropeDims), args.ropeTheta) : nil
 
         super.init()
     }
@@ -2012,27 +2195,42 @@ final class Qwen35Attention: Module {
         let qProjOutput = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[1] ?? kProj(x))
-        var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
         let vProjection = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[2] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
-        // Text-only Qwen positions are ordinary scalar-equivalent positions,
-        // but histories differ across rows. Capture the per-row device offsets
-        // before the cache advances and use the array RoPE overload.
-        if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+        var queries: MLXArray
+        var keys: MLXArray
+        if !exactTargetVerify, positionIds == nil, let plainRope,
+            let fused = Qwen35VerifyQKNormRoPE.apply(
+                queryProjection: qProjOutput, keyProjection: kProjection,
+                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
+                queryHeads: attentionHeads, keyHeads: kvHeads,
+                ropeDims: plainRope.dims, ropeBase: plainRope.base)
+        {
+            // Verify window: q/k RMSNorm and RoPE in one kernel, same bits.
+            (queries, keys) = fused
         } else {
-            let offsets = cache.positionOffsets + 0
-            queries = rope(queries, offset: offsets)
-            keys = rope(keys, offset: offsets)
+            queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
+                .transposed(0, 2, 1, 3)
+
+            // Text-only Qwen positions are ordinary scalar-equivalent positions,
+            // but histories differ across rows. Capture the per-row device offsets
+            // before the cache advances and use the array RoPE overload.
+            if let positionIds {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            } else {
+                let offsets = cache.positionOffsets + 0
+                queries = rope(queries, offset: offsets)
+                keys = rope(keys, offset: offsets)
+            }
         }
 
         let attended = cache.updateAndAttend(

@@ -341,6 +341,22 @@ final class Qwen35MTPModule: Module {
         return norm(fused)
     }
 
+    /// Append committed rows through the K/V-only path; the fused draft step
+    /// (`Qwen35MTPFusedDraftStep`) then runs the round's final row. Valid only
+    /// for a single-layer head, as `lastHiddenWithKVOnlyHistory`.
+    func appendHistoryKV(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) {
+        precondition(layers.count == 1 && cache.count == 1, "inline Qwen MTP history needs one layer")
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(entering(embeds))
+        let h = preFcNormHidden(entering(hidden))
+        layers[0].appendHistoryKV(fc(concatenated([e, h], axis: -1)), cache: cache[0])
+    }
+
     /// Append every leading committed row through a K/V-only path and compute
     /// a full decoder output only for the final proposal row. Multi-layer heads
     /// fail closed before any cache mutation because later layers require the
@@ -392,6 +408,9 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// Draft-only output head over a fixed slice of the target vocabulary.
     /// nil (small fixtures, tied or unpacked heads) keeps the full head.
     private let draftVocabulary: Qwen35MTPDraftVocabulary?
+    /// The fused single-row draft step, built on first use (after load-time
+    /// requantization); `step == nil` keeps the module path.
+    private let fusedDraftStepSlot = Qwen35MTPFusedDraftStepSlot()
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -974,6 +993,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         /// Final proposal hidden rows and draft ids that retain each lazy
         /// head-step graph until the engine's existing finalize synchronization.
         var roundRoots: [MLXArray] = []
+        /// The last fused draft step's hidden and its draft row: the next
+        /// step of the round receives that hidden back and takes the row's
+        /// precomputed embedding projection (`Qwen35MTPFusedDraftStep`).
+        var fusedCarry: (hidden: MLXArray, row: MLXArray)?
 
         var cacheOffset: Int {
             guard let first = caches.first else { return 0 }
@@ -1025,6 +1048,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             roundTrustedHidden.removeAll(keepingCapacity: true)
             roundTrustedTokens.removeAll(keepingCapacity: true)
             roundRoots.removeAll(keepingCapacity: true)
+            fusedCarry = nil
         }
 
         func clearAll() {
@@ -1035,6 +1059,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             roundTrustedHidden.removeAll(keepingCapacity: false)
             roundTrustedTokens.removeAll(keepingCapacity: false)
             roundRoots.removeAll(keepingCapacity: false)
+            fusedCarry = nil
             roundBaseOffset = 0
             roundValidHistoryOffset = 0
             roundDraftSteps = 0
@@ -1321,16 +1346,22 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             feed = (tokens, hidden)
         }
 
-        let output =
-            isFirstStep
-            ? (moduleLastHiddenWithKVOnlyHistory(
-                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
-                ?? moduleForward(
-                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches))
-            : moduleForward(
-                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
-        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
-        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        let draft: MLXArray
+        let lastHidden: MLXArray
+        if shortlist == nil, let fused = fusedRowStep(feed: feed, state: state) {
+            (draft, lastHidden) = fused
+        } else {
+            let output =
+                isFirstStep
+                ? (moduleLastHiddenWithKVOnlyHistory(
+                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+                    ?? moduleForward(
+                        hidden: feed.hidden, tokens: feed.tokens, cache: state.caches))
+                : moduleForward(
+                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+            lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
+            draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        }
         state.roundRoots.append(contentsOf: [lastHidden, draft])
         state.roundDraftSteps += 1
 
@@ -1391,6 +1422,53 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
         return argMax(headLogits(hidden)[0..., -1, 0...], axis: -1)
             .asType(.int32)
+    }
+
+    private var fusedDraftStep: Qwen35MTPFusedDraftStep? {
+        if !fusedDraftStepSlot.resolved {
+            fusedDraftStepSlot.resolved = true
+            if !Self.forceDoubleForward, let draftVocabulary {
+                fusedDraftStepSlot.step = Qwen35MTPFusedDraftStep(
+                    module: mtp, configuration: target.configuration,
+                    embedTokens: target.model.embedTokens, draftHead: draftVocabulary.head,
+                    draftIds: draftVocabulary.ids, screen: Self.draftScreen)
+            }
+        }
+        return fusedDraftStepSlot.step
+    }
+
+    /// The fused single-row step for the feed's final row, after the leading
+    /// rows (the first step's trusted history) entered the KV storage through
+    /// the K/V-only path. Nil, with nothing appended, when the fused step
+    /// does not take these inputs.
+    private func fusedRowStep(
+        feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState
+    ) -> (MLXArray, MLXArray)? {
+        let rows = feed.tokens.dim(1)
+        guard let step = fusedDraftStep, rows >= 1, feed.hidden.dim(1) == rows,
+            state.caches.count == 1
+        else { return nil }
+        let token = rows == 1 ? feed.tokens : feed.tokens[0..., (rows - 1)...]
+        let hidden = rows == 1 ? feed.hidden : feed.hidden[0..., (rows - 1)..., 0...]
+        guard step.accepts(token: token, hidden: hidden, cache: state.caches[0]) else { return nil }
+        if rows > 1 {
+            mtp.appendHistoryKV(
+                hidden: feed.hidden[0..., ..<(rows - 1), 0...],
+                nextTokenIds: feed.tokens[0..., ..<(rows - 1)],
+                embedTokens: target.model.embedTokens, cache: state.caches)
+        }
+        let carried = state.fusedCarry.flatMap { $0.hidden === hidden ? $0.row : nil }
+        state.fusedCarry = nil
+        if let fused = step.step(
+            token: token, hidden: hidden, carriedRow: carried, cache: state.caches[0],
+            fallbackScreen: { self.draftToken(hidden: $0, shortlist: nil) },
+            fallbackNorm: { self.mtp.norm($0) })
+        {
+            if let row = fused.row { state.fusedCarry = (fused.hidden, row) }
+            return (fused.token, fused.hidden)
+        }
+        let output = moduleForward(hidden: hidden, tokens: token, cache: state.caches)
+        return (draftToken(hidden: output, shortlist: nil), output)
     }
 
     /// Explicit pre-cutover A/B oracle. It shares production history upkeep,
@@ -1719,4 +1797,683 @@ extension Qwen35InlineMTPAssistant {
         Stream().synchronize()
         Memory.clearCache()
     }
+}
+
+// MARK: - Fused single-row draft step
+
+/// The head's single-row draft step in eleven kernels instead of the module
+/// path's ~35 (Bonsai 2 9B head geometry: hidden 4096, 16 query and 4 KV heads
+/// of 256, a 12288-wide SwiGLU MLP, every linear 4-bit g128 after
+/// `requantizeHeadLinears`):
+///
+///  1. embedding row + both pre-fc RMSNorms (`HadamardQuantizedEmbedding.draftFrontRow`);
+///  2. fc;
+///  (1-2 on a round's later steps, whose token is the previous step's draft
+///  row `r`: `embeddingProjection[r]` plus fc's hidden half over
+///  `pre_fc_norm_hidden(hidden)`, in one launch);
+///  3. q|gate, k and v in one launch, `input_layernorm` folded in;
+///  4. q/k RMSNorm + RoPE, the new K/V row written in place into the head's
+///     KV storage, split-K attention over every position;
+///  5. the split-K combine;
+///  6. o_proj on `attention · sigmoid(gate)`, plus the residual;
+///  7. gate|up in one launch, `post_attention_layernorm` folded in, SiLU·up out;
+///  8. down_proj plus the residual;
+///  9-11. final norm + rotation, screen, rescore + pick
+///     (`HadamardQuantizedLinear.draftScreenedToken`).
+///
+/// Every linear reads its packed weights and FP16 constants in place with the
+/// MLX qmv lane layout. Draft-only: the arithmetic is FP32 throughout but in a
+/// different order (norms folded into the matvecs, FP32 embedding row), so a
+/// draft may differ from the module path's; the target verifies every token.
+/// `QWEN35_DRAFT_FUSED=0` keeps the module path; `QWEN35_DRAFT_EMBED_PROJECTION=0`
+/// skips the precomputed embedding projection (~400 MB FP16 for the 49,664-row
+/// draft head), so every step runs 1-2 (local A/B only).
+final class Qwen35MTPFusedDraftStep {
+    static func environmentFlag(_ name: String) -> Bool {
+        let raw = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }
+    static let enabled = environmentFlag("QWEN35_DRAFT_FUSED")
+    static let projectsEmbeddings = ProcessInfo.processInfo.environment["QWEN35_DRAFT_EMBED_PROJECTION"] == "1"
+
+    struct Packed {
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+
+        init?(_ module: Module, rows: Int, columns: Int) {
+            guard let linear = module as? QuantizedLinear, linear.mode == .affine,
+                linear.bits == 4, linear.groupSize == 128, linear.bias == nil,
+                let biases = linear.biases, linear.weight.dtype == .uint32,
+                linear.weight.shape == [rows, columns / 8],
+                linear.scales.dtype == .float16, biases.dtype == .float16,
+                linear.scales.shape == [rows, columns / 128], biases.shape == [rows, columns / 128]
+            else { return nil }
+            self.weight = linear.weight
+            self.scales = linear.scales
+            self.biases = biases
+        }
+    }
+
+    static let hidden = 4096
+    static let queryHeads = 16
+    static let kvHeads = 4
+    static let headDim = 256
+    static let intermediate = 12288
+    static let rotaryDims = 64
+    /// Rows per simdgroup and simdgroups per threadgroup of every matvec.
+    static let rows = 4
+    static let simdgroups = 2
+    /// Attention positions per threadgroup and simdgroups per threadgroup.
+    static let attentionChunk = 32
+    static let attentionSimdgroups = 4
+
+    let fc: Packed, q: Packed, k: Packed, v: Packed, o: Packed
+    let gate: Packed, up: Packed, down: Packed
+    let embed: HadamardQuantizedEmbedding
+    let embedNorm: MLXArray, hiddenNorm: MLXArray, inputNorm: MLXArray, postNorm: MLXArray
+    let qNorm: MLXArray, kNorm: MLXArray, finalNorm: MLXArray
+    let eps: MLXArray
+    let inverseFrequencies: MLXArray
+    let head: HadamardQuantizedLinear
+    let ids: MLXArray
+    let screen: (width: Int, chunk: Int)
+    /// fc's embedding half applied to every draft-head row's normalized
+    /// embedding, `[rows, 4096]` FP16: `fc[:, :4096] · rmsNorm(embed(ids[r]))`.
+    let embeddingProjection: MLXArray?
+
+    init?(
+        module: Qwen35MTPModule, configuration: Qwen35TextConfiguration,
+        embedTokens: Embedding, draftHead: HadamardQuantizedLinear, draftIds: MLXArray,
+        screen: (Int, Int)?
+    ) {
+        let H = Self.hidden, D = Self.headDim
+        let ropeType: String = {
+            guard let scaling = configuration.ropeScaling else { return "default" }
+            if case .string(let s) = scaling["type"] ?? scaling["rope_type"] ?? .string("default") {
+                return s
+            }
+            return "?"
+        }()
+        guard Self.enabled, let screen, screen.1 == 32,
+            module.layers.count == 1,
+            configuration.hiddenSize == H, configuration.attentionHeads == Self.queryHeads,
+            configuration.kvHeads == Self.kvHeads, (configuration.headDim ?? 0) == D,
+            Int(Float(D) * configuration.partialRotaryFactor) == Self.rotaryDims,
+            ropeType == "default",
+            let embed = embedTokens as? HadamardQuantizedEmbedding,
+            draftIds.dtype == .int32, draftIds.size == draftHead.weight.dim(0)
+        else { return nil }
+        let layer = module.layers[0]
+        let attention = layer.selfAttn
+        guard attention.rope is RoPE,
+            let mlp = layer.mlp as? Qwen3NextMLP,
+            let fc = Packed(module.fc, rows: H, columns: 2 * H),
+            let q = Packed(attention.qProj, rows: 2 * Self.queryHeads * D, columns: H),
+            let k = Packed(attention.kProj, rows: Self.kvHeads * D, columns: H),
+            let v = Packed(attention.vProj, rows: Self.kvHeads * D, columns: H),
+            let o = Packed(attention.oProj, rows: H, columns: Self.queryHeads * D),
+            let gate = Packed(mlp.gateProj, rows: Self.intermediate, columns: H),
+            let up = Packed(mlp.upProj, rows: Self.intermediate, columns: H),
+            let down = Packed(mlp.downProj, rows: H, columns: Self.intermediate)
+        else { return nil }
+        let norms = [
+            module.preFcNormEmbedding, module.preFcNormHidden, layer.inputLayerNorm,
+            layer.postAttentionLayerNorm, module.norm,
+        ]
+        let eps = module.norm.eps
+        guard norms.allSatisfy({ $0.weight.dtype == .float16 && $0.weight.shape == [H] && $0.eps == eps }),
+            [attention.qNorm, attention.kNorm].allSatisfy({
+                $0.weight.dtype == .float16 && $0.weight.shape == [D] && $0.eps == eps
+            })
+        else { return nil }
+        (self.fc, self.q, self.k, self.v, self.o) = (fc, q, k, v, o)
+        (self.gate, self.up, self.down) = (gate, up, down)
+        self.embed = embed
+        self.embedNorm = module.preFcNormEmbedding.weight
+        self.hiddenNorm = module.preFcNormHidden.weight
+        self.inputNorm = layer.inputLayerNorm.weight
+        self.postNorm = layer.postAttentionLayerNorm.weight
+        self.qNorm = attention.qNorm.weight
+        self.kNorm = attention.kNorm.weight
+        self.finalNorm = module.norm.weight
+        self.eps = MLXArray([eps])
+        let half = Self.rotaryDims / 2
+        let base = Double(configuration.ropeTheta)
+        self.inverseFrequencies = MLXArray(
+            (0 ..< half).map { Float(pow(base, -Double($0) / Double(half))) })
+        self.head = draftHead
+        self.ids = draftIds
+        self.screen = (screen.0, screen.1)
+        eval(self.eps, self.inverseFrequencies)
+        // Built once, in blocks: dequantized embedding rows (the module
+        // path's FP16 lookup), FP32 RMSNorm, fc's embedding half.
+        guard Self.projectsEmbeddings else {
+            self.embeddingProjection = nil
+            return
+        }
+        let halfWeight = fc.weight[0..., ..<(H / 8)]
+        let halfScales = fc.scales[0..., ..<(H / 128)].asType(.float32)
+        let halfOffsets = fc.biases[0..., ..<(H / 128)].asType(.float32)
+        let block = 4096
+        var parts: [MLXArray] = []
+        for start in stride(from: 0, to: draftIds.size, by: block) {
+            let rows = embed(draftIds[start ..< min(draftIds.size, start + block)])
+            let normed = MLXFast.rmsNorm(
+                rows.asType(.float32), weight: module.preFcNormEmbedding.weight.asType(.float32),
+                eps: eps)
+            let part = quantizedMM(
+                normed, halfWeight, scales: halfScales, biases: halfOffsets, transpose: true,
+                groupSize: 128, bits: 4, mode: .affine
+            ).asType(.float16)
+            eval(part)
+            parts.append(part)
+        }
+        let projection = concatenated(parts, axis: 0)
+        parts.removeAll()
+        eval(projection)
+        self.embeddingProjection = projection
+    }
+
+    /// Whether `step` takes these inputs (it may still decline the screen,
+    /// which then runs the module path's).
+    func accepts(token: MLXArray, hidden: MLXArray, cache: any KVCache) -> Bool {
+        guard token.size == 1, hidden.dtype == .float32, hidden.size == Self.hidden,
+            StreamOrDevice.default == StreamOrDevice.gpu,
+            let simple = cache as? KVCacheSimple, type(of: simple) == KVCacheSimple.self
+        else { return false }
+        let storage = simple.innerState()
+        return storage.isEmpty
+            || (storage.count == 2 && storage.allSatisfy { $0.dtype == .float32 })
+    }
+
+    /// The head's KV storage `[1, kvHeads, capacity, headDim]` (FP32, row
+    /// contiguous) with room for one more position, grown through the
+    /// cache's own update when full; nil when the cache is another kind.
+    private func appendStorage(_ cache: any KVCache) -> (cache: KVCacheSimple, keys: MLXArray, values: MLXArray)? {
+        guard let cache = cache as? KVCacheSimple, type(of: cache) == KVCacheSimple.self else {
+            return nil
+        }
+        var storage = cache.innerState()
+        if storage.count != 2 || cache.offset + 1 > storage[0].dim(2) {
+            if let present = storage.first, present.dtype != .float32 { return nil }
+            let zeros = MLXArray.zeros([1, Self.kvHeads, 1, Self.headDim], dtype: .float32)
+            _ = cache.update(keys: zeros, values: zeros)
+            cache.trim(1)
+            storage = cache.innerState()
+        }
+        let shape = [1, Self.kvHeads, storage.first?.dim(2) ?? 0, Self.headDim]
+        guard storage.count == 2, storage.allSatisfy({ $0.dtype == .float32 && $0.shape == shape }),
+            cache.offset + 1 <= shape[2]
+        else { return nil }
+        return (cache, storage[0], storage[1])
+    }
+
+    /// One draft step for one row: the draft token (`[1]`, int32) and the
+    /// head's normalized hidden (`[1, 1, 4096]`). Nil, before any state
+    /// changes, when an input does not take the fused path.
+    /// `carriedRow`: the head row of `token` when it is the previous step's
+    /// draft (its embedding projection is precomputed).
+    func step(
+        token: MLXArray, hidden: MLXArray, carriedRow: MLXArray?, cache: any KVCache,
+        fallbackScreen: (MLXArray) -> MLXArray, fallbackNorm: (MLXArray) -> MLXArray
+    ) -> (token: MLXArray, hidden: MLXArray, row: MLXArray?)? {
+        let H = Self.hidden
+        guard token.size == 1, hidden.dtype == .float32, hidden.size == H,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let threads = (32, Self.simdgroups, 1)
+        let tile: [(String, any KernelTemplateArg)] = [("R", Self.rows), ("SG", Self.simdgroups)]
+        func grid(_ rows: Int) -> (Int, Int, Int) { (32, rows / Self.rows, 1) }
+        let fused: MLXArray
+        if let carriedRow, let embeddingProjection, carriedRow.dtype == .int32, carriedRow.size == 1 {
+            guard let storage = appendStorage(cache) else { return nil }
+            fused = Qwen35MTPFusedKernels.matvecCarried(
+                [hidden.reshaped([H]), hiddenNorm, eps, fc.weight, fc.scales, fc.biases,
+                 embeddingProjection, carriedRow],
+                template: tile + [("K", H), ("KS", 2 * H)],
+                grid: grid(H), threadGroup: threads, outputShapes: [[H]], outputDTypes: [.float32])[0]
+            return finish(fused: fused, storage: storage, fallbackScreen: fallbackScreen, fallbackNorm: fallbackNorm)
+        }
+        guard
+            let front = embed.draftFrontRow(
+                token: token.dtype == .int32 ? token : token.asType(.int32),
+                embedNorm: embedNorm, hidden: hidden, hiddenNorm: hiddenNorm, eps: eps),
+            let storage = appendStorage(cache)
+        else { return nil }
+        fused = Qwen35MTPFusedKernels.matvec(
+            [front, fc.weight, fc.scales, fc.biases], template: tile + [("K", 2 * H), ("KS", 2 * H)],
+            grid: grid(H), threadGroup: threads, outputShapes: [[H]], outputDTypes: [.float32])[0]
+        return finish(fused: fused, storage: storage, fallbackScreen: fallbackScreen, fallbackNorm: fallbackNorm)
+    }
+
+    /// Steps 3-11 from the fc output.
+    private func finish(
+        fused: MLXArray, storage: (cache: KVCacheSimple, keys: MLXArray, values: MLXArray),
+        fallbackScreen: (MLXArray) -> MLXArray, fallbackNorm: (MLXArray) -> MLXArray
+    ) -> (token: MLXArray, hidden: MLXArray, row: MLXArray?) {
+        let H = Self.hidden, D = Self.headDim
+        let threads = (32, Self.simdgroups, 1)
+        let tile: [(String, any KernelTemplateArg)] = [("R", Self.rows), ("SG", Self.simdgroups)]
+        func grid(_ rows: Int) -> (Int, Int, Int) { (32, rows / Self.rows, 1) }
+        let qRows = 2 * Self.queryHeads * D, kvRows = Self.kvHeads * D
+        let qkv = Qwen35MTPFusedKernels.qkv(
+            [fused, inputNorm, eps, q.weight, q.scales, q.biases, k.weight, k.scales, k.biases,
+             v.weight, v.scales, v.biases],
+            template: tile + [("K", H), ("KS", H), ("NQ", qRows), ("NK", kvRows)],
+            grid: grid(qRows + 2 * kvRows), threadGroup: threads,
+            outputShapes: [[qRows + 2 * kvRows]], outputDTypes: [.float32])[0]
+
+        let position = storage.cache.offset
+        let chunk = Self.attentionChunk, attentionSimdgroups = Self.attentionSimdgroups
+        let chunks = (position + 1 + chunk - 1) / chunk
+        let partial = Qwen35MTPFusedKernels.attention(
+            [qkv, qNorm, kNorm, eps, inverseFrequencies, MLXArray([Int32(position)]),
+             storage.keys, storage.values],
+            template: [("G", Self.queryHeads / Self.kvHeads), ("HD", D), ("CH", chunk),
+                       ("NSG", attentionSimdgroups), ("NQH", Self.queryHeads),
+                       ("KVH", Self.kvHeads), ("ROT", Self.rotaryDims)],
+            grid: (32 * attentionSimdgroups * chunks, Self.kvHeads, 1),
+            threadGroup: (32 * attentionSimdgroups, 1, 1),
+            outputShapes: [[Self.queryHeads, chunks], [Self.queryHeads, chunks],
+                           [Self.queryHeads * chunks * D]],
+            outputDTypes: [.float32, .float32, .float32])
+        storage.cache.offset += 1
+        let attended = Qwen35MTPFusedKernels.attentionCombine(
+            partial, template: [("HD", D)], grid: (D, Self.queryHeads, 1), threadGroup: (D, 1, 1),
+            outputShapes: [[Self.queryHeads * D]], outputDTypes: [.float32])[0]
+
+        let afterAttention = Qwen35MTPFusedKernels.outputProjection(
+            [attended, qkv, fused, o.weight, o.scales, o.biases],
+            template: tile + [("K", Self.queryHeads * D), ("KS", Self.queryHeads * D), ("HD", D)],
+            grid: grid(H), threadGroup: threads, outputShapes: [[H]], outputDTypes: [.float32])[0]
+        let activated = Qwen35MTPFusedKernels.gateUp(
+            [afterAttention, postNorm, eps, gate.weight, gate.scales, gate.biases,
+             up.weight, up.scales, up.biases],
+            template: tile + [("K", H), ("KS", H)], grid: grid(Self.intermediate), threadGroup: threads,
+            outputShapes: [[Self.intermediate]], outputDTypes: [.float32])[0]
+        let output = Qwen35MTPFusedKernels.downProjection(
+            [activated, afterAttention, down.weight, down.scales, down.biases],
+            template: tile + [("K", Self.intermediate), ("KS", Self.intermediate)], grid: grid(H), threadGroup: threads,
+            outputShapes: [[H]], outputDTypes: [.float32])[0]
+
+        if let screened = head.draftScreenedToken(
+            output, normWeight: finalNorm, eps: eps, ids: ids,
+            width: screen.width, chunk: screen.chunk)
+        {
+            return (screened.token, screened.hidden, screened.row)
+        }
+        let normalized = fallbackNorm(output.reshaped([1, 1, H]))
+        return (fallbackScreen(normalized), normalized, nil)
+    }
+}
+
+/// The assistant's lazily built fused step.
+final class Qwen35MTPFusedDraftStepSlot: @unchecked Sendable {
+    var resolved = false
+    var step: Qwen35MTPFusedDraftStep?
+}
+
+/// Kernels of `Qwen35MTPFusedDraftStep`. Every matvec: simdgroup `s` of
+/// threadgroup `t` owns rows `t·SG·R + s·R ..< +R`; lane `l` covers inputs
+/// `16l + 512j ..< +16` (MLX qmv_fast's 4-bit lane layout and nibble scaling),
+/// reading the packed weights and the FP16 scales and offsets in place.
+enum Qwen35MTPFusedKernels {
+    static let header = """
+        METAL_FUNC float mtp_q4_dot16(const device uint8_t* p, thread const float* xt, float s, float b, float sum) {
+          const uint2 q2 = *(const device uint2*)p;
+          float a = 0;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 2; j++) {
+            const uint q = j == 0 ? q2.x : q2.y;
+            a += xt[8 * j + 0] * float(q & 0xfu) + xt[8 * j + 1] * float(q & 0xf0u)
+               + xt[8 * j + 2] * float(q & 0xf00u) + xt[8 * j + 3] * float(q & 0xf000u);
+            const uint h = q >> 16;
+            a += xt[8 * j + 4] * float(h & 0xfu) + xt[8 * j + 5] * float(h & 0xf0u)
+               + xt[8 * j + 6] * float(h & 0xf00u) + xt[8 * j + 7] * float(h & 0xf000u);
+          }
+          return s * a + b * sum;
+        }
+        """
+
+    /// The matvec body. `loadX` fills `float4 v[4]` with the lane's 16 inputs
+    /// at `kk` (and may accumulate `ss`); `rowSetup` binds `ws`/`sc`/`bi`
+    /// (and the sibling's `ws2`/`sc2`/`bi2` when `merged`).
+    static func matvecBody(loadX: String, rowSetup: String, epilogue: String, merged: Bool) -> String {
+        let rowLoop = merged ? """
+                #pragma clang loop unroll(full)
+                for (int r = 0; r < R; r++) {
+                  acc[r] += mtp_q4_dot16(ws + r * in_w, xt, float(sc[r * in_g]), float(bi[r * in_g]), sum);
+                  acc2[r] += mtp_q4_dot16(ws2 + r * in_w, xt, float(sc2[r * in_g]), float(bi2[r * in_g]), sum);
+                }
+                ws2 += 256; sc2 += 4; bi2 += 4;
+            """ : """
+                #pragma clang loop unroll(full)
+                for (int r = 0; r < R; r++) {
+                  acc[r] += mtp_q4_dot16(ws + r * in_w, xt, float(sc[r * in_g]), float(bi[r * in_g]), sum);
+                }
+            """
+        return """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint lid = thread_index_in_simdgroup;
+            const int in_w = KS / 2;
+            const int in_g = KS / 128;
+            const int row = int(threadgroup_position_in_grid.y) * (SG * R) + int(simd_gid) * R;
+            \(rowSetup)
+            float ss = 0;
+            float acc[R];
+            float acc2[R];
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < R; r++) { acc[r] = 0; acc2[r] = 0; }
+            for (int kk = int(lid) * 16; kk < K; kk += 512) {
+              float4 v[4];
+              \(loadX)
+              float xt[16];
+              float sum = 0;
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < 4; i++) {
+                sum += v[i].x + v[i].y + v[i].z + v[i].w;
+                xt[4 * i] = v[i].x;
+                xt[4 * i + 1] = v[i].y * 0.0625f;
+                xt[4 * i + 2] = v[i].z * 0.00390625f;
+                xt[4 * i + 3] = v[i].w * 0.000244140625f;
+              }
+              \(rowLoop)
+              ws += 256; sc += 4; bi += 4;
+            }
+            \(epilogue)
+            """
+    }
+
+    static let rowSetup = """
+        const device uint8_t* ws = (const device uint8_t*)w + row * in_w + lid * 8;
+        const device half* sc = scales + row * in_g + lid / 8;
+        const device half* bi = biases + row * in_g + lid / 8;
+        """
+    static let loadPlain = """
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) v[i] = *((const device float4*)(x + kk) + i);
+        """
+    /// RMSNorm folded in: the lane scales its inputs by the norm weight and
+    /// sums their squares; the epilogue applies `rsqrt(mean + eps)` to the dot.
+    static let loadNormed = """
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; i++) {
+          const float4 raw = *((const device float4*)(x + kk) + i);
+          ss += dot(raw, raw);
+          v[i] = raw * float4(*((const device half4*)(g + kk) + i));
+        }
+        """
+    static let storePlain = """
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) { const float t = simd_sum(acc[r]); if (lid == 0) y[row + r] = t; }
+        """
+    static let storeNormed = """
+        const float inv = metal::precise::rsqrt(simd_sum(ss) / float(K) + eps[0]);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) { const float t = simd_sum(acc[r]); if (lid == 0) y[row + r] = t * inv; }
+        """
+    static let storeResidual = """
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; r++) { const float t = simd_sum(acc[r]); if (lid == 0) y[row + r] = res[row + r] + t; }
+        """
+
+    /// fc's hidden half (columns `[KS - K, KS)`) over `rmsNorm(x) · g`, plus
+    /// the precomputed embedding-half row `proj[row]`.
+    static let matvecCarried = MLXFast.metalKernel(
+        name: "mtp_draft_q4_fc_carried",
+        inputNames: ["x", "g", "eps", "w", "scales", "biases", "proj", "prow"], outputNames: ["y"],
+        source: matvecBody(
+            loadX: loadNormed,
+            rowSetup: """
+                const device uint8_t* ws = (const device uint8_t*)w + row * in_w + (KS - K) / 2 + lid * 8;
+                const device half* sc = scales + row * in_g + (KS - K) / 128 + lid / 8;
+                const device half* bi = biases + row * in_g + (KS - K) / 128 + lid / 8;
+                """,
+            epilogue: """
+                const float inv = metal::precise::rsqrt(simd_sum(ss) / float(K) + eps[0]);
+                const device half* pr = proj + int64_t(prow[0]) * int64_t(proj_shape[1]);
+                #pragma clang loop unroll(full)
+                for (int r = 0; r < R; r++) {
+                  const float t = simd_sum(acc[r]);
+                  if (lid == 0) y[row + r] = t * inv + float(pr[row + r]);
+                }
+                """,
+            merged: false),
+        header: header)
+
+    /// fc over the front row.
+    static let matvec = MLXFast.metalKernel(
+        name: "mtp_draft_q4_matvec", inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: matvecBody(loadX: loadPlain, rowSetup: rowSetup, epilogue: storePlain, merged: false),
+        header: header)
+
+    /// q|gate, k, v in one launch over `rmsNorm(x) · g`: rows `[0, NQ)` q,
+    /// `[NQ, NQ + NK)` k, then v.
+    static let qkv = MLXFast.metalKernel(
+        name: "mtp_draft_q4_qkv_normed",
+        inputNames: ["x", "g", "eps", "wq", "sq", "bq", "wk", "sk", "bk", "wv", "sv", "bv"],
+        outputNames: ["y"],
+        source: matvecBody(
+            loadX: loadNormed,
+            rowSetup: """
+                const device uint32_t* wsel;
+                const device half* ssel;
+                const device half* bsel;
+                int lrow;
+                if (row < NQ) { wsel = wq; ssel = sq; bsel = bq; lrow = row; }
+                else if (row < NQ + NK) { wsel = wk; ssel = sk; bsel = bk; lrow = row - NQ; }
+                else { wsel = wv; ssel = sv; bsel = bv; lrow = row - NQ - NK; }
+                const device uint8_t* ws = (const device uint8_t*)wsel + lrow * in_w + lid * 8;
+                const device half* sc = ssel + lrow * in_g + lid / 8;
+                const device half* bi = bsel + lrow * in_g + lid / 8;
+                """,
+            epilogue: storeNormed, merged: false),
+        header: header)
+
+    /// o_proj over `attention · sigmoid(gate)` (gate: the second half of each
+    /// head's 2·HD q projection), plus the residual.
+    static let outputProjection = MLXFast.metalKernel(
+        name: "mtp_draft_q4_o_gated_residual",
+        inputNames: ["x", "qkv", "res", "w", "scales", "biases"], outputNames: ["y"],
+        source: matvecBody(
+            loadX: """
+                {
+                  const int gidx = (kk / HD) * (2 * HD) + HD + (kk % HD);
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < 4; i++) {
+                    const float4 a = *((const device float4*)(x + kk) + i);
+                    const float4 gt = *((const device float4*)(qkv + gidx) + i);
+                    v[i] = a * (1.0f / (1.0f + metal::exp(-gt)));
+                  }
+                }
+                """,
+            rowSetup: rowSetup, epilogue: storeResidual, merged: false),
+        header: header)
+
+    /// gate|up in one launch over `rmsNorm(x) · g`; writes `silu(gate) · up`.
+    static let gateUp = MLXFast.metalKernel(
+        name: "mtp_draft_q4_gate_up_normed_swiglu",
+        inputNames: ["x", "g", "eps", "w", "scales", "biases", "w2", "scales2", "biases2"],
+        outputNames: ["y"],
+        source: matvecBody(
+            loadX: loadNormed,
+            rowSetup: rowSetup + """
+                const device uint8_t* ws2 = (const device uint8_t*)w2 + row * in_w + lid * 8;
+                const device half* sc2 = scales2 + row * in_g + lid / 8;
+                const device half* bi2 = biases2 + row * in_g + lid / 8;
+                """,
+            epilogue: """
+                const float inv = metal::precise::rsqrt(simd_sum(ss) / float(K) + eps[0]);
+                #pragma clang loop unroll(full)
+                for (int r = 0; r < R; r++) {
+                  const float gv = simd_sum(acc[r]) * inv;
+                  const float uv = simd_sum(acc2[r]) * inv;
+                  if (lid == 0) y[row + r] = (gv / (1.0f + metal::exp(-gv))) * uv;
+                }
+                """,
+            merged: true),
+        header: header)
+
+    /// down_proj plus the residual.
+    static let downProjection = MLXFast.metalKernel(
+        name: "mtp_draft_q4_down_residual",
+        inputNames: ["x", "res", "w", "scales", "biases"], outputNames: ["y"],
+        source: matvecBody(loadX: loadPlain, rowSetup: rowSetup, epilogue: storeResidual, merged: false),
+        header: header)
+
+    /// Single-query attention, pass 1. One threadgroup per (CH-position chunk,
+    /// KV head), NSG simdgroups striding the chunk; lane `l` owns dims
+    /// `[l·E, l·E + E)` of the G query heads sharing the KV head. q/k get
+    /// their RMSNorm and non-traditional RoPE on the first ROT dims here; the
+    /// chunk owning position `pos` first writes the new K/V row into `kc`/`vc`
+    /// (`[1, KVH, capacity, HD]`, written in place). Writes each (query head,
+    /// chunk)'s running max, sum and unnormalized output.
+    static let attention = MLXFast.metalKernel(
+        name: "mtp_draft_attention_append",
+        inputNames: ["qkv", "qn", "kn", "eps", "inv_freq", "pos", "kc", "vc"],
+        outputNames: ["pm", "pl", "po"],
+        source: """
+            threadgroup float tm[NSG][G];
+            threadgroup float tl[NSG][G];
+            threadgroup float to[NSG][G][HD];
+            constexpr int E = HD / 32;
+            const uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+            const int h = int(threadgroup_position_in_grid.y);
+            const int c = int(threadgroup_position_in_grid.x);
+            const int nC = int(threadgroups_per_grid.x);
+            const int P = pos[0];
+            const int n = P + 1;
+            const int64_t cap = int64_t(kc_shape[2]);
+            const float L = float(P);
+            const float scale = metal::rsqrt(float(HD));
+            float qr[G][E];
+            #pragma clang loop unroll(full)
+            for (int g = 0; g < G; g++) {
+              const device float* src = qkv + (h * G + g) * 2 * HD + lane * E;
+              float ss = 0;
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) { qr[g][e] = src[e]; ss += qr[g][e] * qr[g][e]; }
+              const float inv = metal::precise::rsqrt(simd_sum(ss) / float(HD) + eps[0]);
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) qr[g][e] = float(qn[lane * E + e]) * (qr[g][e] * inv);
+              mtp_rope_lane<E, ROT>(qr[g], lane, L, inv_freq);
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) qr[g][e] *= scale;
+            }
+            if (c == P / CH) {
+              if (sg == 0) {
+                float kv[E];
+                const device float* src = qkv + NQH * 2 * HD + h * HD + lane * E;
+                float ss = 0;
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < E; e++) { kv[e] = src[e]; ss += kv[e] * kv[e]; }
+                const float inv = metal::precise::rsqrt(simd_sum(ss) / float(HD) + eps[0]);
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < E; e++) kv[e] = float(kn[lane * E + e]) * (kv[e] * inv);
+                mtp_rope_lane<E, ROT>(kv, lane, L, inv_freq);
+                const device float* vsrc = qkv + NQH * 2 * HD + KVH * HD + h * HD + lane * E;
+                device float* kd = kc + (int64_t(h) * cap + P) * HD + lane * E;
+                device float* vd = vc + (int64_t(h) * cap + P) * HD + lane * E;
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < E; e++) { kd[e] = kv[e]; vd[e] = vsrc[e]; }
+              }
+              threadgroup_barrier(mem_flags::mem_device);
+            }
+            float m[G], l[G], o[G][E];
+            #pragma clang loop unroll(full)
+            for (int g = 0; g < G; g++) {
+              m[g] = -INFINITY;
+              l[g] = 0;
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) o[g][e] = 0;
+            }
+            const int p0 = c * CH;
+            const int p1 = min(n, p0 + CH);
+            for (int p = p0 + int(sg); p < p1; p += NSG) {
+              const device float* kr = kc + (int64_t(h) * cap + p) * HD + lane * E;
+              const device float* vr = vc + (int64_t(h) * cap + p) * HD + lane * E;
+              float kv[E], vv[E];
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e += 4) {
+                *(thread float4*)(kv + e) = *(const device float4*)(kr + e);
+                *(thread float4*)(vv + e) = *(const device float4*)(vr + e);
+              }
+              #pragma clang loop unroll(full)
+              for (int g = 0; g < G; g++) {
+                float d = 0;
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < E; e++) d += qr[g][e] * kv[e];
+                const float sc = simd_sum(d);
+                const float mn = max(m[g], sc);
+                const float a = metal::exp(m[g] - mn), b = metal::exp(sc - mn);
+                l[g] = l[g] * a + b;
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < E; e++) o[g][e] = o[g][e] * a + b * vv[e];
+                m[g] = mn;
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int g = 0; g < G; g++) {
+              if (lane == 0) { tm[sg][g] = m[g]; tl[sg][g] = l[g]; }
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) to[sg][g][lane * E + e] = o[g][e];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = sg * 32 + lane; idx < uint(G * HD); idx += NSG * 32) {
+              const int g = int(idx) / HD, d = int(idx) % HD;
+              float M = -INFINITY;
+              for (int s = 0; s < NSG; s++) M = max(M, tm[s][g]);
+              float Ls = 0, O = 0;
+              for (int s = 0; s < NSG; s++) {
+                const float w = (tm[s][g] == -INFINITY) ? 0.0f : metal::exp(tm[s][g] - M);
+                Ls += tl[s][g] * w;
+                O += to[s][g][d] * w;
+              }
+              const int qh = h * G + g;
+              po[(qh * nC + c) * HD + d] = O;
+              if (d == 0) { pm[qh * nC + c] = M; pl[qh * nC + c] = Ls; }
+            }
+            """,
+        header: """
+            // Non-traditional RoPE on the first ROT dims of a head vector whose lane
+            // l holds dims [l*E, l*E+E): dim d < ROT/2 pairs with d + ROT/2, held by
+            // lane l ^ (ROT / (2E)).
+            template <int E, int ROT>
+            METAL_FUNC void mtp_rope_lane(thread float* v, uint lane, float L, const device float* inv_freq) {
+              constexpr uint half_lanes = ROT / (2 * E);
+              const bool lo = (lane & half_lanes) == 0;
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < E; e++) {
+                const float other = simd_shuffle_xor(v[e], ushort(half_lanes));
+                if (lane < uint(ROT / E)) {
+                  const int d = int(lane % half_lanes) * E + e;
+                  const float th = L * inv_freq[d];
+                  const float cs = metal::cos(th), sn = metal::sin(th);
+                  v[e] = lo ? (v[e] * cs - other * sn) : (other * sn + v[e] * cs);
+                }
+              }
+            }
+            """,
+        mutableInputs: ["kc", "vc"])
+
+    /// Pass 2: combine the chunks of each query head (HD threads per head).
+    static let attentionCombine = MLXFast.metalKernel(
+        name: "mtp_draft_attention_combine", inputNames: ["pm", "pl", "po"], outputNames: ["y"],
+        source: """
+            const int qh = int(threadgroup_position_in_grid.y);
+            const int d = int(thread_position_in_threadgroup.x);
+            const int nC = pm_shape[1];
+            float M = -INFINITY;
+            for (int c = 0; c < nC; c++) M = max(M, pm[qh * nC + c]);
+            float L = 0, O = 0;
+            for (int c = 0; c < nC; c++) {
+              const float mc = pm[qh * nC + c];
+              const float w = (mc == -INFINITY) ? 0.0f : metal::exp(mc - M);
+              L += pl[qh * nC + c] * w;
+              O += po[(qh * nC + c) * HD + d] * w;
+            }
+            y[qh * HD + d] = O / L;
+            """)
 }
