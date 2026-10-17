@@ -265,6 +265,8 @@ final class CBv2MTPRoundDriver {
     let lookupNgram: Int?
     /// Depth of a round whose lookup misses, or nil to keep the declared one.
     let lookupMissDepth: Int?
+    /// Device-continuation rows appended after a lookup-miss chain (0: none).
+    let lookupMissExtension: Int
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -375,6 +377,11 @@ final class CBv2MTPRoundDriver {
             ? nil
             : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissDraftDepth
                 .flatMap { $0 > 0 && $0 < (config.fixedDraftTokens ?? 0) ? $0 : nil }
+        self.lookupMissExtension = lookupMissDepth.map { missDepth in
+            max(0, min(
+                (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissExtensionDepth ?? 0,
+                (config.fixedDraftTokens ?? 0) - missDepth))
+        } ?? 0
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
         self.config = config
         self.drafter = drafter

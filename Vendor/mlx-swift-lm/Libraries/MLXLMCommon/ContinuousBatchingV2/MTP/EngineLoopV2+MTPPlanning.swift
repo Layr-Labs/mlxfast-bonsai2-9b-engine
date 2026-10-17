@@ -219,11 +219,12 @@ extension EngineLoopV2 {
         // Prompt lookup proposes the declared depth only where every row's
         // newest n-gram recurs; otherwise the drafter runs a shorter chain,
         // since its acceptance falls off with depth while a lookup's does not.
-        if let missDepth = mtp.lookupMissDepth, mtp.planDepth > missDepth,
+        if let missDepth = mtp.lookupMissDepth,
+            mtp.planDepth > missDepth + mtp.lookupMissExtension,
             !eligibleRows.isEmpty,
             !eligibleRows.allSatisfy({ mtp.lookupDraft(for: $0, depth: mtp.planDepth) != nil })
         {
-            mtp.clampPlanDepth(to: missDepth, reason: "lookup_miss")
+            mtp.clampPlanDepth(to: missDepth + mtp.lookupMissExtension, reason: "lookup_miss")
         }
         if mtp.planDepth > 0 {
             let eligibleIDs = Set(eligibleRows.map(\.id))

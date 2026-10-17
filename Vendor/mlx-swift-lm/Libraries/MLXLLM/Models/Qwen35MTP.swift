@@ -1059,6 +1059,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
 
+    /// Rows a lookup-miss round appends after the head's chain, proposed by
+    /// the engine's device-side continuation of the chain from the request's
+    /// own history (bounded by the declared depth). Default 3. Local
+    /// experiments override it with `QWEN35_PLD_MISS_EXTEND=<n>`; `0`
+    /// disables it.
+    static let promptLookupMissExtension: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_EXTEND"] else {
+            return 3
+        }
+        return max(0, Int(raw) ?? 0)
+    }()
+
+    public var lookupMissExtensionDepth: Int { Self.promptLookupMissExtension }
+
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
@@ -1325,8 +1339,11 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
         precondition(!state.isReleased, "inline Qwen MTP finalized released request state")
         precondition(state.roundInFlight, "inline Qwen MTP finalized without a round")
+        // A chain extended past the head's own steps (lookup-miss extension)
+        // confirms up to the declared depth; those rows were never staged in
+        // the head cache and enter history through the backlog below.
         precondition(
-            (0 ... state.roundDraftSteps + 1).contains(confirmedInputTokens),
+            (0 ... Self.maximumDepth + 1).contains(confirmedInputTokens),
             "inline Qwen MTP confirmed prefix exceeds the draft round")
         precondition(
             committedDraftTokens.ndim == 2 && committedTargetHidden.ndim == 3
@@ -1336,7 +1353,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             "inline Qwen MTP committed target rows mismatch")
         let committedDraftCount = committedDraftTokens.dim(1)
         precondition(
-            committedDraftCount <= state.roundDraftSteps
+            committedDraftCount <= Self.maximumDepth
                 && committedDraftCount <= max(0, confirmedInputTokens - 1),
             "inline Qwen MTP committed drafts exceed confirmed target inputs")
 

@@ -616,7 +616,13 @@ extension EngineLoopV2 {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }
             var currentHidden = carryHiddens
-            for draftIndex in 0 ..< k {
+            // A lookup-miss round runs the head for its shallower depth and,
+            // when the drafter opts in, extends the chain to `k` with the
+            // device-side continuation of the row's history (below).
+            let headSteps =
+                mtp.lookupNgram != nil && mtp.lookupMissExtension > 0
+                ? min(k, mtp.lookupMissDepth ?? k) : k
+            for draftIndex in 0 ..< headSteps {
                 var nextRows: [MLXArray] = []
                 var nextHiddens: [MLXArray] = []
                 var stepEvalTargets: [MLXArray] = []
@@ -651,6 +657,24 @@ extension EngineLoopV2 {
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
+            }
+            if headSteps < k {
+                var extensions: [MLXArray] = []
+                extensions.reserveCapacity(batch)
+                for (index, row) in verifyRows.enumerated() {
+                    var history = row.rec.tokens
+                    if history.last != row.carry!.token { history.append(row.carry!.token) }
+                    let chain = concatenated(
+                        draftSteps.map { $0[index ..< index + 1] }, axis: 0)
+                    extensions.append(
+                        CBv2MTPChainExtension.extend(
+                            history: history, chain: chain, count: k - headSteps))
+                }
+                for position in 0 ..< (k - headSteps) {
+                    let column = extensions.map { $0[position ..< position + 1] }
+                    draftSteps.append(
+                        column.count == 1 ? column[0] : concatenated(column, axis: 0))
+                }
             }
             // Submit the completed chain while the host constructs target
             // verification. Existing owners and the finalize fence retain it.
