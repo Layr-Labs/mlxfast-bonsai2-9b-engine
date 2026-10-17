@@ -340,6 +340,18 @@ public final class CBv2RecurrentRequestState {
         }
     }
     private var hasCommitted: Bool { deferredCommitted != nil || !committedStorage.isEmpty }
+    /// State a commit or rollback replaced. Dropping the last reference to
+    /// these arrays frees their MLX buffers, which costs host time; at a
+    /// verify round's finalize that time would sit between the acceptance
+    /// readback and the next round's first submit, with the GPU idle. They
+    /// are held here instead and dropped by `releaseReplacedState()`, which
+    /// the engine calls before its next readback wait. Values never change.
+    private var replacedState: [Any] = []
+
+    /// Drop the state the last commits and rollbacks replaced.
+    public func releaseReplacedState() {
+        if !replacedState.isEmpty { replacedState.removeAll(keepingCapacity: true) }
+    }
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
@@ -468,6 +480,12 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
         }
+        func retainReplacedState() {
+            replacedState.append(first)
+            replacedState.append(committedStorage)
+            replacedState.append(committedTransitionRetainedRoots)
+            if let deferredCommitted { replacedState.append(deferredCommitted) }
+        }
         func clearOlderTransitionRetention() {
             guard let retainedGeneration = committedTransitionGeneration,
                 generation > retainedGeneration
@@ -482,6 +500,7 @@ public final class CBv2RecurrentRequestState {
                     "captured commit requires keepPositions in 1...\(captured) "
                         + "(got \(String(describing: keepPositions)))")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
@@ -507,6 +526,7 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
             committed = [:]
@@ -541,6 +561,7 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "keepPositions is only valid for captured or prefix replay verify windows")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             committed = first.layers
         }
@@ -552,6 +573,7 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent rollback must target the newest pending generation")
         }
+        replacedState.append(last)
         pending.removeLast()
     }
 
@@ -574,6 +596,7 @@ public final class CBv2RecurrentRequestState {
                 "release with recurrent work still in flight")
         }
         committed.removeAll(keepingCapacity: false)
+        replacedState.removeAll(keepingCapacity: false)
         committedTransitionGeneration = nil
         committedTransitionRetainedByteCount = 0
         committedTransitionRetainedRoots.removeAll(keepingCapacity: false)

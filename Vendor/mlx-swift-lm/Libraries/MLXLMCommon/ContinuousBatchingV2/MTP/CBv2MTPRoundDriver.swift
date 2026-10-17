@@ -391,7 +391,7 @@ final class CBv2MTPRoundDriver {
             ? nil
             : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissDeepDraft
                 .flatMap {
-                    $0.depth > (missDepth ?? 0) && $0.depth < (config.fixedDraftTokens ?? 0)
+                    $0.depth > (missDepth ?? 0) && $0.depth <= (config.fixedDraftTokens ?? 0)
                         && $0.minimumMargin.isFinite ? $0 : nil
                 }
         self.missDepthSchedule = config.missDepthSchedule
@@ -841,7 +841,17 @@ final class CBv2MTPRoundDriver {
             guard let margin = carries[rec.id]?.previousTopTwoMargin else { return false }
             return margin >= deep.minimumMargin
         }
-        return allConfident ? deep.depth : missDepth
+        if allConfident {
+            return deep.depth
+        }
+        let lowMargin = rows.contains { rec in
+            guard let margin = carries[rec.id]?.previousTopTwoMargin else { return false }
+            return margin < 1.25
+        }
+        if lowMargin {
+            return min(missDepth, 2)
+        }
+        return missDepth
     }
 
     /// The `depth` tokens that followed the most recent earlier occurrence of
