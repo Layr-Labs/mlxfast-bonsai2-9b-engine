@@ -35,6 +35,7 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
         guard mode == .affine, x.dtype == .float32, scales.dtype == .float16 else {
             return super.callAsFunction(x)
         }
+        if let single = singleRowFloat16Constants(x) { return single }
         let widenedScales = mtpScaleCastCache.cachedCast(
             scales, to: x.dtype, allowFloat16: true) ?? scales
         let widenedOffsets = biases.map {
@@ -45,6 +46,120 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
             groupSize: groupSize, bits: bits, mode: mode)
         if let bias { output = output + bias }
         return output
+    }
+
+    /// One activation row (every draft step after a round's first) through
+    /// MLX's `qmv_fast` arithmetic for 4-bit codes, reading the FP16
+    /// scales and offsets in place instead of their cached FP32 widening.
+    /// Widening FP16 to FP32 is exact, so each product and sum is the same as
+    /// `quantizedMM` over the widened tables; the head streams half the
+    /// constant bytes per projection.
+    private func singleRowFloat16Constants(_ x: MLXArray) -> MLXArray? {
+        let K = x.dim(-1)
+        let N = weight.dim(0)
+        guard bits == 4, groupSize == 64 || groupSize == 128, x.size == K, K % 512 == 0,
+            N % 8 == 0, weight.dtype == .uint32, weight.dim(1) == K / 8, let offsets = biases,
+            offsets.dtype == .float16, scales.dim(1) == K / groupSize
+        else { return nil }
+        if Self.float16ConstantsVerified == false { return nil }
+        var output = Qwen35MTPFloat16ConstantQMV.fast(
+            [x.reshaped([1, K]), weight, scales, offsets],
+            template: [("G", groupSize)],
+            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[N]], outputDTypes: [.float32])[0]
+            .reshaped(Array(x.shape.dropLast()) + [N])
+        if Self.float16ConstantsVerified == nil {
+            // Once per process: the kernel must reproduce `quantizedMM` over
+            // the widened tables bit for bit, or the head keeps that path.
+            let reference = quantizedMM(
+                x, weight, scales: scales.asType(.float32),
+                biases: offsets.asType(.float32), transpose: true,
+                groupSize: groupSize, bits: bits, mode: mode)
+            let same = arrayEqual(output, reference).item(Bool.self)
+            Self.float16ConstantsVerified = same
+            FileHandle.standardError.write(
+                Data("MTP head qmv f16 constants: \(same ? "bit-identical" : "differs, off")\n".utf8))
+            if !same { return nil }
+        }
+        if let bias { output = output + bias }
+        return output
+    }
+
+    nonisolated(unsafe) private static var float16ConstantsVerified: Bool? = nil
+}
+
+/// MLX `qmv_fast_impl` for 4 bits at group size `G` (64 or 128): 16 values
+/// per lane, 4 rows per simdgroup, 2 simdgroups per threadgroup, with FP16
+/// scales and offsets.
+private enum Qwen35MTPFloat16ConstantQMV {
+    static let fast = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_fast_4bit_f16_constants",
+        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[x_ndim - 1];
+            const int in_w = K / 2;
+            const int in_g = K / G;
+            const int out_row = tid.y * 8 + simd_gid * 4;
+            const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 8;
+            const device half* sc = scales + out_row * in_g + simd_lid / (G / 16);
+            const device half* bi = biases + out_row * in_g + simd_lid / (G / 16);
+            const device float* xp = x + simd_lid * 16;
+            float x_thread[16];
+            float result[4] = {0, 0, 0, 0};
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              for (int i = 0; i < 16; i += 4) {
+                sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                x_thread[i] = xp[i];
+                x_thread[i + 1] = xp[i + 1] / 16.0f;
+                x_thread[i + 2] = xp[i + 2] / 256.0f;
+                x_thread[i + 3] = xp[i + 3] / 4096.0f;
+              }
+              for (int r = 0; r < 4; r++) {
+                const device uint16_t* wr = (const device uint16_t*)(ws + r * in_w);
+                const float s = float(sc[r * in_g]);
+                const float b = float(bi[r * in_g]);
+                float accum = 0;
+                for (int i = 0; i < 4; i++) {
+                  accum += (x_thread[4 * i] * (wr[i] & 0x000f) + x_thread[4 * i + 1] * (wr[i] & 0x00f0)
+                      + x_thread[4 * i + 2] * (wr[i] & 0x0f00) + x_thread[4 * i + 3] * (wr[i] & 0xf000));
+                }
+                result[r] += s * accum + sum * b;
+              }
+              ws += 256;
+              sc += 512 / G;
+              bi += 512 / G;
+              xp += 512;
+            }
+            for (int r = 0; r < 4; r++) {
+              const float total = simd_sum(result[r]);
+              if (simd_lid == 0) y[out_row + r] = total;
+            }
+            """)
+}
+
+/// An MTP-head RMSNorm whose FP16 weight is widened to FP32 once, for the
+/// FP32 activations the head normalizes (the same values `rmsNorm` widens to
+/// on each call).
+final class Qwen35MTPWidenedRMSNorm: RMSNorm {
+    /// Boxed so `Module` reflection does not see a second parameter.
+    private final class Box { let weight: MLXArray; init(_ weight: MLXArray) { self.weight = weight } }
+    private let widened: Box
+
+    init(_ norm: RMSNorm) {
+        widened = Box(norm.weight.asType(.float32))
+        eval(widened.weight)
+        super.init(dimensions: norm.weight.dim(0), eps: norm.eps)
+        _ = try? update(
+            parameters: ModuleParameters.unflattened(["weight": norm.weight]), verify: [])
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        guard x.dtype == .float32, weight.dtype == .float16 else { return super.callAsFunction(x) }
+        return MLXFast.rmsNorm(x, weight: widened.weight, eps: eps)
     }
 }
 
@@ -523,6 +638,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
         requantizeHeadLinears(in: assistant.mtp)
+        widenHeadNorms(in: assistant.mtp)
         // Warm after re-quantization, so the warm round compiles the
         // kernels of the head geometry the scored rounds run.
         assistant.warmEngineRound(serving: serving)
@@ -571,6 +687,26 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 // intermediate frees before the next module dequantizes.
                 eval(replacement)
                 return replacement
+            })
+    }
+
+    /// Every RMSNorm of the head holds FP16 weights and normalizes FP32
+    /// activations, so `rmsNorm` widened each weight to FP32 on every draft
+    /// step. Widen each once instead (exact); the normalization is unchanged.
+    private static func widenHeadNorms(in head: Qwen35MTPModule) {
+        quantize(
+            model: head,
+            filter: { path, module in
+                // `norm` is a plain stored module (not replaceable in place).
+                guard path != "norm", let norm = module as? RMSNorm,
+                    !(norm is Qwen35MTPWidenedRMSNorm),
+                    norm.weight.dtype == .float16
+                else { return nil }
+                return (64, 4, QuantizationMode.affine)
+            },
+            apply: { module, _, _, _ in
+                guard let norm = module as? RMSNorm else { return nil }
+                return Qwen35MTPWidenedRMSNorm(norm)
             })
     }
 
