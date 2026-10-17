@@ -1480,7 +1480,7 @@ enum Qwen35RegisterGatedSIMD {
 /// the bits of the four-kernel graph; each element is written by exactly
 /// one threadgroup.
 enum Qwen35FusedGDNVerify {
-    static let maximumRows = 8
+    static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_verify_fused",
@@ -2873,7 +2873,7 @@ enum Qwen35VerifyQKNormRoPE {
         queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float
     ) -> (MLXArray, MLXArray)? {
         guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
-            (2 ... 8).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1)),
+            (2 ... 16).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1)),
             queryProjection.dim(2) == queryHeads * 512, keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
@@ -4200,6 +4200,15 @@ extension Qwen35TextModel: DFlash2TapTarget {
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
         lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
+
+    /// One exact top-2 at `rows` rows over a fixed normalized activation: the
+    /// head's lazily built constants and its one-time bit-exact self-check at
+    /// that row count run here, at load, instead of inside the first round.
+    public func prepareDFlash2Verify(rows: Int) {
+        guard let head = lmHead as? HadamardQuantizedLinear else { return }
+        let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
+        if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }
+    }
 }
 
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
@@ -4481,6 +4490,10 @@ extension Qwen35Model: DFlash2TapTarget {
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
         languageModel.logitsForDFlash2Hidden(hidden)
+    }
+
+    public func prepareDFlash2Verify(rows: Int) {
+        languageModel.prepareDFlash2Verify(rows: rows)
     }
 }
 
