@@ -1806,7 +1806,7 @@ enum DF2Fast {
 
     /// An in-memory 4-bit affine copy of one pinned linear (the file on disk is untouched), built once
     /// at load: per group of `group` input columns, the range [lo, hi] shrunk toward zero by the factor
-    /// in {1, 0.95, ..., 0.75} with the least squared error against the pinned weights, then FP16
+    /// in {1, 0.975, ..., 0.75} with the least squared error against the pinned weights, then FP16
     /// scale (hi - lo) / 15 and offset lo. Codes are row-major [N, K / 2]; a word holds k = 8j ... 8j + 3
     /// in its low nibbles and k = 8j + 4 ... 8j + 7 in its high nibbles. Scales and offsets are [G, N].
     static func w4Operands(_ layer: Linear, group: Int) -> W4Operands? {
@@ -1824,7 +1824,11 @@ enum DF2Fast {
         let lo0 = w.min(axis: -1), hi0 = w.max(axis: -1)
         var best: MLXArray? = nil
         var lo = lo0, hi = hi0
-        for c: Float in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75] {
+        // Evaluate the original grid first so equal-error ties retain its choice.
+        for c: Float in [
+            1.0, 0.95, 0.9, 0.85, 0.8, 0.75,
+            0.975, 0.925, 0.875, 0.825, 0.775,
+        ] {
             let l = lo0 * c, h = hi0 * c
             let sc = which(h .> l, (h - l) / 15, Float(1)).asType(.float16).asType(.float32)
             let bc = l.asType(.float16).asType(.float32)
