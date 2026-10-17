@@ -3028,6 +3028,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify, let verifyOutputs = VerifyInt8Matmul.matmul(
+            PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+            layers: packed.map(\.verifyOperands))
+        {
+            let outputs = zip(packed, verifyOutputs).map { layer, output in
+                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { reshaped + $0 } ?? reshaped
+            }
+            return (activation.last!, outputs)
+        }
         let outputs = packed.map { layer in
             if verify {
                 let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
