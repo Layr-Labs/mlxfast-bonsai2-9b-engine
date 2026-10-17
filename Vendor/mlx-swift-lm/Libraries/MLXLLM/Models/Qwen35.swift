@@ -1627,8 +1627,7 @@ final class Qwen35GatedDeltaNet: Module {
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
                         fullAcceptanceRetainedRoots: [tape.convInput],
                         fullAcceptance: {
-                            let detachedConv = finalConv + MLXArray.zeros(
-                                finalConv.shape, dtype: finalConv.dtype)
+                            let detachedConv = contiguous(finalConv)
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
                         },

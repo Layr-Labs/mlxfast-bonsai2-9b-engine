@@ -11,6 +11,8 @@ import MLXLMCommon
 import MLXNN
 
 private enum Qwen35MTPFloat16ConstantQMV {
+    static let maximumWideRows = 8
+
     static let fast = MLXFast.metalKernel(
         name: "qwen35_mtp_qmv_fast_w4_f16_constants",
         inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
@@ -63,6 +65,295 @@ private enum Qwen35MTPFloat16ConstantQMV {
             }
             """)
 
+    static let wide = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_wide_w4_f16_constants",
+        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: """
+            constexpr int k_lanes = 8;
+            constexpr int results_per_sg = 32 / k_lanes;
+            constexpr int sub = 8;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const short k_lane = simd_lid % k_lanes;
+            const short sg_row = simd_lid / k_lanes;
+            const int K = x_shape[x_ndim - 1];
+            const int N = w_shape[0];
+            const int out_row = int(tid.y) * 8 + int(simd_gid) * results_per_sg + int(sg_row);
+            const int row = min(out_row, N - 1);
+            const int in_w = K / 2;
+            const int in_g = K / GS;
+            const device uint8_t* wrow = (const device uint8_t*)w + row * in_w;
+            const device half* srow = scales + row * in_g;
+            const device half* brow = biases + row * in_g;
+            const device float* xv[ROWS];
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) {
+              xv[v] = x + v * K;
+            }
+            float result[ROWS];
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) result[v] = 0.0f;
+            for (int g = k_lane; g < in_g; g += k_lanes) {
+              const float scale = float(srow[g]);
+              const float bias = float(brow[g]);
+              const float sc1 = scale / 16.0f;
+              #pragma clang loop unroll(full)
+              for (int sc = 0; sc < GS / sub; sc++) {
+                const int k0 = g * GS + sc * sub;
+                const device uint8_t* wc = wrow + k0 / 2;
+                float w_dq[sub];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                  w_dq[2 * i] = scale * float(wc[i] & 0x0fu) + bias;
+                  w_dq[2 * i + 1] = sc1 * float(wc[i] & 0xf0u) + bias;
+                }
+                #pragma clang loop unroll(full)
+                for (int v = 0; v < ROWS; v++) {
+                  const device float* xc = xv[v] + k0;
+                  float acc = 0.0f;
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < sub; i++) {
+                    acc += xc[i] * w_dq[i];
+                  }
+                  result[v] += acc;
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) {
+              result[v] += simd_shuffle_down(result[v], 4);
+              result[v] += simd_shuffle_down(result[v], 2);
+              result[v] += simd_shuffle_down(result[v], 1);
+            }
+            if (k_lane == 0 && out_row < N) {
+              #pragma clang loop unroll(full)
+              for (int v = 0; v < ROWS; v++) {
+                y[v * N + out_row] = result[v];
+              }
+            }
+            """)
+
+    static let fastGateUpSilu = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_fast_gate_up_silu_w4_f16",
+        inputNames: ["x", "wg", "sg", "bg", "wu", "su", "bu"], outputNames: ["y"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[x_ndim - 1];
+            const int in_w = K / 2;
+            const int in_g = K / GS;
+            const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+            const device uint8_t* wgs = (const device uint8_t*)wg + out_row * in_w + simd_lid * 8;
+            const device half* scg = sg + out_row * in_g + simd_lid / (GS / 16);
+            const device half* big = bg + out_row * in_g + simd_lid / (GS / 16);
+            const device uint8_t* wus = (const device uint8_t*)wu + out_row * in_w + simd_lid * 8;
+            const device half* scu = su + out_row * in_g + simd_lid / (GS / 16);
+            const device half* biu = bu + out_row * in_g + simd_lid / (GS / 16);
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float x_thread[16];
+            float res_g[4] = {0, 0, 0, 0};
+            float res_u[4] = {0, 0, 0, 0};
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.0625f;
+                x_thread[4 * i + 2] = xv.z * 0.00390625f;
+                x_thread[4 * i + 3] = xv.w * 0.000244140625f;
+              }
+              for (int r = 0; r < 4; r++) {
+                const device uint16_t* wlg = (const device uint16_t*)(wgs + r * in_w);
+                const device uint16_t* wlu = (const device uint16_t*)(wus + r * in_w);
+                const float s_g = float(scg[r * in_g]);
+                const float b_g = float(big[r * in_g]);
+                const float s_u = float(scu[r * in_g]);
+                const float b_u = float(biu[r * in_g]);
+                float acc_g = 0;
+                float acc_u = 0;
+                for (int i = 0; i < 4; i++) {
+                  const uint16_t pg = wlg[i];
+                  const uint16_t pu = wlu[i];
+                  acc_g += (x_thread[4 * i] * float(pg & 0x000fu)
+                      + x_thread[4 * i + 1] * float(pg & 0x00f0u)
+                      + x_thread[4 * i + 2] * float(pg & 0x0f00u)
+                      + x_thread[4 * i + 3] * float(pg & 0xf000u));
+                  acc_u += (x_thread[4 * i] * float(pu & 0x000fu)
+                      + x_thread[4 * i + 1] * float(pu & 0x00f0u)
+                      + x_thread[4 * i + 2] * float(pu & 0x0f00u)
+                      + x_thread[4 * i + 3] * float(pu & 0xf000u));
+                }
+                res_g[r] += s_g * acc_g + sum * b_g;
+                res_u[r] += s_u * acc_u + sum * b_u;
+              }
+              wgs += 256; scg += 512 / GS; big += 512 / GS;
+              wus += 256; scu += 512 / GS; biu += 512 / GS;
+              xp4 += 128;
+            }
+            for (int r = 0; r < 4; r++) {
+              const float g = simd_sum(res_g[r]);
+              const float u = simd_sum(res_u[r]);
+              if (simd_lid == 0) {
+                #pragma clang fp contract(off)
+                const float y_sig = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                const float sig = (g < 0.0f) ? y_sig : (1.0f - y_sig);
+                const float sg_val = g * sig;
+                y[out_row + r] = sg_val * u;
+              }
+            }
+            """)
+
+    static let fastQKV = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_fast_qkv_w4_f16",
+        inputNames: ["x", "wq", "sq", "bq", "wk", "sk", "bk", "wv", "sv", "bv"],
+        outputNames: ["yq", "yk", "yv"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[x_ndim - 1];
+            const int in_w = K / 2;
+            const int in_g = K / GS;
+            const int Nq = wq_shape[0];
+            const int Nk = wk_shape[0];
+            const int global_row = int(tid.y) * 8 + int(simd_gid) * 4;
+            const device uint8_t* w_base;
+            const device half* s_base;
+            const device half* b_base;
+            device float* y_base;
+            int out_row;
+            if (global_row < Nq) {
+              out_row = global_row;
+              w_base = (const device uint8_t*)wq;
+              s_base = sq; b_base = bq; y_base = yq;
+            } else if (global_row < Nq + Nk) {
+              out_row = global_row - Nq;
+              w_base = (const device uint8_t*)wk;
+              s_base = sk; b_base = bk; y_base = yk;
+            } else {
+              out_row = global_row - (Nq + Nk);
+              w_base = (const device uint8_t*)wv;
+              s_base = sv; b_base = bv; y_base = yv;
+            }
+            const device uint8_t* ws = w_base + out_row * in_w + simd_lid * 8;
+            const device half* sc = s_base + out_row * in_g + simd_lid / (GS / 16);
+            const device half* bi = b_base + out_row * in_g + simd_lid / (GS / 16);
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float x_thread[16];
+            float result[4] = {0, 0, 0, 0};
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.0625f;
+                x_thread[4 * i + 2] = xv.z * 0.00390625f;
+                x_thread[4 * i + 3] = xv.w * 0.000244140625f;
+              }
+              for (int r = 0; r < 4; r++) {
+                const device uint16_t* wl = (const device uint16_t*)(ws + r * in_w);
+                const float s = float(sc[r * in_g]);
+                const float b = float(bi[r * in_g]);
+                float accum = 0;
+                for (int i = 0; i < 4; i++) {
+                  const uint16_t packed_w = wl[i];
+                  accum += (x_thread[4 * i] * float(packed_w & 0x000fu)
+                      + x_thread[4 * i + 1] * float(packed_w & 0x00f0u)
+                      + x_thread[4 * i + 2] * float(packed_w & 0x0f00u)
+                      + x_thread[4 * i + 3] * float(packed_w & 0xf000u));
+                }
+                result[r] += s * accum + sum * b;
+              }
+              ws += 256;
+              sc += 512 / GS;
+              bi += 512 / GS;
+              xp4 += 128;
+            }
+            for (int r = 0; r < 4; r++) {
+              const float total = simd_sum(result[r]);
+              if (simd_lid == 0) y_base[out_row + r] = total;
+            }
+            """)
+
+    static let wideKV = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_wide_kv_w4_f16",
+        inputNames: ["x", "wk", "sk", "bk", "wv", "sv", "bv"],
+        outputNames: ["yk", "yv"],
+        source: """
+            constexpr int k_lanes = 8;
+            constexpr int results_per_sg = 32 / k_lanes;
+            constexpr int sub = 8;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const short k_lane = simd_lid % k_lanes;
+            const short sg_row = simd_lid / k_lanes;
+            const int K = x_shape[x_ndim - 1];
+            const int Nk = wk_shape[0];
+            const int Nv = wv_shape[0];
+            const int global_row = int(tid.y) * 8 + int(simd_gid) * results_per_sg + int(sg_row);
+            const bool is_v = global_row >= Nk;
+            const int N = is_v ? Nv : Nk;
+            const int out_row = is_v ? (global_row - Nk) : global_row;
+            const int row = min(out_row, N - 1);
+            const int in_w = K / 2;
+            const int in_g = K / GS;
+            const device uint8_t* wrow = (const device uint8_t*)(is_v ? wv : wk) + row * in_w;
+            const device half* srow = (is_v ? sv : sk) + row * in_g;
+            const device half* brow = (is_v ? bv : bk) + row * in_g;
+            device float* y_base = is_v ? yv : yk;
+            const device float* xv[ROWS];
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) {
+              xv[v] = x + v * K;
+            }
+            float result[ROWS];
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) result[v] = 0.0f;
+            for (int g = k_lane; g < in_g; g += k_lanes) {
+              const float scale = float(srow[g]);
+              const float bias = float(brow[g]);
+              const float sc1 = scale / 16.0f;
+              #pragma clang loop unroll(full)
+              for (int sc = 0; sc < GS / sub; sc++) {
+                const int k0 = g * GS + sc * sub;
+                const device uint8_t* wc = wrow + k0 / 2;
+                float w_dq[sub];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                  w_dq[2 * i] = scale * float(wc[i] & 0x0fu) + bias;
+                  w_dq[2 * i + 1] = sc1 * float(wc[i] & 0xf0u) + bias;
+                }
+                #pragma clang loop unroll(full)
+                for (int v = 0; v < ROWS; v++) {
+                  const device float* xc = xv[v] + k0;
+                  float acc = 0.0f;
+                  #pragma clang loop unroll(full)
+                  for (int i = 0; i < sub; i++) {
+                    acc += xc[i] * w_dq[i];
+                  }
+                  result[v] += acc;
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int v = 0; v < ROWS; v++) {
+              result[v] += simd_shuffle_down(result[v], 4);
+              result[v] += simd_shuffle_down(result[v], 2);
+              result[v] += simd_shuffle_down(result[v], 1);
+            }
+            if (k_lane == 0 && out_row < N) {
+              #pragma clang loop unroll(full)
+              for (int v = 0; v < ROWS; v++) {
+                y_base[v * N + out_row] = result[v];
+              }
+            }
+            """)
+
     static func matmul(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int
     ) -> MLXArray {
@@ -73,18 +364,196 @@ private enum Qwen35MTPFloat16ConstantQMV {
             grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
     }
+
+    static func matmulWide(
+        _ x: MLXArray, rows: Int, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int
+    ) -> MLXArray {
+        let N = weight.dim(0)
+        return wide(
+            [x, weight, scales, biases],
+            template: [("GS", groupSize), ("ROWS", rows)],
+            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+    }
+
+    static func gateUpSilu(
+        _ x: MLXArray, gate: Qwen35MTPQuantizedLinear, up: Qwen35MTPQuantizedLinear
+    ) -> MLXArray? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        let N = gate.weight.dim(0)
+        guard rows == 1, N == up.weight.dim(0), gate.groupSize == up.groupSize,
+            gate.eligibleForFast(rows: 1), up.eligibleForFast(rows: 1),
+            gate.bias == nil, up.bias == nil,
+            let bg = gate.biases, let bu = up.biases
+        else { return nil }
+        return fastGateUpSilu(
+            [x, gate.weight, gate.scales, bg, up.weight, up.scales, bu],
+            template: [("GS", gate.groupSize)],
+            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+    }
+
+    static func qkv(
+        _ x: MLXArray, q: Qwen35MTPQuantizedLinear, k: Qwen35MTPQuantizedLinear,
+        v: Qwen35MTPQuantizedLinear
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        guard rows == 1,
+            q.groupSize == k.groupSize, q.groupSize == v.groupSize,
+            q.eligibleForFast(rows: 1), k.eligibleForFast(rows: 1), v.eligibleForFast(rows: 1),
+            q.bias == nil, k.bias == nil, v.bias == nil,
+            let bq = q.biases, let bk = k.biases, let bv = v.biases
+        else { return nil }
+        let Nq = q.weight.dim(0)
+        let Nk = k.weight.dim(0)
+        let Nv = v.weight.dim(0)
+        let prefix = Array(x.shape.dropLast())
+        let outs = fastQKV(
+            [x, q.weight, q.scales, bq, k.weight, k.scales, bk, v.weight, v.scales, bv],
+            template: [("GS", q.groupSize)],
+            grid: (32, (Nq + Nk + Nv) / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [prefix + [Nq], prefix + [Nk], prefix + [Nv]],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outs[0], outs[1], outs[2])
+    }
+
+    static func kvWide(
+        _ x: MLXArray, k: Qwen35MTPQuantizedLinear, v: Qwen35MTPQuantizedLinear
+    ) -> (MLXArray, MLXArray)? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        guard (2 ... maximumWideRows).contains(rows),
+            k.groupSize == v.groupSize,
+            k.eligibleForFast(rows: rows), v.eligibleForFast(rows: rows),
+            k.bias == nil, v.bias == nil,
+            let bk = k.biases, let bv = v.biases
+        else { return nil }
+        let Nk = k.weight.dim(0)
+        let Nv = v.weight.dim(0)
+        let prefix = Array(x.shape.dropLast())
+        let outs = wideKV(
+            [x, k.weight, k.scales, bk, v.weight, v.scales, bv],
+            template: [("GS", k.groupSize), ("ROWS", rows)],
+            grid: (32, (Nk + Nv) / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [prefix + [Nk], prefix + [Nv]],
+            outputDTypes: [.float32, .float32])
+        return (outs[0], outs[1])
+    }
+}
+
+final class Qwen35MTPRMSNorm: RMSNorm {
+    private let weightCastCache = ConstantArrayCastCache()
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { weightCastCache.clear() }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let w = x.dtype == .float32 && weight.dtype == .float16
+            ? (weightCastCache.cachedCast(weight, to: .float32, allowFloat16: true) ?? weight)
+            : weight
+        return MLXFast.rmsNorm(x, weight: w, eps: eps)
+    }
+}
+
+private enum Qwen35MTPNormPair {
+    nonisolated(unsafe) static var verified: Bool?
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_mtp_norm_concat_4096",
+        inputNames: ["e", "we", "h", "wh"], outputNames: ["out"],
+        source: """
+            constexpr int N = 4096;
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            const device float4* e4 = (const device float4*)(e + row * N);
+            const device float4* h4 = (const device float4*)(h + row * N);
+            const device half4* we4 = (const device half4*)we;
+            const device half4* wh4 = (const device half4*)wh;
+            device float4* out_e = (device float4*)(out + row * (2 * N));
+            device float4* out_h = out_e + (N / 4);
+            #pragma clang fp contract(off)
+            const float4 ev = e4[tid];
+            const float4 hv = h4[tid];
+            float se = ((ev.x * ev.x + ev.y * ev.y) + ev.z * ev.z) + ev.w * ev.w;
+            float sh = ((hv.x * hv.x + hv.y * hv.y) + hv.z * hv.z) + hv.w * hv.w;
+            se = simd_sum(se);
+            sh = simd_sum(sh);
+            threadgroup float lse[32];
+            threadgroup float lsh[32];
+            if (simd_lid == 0) {
+                lse[simd_gid] = se;
+                lsh[simd_gid] = sh;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_gid == 0) {
+                se = simd_sum(lse[simd_lid]);
+                sh = simd_sum(lsh[simd_lid]);
+                if (simd_lid == 0) {
+                    lse[0] = metal::precise::rsqrt(se * (1.0f / 4096.0f) + 1e-6f);
+                    lsh[0] = metal::precise::rsqrt(sh * (1.0f / 4096.0f) + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv_e = lse[0];
+            const float inv_h = lsh[0];
+            out_e[tid] = float4(we4[tid]) * (ev * inv_e);
+            out_h[tid] = float4(wh4[tid]) * (hv * inv_h);
+            """)
+
+    static func fusedConcat(
+        embeds: MLXArray, normEmbeds: RMSNorm,
+        hidden: MLXArray, normHidden: RMSNorm
+    ) -> MLXArray? {
+        guard verified != false,
+            embeds.ndim == 3, hidden.ndim == 3,
+            embeds.shape == hidden.shape,
+            embeds.dim(-1) == 4096,
+            embeds.dtype == .float32, hidden.dtype == .float32,
+            normEmbeds.weight.dtype == .float16, normHidden.weight.dtype == .float16,
+            abs(normEmbeds.eps - 1e-6) < 1e-12, normEmbeds.eps == normHidden.eps
+        else { return nil }
+        let rows = embeds.dim(0) * embeds.dim(1)
+        guard rows >= 1 else { return nil }
+        let fastOut = kernel(
+            [embeds, normEmbeds.weight, hidden, normHidden.weight],
+            grid: (1024, rows, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[embeds.dim(0), embeds.dim(1), 8192]],
+            outputDTypes: [.float32])[0]
+        if verified == true {
+            return fastOut
+        }
+        let refOut = concatenated([normEmbeds(embeds), normHidden(hidden)], axis: -1)
+        eval(fastOut, refOut)
+        let same = fastOut.asArray(Float.self).map(\Float.bitPattern)
+            == refOut.asArray(Float.self).map(\Float.bitPattern)
+        verified = same
+        return same ? fastOut : refOut
+    }
 }
 
 // The pinned MTP head carries FP16 affine metadata while the target feeds it
 // FP32 activations. Reuse only the exact constant widening that quantizedMM
 // would otherwise repeat at every draft step, or read FP16 scales/biases in
-// place for 1-row steps once verified bit-identical. This cache is
-// input-independent; the packed weights and the module's original parameter
-// tree remain unchanged.
+// place for 1-row and short-window steps once verified bit-identical. This
+// cache is input-independent; the packed weights and the module's original
+// parameter tree remain unchanged.
 final class Qwen35MTPQuantizedLinear: QuantizedLinear {
     private let mtpScaleCastCache = ConstantArrayCastCache()
     private let mtpOffsetCastCache = ConstantArrayCastCache()
     private var verifiedOneRowFast: Bool?
+    private var verifiedWideFast: [Int: Bool] = [:]
 
     @discardableResult
     override func update(
@@ -95,9 +564,20 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
             mtpScaleCastCache.clear()
             mtpOffsetCastCache.clear()
             verifiedOneRowFast = nil
+            verifiedWideFast.removeAll()
         }
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    func eligibleForFast(rows: Int) -> Bool {
+        guard mode == .affine, scales.dtype == .float16,
+            let biases, biases.dtype == .float16,
+            bits == 4, (groupSize == 64 || groupSize == 128),
+            (weight.dim(1) * 8) % 512 == 0, weight.dim(0) % 8 == 0
+        else { return false }
+        if rows == 1 { return verifiedOneRowFast == true }
+        return verifiedWideFast[rows] == true
     }
 
     override func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -127,6 +607,32 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
             let same = fastOut.asArray(Float.self).map(\.bitPattern)
                 == refOut.asArray(Float.self).map(\.bitPattern)
             verifiedOneRowFast = same
+            let chosen = same ? fastOut : refOut
+            return bias.map { chosen + $0 } ?? chosen
+        }
+        if (2 ... Qwen35MTPFloat16ConstantQMV.maximumWideRows).contains(rows),
+            bits == 4, (groupSize == 64 || groupSize == 128),
+            K % 512 == 0, weight.dim(0) % 8 == 0,
+            let biases, biases.dtype == .float16,
+            verifiedWideFast[rows] != false
+        {
+            let fastOut = Qwen35MTPFloat16ConstantQMV.matmulWide(
+                x, rows: rows, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize)
+            if verifiedWideFast[rows] == true {
+                return bias.map { fastOut + $0 } ?? fastOut
+            }
+            let widenedScales = mtpScaleCastCache.cachedCast(
+                scales, to: x.dtype, allowFloat16: true) ?? scales
+            let widenedOffsets = mtpOffsetCastCache.cachedCast(
+                biases, to: x.dtype, allowFloat16: true) ?? biases
+            let refOut = quantizedMM(
+                x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
+                groupSize: groupSize, bits: bits, mode: mode)
+            eval(fastOut, refOut)
+            let same = fastOut.asArray(Float.self).map(\.bitPattern)
+                == refOut.asArray(Float.self).map(\.bitPattern)
+            verifiedWideFast[rows] = same
             let chosen = same ? fastOut : refOut
             return bias.map { chosen + $0 } ?? chosen
         }
@@ -206,12 +712,94 @@ extension Qwen35Attention {
     func appendMTPHistoryKV(_ x: MLXArray, cache: any KVCache) {
         let batch = x.dim(0)
         let length = x.dim(1)
-        var keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1))
+        let kRaw: MLXArray
+        let vRaw: MLXArray
+        if let kp = kProj as? Qwen35MTPQuantizedLinear,
+            let vp = vProj as? Qwen35MTPQuantizedLinear,
+            let fused = Qwen35MTPFloat16ConstantQMV.kvWide(x, k: kp, v: vp)
+        {
+            (kRaw, vRaw) = fused
+        } else {
+            kRaw = kProj(x)
+            vRaw = vProj(x)
+        }
+        var keys = kNorm(kRaw.reshaped(batch, length, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(batch, length, kvHeads, -1)
+        let values = vRaw.reshaped(batch, length, kvHeads, -1)
             .transposed(0, 2, 1, 3)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
+    }
+
+    func callMTP1Row(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let qProjOutput: MLXArray
+        var keys: MLXArray
+        var values: MLXArray
+        if L == 1,
+            let qp = qProj as? Qwen35MTPQuantizedLinear,
+            let kp = kProj as? Qwen35MTPQuantizedLinear,
+            let vp = vProj as? Qwen35MTPQuantizedLinear,
+            let fused = Qwen35MTPFloat16ConstantQMV.qkv(x, q: qp, k: kp, v: vp)
+        {
+            (qProjOutput, keys, values) = fused
+        } else {
+            return callAsFunction(x, mask: mask, cache: cache)
+        }
+        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        let gate = qSplit[1].reshaped(B, L, -1)
+        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let output = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values,
+            cache: cache, scale: scale, mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+        return oProj(sigmoidMultiply(output, gate))
+    }
+
+    func callMTPLastPositionOnly(
+        _ normed: MLXArray, normedLast: MLXArray, cache: any KVCache
+    ) -> MLXArray {
+        let B = normed.dim(0)
+        let L = normed.dim(1)
+        let qProjOutput = qProj(normedLast)
+        let qSplit = qProjOutput.reshaped(B, 1, attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        let gate = qSplit[1].reshaped(B, 1, -1)
+
+        let kRaw: MLXArray
+        let vRaw: MLXArray
+        if let kp = kProj as? Qwen35MTPQuantizedLinear,
+            let vp = vProj as? Qwen35MTPQuantizedLinear,
+            let fused = Qwen35MTPFloat16ConstantQMV.kvWide(normed, k: kp, v: vp)
+        {
+            (kRaw, vRaw) = fused
+        } else {
+            kRaw = kProj(normed)
+            vRaw = vProj(normed)
+        }
+        var keys = kNorm(kRaw.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = vRaw.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let baseOffset = cache.offset
+        queries = rope(queries, offset: baseOffset + L - 1)
+        keys = rope(keys, offset: baseOffset)
+        let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            scale: scale, mask: .none
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, 1, -1)
+        return oProj(sigmoidMultiply(output, gate))
     }
 }
 
@@ -226,9 +814,18 @@ final class Qwen35MTPDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
     @ModuleInfo(key: "mlp") var mlp: Module
+    private var verifiedMLP1Row: Bool?
 
     init(_ args: Qwen35TextConfiguration) {
-        _selfAttn.wrappedValue = Qwen35Attention(args)
+        let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
+        let attn = Qwen35Attention(args)
+        try? attn.update(
+            modules: ModuleChildren(values: [
+                "q_norm": .value(Qwen35MTPRMSNorm(dimensions: headDim, eps: args.rmsNormEps)),
+                "k_norm": .value(Qwen35MTPRMSNorm(dimensions: headDim, eps: args.rmsNormEps)),
+            ]),
+            verify: [])
+        _selfAttn.wrappedValue = attn
         if args.numExperts > 0 {
             // Split gate/up: the assistant's quantization table
             // (`mtplx_mtp_quantization`) and the checkpoint's mtp.* tensors
@@ -241,11 +838,31 @@ final class Qwen35MTPDecoderLayer: Module {
                 hiddenDimensions: args.intermediateSize
             )
         }
-        _inputLayerNorm.wrappedValue = RMSNorm(
+        _inputLayerNorm.wrappedValue = Qwen35MTPRMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
-        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+        _postAttentionLayerNorm.wrappedValue = Qwen35MTPRMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         super.init()
+    }
+
+    private func callMLP(_ x: MLXArray) -> MLXArray {
+        if x.dim(1) == 1, verifiedMLP1Row != false,
+            let denseMLP = mlp as? Qwen3NextMLP,
+            let gate = denseMLP.gateProj as? Qwen35MTPQuantizedLinear,
+            let up = denseMLP.upProj as? Qwen35MTPQuantizedLinear,
+            let gated = Qwen35MTPFloat16ConstantQMV.gateUpSilu(x, gate: gate, up: up)
+        {
+            if verifiedMLP1Row == true {
+                return denseMLP.downProj(gated)
+            }
+            let refGated = silu(denseMLP.gateProj(x)) * denseMLP.upProj(x)
+            eval(gated, refGated)
+            let same = gated.asArray(Float.self).map(\.bitPattern)
+                == refGated.asArray(Float.self).map(\.bitPattern)
+            verifiedMLP1Row = same
+            return denseMLP.downProj(same ? gated : refGated)
+        }
+        return (mlp as! UnaryLayer)(x)
     }
 
     func callAsFunction(
@@ -254,9 +871,22 @@ final class Qwen35MTPDecoderLayer: Module {
         cache: (any KVCache)?
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
-        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        let normed = inputLayerNorm(x)
+        let r = x.dim(1) == 1
+            ? selfAttn.callMTP1Row(normed, mask: mask, cache: cache)
+            : selfAttn(normed, mask: mask, cache: cache)
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return h + callMLP(postAttentionLayerNorm(h))
+    }
+
+    func callLastPositionOnly(_ x: MLXArray, cache: any KVCache) -> MLXArray {
+        let L = x.dim(1)
+        let normed = inputLayerNorm(x)
+        let normedLast = normed[0..., (L - 1)..., 0...]
+        let xLast = x[0..., (L - 1)..., 0...]
+        let r = selfAttn.callMTPLastPositionOnly(normed, normedLast: normedLast, cache: cache)
+        let h = xLast + r
+        return h + callMLP(postAttentionLayerNorm(h))
     }
 
     /// Populate this layer's K/V history without computing a dead decoder
@@ -291,15 +921,15 @@ final class Qwen35MTPModule: Module {
     let norm: RMSNorm
 
     init(_ args: Qwen35TextConfiguration) {
-        _preFcNormHidden.wrappedValue = RMSNorm(
+        _preFcNormHidden.wrappedValue = Qwen35MTPRMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
-        _preFcNormEmbedding.wrappedValue = RMSNorm(
+        _preFcNormEmbedding.wrappedValue = Qwen35MTPRMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
         self.layers = (0 ..< args.mtpNumHiddenLayers).map { _ in
             Qwen35MTPDecoderLayer(args)
         }
-        self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self.norm = Qwen35MTPRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         super.init()
     }
 
@@ -314,6 +944,20 @@ final class Qwen35MTPModule: Module {
         return x.asType(fc.weight.dtype)
     }
 
+    private func fuseNormed(embeds: MLXArray, hidden: MLXArray) -> MLXArray {
+        let eIn = entering(embeds)
+        let hIn = entering(hidden)
+        if let pair = Qwen35MTPNormPair.fusedConcat(
+            embeds: eIn, normEmbeds: preFcNormEmbedding,
+            hidden: hIn, normHidden: preFcNormHidden)
+        {
+            return fc(pair)
+        }
+        let e = preFcNormEmbedding(eIn)
+        let h = preFcNormHidden(hIn)
+        return fc(concatenated([e, h], axis: -1))
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -323,9 +967,7 @@ final class Qwen35MTPModule: Module {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(entering(embeds))
-        let h = preFcNormHidden(entering(hidden))
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = fuseNormed(embeds: embeds, hidden: hidden)
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -357,9 +999,10 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(entering(embeds))
-        let h = preFcNormHidden(entering(hidden))
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = fuseNormed(embeds: embeds, hidden: hidden)
+        if (2 ... Qwen35MTPFloat16ConstantQMV.maximumWideRows).contains(fused.dim(1)) {
+            return norm(layers[0].callLastPositionOnly(fused, cache: cache[0]))
+        }
         let historyCount = fused.dim(1) - 1
         layers[0].appendHistoryKV(
             fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
@@ -1704,6 +2347,20 @@ extension Qwen35InlineMTPAssistant {
         while released != nil, waited < 500 {
             usleep(1_000)
             waited += 1
+        }
+        for r in 2 ... Qwen35MTPFloat16ConstantQMV.maximumWideRows {
+            let warmCaches = makeCache()
+            let count = r * target.configuration.hiddenSize
+            let warmH = (MLXArray(0 ..< count).asType(.float32) * Float(1e-4))
+                .reshaped(1, r, target.configuration.hiddenSize)
+            let warmT = MLXArray.zeros([1, r], dtype: .int32)
+            for _ in 0 ..< 2 {
+                if let out = moduleLastHiddenWithKVOnlyHistory(
+                    hidden: warmH, tokens: warmT, cache: warmCaches)
+                {
+                    eval([out] + warmCaches.flatMap { $0.innerState() })
+                }
+            }
         }
         let warmQ = MLXArray.zeros([1, 1, 16, 128], dtype: .float32)
         let warmV = MLXArray.zeros([1, 1, 32, 128], dtype: .float32)
