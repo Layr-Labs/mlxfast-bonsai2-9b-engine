@@ -261,7 +261,8 @@ public struct SignedBlockHadamard {
 
     private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
-        attentionGate: Bool = false, normalizedOutput: Bool = false
+        attentionGate: Bool = false, normalizedOutput: Bool = false,
+        rotatedOutput: Bool = false
     ) -> String {
         let valueRead = swiglu ? """
             const float4 g = in4[w];
@@ -271,6 +272,13 @@ public struct SignedBlockHadamard {
             float4 val = ((g * sigmoid_g) * u) * s4[w];
             """ : "float4 val = in4[w] * s4[w];"
         let prefix = residualNorm ? residualNormSource : gatedNorm ? gatedNormSource : ""
+        let rotatedWrite = rotatedOutput ? """
+            device float4* rot4 = (device float4*)(rotated_out + batch_idx + uint(base0));
+            #pragma clang loop unroll(full)
+            for (short w = 0; w < 4; w++) {
+              rot4[w] = float4(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
+            }
+            """ : ""
         let inputRead = residualNorm && normalizedOutput ? """
             const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
             *((device float4*)(residual_out + in_offset) + w) = raw;
@@ -373,6 +381,7 @@ public struct SignedBlockHadamard {
               v[r] = buf[i * 17 + r];
               amax = max(amax, fabs(v[r]));
             }
+            \(rotatedWrite)
             amax = max(amax, simd_shuffle_xor(amax, ushort(1)));
             amax = max(amax, simd_shuffle_xor(amax, ushort(2)));
             amax = max(amax, simd_shuffle_xor(amax, ushort(4)));
@@ -444,6 +453,12 @@ public struct SignedBlockHadamard {
         inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb"],
         source: quantized4096Source(swiglu: false), header: quantized4096Header,
         ensureRowContiguous: true)
+
+    private static let quantized4096RotatedKernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_4096_q8_rot",
+        inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb", "rotated_out"],
+        source: quantized4096Source(swiglu: false, rotatedOutput: true),
+        header: quantized4096Header, ensureRowContiguous: true)
 
     private static let quantizedSwiGLU4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_swiglu_4096_q8",
@@ -642,6 +657,28 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
+    /// `quantizedForVerify` that also emits the exact FP32 rotated tensor
+    /// `[rows, width]` from the same 3-pass Hadamard butterfly.
+    func quantizedForVerifyWithRotated(_ x: MLXArray) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
+        validate(x)
+        let rows = x.size / width
+        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let outputs = Self.quantized4096RotatedKernel(
+            [x.reshaped([rows, width]), signs],
+            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
+        return (
+            PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            outputs[3])
+    }
+
     /// Transform activations before multiplication by folded weights.
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         validate(x)
@@ -834,7 +871,7 @@ private enum Float16ConstantQMV {
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
+                const float b = NEG ? -s : float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
@@ -1119,7 +1156,8 @@ private enum Float16ConstantQMV {
     }
 
     static func matmul(
-        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        negative: Bool = false
     ) -> MLXArray {
         let K = x.dim(-1)
         let rows = x.size / K
@@ -1130,7 +1168,7 @@ private enum Float16ConstantQMV {
         let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
         return (rows == 1 ? fast : Self.rows)(
             [x, weight, scales, biases],
-            template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
+            template: rows == 1 ? [("NEG", negative ? 1 : 0)] : [("rows", rows), ("outputs", outputs)],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
     }
@@ -1293,7 +1331,10 @@ enum ExactVerifyHead {
               constexpr int rows = 1;
               constexpr int outputs = 1;
             """ + Float16ConstantQMV.rowsAccumulate.replacingOccurrences(
-                of: "(x + simd_lid", with: "(x + size_t(row) * size_t(K) + simd_lid") + """
+                of: "(x + simd_lid", with: "(x + size_t(row) * size_t(K) + simd_lid"
+            ).replacingOccurrences(
+                of: "b[r] = float(bi[r * in_g]);", with: "b[r] = NEG ? -s : float(bi[r * in_g]);"
+            ) + """
               const float total = simd_sum(result[0][0]);
               if (simd_lid == 0) cand_values[c] = total;
             }
@@ -1383,14 +1424,15 @@ enum ExactVerifyHead {
     /// (the full float top-2 through the same kernels).
     static func run(
         rotated: MLXArray, logits: MLXArray, ascale: MLXArray, bounds: MLXArray,
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int, force: Bool = false
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int,
+        negative: Bool = false, force: Bool = false
     ) -> (ids: MLXArray, values: MLXArray, flag: MLXArray, info: MLXArray) {
         let K = rotated.dim(-1)
         let N = weight.dim(0)
         let x = rotated.reshaped([rows, K])
         let selected = select(
             [logits, ascale, bounds, x, weight, scales, biases],
-            template: [("CAP", cap), ("THREADS", threads)],
+            template: [("CAP", cap), ("THREADS", threads), ("NEG", negative ? 1 : 0)],
             grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
             outputDTypes: [.int32, .float32, .int32, .float32])
@@ -1466,14 +1508,14 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
+                const float b = NEG ? -s : float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
@@ -1518,9 +1560,9 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               const uint packed_w = *(const device uint*)ws;
               float accum = 0;
@@ -1529,7 +1571,9 @@ private enum DraftScreenQMV {
                 accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                     + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
               }
-              result += float(*sc) * accum + sum * float(*bi);
+              const float s = float(*sc);
+              const float b = NEG ? -s : float(*bi);
+              result += s * accum + sum * b;
               ws += 128;
               sc += 4;
               bi += 4;
@@ -1539,6 +1583,116 @@ private enum DraftScreenQMV {
             if (simd_lid == 0) {
               y[c] = total;
               row[c] = r;
+            }
+            """)
+
+    /// Fused `argMax(partial.reshaped([blocks, 32]), axis: -1)` + `rescore`
+    /// when `CH == 32` and `biases == -scales`: each 32-lane simdgroup reduces
+    /// its 32 `partial` values in registers via 5 `simd_shuffle_xor` steps and
+    /// immediately rescores the winning row `r` without reading `biases`.
+    static let rescoreFast32 = MLXFast.metalKernel(
+        name: "hadamard_qmv_screen_rescore_fast32_f16",
+        inputNames: ["x", "w", "scales", "partial"], outputNames: ["y", "row"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int K = x_shape[1];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
+            float best_v = partial[c * 32 + int(simd_lid)];
+            int best_i = int(simd_lid);
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+              const float other_v = simd_shuffle_xor(best_v, offset);
+              const int other_i = simd_shuffle_xor(best_i, offset);
+              if (other_v > best_v || (other_v == best_v && other_i < best_i)) {
+                best_v = other_v;
+                best_i = other_i;
+              }
+            }
+            const int r = c * 32 + best_i;
+            const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
+            const device half* sc = scales + r * in_g + simd_lid / 8;
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float result = 0;
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              float x_thread[16];
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
+              }
+              const uint packed_w = *(const device uint*)ws;
+              float accum = 0;
+              for (int i = 0; i < 4; i++) {
+                const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
+                accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
+                    + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
+              }
+              const float s = float(*sc);
+              result += s * accum + sum * (-s);
+              ws += 128;
+              sc += 4;
+              xp4 += 128;
+            }
+            const float total = simd_sum(result);
+            if (simd_lid == 0) {
+              y[c] = total;
+              row[c] = r;
+            }
+            """)
+
+    /// Single-threadgroup final argmax + gather: finds the winning block across
+    /// `y[0 ..< BLOCKS]`, resolves `win_row = row[best_c]`, and writes either
+    /// `win_row` (`USE_IDS == 0`) or `ids[win_row]` (`USE_IDS == 1`).
+    static let finalPick = MLXFast.metalKernel(
+        name: "hadamard_qmv_screen_final_pick",
+        inputNames: ["y", "row", "ids"], outputNames: ["out"],
+        source: """
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            float best_v = -INFINITY;
+            int best_c = 0x7fffffff;
+            for (int c = int(lane); c < BLOCKS; c += 256) {
+              const float v = y[c];
+              if (v > best_v || (v == best_v && c < best_c)) {
+                best_v = v;
+                best_c = c;
+              }
+            }
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+              const float other_v = simd_shuffle_xor(best_v, offset);
+              const int other_c = simd_shuffle_xor(best_c, offset);
+              if (other_v > best_v || (other_v == best_v && other_c < best_c)) {
+                best_v = other_v;
+                best_c = other_c;
+              }
+            }
+            threadgroup float shared_v[8];
+            threadgroup int shared_c[8];
+            if (simd_lid == 0) {
+              shared_v[simd_gid] = best_v;
+              shared_c[simd_gid] = best_c;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              float fv = shared_v[0];
+              int fc = shared_c[0];
+              for (int s = 1; s < 8; s++) {
+                const float sv = shared_v[s];
+                const int sc_idx = shared_c[s];
+                if (sv > fv || (sv == fv && sc_idx < fc)) {
+                  fv = sv;
+                  fc = sc_idx;
+                }
+              }
+              const int win_row = row[fc];
+              out[0] = USE_IDS ? ids[win_row] : win_row;
             }
             """)
 }
@@ -2992,27 +3146,50 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// scored on the leading `width` rotated inputs only; each `chunk`-row
     /// block keeps its best-screened row, those rows are rescored on the full
     /// width, and the best of them wins. Returns the row index (`[1]`,
-    /// int32), or nil when the packing or the shape does not take it. The
-    /// winner can differ from the exact argmax, so only a proposal may use it.
-    public func screenedArgMax(_ x: MLXArray, width: Int, chunk: Int) -> MLXArray? {
+    /// int32) or mapped `ids[row]` when `ids` is supplied, or nil when the
+    /// packing or the shape does not take it. The winner can differ from the
+    /// exact argmax, so only a proposal may use it.
+    public func screenedArgMax(
+        _ x: MLXArray, width: Int, chunk: Int, ids: MLXArray? = nil
+    ) -> MLXArray? {
         let K = transform.width
         let N = weight.dim(0)
         guard readsFloat16ConstantsInPlace, bias == nil, gdnLayout == nil, let biases,
             x.dtype == .float32, x.size == K, width > 0, width < K, width % 512 == 0,
             chunk > 0, N % chunk == 0, (N / chunk) % 2 == 0
         else { return nil }
+        let neg = promptConstants.negative ? 1 : 0
         let rotated = transform(x).reshaped([1, K])
         let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases], template: [("P", width)],
+            [rotated, weight, scales, biases], template: [("P", width), ("NEG", neg)],
             grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
-        let pick = argMax(partial.reshaped([blocks, chunk]), axis: -1)
-        let rescored = DraftScreenQMV.rescore(
-            [rotated, weight, scales, biases, pick], template: [("CH", chunk)],
-            grid: (32, blocks, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
-        return rescored[1][argMax(rescored[0], axis: 0, keepDims: true)]
+        let rescored: [MLXArray]
+        if chunk == 32 && promptConstants.negative {
+            rescored = DraftScreenQMV.rescoreFast32(
+                [rotated, weight, scales, partial],
+                grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        } else {
+            let pick = argMax(partial.reshaped([blocks, chunk]), axis: -1)
+            rescored = DraftScreenQMV.rescore(
+                [rotated, weight, scales, biases, pick],
+                template: [("CH", chunk), ("NEG", neg)],
+                grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        }
+        let idsInput = ids ?? rescored[1]
+        let useIds = (ids != nil && ids!.dtype == .int32) ? 1 : 0
+        let picked = DraftScreenQMV.finalPick(
+            [rescored[0], rescored[1], idsInput],
+            template: [("BLOCKS", blocks), ("USE_IDS", useIds)],
+            grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1]], outputDTypes: [.int32])[0]
+        if let ids, useIds == 0 {
+            return ids[picked]
+        }
+        return picked
     }
 
     /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify-width GDN
@@ -3069,7 +3246,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {
             let output = Float16ConstantQMV.matmul(
-                rotated, weight: weight, scales: scales, biases: biases!)
+                rotated, weight: weight, scales: scales, biases: biases!,
+                negative: promptConstants.negative)
             return bias.map { output + $0 } ?? output
         }
         if permitsFloat16ConstantReuse && rotated.dtype == .float32 {
@@ -3088,10 +3266,13 @@ extension HadamardQuantizedLinear {
     /// module or shape has no exact path.
     public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
+        if x.ndim >= 1, x.dim(-1) == transform.width {
+            let rows = x.size / x.dim(-1)
+            if let exact = exactHeadTopTwo(x, rows: rows) { return exact }
+        }
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
         guard rotated.dtype == .float32 else { return nil }
         let rows = rotated.size / rotated.dim(-1)
-        if let exact = exactHeadTopTwo(x, rotated: rotated, rows: rows) { return exact }
         if (5 ... 8).contains(rows), ExactVerifyHead.verified[rows] == false { return nil }
         return Float16ConstantQMV.topTwo(
             rotated, weight: weight, scales: scales, biases: biases!)
@@ -3103,13 +3284,13 @@ extension HadamardQuantizedLinear {
     /// (and, at 2-4 rows, with `Float16ConstantQMV.topTwo`); on a mismatch
     /// that row count keeps the record's head.
     private func exactHeadTopTwo(
-        _ x: MLXArray, rotated: MLXArray, rows: Int
+        _ x: MLXArray, rows: Int
     ) -> (ids: MLXArray, values: MLXArray)? {
         guard let range = ExactVerifyHead.rowRange, range.contains(rows),
             ExactVerifyHead.verified[rows] != false,
             gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
             weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            let activation = transform.quantizedForVerify(x)
+            let (activation, rotated) = transform.quantizedForVerifyWithRotated(x)
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
@@ -3119,12 +3300,14 @@ extension HadamardQuantizedLinear {
         let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
         let result = ExactVerifyHead.run(
             rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
-            weight: weight, scales: scales, biases: biases!, rows: rows)
+            weight: weight, scales: scales, biases: biases!, rows: rows,
+            negative: promptConstants.negative)
         let first = ExactVerifyHead.verified[rows] == nil
         guard first || ExactVerifyHead.checkEveryCall else { return (result.ids, result.values) }
         let full = ExactVerifyHead.run(
             rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
-            weight: weight, scales: scales, biases: biases!, rows: rows, force: true)
+            weight: weight, scales: scales, biases: biases!, rows: rows,
+            negative: promptConstants.negative, force: true)
         let fused = rows <= 4
             ? Float16ConstantQMV.topTwo(rotated, weight: weight, scales: scales, biases: biases!)
             : nil
@@ -3133,7 +3316,9 @@ extension HadamardQuantizedLinear {
             // Full float logits (rows kernel; 8 rows as 4 + 4) against the int8 logits.
             let flat = rotated.reshaped([rows, rotated.dim(-1)])
             let full32 = rows <= Float16ConstantQMV.maximumRows
-                ? Float16ConstantQMV.matmul(flat, weight: weight, scales: scales, biases: biases!)
+                ? Float16ConstantQMV.matmul(
+                    flat, weight: weight, scales: scales, biases: biases!,
+                    negative: promptConstants.negative)
                 : concatenated([
                     Float16ConstantQMV.matmul(flat[0 ..< 4], weight: weight, scales: scales, biases: biases!),
                     Float16ConstantQMV.matmul(flat[4 ..< rows], weight: weight, scales: scales, biases: biases!),

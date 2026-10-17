@@ -547,7 +547,7 @@ private enum Qwen35RegisterGDN {
 
 }
 
-private enum Qwen35RegisterGatedSIMD {
+enum Qwen35RegisterGatedSIMD {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_gate_simd",
         inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
@@ -606,8 +606,10 @@ private enum Qwen35RegisterGatedSIMD {
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((const device float4*)k_)[j];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
-            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            if (!STATE_ONLY) {
+              const float4 q4 = ((const device float4*)q_)[j];
+              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            }
           }
           float kv[DVPL];
           float vt[DVPL];
@@ -644,23 +646,31 @@ private enum Qwen35RegisterGatedSIMD {
               state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
               state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
               state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              o0 = fma(state[d][4 * j], qr[4 * j], o0);
-              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              if (!STATE_ONLY) {
+                o0 = fma(state[d][4 * j], qr[4 * j], o0);
+                o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+                o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+                o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              }
             }
-            out[d] = (o0 + o1) + (o2 + o3);
+            if (!STATE_ONLY) {
+              out[d] = (o0 + o1) + (o2 + o3);
+            }
           }
-          out[0] += simd_shuffle_xor(out[0], 4);
-          out[1] += simd_shuffle_xor(out[1], 4);
-          out[0] += simd_shuffle_xor(out[0], 2);
-          out[1] += simd_shuffle_xor(out[1], 2);
-          out[0] += simd_shuffle_xor(out[0], 1);
-          out[1] += simd_shuffle_xor(out[1], 1);
-          if (lane % LPD == 0) {
-            *((device float2*)y_) = float2(out[0], out[1]);
+          if (!STATE_ONLY) {
+            out[0] += simd_shuffle_xor(out[0], 4);
+            out[1] += simd_shuffle_xor(out[1], 4);
+            out[0] += simd_shuffle_xor(out[0], 2);
+            out[1] += simd_shuffle_xor(out[1], 2);
+            out[0] += simd_shuffle_xor(out[0], 1);
+            out[1] += simd_shuffle_xor(out[1], 1);
+            if (lane % LPD == 0) {
+              *((device float2*)y_) = float2(out[0], out[1]);
+            }
+            q_ += Hk * Dk;
+            y_ += Hv * Dv;
           }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
+          k_ += Hk * Dk; v_ += Hv * Dv; a_ += Hv; bb_ += Hv;
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -712,10 +722,23 @@ private enum Qwen35RegisterGatedSIMD {
         let Hv = v.dim(2), Dv = v.dim(3)
         let result = kernel(
             [q, k, v, a, b, aLog, dtBias, state],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 0)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
+    }
+
+    static func runStateOnly(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
+                             b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                             state: MLXArray) -> MLXArray {
+        let B = k.dim(0), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let result = kernel(
+            [q, k, v, a, b, aLog, dtBias, state],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[1], state.shape], outputDTypes: [.float32, .float32])
+        return result[1]
     }
 }
 
@@ -1079,6 +1102,28 @@ final class Qwen35GatedDeltaNet: Module {
             q: q, k: k, v: v, g: g, beta: beta, state: floatState)
     }
 
+    private func updateRecurrenceStateOnly(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+    ) -> MLXArray {
+        if mask == nil, headKDim == 128, headVDim == 128,
+            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            q.dim(1) <= 16, a.dtype == .float32, b.dtype == .float32,
+            aLog.dtype == .float32, dtBias.dtype == .float32
+        {
+            let initial = state ?? MLXArray.zeros(
+                [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
+            let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+            return Qwen35RegisterGatedSIMD.runStateOnly(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: floatState)
+        }
+        return updateRecurrence(
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: state, mask: mask
+        ).1
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -1241,7 +1286,7 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
-        let boundarySsm = updateRecurrence(
+        let boundarySsm = updateRecurrenceStateOnly(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
@@ -1251,13 +1296,12 @@ final class Qwen35GatedDeltaNet: Module {
             dtBias: dtBias,
             state: tape.ssmPre,
             mask: tape.mask.map { $0[0..., rows] }
-        ).1
+        )
         let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
             0...]
-        let boundaryConv = boundaryConvView + MLXArray.zeros(
-            boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        let boundaryConv = contiguous(boundaryConvView)
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
@@ -2851,11 +2895,24 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
         let logits: MLXArray
         verifyHeadTopTwo.value = nil
         if let lmHead {
-            logits = model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
-            if !model.exactTargetVerify, let head = lmHead as? HadamardQuantizedLinear {
-                verifyHeadTopTwo.value = head.topTwoRows(normalized)
+            if !model.exactTargetVerify,
+                let head = lmHead as? HadamardQuantizedLinear,
+                let topTwo = head.topTwoRows(normalized)
+            {
+                verifyHeadTopTwo.value = topTwo
+                if Qwen35InlineMTPAssistant.shortlistSize == nil,
+                    ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+                {
+                    logits = broadcast(
+                        normalized[0..., 0..., 0 ..< 1],
+                        to: [normalized.dim(0), normalized.dim(1), head.weight.dim(0)])
+                } else {
+                    logits = lmHead(normalized)
+                }
+            } else {
+                logits = model.exactTargetVerify
+                    ? qwen35A3BExactW4G64Projection(lmHead, normalized)
+                    : lmHead(normalized)
             }
         } else if model.exactTargetVerify, normalized.dim(1) > 1 {
             logits = qwen35A3BTimewiseProjection(normalized) {

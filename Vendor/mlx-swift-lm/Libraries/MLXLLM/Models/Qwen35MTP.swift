@@ -10,13 +10,81 @@ import Foundation
 import MLXLMCommon
 import MLXNN
 
+private enum Qwen35MTPFloat16ConstantQMV {
+    static let fast = MLXFast.metalKernel(
+        name: "qwen35_mtp_qmv_fast_w4_f16_constants",
+        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[x_ndim - 1];
+            const int in_w = K / 2;
+            const int in_g = K / GS;
+            const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+            const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 8;
+            const device half* sc = scales + out_row * in_g + simd_lid / (GS / 16);
+            const device half* bi = biases + out_row * in_g + simd_lid / (GS / 16);
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float x_thread[16];
+            float result[4] = {0, 0, 0, 0};
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.0625f;
+                x_thread[4 * i + 2] = xv.z * 0.00390625f;
+                x_thread[4 * i + 3] = xv.w * 0.000244140625f;
+              }
+              for (int r = 0; r < 4; r++) {
+                const device uint16_t* wl = (const device uint16_t*)(ws + r * in_w);
+                const float s = float(sc[r * in_g]);
+                const float b = float(bi[r * in_g]);
+                float accum = 0;
+                for (int i = 0; i < 4; i++) {
+                  const uint16_t packed_w = wl[i];
+                  accum += (x_thread[4 * i] * float(packed_w & 0x000fu)
+                      + x_thread[4 * i + 1] * float(packed_w & 0x00f0u)
+                      + x_thread[4 * i + 2] * float(packed_w & 0x0f00u)
+                      + x_thread[4 * i + 3] * float(packed_w & 0xf000u));
+                }
+                result[r] += s * accum + sum * b;
+              }
+              ws += 256;
+              sc += 512 / GS;
+              bi += 512 / GS;
+              xp4 += 128;
+            }
+            for (int r = 0; r < 4; r++) {
+              const float total = simd_sum(result[r]);
+              if (simd_lid == 0) y[out_row + r] = total;
+            }
+            """)
+
+    static func matmul(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int
+    ) -> MLXArray {
+        let N = weight.dim(0)
+        return fast(
+            [x, weight, scales, biases],
+            template: [("GS", groupSize)],
+            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+    }
+}
+
 // The pinned MTP head carries FP16 affine metadata while the target feeds it
 // FP32 activations. Reuse only the exact constant widening that quantizedMM
-// would otherwise repeat at every draft step. This cache is input-independent;
-// the packed weights and the module's original parameter tree remain unchanged.
+// would otherwise repeat at every draft step, or read FP16 scales/biases in
+// place for 1-row steps once verified bit-identical. This cache is
+// input-independent; the packed weights and the module's original parameter
+// tree remain unchanged.
 final class Qwen35MTPQuantizedLinear: QuantizedLinear {
     private let mtpScaleCastCache = ConstantArrayCastCache()
     private let mtpOffsetCastCache = ConstantArrayCastCache()
+    private var verifiedOneRowFast: Bool?
 
     @discardableResult
     override func update(
@@ -26,6 +94,7 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
         defer {
             mtpScaleCastCache.clear()
             mtpOffsetCastCache.clear()
+            verifiedOneRowFast = nil
         }
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
@@ -34,6 +103,32 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
     override func callAsFunction(_ x: MLXArray) -> MLXArray {
         guard mode == .affine, x.dtype == .float32, scales.dtype == .float16 else {
             return super.callAsFunction(x)
+        }
+        let K = x.dim(-1)
+        let rows = x.size / K
+        if rows == 1, bits == 4, (groupSize == 64 || groupSize == 128),
+            K % 512 == 0, weight.dim(0) % 8 == 0,
+            let biases, biases.dtype == .float16,
+            verifiedOneRowFast != false
+        {
+            let fastOut = Qwen35MTPFloat16ConstantQMV.matmul(
+                x, weight: weight, scales: scales, biases: biases, groupSize: groupSize)
+            if verifiedOneRowFast == true {
+                return bias.map { fastOut + $0 } ?? fastOut
+            }
+            let widenedScales = mtpScaleCastCache.cachedCast(
+                scales, to: x.dtype, allowFloat16: true) ?? scales
+            let widenedOffsets = mtpOffsetCastCache.cachedCast(
+                biases, to: x.dtype, allowFloat16: true) ?? biases
+            let refOut = quantizedMM(
+                x, weight, scales: widenedScales, biases: widenedOffsets, transpose: true,
+                groupSize: groupSize, bits: bits, mode: mode)
+            eval(fastOut, refOut)
+            let same = fastOut.asArray(Float.self).map(\.bitPattern)
+                == refOut.asArray(Float.self).map(\.bitPattern)
+            verifiedOneRowFast = same
+            let chosen = same ? fastOut : refOut
+            return bias.map { chosen + $0 } ?? chosen
         }
         let widenedScales = mtpScaleCastCache.cachedCast(
             scales, to: x.dtype, allowFloat16: true) ?? scales
@@ -1284,9 +1379,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
         if let draftVocabulary {
             if let (width, chunk) = Self.draftScreen,
-                let local = draftVocabulary.head.screenedArgMax(hidden, width: width, chunk: chunk)
+                let picked = draftVocabulary.head.screenedArgMax(
+                    hidden, width: width, chunk: chunk, ids: draftVocabulary.ids)
             {
-                return draftVocabulary.ids[local]
+                return picked
             }
             let local = argMax(draftVocabulary.head(hidden)[0..., -1, 0...], axis: -1)
             return draftVocabulary.ids[local]
@@ -1609,6 +1705,15 @@ extension Qwen35InlineMTPAssistant {
             usleep(1_000)
             waited += 1
         }
+        let warmQ = MLXArray.zeros([1, 1, 16, 128], dtype: .float32)
+        let warmV = MLXArray.zeros([1, 1, 32, 128], dtype: .float32)
+        let warmA = MLXArray.zeros([1, 1, 32], dtype: .float32)
+        let warmLog = MLXArray.zeros([32], dtype: .float32)
+        let warmState = MLXArray.zeros([1, 32, 128, 128], dtype: .float32)
+        eval(
+            Qwen35RegisterGatedSIMD.runStateOnly(
+                q: warmQ, k: warmQ, v: warmV, a: warmA, b: warmA,
+                aLog: warmLog, dtBias: warmLog, state: warmState))
         Stream().synchronize()
         Memory.clearCache()
     }
