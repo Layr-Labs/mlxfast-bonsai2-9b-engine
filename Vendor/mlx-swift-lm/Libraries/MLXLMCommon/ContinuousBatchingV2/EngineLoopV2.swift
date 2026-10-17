@@ -632,6 +632,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// acceptance readback, finalize) on a performance core.
     private let engineQueue = DispatchQueue(
         label: "com.eigen.cbv2.engine", qos: .userInteractive)
+    /// Keeps each round's host work on a performance core
+    /// (`CBv2EngineWorkInterval`). Engine-queue only.
+    let engineWorkInterval = CBv2EngineWorkInterval()
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -2103,6 +2106,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: The step loop
 
     private func engineStep() {
+        let joinedWorkInterval = engineWorkInterval.stepBegan()
+        defer { if joinedWorkInterval { engineWorkInterval.stepEnded() } }
         guard running else { return }
         if let suspendedAt = suspendStepExecutionAtCountForTesting,
             stepCount >= suspendedAt
@@ -2274,6 +2279,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             scheduleIdleRecheck()
             return
+        }
+
+        // A step that finalized nothing (the prompt step of a request that
+        // arrived on an idle engine) has no readback to wait for, so its host
+        // work, the prompt forward's graph build and encoding, starts here and
+        // joins the work interval like a round's does. After a readback this is
+        // a no-op: `finalize` already started the interval, so a round's start
+        // is unchanged. Idle steps return above and never start it.
+        if joinedWorkInterval {
+            engineWorkInterval.hostWorkBegan()
         }
 
         beginMTPPlan()
@@ -3511,6 +3526,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             eval(step.evalTargets)
             CBv2CoreInstrumentation.recordHostSync()
         }
+        engineWorkInterval.hostWorkBegan()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
