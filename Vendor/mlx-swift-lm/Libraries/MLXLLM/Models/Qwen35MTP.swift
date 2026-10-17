@@ -1117,12 +1117,13 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// the leading `width` rotated inputs of every draft-vocabulary row, then
     /// the full width for the best row of each `chunk`-row block. Local
     /// experiments override it with `QWEN35_DRAFT_SCREEN=<width>,<chunk>` or
-    /// `off`. (2048, 16) proposes the exact draft head's token on the public
-    /// prompt (224 rounds over 1,023 tokens, like the unscreened head) for
-    /// about 32 MB per step; (1536, 32) read 23 MB and needed 231 rounds.
+    /// `off`. (1536, 8) reads about 27 MB per step (20.3 MB of leading-width
+    /// partials, 6.8 MB of full-width rescores over 6,208 blocks) against
+    /// 30.4 MB for (2048, 16), and matched the exact draft head's argmax on
+    /// 652 of 654 public-prompt draft steps where (2048, 16) matched 650.
     static let draftScreen: (Int, Int)? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_DRAFT_SCREEN"] else {
-            return (2048, 16)
+            return (1536, 8)
         }
         let parts = raw.split(separator: ",").compactMap { Int($0) }
         return parts.count == 2 ? (parts[0], parts[1]) : nil
