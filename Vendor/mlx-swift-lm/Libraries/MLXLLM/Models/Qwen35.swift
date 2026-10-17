@@ -3794,13 +3794,19 @@ public class Qwen35TextModelInner: Module {
 
     /// Layers per early verify submission.
     static let verifySubmitEvery = 4
+    /// Layers per early submission of a verify window (a captured recurrent
+    /// window): the host builds a 16-row verify layer more slowly than the
+    /// GPU runs one, so the GPU is fed in smaller steps.
+    static let verifyWindowSubmitEvery = 2
 
     /// Verify: submit after the first layer, so the GPU starts on the round
     /// while the host builds the rest, then after every `verifySubmitEvery`
     /// layers. Submission points change only when encoded work is
     /// committed; the graph and its kernels are the same.
-    static func submitsVerify(after layerIndex: Int, of count: Int) -> Bool {
-        layerIndex + 1 < count && (layerIndex == 0 || (layerIndex + 1) % verifySubmitEvery == 0)
+    static func submitsVerify(
+        after layerIndex: Int, of count: Int, every: Int = verifySubmitEvery
+    ) -> Bool {
+        layerIndex + 1 < count && (layerIndex == 0 || (layerIndex + 1) % every == 0)
     }
 
     func cbv2Forward(
@@ -3882,7 +3888,9 @@ public class Qwen35TextModelInner: Module {
                     tapped[prevSlot] = fused.inputResidual
                 }
                 (hiddenStates, pendingDelta) = (fused.residual, fused.delta)
-                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
+                if Self.submitsVerify(
+                    after: modelLayerIndex, of: layers.count, every: Self.verifyWindowSubmitEvery)
+                {
                     asyncEval(hiddenStates, fused.delta)
                 }
                 continue
@@ -3916,7 +3924,9 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds)
             {
                 (hiddenStates, pendingDelta) = (split.residual, split.delta)
-                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
+                if Self.submitsVerify(
+                    after: modelLayerIndex, of: layers.count, every: Self.verifyWindowSubmitEvery)
+                {
                     asyncEval(hiddenStates, split.delta)
                 }
                 continue
@@ -3954,7 +3964,9 @@ public class Qwen35TextModelInner: Module {
             // stepper's timed prefill) is included: without it the GPU waits
             // until the host has built all layers.
             if (captureRecurrentWindow || !lastPositionOnly || inputs.dim(1) >= 64),
-                Self.submitsVerify(after: modelLayerIndex, of: layers.count)
+                Self.submitsVerify(
+                    after: modelLayerIndex, of: layers.count,
+                    every: captureRecurrentWindow ? Self.verifyWindowSubmitEvery : Self.verifySubmitEvery)
             {
                 asyncEval(hiddenStates)
             }
