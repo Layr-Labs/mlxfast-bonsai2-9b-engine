@@ -2,6 +2,7 @@
 // Preserve the published Bonsai pack's FP32 transform / original output dtype contract.
 import Foundation
 import MLX
+import os
 
 /// Invalid transform metadata or incompatible packed weights.
 public enum HadamardError: Error {
@@ -1000,11 +1001,7 @@ private enum Float16ConstantQMV {
     /// A threadgroup covers `blocks` consecutive spans of `2 * outputs` output
     /// rows and writes one partial pair per activation row, so the
     /// `rows x N` logits are never written.
-    static let topTwoPartial = MLXFast.metalKernel(
-        name: "hadamard_qmv_rows_f16_constants_top2",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["partial_ids", "partial_values"],
-        source: """
+    static let topTwoPartialSource = """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
@@ -1038,15 +1035,17 @@ private enum Float16ConstantQMV {
                 partial_values[base + 1] = best[v].second_value;
               }
             }
-            """,
+            """
+
+    static let topTwoPartial = MLXFast.metalKernel(
+        name: "hadamard_qmv_rows_f16_constants_top2",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: topTwoPartialSource,
         header: topTwoHeader)
 
     /// One threadgroup per activation row merges its partial pairs.
-    static let topTwoFinalize = MLXFast.metalKernel(
-        name: "hadamard_qmv_top2_finalize",
-        inputNames: ["partial_ids", "partial_values"],
-        outputNames: ["top_ids", "top_values"],
-        source: """
+    static let topTwoFinalizeSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint lane = thread_position_in_threadgroup.x;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -1077,7 +1076,13 @@ private enum Float16ConstantQMV {
               top_values[row * 2] = local.first_value;
               top_values[row * 2 + 1] = local.second_value;
             }
-            """,
+            """
+
+    static let topTwoFinalize = MLXFast.metalKernel(
+        name: "hadamard_qmv_top2_finalize",
+        inputNames: ["partial_ids", "partial_values"],
+        outputNames: ["top_ids", "top_values"],
+        source: topTwoFinalizeSource,
         header: topTwoHeader)
 
     /// Output spans of `2 * outputs` rows per top-2 threadgroup.
@@ -1128,6 +1133,308 @@ private enum Float16ConstantQMV {
             template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+    }
+}
+
+/// Exact verify-head top-2 at 2 to 8 rows decided by float arithmetic only,
+/// at about the cost of one int8 head pass.
+///
+/// The int8 verify route (`VerifyInt8Matmul`) computes the head logits L8
+/// from rounded activation codes, so a near tie can order two tokens
+/// differently than the float logits F that `Float16ConstantQMV.topTwo`
+/// reduces. Here L8 only screens: it picks the candidates, and float values
+/// with exactly the per-row arithmetic of `rowsAccumulate` decide.
+///
+/// For a row, `L8[n] = sum_k xhat_k w_nk` with `xhat = ascale * q` and
+/// `F[n] = sum_k v_k w_nk`, where v is the rotated row and `q = rint(v /
+/// ascale)` per 128-group. So `|F[n] - L8[n]| <= E` with
+///
+///     E = 1.001 * sum_g ascale_g * (Amax_g * (0.5 + 127 gf) + Bmax_g * gi)
+///
+/// `Amax_g = max_n sum_{k in g} |s_ng c_nk + b_ng|` bounds the rounding of
+/// the codes (`|v - xhat| <= ascale / 2`), `Bmax_g = max_n 127 (|s_ng| sum_k
+/// c_nk + 128 |b_ng|)` bounds the size of the int8 route's terms, and gf, gi
+/// cover the FP32 rounding of both sums with a wide margin. Amax and Bmax are
+/// properties of the head weights, computed once.
+///
+/// With i2 the second-largest L8 value of the row and `tau <= i2 - 2E`, every
+/// id outside `S = {n : L8[n] >= tau}` has `F[n] <= L8[n] + E < i2 - E`,
+/// while the two int8 leaders (both in S) have `F >= i2 - E`. So the float
+/// top-2 lies in S, and the top-2 of S's float values in the float top-2
+/// order (value descending, id ascending) is the float top-2. A row whose S
+/// holds more than `cap` ids, or that shows a non-finite value, runs the full
+/// float top-2 instead (`guardedPartial`, a no-op for every other row).
+enum ExactVerifyHead {
+    static let cap = 256
+    static let threads = 512
+
+    /// One threadgroup per 128-group g: `bounds[g] = Amax_g`, `bounds[G + g]
+    /// = Bmax_g`.
+    static let bounds = MLXFast.metalKernel(
+        name: "hadamard_xhead_bounds",
+        inputNames: ["w", "scales", "biases"], outputNames: ["bounds"],
+        source: """
+            const uint g = threadgroup_position_in_grid.x;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const int N = w_shape[0];
+            const int words = w_shape[1];
+            const int G = scales_shape[1];
+            float amax = 0.0f, bmax = 0.0f;
+            for (int n = int(lane); n < N; n += 256) {
+              const device uint32_t* wr = w + size_t(n) * size_t(words) + g * 8;
+              int n1 = 0, n2 = 0, n3 = 0;
+              for (int j = 0; j < 8; j++) {
+                const uint v = wr[j];
+                const uint lo = v & 0x55555555u;
+                const uint hi = (v >> 1) & 0x55555555u;
+                n3 += popcount(lo & hi);
+                n1 += popcount(lo & ~hi);
+                n2 += popcount(hi & ~lo);
+              }
+              const int n0 = 128 - n1 - n2 - n3;
+              const float s = float(scales[size_t(n) * size_t(G) + g]);
+              const float b = float(biases[size_t(n) * size_t(G) + g]);
+              const float a = float(n0) * fabs(b) + float(n1) * fabs(s + b)
+                  + float(n2) * fabs(2.0f * s + b) + float(n3) * fabs(3.0f * s + b);
+              const float bb = 127.0f * (fabs(s) * float(n1 + 2 * n2 + 3 * n3) + 128.0f * fabs(b));
+              amax = max(amax, a);
+              bmax = max(bmax, bb);
+            }
+            amax = simd_max(amax);
+            bmax = simd_max(bmax);
+            threadgroup float sa[8], sb[8];
+            if (simd_lid == 0) { sa[simd_gid] = amax; sb[simd_gid] = bmax; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              for (int i = 1; i < 8; i++) { amax = max(amax, sa[i]); bmax = max(bmax, sb[i]); }
+              bounds[g] = amax;
+              bounds[G + g] = bmax;
+            }
+            """)
+
+    /// One threadgroup of `threads` per row: int8 top-2, E, the candidate
+    /// set, its float values (`rowsAccumulate` at one row and one output
+    /// row, so each value is the one `topTwoPartial` computes for that id)
+    /// and their top-2. `info[row] = (E, |S|)`.
+    static let select = MLXFast.metalKernel(
+        name: "hadamard_xhead_select",
+        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases"],
+        outputNames: ["sel_ids", "sel_values", "flag", "info"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const int K = x_shape[1];
+            const int N = w_shape[0];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            const device float* lrow = logits + size_t(row) * size_t(N);
+            threadgroup atomic_int any_bad;
+            threadgroup atomic_int cand_count;
+            threadgroup int cand_ids[CAP];
+            threadgroup float cand_values[CAP];
+            threadgroup hadamard_top2 scratch[THREADS / 32];
+            threadgroup float shared_tau[2];
+            if (lane == 0) {
+              atomic_store_explicit(&any_bad, 0, memory_order_relaxed);
+              atomic_store_explicit(&cand_count, 0, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            hadamard_top2 local = hadamard_top2_empty();
+            bool bad = false;
+            for (int n = int(lane); n < N; n += THREADS) {
+              const float v = lrow[n];
+              bad = bad || !isfinite(v);
+              if (local.count == 2 && !(v > local.second_value)) continue;
+              hadamard_top2_insert(local, v, uint(n));
+            }
+            if (bad) atomic_store_explicit(&any_bad, 1, memory_order_relaxed);
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+              hadamard_top2 other;
+              other.first_value = simd_shuffle_down(local.first_value, stride);
+              other.second_value = simd_shuffle_down(local.second_value, stride);
+              other.first_id = simd_shuffle_down(local.first_id, stride);
+              other.second_id = simd_shuffle_down(local.second_id, stride);
+              other.count = simd_shuffle_down(local.count, stride);
+              if (simd_lid < stride) hadamard_top2_merge(local, other);
+            }
+            if (simd_lid == 0) scratch[simd_gid] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              for (uint s = 1; s < THREADS / 32; s++) hadamard_top2_merge(local, scratch[s]);
+              float e = 0.0f;
+              for (int g = 0; g < in_g; g++) {
+                e += ascale[row * uint(in_g) + uint(g)]
+                    * (bounds[g] * (0.5f + 127.0f * 3.0e-5f) + bounds[in_g + g] * 1.0e-5f);
+              }
+              e *= 1.001f;
+              const float t = local.second_value - 2.0f * e;
+              shared_tau[0] = t - (fabs(t) * 2.4e-7f + 1.0e-30f);
+              shared_tau[1] = e;
+              if (local.count < 2 || !isfinite(e) || !isfinite(t))
+                atomic_store_explicit(&any_bad, 1, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float tau = shared_tau[0];
+            for (int n = int(lane); n < N; n += THREADS) {
+              if (lrow[n] >= tau) {
+                const int slot = atomic_fetch_add_explicit(&cand_count, 1, memory_order_relaxed);
+                if (slot < CAP) cand_ids[slot] = n;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int count = atomic_load_explicit(&cand_count, memory_order_relaxed);
+            const int used = min(count, CAP);
+            for (int c = int(simd_gid); c < used; c += THREADS / 32) {
+              const int out_row = cand_ids[c];
+              constexpr int rows = 1;
+              constexpr int outputs = 1;
+            """ + Float16ConstantQMV.rowsAccumulate.replacingOccurrences(
+                of: "(x + simd_lid", with: "(x + size_t(row) * size_t(K) + simd_lid") + """
+              const float total = simd_sum(result[0][0]);
+              if (simd_lid == 0) cand_values[c] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              hadamard_top2 best = hadamard_top2_empty();
+              bool nonfinite = false;
+              for (int c = 0; c < used; c++) {
+                nonfinite = nonfinite || !isfinite(cand_values[c]);
+                hadamard_top2_insert(best, cand_values[c], uint(cand_ids[c]));
+              }
+              const bool fallback = atomic_load_explicit(&any_bad, memory_order_relaxed) != 0
+                  || count > CAP || nonfinite || best.count < 2;
+              sel_ids[row * 2] = int(best.first_id);
+              sel_ids[row * 2 + 1] = int(best.second_id);
+              sel_values[row * 2] = best.first_value;
+              sel_values[row * 2 + 1] = best.second_value;
+              flag[row] = fallback ? 1 : 0;
+              info[row * 2] = shared_tau[1];
+              info[row * 2 + 1] = float(count);
+            }
+            """,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// `topTwoPartial` for every row when any row is flagged; otherwise each
+    /// threadgroup returns at once. Rows are independent in `rowsAccumulate`,
+    /// so the values match the 2-4 row kernel for each row.
+    static let guardedPartial = MLXFast.metalKernel(
+        name: "hadamard_xhead_guarded_top2",
+        inputNames: ["x", "w", "scales", "biases", "flag"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: """
+            {
+              bool needed = false;
+              for (int v = 0; v < rows; v++) needed = needed || (flag[v] != 0);
+              if (!needed) return;
+            }
+            """ + Float16ConstantQMV.topTwoPartialSource,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// Per row: the selected pair, or `topTwoFinalize` over the full-float
+    /// partials for a flagged row.
+    static let finalize = MLXFast.metalKernel(
+        name: "hadamard_xhead_finalize",
+        inputNames: ["partial_ids", "partial_values", "flag", "sel_ids", "sel_values"],
+        outputNames: ["top_ids", "top_values"],
+        source: """
+            if (flag[threadgroup_position_in_grid.x] == 0) {
+              if (thread_position_in_threadgroup.x == 0) {
+                const uint r2 = threadgroup_position_in_grid.x * 2;
+                top_ids[r2] = sel_ids[r2];
+                top_ids[r2 + 1] = sel_ids[r2 + 1];
+                top_values[r2] = sel_values[r2];
+                top_values[r2 + 1] = sel_values[r2 + 1];
+              }
+              return;
+            }
+            """ + Float16ConstantQMV.topTwoFinalizeSource,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// `DARKBLOOM_BONSAI_XHEAD=0` keeps the record's head (float top-2 at 2-4
+    /// rows, int8 logits at 5-8); `=5` takes this path at 5-8 rows only.
+    static let rowRange: ClosedRange<Int>? = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_XHEAD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(value ?? "") { return nil }
+        if let value, let low = Int(value), (2 ... 8).contains(low) { return low ... 8 }
+        return 2 ... 8
+    }()
+
+    /// `DARKBLOOM_BONSAI_XHEAD_CHECK=1`: every call is also checked against
+    /// the full float top-2 and the full float logits (development only).
+    static let checkEveryCall: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_XHEAD_CHECK"] == "1"
+
+    /// Row counts whose first call passed (true) or failed (false) the
+    /// load-time comparison with the full float top-2.
+    nonisolated(unsafe) static var verified: [Int: Bool] = [:]
+    nonisolated(unsafe) static var stats: [Int: (calls: Int, fallbacks: Int, maxRatio: Float, maxCount: Float)] = [:]
+
+    static func log(_ message: String) {
+        FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+        os_log("%{public}@", log: .default, type: .default, message as NSString)
+    }
+
+    /// `(ids, values, flag, info)` for `rows` rows; `force` flags every row
+    /// (the full float top-2 through the same kernels).
+    static func run(
+        rotated: MLXArray, logits: MLXArray, ascale: MLXArray, bounds: MLXArray,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int, force: Bool = false
+    ) -> (ids: MLXArray, values: MLXArray, flag: MLXArray, info: MLXArray) {
+        let K = rotated.dim(-1)
+        let N = weight.dim(0)
+        let x = rotated.reshaped([rows, K])
+        let selected = select(
+            [logits, ascale, bounds, x, weight, scales, biases],
+            template: [("CAP", cap), ("THREADS", threads)],
+            grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
+            outputDTypes: [.int32, .float32, .int32, .float32])
+        let flag = force ? MLXArray(Array(repeating: Int32(1), count: rows)) : selected[2]
+        let outputs = 4
+        let span = 2 * outputs * Float16ConstantQMV.topTwoBlocks
+        let groups = N / span
+        let partials = guardedPartial(
+            [x, weight, scales, biases, flag],
+            template: [
+                ("rows", rows), ("outputs", outputs), ("blocks", Float16ConstantQMV.topTwoBlocks),
+                ("groups", groups),
+            ],
+            grid: (32, groups * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, groups, 2], [rows, groups, 2]],
+            outputDTypes: [.int32, .float32])
+        let top = finalize(
+            [partials[0], partials[1], flag, selected[0], selected[1]],
+            grid: (rows * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2]], outputDTypes: [.int32, .float32])
+        return (top[0], top[1], selected[2], selected[3])
+    }
+
+    static func sameBits(_ a: (ids: MLXArray, values: MLXArray), _ b: (ids: MLXArray, values: MLXArray)) -> Bool {
+        let ai = a.ids.asArray(Int32.self), bi = b.ids.asArray(Int32.self)
+        let av = a.values.asArray(Float.self).map(\.bitPattern)
+        let bv = b.values.asArray(Float.self).map(\.bitPattern)
+        return ai == bi && av == bv
+    }
+}
+
+/// The head's `Amax_g, Bmax_g` for `ExactVerifyHead`, made on first use.
+final class ExactVerifyHeadBounds {
+    private var cached: MLXArray?
+
+    func get(weight: MLXArray, scales: MLXArray, biases: MLXArray) -> MLXArray {
+        if let cached { return cached }
+        let groups = scales.dim(1)
+        let value = ExactVerifyHead.bounds(
+            [weight, scales, biases], grid: (groups * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[2 * groups]], outputDTypes: [.float32])[0]
+        eval(value)
+        cached = value
+        return value
     }
 }
 
@@ -1945,6 +2252,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     let readsFloat16ConstantsInPlace: Bool
 
     private let promptConstants = PromptInt8Constants()
+    let exactHeadBounds = ExactVerifyHeadBounds()
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
     /// input, the packing or the device does not take it.
@@ -2252,15 +2560,96 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 extension HadamardQuantizedLinear {
     /// Exact top-2 output ids and values per activation row, ordered by value
     /// descending and id ascending on ties, without writing the `rows x N`
-    /// outputs: the same values `callAsFunction` returns for 2 to 4 FP32 rows.
+    /// outputs: the float values of `Float16ConstantQMV.rows` for 2 to 8
+    /// FP32 rows (`ExactVerifyHead`; at 2 to 4 rows also the fused top-2).
     /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
-    /// module or shape has no fused path.
+    /// module or shape has no exact path.
     public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
         let rotated = transform(gdnLayout.map { $0(x) } ?? x)
         guard rotated.dtype == .float32 else { return nil }
+        let rows = rotated.size / rotated.dim(-1)
+        if let exact = exactHeadTopTwo(x, rotated: rotated, rows: rows) { return exact }
+        if (5 ... 8).contains(rows), ExactVerifyHead.verified[rows] == false { return nil }
         return Float16ConstantQMV.topTwo(
             rotated, weight: weight, scales: scales, biases: biases!)
+    }
+
+    /// `ExactVerifyHead` for this module: int8 screen, float rescore, full
+    /// float top-2 for a row the margin does not settle. The first call at
+    /// each row count is compared bit for bit with the full float top-2
+    /// (and, at 2-4 rows, with `Float16ConstantQMV.topTwo`); on a mismatch
+    /// that row count keeps the record's head.
+    private func exactHeadTopTwo(
+        _ x: MLXArray, rotated: MLXArray, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let range = ExactVerifyHead.rowRange, range.contains(rows),
+            ExactVerifyHead.verified[rows] != false,
+            gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
+            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
+            let activation = transform.quantizedForVerify(x)
+        else { return nil }
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        guard let logits = VerifyInt8Matmul.matmul(
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        else { return nil }
+        let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
+        let result = ExactVerifyHead.run(
+            rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
+            weight: weight, scales: scales, biases: biases!, rows: rows)
+        let first = ExactVerifyHead.verified[rows] == nil
+        guard first || ExactVerifyHead.checkEveryCall else { return (result.ids, result.values) }
+        let full = ExactVerifyHead.run(
+            rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
+            weight: weight, scales: scales, biases: biases!, rows: rows, force: true)
+        let fused = rows <= 4
+            ? Float16ConstantQMV.topTwo(rotated, weight: weight, scales: scales, biases: biases!)
+            : nil
+        var ratio: MLXArray? = nil
+        if ExactVerifyHead.checkEveryCall {
+            // Full float logits (rows kernel; 8 rows as 4 + 4) against the int8 logits.
+            let flat = rotated.reshaped([rows, rotated.dim(-1)])
+            let full32 = rows <= Float16ConstantQMV.maximumRows
+                ? Float16ConstantQMV.matmul(flat, weight: weight, scales: scales, biases: biases!)
+                : concatenated([
+                    Float16ConstantQMV.matmul(flat[0 ..< 4], weight: weight, scales: scales, biases: biases!),
+                    Float16ConstantQMV.matmul(flat[4 ..< rows], weight: weight, scales: scales, biases: biases!),
+                ], axis: 0)
+            let bound = result.info.reshaped([rows, 2])[0 ..< rows, 0 ..< 1].reshaped([rows])
+            ratio = abs(full32 - logits).max(axis: -1) / bound
+        }
+        var arrays = [result.ids, result.values, result.flag, result.info, full.ids, full.values]
+        if let fused { arrays += [fused.ids, fused.values] }
+        if let ratio { arrays.append(ratio) }
+        eval(arrays)
+        var same = ExactVerifyHead.sameBits((result.ids, result.values), (full.ids, full.values))
+        if let fused { same = same && ExactVerifyHead.sameBits((result.ids, result.values), fused) }
+        let flags = result.flag.asArray(Int32.self)
+        let info = result.info.asArray(Float.self)
+        let worst = ratio.map { $0.asArray(Float.self).max() ?? 0 } ?? 0
+        var stat = ExactVerifyHead.stats[rows] ?? (0, 0, 0, 0)
+        stat.calls += 1
+        stat.fallbacks += flags.filter { $0 != 0 }.count
+        stat.maxRatio = max(stat.maxRatio, worst)
+        stat.maxCount = max(stat.maxCount, stride(from: 1, to: info.count, by: 2).map { info[$0] }.max() ?? 0)
+        ExactVerifyHead.stats[rows] = stat
+        if first {
+            ExactVerifyHead.verified[rows] = same
+            ExactVerifyHead.log("XHEAD verify head rows \(rows): \(same ? "exact path on" : "MISMATCH, record head kept")")
+        }
+        if ExactVerifyHead.checkEveryCall {
+            if !same || worst > 1 || !worst.isFinite {
+                ExactVerifyHead.log("XHEAD CHECK FAILED rows \(rows) same \(same) ratio \(worst) info \(info)")
+                preconditionFailure("XHEAD check failed at rows \(rows): same \(same), ratio \(worst)")
+            }
+            if stat.calls % 25 == 1 || flags.contains(where: { $0 != 0 }) {
+                ExactVerifyHead.log(
+                    "XHEAD stats rows \(rows) calls \(stat.calls) fallback_rows \(stat.fallbacks) "
+                        + "max_err_over_E \(stat.maxRatio) max_candidates \(stat.maxCount) last_info \(info)")
+            }
+        }
+        if !same { return nil }
+        return (result.ids, result.values)
     }
 }
 
