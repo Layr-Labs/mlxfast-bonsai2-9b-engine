@@ -2394,6 +2394,14 @@ public class Qwen35TextModelInner: Module {
     /// Layers per early verify submission.
     static let verifySubmitEvery = 4
 
+    /// Verify: submit after the first layer, so the GPU starts on the round
+    /// while the host builds the rest, then after every `verifySubmitEvery`
+    /// layers. Submission points change only when encoded work is
+    /// committed; the graph and its kernels are the same.
+    static func submitsVerify(after layerIndex: Int, of count: Int) -> Bool {
+        layerIndex + 1 < count && (layerIndex == 0 || (layerIndex + 1) % verifySubmitEvery == 0)
+    }
+
     func cbv2Forward(
         _ inputs: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -2442,9 +2450,7 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds)
             {
                 (hiddenStates, pendingDelta) = (fused.residual, fused.delta)
-                if (modelLayerIndex + 1) % Self.verifySubmitEvery == 0,
-                    modelLayerIndex + 1 < layers.count
-                {
+                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
                     asyncEval(hiddenStates, fused.delta)
                 }
                 continue
@@ -2460,7 +2466,7 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds)
             {
                 (hiddenStates, pendingDelta) = (split.residual, split.delta)
-                if (modelLayerIndex + 1) % Self.verifySubmitEvery == 0 {
+                if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
                     asyncEval(hiddenStates, split.delta)
                 }
                 continue
@@ -2482,11 +2488,10 @@ public class Qwen35TextModelInner: Module {
             if let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
                 tapped[slot] = hiddenStates
             }
-            // Verify: hand finished layers to the GPU while the rest of the
-            // graph is still being built. Same graph and same kernels.
-            if captureRecurrentWindow,
-                (modelLayerIndex + 1) % Self.verifySubmitEvery == 0,
-                modelLayerIndex + 1 < layers.count
+            // Verify & Prefill: hand finished layers to the GPU while the rest
+            // of the graph is still being built. Same graph and same kernels.
+            if (captureRecurrentWindow || !lastPositionOnly),
+                Self.submitsVerify(after: modelLayerIndex, of: layers.count)
             {
                 asyncEval(hiddenStates)
             }
