@@ -559,6 +559,41 @@ private final class DFlash2Attention: Module {
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
     }
+
+    /// The CONTEXT half of `callAsFunction`, with no block: the same sliding
+    /// skip, the same k/v projections, norms, rotation at the cache's offset
+    /// and `cache.update`, in the same order on the same operands. A later
+    /// forward over the remaining rows continues the cache exactly where a
+    /// single combined pass would have put it, which is also how every
+    /// steady-state round already extends this cache.
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+        var context = context
+        var contextLength = context.dim(1)
+        if let slidingWindow {
+            let skip = DFlash2SlidingMask.contextSkip(
+                contextLength: contextLength, slidingWindow: slidingWindow)
+            if skip > 0 {
+                context = context[0..., skip..., 0...]
+                contextLength = context.dim(1)
+                if let base = cache as? BaseKVCache {
+                    base.offset += skip
+                }
+            }
+        }
+        let B = context.dim(0)
+        var contextKeys: MLXArray, contextValues: MLXArray
+        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+            (contextKeys, contextValues) = (kv[0], kv[1])
+        } else {
+            (contextKeys, contextValues) = (kProj(context), vProj(context))
+        }
+        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
+            .transposed(0, 2, 1, 3)
+        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        contextKeys = rope(contextKeys, offset: cache.offset)
+        _ = cache.update(keys: contextKeys, values: contextValues)
+    }
 }
 
 // MARK: - The grouped dynamic causal convolution
@@ -725,6 +760,13 @@ private final class DFlash2DecoderLayer: Module {
                 dynamic: attentionTaps)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+    }
+
+    /// Context-only: nothing of the block runs (no norms, convolutions, MLP
+    /// or attention output), only the attention sub-layer's context keys and
+    /// values enter the cache.
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+        selfAttn.absorbContext(context, rope: rope, cache: cache)
     }
 }
 
@@ -946,6 +988,26 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return DF2Fast.rms(h, norm)
+    }
+
+    /// Absorb committed context rows into the drafter's caches without
+    /// proposing: the context side of `hiddenStates` — the `fc` projection,
+    /// `hiddenNorm`, and each layer's context keys and values — on the same
+    /// operands in the same order, with no block forward. `blockContext` in
+    /// a later `propose` continues these caches exactly as a steady-state
+    /// round's incremental absorption does.
+    public func absorbContext(targetHidden: MLXArray, cache: [KVCache]) throws {
+        guard cache.count == layers.count else {
+            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
+        }
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+            throw DFlash2Error.targetHiddenSizeMismatch(
+                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
+        }
+        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
+        for (index, layer) in layers.enumerated() {
+            layer.absorbContext(context, rope: rope, cache: cache[index])
+        }
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
