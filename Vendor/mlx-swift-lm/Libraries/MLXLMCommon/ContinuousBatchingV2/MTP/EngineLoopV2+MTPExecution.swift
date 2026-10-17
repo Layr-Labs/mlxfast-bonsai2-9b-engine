@@ -132,6 +132,11 @@ extension EngineLoopV2 {
 
         // Plain and seed rows share one eager [B, 1] target batch. Seed rows
         // retain the pre-norm hidden; logits remain identical to plain eager.
+        // Seed, decode and prefill rows bind recurrent state below, before
+        // any draft submission: resolve pending transactions first.
+        if work.contains(where: { $0.carry == nil }) {
+            mtpResolveDeferredRecurrentCommits()
+        }
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
@@ -645,7 +650,13 @@ extension EngineLoopV2 {
                 // the host builds step d + 1. This is nonblocking and joins
                 // the round's sole finalize fence.
                 asyncEval(stepEvalTargets)
-                if draftIndex == 0 { mtp.recordEarlyDraftSubmission() }
+                if draftIndex == 0 {
+                    mtp.recordEarlyDraftSubmission()
+                    // The drafter's first step is submitted: resolve the last
+                    // round's recurrent transactions before the target
+                    // verification below binds that state.
+                    mtpResolveDeferredRecurrentCommits()
+                }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = nextRows.count == 1 ? nextRows[0] : concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
@@ -692,6 +703,7 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        mtpResolveDeferredRecurrentCommits()
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)

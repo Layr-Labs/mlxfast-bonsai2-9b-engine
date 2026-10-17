@@ -218,7 +218,33 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
-            if let evaluations = verify.recurrentEvaluations[id] {
+            // The target's recurrent (GDN) state transaction is read only by
+            // the next TARGET forward; the next round's first GPU work is the
+            // drafter's step 0, which never reads it. A continuing row with no
+            // prefix publication therefore resolves the transaction right
+            // after that submission (`mtpResolveDeferredRecurrentCommits`),
+            // before anything binds recurrent state again. Same transaction,
+            // same keep count; only its host construction moves.
+            if let evaluations = verify.recurrentEvaluations[id],
+                finishReason == nil, hybridPrefixCache == nil,
+                completeCheckpointCapture == nil,
+                evaluations.count == 1, evaluations[0].isCaptured
+            {
+                let evaluation = evaluations[0]
+                let keep = confirmed
+                mtpDeferredRecurrentCommits.append {
+                    do {
+                        if keep > 0 {
+                            try evaluation.commit(keepPositions: keep)
+                        } else {
+                            try evaluation.rollback()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 captured MTP finalization failed for \(id): \(error)")
+                    }
+                }
+            } else if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
                     // accepted prefix commits by device-side selection of the

@@ -1336,21 +1336,22 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         let isFirstStep = !state.roundInFlight
-        let feed: (tokens: MLXArray, hidden: MLXArray)
+        let split: RoundFeed
         if isFirstStep {
-            feed = beginRound(tokens: tokens, hidden: hidden, state: state)
+            split = beginRoundFeed(tokens: tokens, hidden: hidden, state: state)
         } else {
             precondition(
                 state.roundDraftSteps < Self.maximumDepth,
                 "inline Qwen MTP exceeded its \(Self.maximumDepth)-step draft chain")
-            feed = (tokens, hidden)
+            split = RoundFeed(history: nil, tokens: tokens, hidden: hidden)
         }
 
         let draft: MLXArray
         let lastHidden: MLXArray
-        if shortlist == nil, let fused = fusedRowStep(feed: feed, state: state) {
+        if shortlist == nil, let fused = fusedRowStep(split: split, state: state) {
             (draft, lastHidden) = fused
         } else {
+            let feed = split.joined
             let output =
                 isFirstStep
                 ? (moduleLastHiddenWithKVOnlyHistory(
@@ -1373,9 +1374,33 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return (draft, lastHidden)
     }
 
+    /// A round's first-step feed with its trusted history rows kept apart
+    /// from the final (carry) row. The fused step reads the two parts
+    /// directly, so the common round never concatenates the carry onto the
+    /// history only to slice it back off; `joined` rebuilds the one-array
+    /// feed (same values) for the unfused paths.
+    struct RoundFeed {
+        let history: (tokens: MLXArray, hidden: MLXArray)?
+        let tokens: MLXArray
+        let hidden: MLXArray
+
+        var joined: (tokens: MLXArray, hidden: MLXArray) {
+            guard let history else { return (tokens, hidden) }
+            return (
+                concatenated([history.tokens, tokens], axis: 1),
+                concatenated([history.hidden, hidden], axis: 1))
+        }
+    }
+
     private func beginRound(
         tokens: MLXArray, hidden: MLXArray, state: RequestState
     ) -> (tokens: MLXArray, hidden: MLXArray) {
+        beginRoundFeed(tokens: tokens, hidden: hidden, state: state).joined
+    }
+
+    private func beginRoundFeed(
+        tokens: MLXArray, hidden: MLXArray, state: RequestState
+    ) -> RoundFeed {
         precondition(!state.roundInFlight, "inline Qwen MTP round already in flight")
         precondition(
             state.backlogHidden.count == state.backlogTokens.count,
@@ -1396,12 +1421,22 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         state.roundTrustedTokens.append(tokens)
         state.targetHiddenFrontier = nil
 
-        if state.roundTrustedTokens.count == 1 {
-            return (state.roundTrustedTokens[0], state.roundTrustedHidden[0])
+        let count = state.roundTrustedTokens.count
+        let lastTokens = state.roundTrustedTokens[count - 1]
+        let lastHidden = state.roundTrustedHidden[count - 1]
+        if count == 1 {
+            return RoundFeed(history: nil, tokens: lastTokens, hidden: lastHidden)
         }
-        let feedTokens = concatenated(state.roundTrustedTokens, axis: 1)
-        let feedHidden = concatenated(state.roundTrustedHidden, axis: 1)
-        return (feedTokens, feedHidden)
+        if count == 2 {
+            return RoundFeed(
+                history: (state.roundTrustedTokens[0], state.roundTrustedHidden[0]),
+                tokens: lastTokens, hidden: lastHidden)
+        }
+        return RoundFeed(
+            history: (
+                concatenated(Array(state.roundTrustedTokens[..<(count - 1)]), axis: 1),
+                concatenated(Array(state.roundTrustedHidden[..<(count - 1)]), axis: 1)),
+            tokens: lastTokens, hidden: lastHidden)
     }
 
     private func draftToken(hidden: MLXArray, shortlist: MLXArray?) -> MLXArray {
@@ -1442,19 +1477,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// the K/V-only path. Nil, with nothing appended, when the fused step
     /// does not take these inputs.
     private func fusedRowStep(
-        feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState
+        split: RoundFeed, state: RequestState
     ) -> (MLXArray, MLXArray)? {
-        let rows = feed.tokens.dim(1)
-        guard let step = fusedDraftStep, rows >= 1, feed.hidden.dim(1) == rows,
+        let token = split.tokens
+        let hidden = split.hidden
+        guard let step = fusedDraftStep, token.dim(1) == 1, hidden.dim(1) == 1,
+            split.history.map({ $0.tokens.dim(1) >= 1 && $0.hidden.dim(1) == $0.tokens.dim(1) })
+                ?? true,
             state.caches.count == 1
         else { return nil }
-        let token = rows == 1 ? feed.tokens : feed.tokens[0..., (rows - 1)...]
-        let hidden = rows == 1 ? feed.hidden : feed.hidden[0..., (rows - 1)..., 0...]
         guard step.accepts(token: token, hidden: hidden, cache: state.caches[0]) else { return nil }
-        if rows > 1 {
+        if let history = split.history {
             mtp.appendHistoryKV(
-                hidden: feed.hidden[0..., ..<(rows - 1), 0...],
-                nextTokenIds: feed.tokens[0..., ..<(rows - 1)],
+                hidden: history.hidden,
+                nextTokenIds: history.tokens,
                 embedTokens: target.model.embedTokens, cache: state.caches)
         }
         let carried = state.fusedCarry.flatMap { $0.hidden === hidden ? $0.row : nil }

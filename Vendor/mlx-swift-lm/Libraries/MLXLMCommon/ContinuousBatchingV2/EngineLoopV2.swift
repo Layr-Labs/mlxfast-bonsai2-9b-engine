@@ -731,6 +731,19 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// back to `.decode` and undo the rewind (PR#82 review). Engine-thread-
     /// confined; drained at the finalize site every step.
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
+    /// Captured recurrent-state transactions of the last MTP round's
+    /// continuing verify rows. Only a target forward reads that state, so the
+    /// finalize leaves them here and the next launch resolves them right after
+    /// the drafter's first submission, and in every case before recurrent
+    /// state is bound, released or preempted again (each drain site below).
+    /// Engine-thread-confined; resolved in finalize order.
+    var mtpDeferredRecurrentCommits: [() -> Void] = []
+    func mtpResolveDeferredRecurrentCommits() {
+        guard !mtpDeferredRecurrentCommits.isEmpty else { return }
+        let work = mtpDeferredRecurrentCommits
+        mtpDeferredRecurrentCommits.removeAll(keepingCapacity: true)
+        for item in work { item() }
+    }
     private var inFlight: CBv2InFlightStep?
     private var running = false
     /// Nil in production. Configuration and records are engine-queue confined.
@@ -2137,6 +2150,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
         boundaryClockNanos = 0  // see `boundaryFinishNanos`
+        mtpResolveDeferredRecurrentCommits()
         processCancellations(now: stepNow)
         processLeaseExpiry(now: stepNow)
 
@@ -2261,6 +2275,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         guard scheduler.hasWork else {
+            mtpResolveDeferredRecurrentCommits()
             // Idle: no future step will rebind the eager caches, so drop
             // their row bindings now — otherwise the last batch's (retired)
             // rows stay strongly retained by the provider until some future
@@ -2282,8 +2297,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
+        if !plan.preemptions.isEmpty { mtpResolveDeferredRecurrentCommits() }
         handlePreemptions(plan.preemptions, now: stepNow)
         guard !plan.assignments.isEmpty else {
+            mtpResolveDeferredRecurrentCommits()
             publishGauges()
             scheduleIdleRecheck()
             return
@@ -2299,11 +2316,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         // predicate are structurally wrong for speculative tokens.
         let measurement = mtpMeasurement(for: plan)
         let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        let mtpRound = mtpRoundNeeded(plan)
+        if !mtpRound { mtpResolveDeferredRecurrentCommits() }
         do {
-            inFlight = try (mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan))
+            inFlight = try (mtpRound ? executeMTPRound(plan) : executeMixed(plan))
         } catch {
             handlePagedWriteFailure(error, plan: plan, boundary: boundary, now: stepNow)
         }
+        mtpResolveDeferredRecurrentCommits()
         attachMTPMeasurement(measurement, to: inFlight, chained: false)
         stepCount += 1
         publishGauges()
@@ -3499,6 +3519,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Finalization (deferred stop detection)
 
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        mtpResolveDeferredRecurrentCommits()
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.

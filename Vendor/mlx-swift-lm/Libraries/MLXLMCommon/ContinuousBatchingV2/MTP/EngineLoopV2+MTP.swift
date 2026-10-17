@@ -105,6 +105,7 @@ extension EngineLoopV2 {
         }
         step.forwardShapes = shapes
         shapes?.attach()
+        mtpResolveDeferredRecurrentCommits()
         return step
     }
 }
