@@ -509,6 +509,9 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// of opening the first timed decode round. A drafter that absorbs
     /// lazily keeps the default and nothing changes.
     func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
+
+    func prestageBlock(
+        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPBlockDrafter {
@@ -517,6 +520,10 @@ extension CBv2MTPBlockDrafter {
     public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
         []
     }
+
+    public func prestageBlock(
+        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
+    ) {}
 
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block

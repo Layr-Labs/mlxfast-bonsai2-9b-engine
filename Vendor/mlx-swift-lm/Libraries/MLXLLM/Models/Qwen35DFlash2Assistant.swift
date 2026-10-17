@@ -157,6 +157,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var contextAbsorbed = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
+        var prestaged: (anchor: Int, depth: Int, tokens: MLXArray)?
         var isReleased = false
 
         init(caches: [any KVCache]) { self.caches = caches }
@@ -207,6 +208,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
+            prestaged = nil
             pendingRows = 0
             isReleased = true
         }
@@ -259,6 +261,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
+        if let p = state.prestaged {
+            state.prestaged = nil
+            if p.anchor == anchor && p.depth == depth {
+                return p.tokens
+            }
+        }
         guard !state.pending.isEmpty || state.contextAbsorbed else {
             throw DFlash2Error.emptyBlockContext
         }
@@ -285,6 +293,17 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.contextAbsorbed = false
         state.roots.append(tokens)
         return tokens
+    }
+
+    public func prestageBlock(
+        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
+    ) {
+        let state = self.state(requestState)
+        guard state.prestaged == nil else { return }
+        guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
+        else { return }
+        state.prestaged = (anchor: anchor, depth: depth, tokens: tokens)
+        asyncEval(evaluationTargets(for: requestState))
     }
 
     /// Absorb every pending committed row into the drafter's caches now,
@@ -360,6 +379,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     ) {
         let state = self.state(requestState)
         state.roots.removeAll(keepingCapacity: true)
+        state.prestaged = nil
         append(committedTargetHidden, to: requestState)
     }
 
@@ -367,6 +387,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// the proposal absorbed were committed before it ran, and the proposal
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        state(requestState).roots.removeAll(keepingCapacity: true)
+        let state = self.state(requestState)
+        state.roots.removeAll(keepingCapacity: true)
+        state.prestaged = nil
     }
 }
