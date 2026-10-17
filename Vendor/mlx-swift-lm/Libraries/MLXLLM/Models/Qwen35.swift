@@ -1299,6 +1299,12 @@ final class Qwen35GatedDeltaNet: Module {
             if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
                 return (qkv, z, ba.0, ba.1)
             }
+            if let sharedBA = (S >= 128
+                ? HadamardQuantizedLinear.sharedPromptProjections(inputs, [inProjB, inProjA])
+                : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjB, inProjA]))
+            {
+                return (qkv, z, sharedBA[0], sharedBA[1])
+            }
             return (qkv, z, inProjB(inputs), inProjA(inputs))
         }
         let outFused = fusedInProj(inputs)
@@ -2062,7 +2068,7 @@ enum Qwen35VerifyQKNormRoPE {
         queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float
     ) -> (MLXArray, MLXArray)? {
         guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
-            (2 ... 8).contains(queryProjection.dim(1)),
+            queryProjection.dim(1) >= 2, queryProjection.dim(1) <= 4096,
             queryProjection.dim(2) == queryHeads * 512, keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
@@ -2149,18 +2155,32 @@ final class Qwen35Attention: Module {
             : HadamardQuantizedLinear.sharedShortProjections(x, [qProj, kProj, vProj])
         let qProjOutput = shared?[0] ?? qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qSplit[0]
+        let unnormedQueries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
         var keys = shared?[1] ?? kProj(x)
         var values = shared?[2] ?? vProj(x)
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        var queries: MLXArray
+        let offsetArray = (graphOffsetArray(for: cache)
+            ?? (cache.map { MLXArray(Int32($0.offset)) } ?? MLXArray(Int32(0))))
+            .asType(.int32).reshaped([1])
+        if B == 1, let plainRope,
+            let fused = Qwen35VerifyQKNormRoPE.apply(
+                queryProjection: qProjOutput, keyProjection: keys,
+                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: offsetArray,
+                queryHeads: attentionHeads, keyHeads: kvHeads,
+                ropeDims: plainRope.dims, ropeBase: plainRope.base)
+        {
+            (queries, keys) = fused
+        } else {
+            queries = qNorm(unnormedQueries).transposed(0, 2, 1, 3)
+            keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -2553,7 +2573,10 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let normalized = postAttentionLayerNorm(h)
+        let feedForward = (mlp as? Qwen3NextMLP)?.qwen35TargetVerify(normalized, exact: false)
+            ?? (mlp as! UnaryLayer)(normalized)
+        return h + feedForward
     }
 
     func cbv2Forward(

@@ -3381,7 +3381,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return packed.map { $0.forwardRotated(rotated) }
         }
 
-        return nil
+        // Route 3: Generic shared Hadamard rotation for arbitrary row counts
+        let rotated = first.transform(x)
+        return packed.map { $0.forwardRotated(rotated) }
     }
 
     /// This layer's operands for `VerifyInt8Matmul.matmul(_:layers:)` and
