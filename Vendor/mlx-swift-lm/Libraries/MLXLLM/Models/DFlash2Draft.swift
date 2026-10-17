@@ -1378,7 +1378,6 @@ enum DF2Fast {
         let ru = group / 32  // packed uint4 per row and group
         let tw = group / 16  // unpacked uint4 per row and group
         var pick = """
-            const int K = ksz[0];
             int bx = int(threadgroup_position_in_grid.x);
             const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
             device float* out = out0; int N = ksz[2];
@@ -1500,7 +1499,7 @@ enum DF2Fast {
         let kernel = w4Kernels[layers.count - 1]
         let outs = kernel(
             inputs,
-            template: [("SPLIT", split)],
+            template: [("K", K), ("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
         let lead = Array(x.shape.dropLast())
