@@ -1144,13 +1144,22 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     /// The head's chain depth on rounds whose prompt lookup misses, when the
     /// declared depth is deeper: lookup rounds propose the declared depth.
-    /// Default 4: with the verify body and the exact screened head both flat
-    /// for 2 to 8 rows, a fourth head step commits more per round than it
-    /// costs. Local experiments override it with
+    /// Default 5: the depth cliff just moved. Depth 6 collapsed official
+    /// acceptance 0.6783 -> 0.5388 (e55d6922, sealed 2.5273, rejected) — but
+    /// that was measured under the old (1536,32) screen, whose proposals the
+    /// pinned target rejected deep down the chain. This tree's (2048,16)
+    /// screen matches the exact draft head's picks (acc 0.7101 at depth 4,
+    /// 8341392a): deeper chains now propose tokens the head itself would
+    /// have proposed, so each extra step costs a flat-verify row (flat for
+    /// 2-8 rows, 6 drafts + seed = 7) and buys another amortized token slot
+    /// at near-depth-4 quality. Depth 5 is the midpoint of the bracketed
+    /// cliff — never tested officially under a matching screen. Local pools
+    /// cannot rank miss-depth (hit-dominated: identical acc/rounds at
+    /// 4/5/6); this is an official-pool bet, recorded honestly. Overrides:
     /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
     static let promptLookupMissDepth: Int? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
-            return 4
+            return 5
         }
         guard let value = Int(raw), value > 0 else { return nil }
         return value
