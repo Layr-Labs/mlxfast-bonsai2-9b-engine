@@ -966,7 +966,7 @@ enum CBv2AttentionV1 {
 /// query) go to memory and a second kernel combines them with MLX's
 /// cross-simdgroup code (lane l = class l). Outputs are the bits of
 /// `MLXFast.scaledDotProductAttention(..., mask: .causal)`.
-enum CBv2VerifyVectorAttention {
+public enum CBv2VerifyVectorAttention {
     /// Key classes per partial threadgroup: 2, except 1 on a GPU whose
     /// parsed generation is below MLX's `is_nax_available` rule (as in
     /// `PromptInt8Matmul.architectureHasNAX`), where 64 * L threads can
@@ -1103,9 +1103,54 @@ enum CBv2VerifyVectorAttention {
             }
             """)
 
-    /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
-    static func attend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
+    private static let combineGated = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_combine_gated",
+        inputNames: ["part_o", "part_m", "part_s", "gate"],
+        outputNames: ["out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int v_per_thread = 8;
+            threadgroup float staged[32 * 129];
+            const uint head = threadgroup_position_in_grid.x / 2u;
+            const uint half_ = threadgroup_position_in_grid.x % 2u;
+            const uint t = threadgroup_position_in_grid.y;
+            const uint L = threadgroups_per_grid.y;
+            const uint tid = thread_index_in_threadgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint base = (head * L + t) * 32u;
+            for (uint idx = tid; idx < 32u * 128u; idx += 512u) {
+              const uint c = idx / 128u, x = idx % 128u;
+              staged[c * 129u + x] = part_o[(base + c) * 256u + half_ * 128u + x];
+            }
+            float max_score = part_m[base + simd_lid];
+            float new_max = simd_max(max_score);
+            float factor = fast::exp(max_score - new_max);
+            float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float o[v_per_thread];
+            for (int i = 0; i < v_per_thread; i++) {
+              o[i] = simd_sum(staged[simd_lid * 129u + simd_gid * v_per_thread + i] * factor);
+              o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
+            }
+            if (simd_lid == 0) {
+              const uint out_offset = (t * 16u + head) * 256u + half_ * 128u + simd_gid * v_per_thread;
+              device float* op = out + out_offset;
+              const device float* gp = gate + out_offset;
+              for (int i = 0; i < v_per_thread; i++) {
+                float g = gp[i];
+                float e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                float sig = g < 0.0f ? e : (1.0f - e);
+                op[i] = o[i] * sig;
+              }
+            }
+            """)
+
+    /// `[1, 16, L, 256]`, or `[1, L, 4096]` when `gate` is provided; nil when the inputs do not qualify.
+    public static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        gate: MLXArray? = nil
     ) -> MLXArray? {
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
             queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
@@ -1123,6 +1168,12 @@ enum CBv2VerifyVectorAttention {
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
             outputDTypes: [.float32, .float32, .float32])
+        if let gate {
+            guard gate.dtype == .float32, gate.size == L * 4096 else { return nil }
+            return combineGated(
+                parts + [gate.reshaped([1, L, 4096])], grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
+                outputShapes: [[1, L, 4096]], outputDTypes: [.float32])[0]
+        }
         return combine(
             parts, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
