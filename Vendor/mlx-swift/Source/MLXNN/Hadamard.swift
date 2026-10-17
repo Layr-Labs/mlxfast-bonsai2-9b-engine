@@ -2342,12 +2342,107 @@ enum PromptInt8Matmul {
         }
         """
 
-    /// `naxSgBody` for `layers` sibling projections of one activation in one
-    /// dispatch: threadgroups x < N0 / 64 take layer 0, the next N1 / 64
-    /// layer 1, and so on, each running the one-layer body unchanged. Inputs
-    /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
-    /// N0, N1, ...]; outputs `out0`....
-    static func naxSgSource(layers: Int) -> String {
+    // `naxSgBody` with 128 output rows per threadgroup: eight simdgroups
+    // (256 threads), simdgroup q owning rows 32 (q >> 1) and columns
+    // 32 (q & 1) of the 128 x 64 tile, each running the same per-simdgroup
+    // 32 x 32 x 128 int8 tensor op and epilogue as `naxSgBody`. The 64-column
+    // weight tile is staged once per 128 rows instead of once per 64: the 256
+    // threads each expand two words (the same bytes at the same threadgroup
+    // addresses as the 128-thread staging), into the same double-buffered
+    // 16 KiB. The constants of rows m0 + 32 (q >> 1) ... are read from their
+    // own 64-row tile (m0 / 64 + (q >> 2)) at that tile's half (q >> 1) & 1,
+    // the indices `naxSgBody` uses for that row block. Same integer C per
+    // group, same three roundings, groups ascending from `acc = 0`: every
+    // output is `naxSgBody`'s bits. Needs M a multiple of 128.
+    static let naxSg128Body = """
+        const int Kg = K / 128;
+        const int n0 = bx * 64;
+        const int m0 = int(threadgroup_position_in_grid.y) * 128;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        const int q = int(sg & 7);
+        const int sm = 32 * (q >> 1), sn = 32 * (q & 1);
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        threadgroup uint32_t bs[2][64 * 128 / 4];
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
+        auto B0s = B0.template slice<128, 32>(0, sn);
+        auto B1s = B1.template slice<128, 32>(0, sn);
+        auto tA0 = A.template slice<128, 32>(0, m0 + sm);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0s)>, int32_t>();
+        bool ok = int(cT.get_capacity()) == 32;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i++) {
+          auto ids = cT.get_multidimensional_index(i);
+          ok = ok && int(ids[1]) == fm + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1)
+                  && int(ids[0]) == fn + 16 * ((i >> 3) & 1) + (i & 3);
+        }
+        const bool good = simd_all(ok);
+        const int sc = int(tid >> 2); const int sh = int(tid & 3);
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 2;
+        auto stage = [&](int g, int buf) {
+          const uint2 v = *(const device uint2*)(wrow + g * 8);
+          threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 8;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 2; j++) {
+            const uint32_t wv = v[j];
+            *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                wv & 0x03030303u, (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+          }
+        };
+        const int nb = n0 + sn + fn;
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 16);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 16);
+        const int NQ = N / 4;
+        const size_t tbase = (size_t)(m0 / 64 + (q >> 2)) * (size_t)Kg * 64 + (size_t)(4 * fm + 2 * ((q >> 1) & 1));
+        float acc[32];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i++) { acc[i] = 0.0f; }
+        stage(0, 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < Kg; g++) {
+          if (g + 1 < Kg) { stage(g + 1, (g + 1) & 1); }
+          auto tA = A.template slice<128, 32>(g * 128, m0 + sm);
+          if ((g & 1) == 0) { op.run(tA, B0s, cT); } else { op.run(tA, B1s, cT); }
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
+          const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
+          const float2 a0 = *(const device float2*)(ascale + tbase + (size_t)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tbase + 32 + (size_t)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tbase + (size_t)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tbase + 32 + (size_t)g * 64);
+          float as[4], rb[4];
+          as[0] = a0.x; as[1] = a0.y; as[2] = a1.x; as[3] = a1.y;
+          rb[0] = r0.x; rb[1] = r0.y; rb[2] = r1.x; rb[3] = r1.y;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 32; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float t = s * float(cT[i]);
+            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const int mb = m0 + sm + fm;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i += 4) {
+          const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+          const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
+    /// The layer pick of `naxSgSource` and `naxSg128Source`: threadgroups
+    /// x < N0 / 64 take layer 0, the next N1 / 64 layer 1, and so on.
+    private static func naxSgPick(layers: Int) -> String {
         var pick = """
             const int K = ksz[0]; const int M = ksz[1];
             int bx = int(threadgroup_position_in_grid.x);
@@ -2361,40 +2456,69 @@ enum PromptInt8Matmul {
         for l in 1 ..< layers {
             pick += "if (bx >= N / 64) { bx -= N / 64; w = w\(l); scalesT = s\(l); biasesT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + naxSgBody
+        return pick
+    }
+
+    /// `naxSgBody` for `layers` sibling projections of one activation in one
+    /// dispatch: threadgroups x < N0 / 64 take layer 0, the next N1 / 64
+    /// layer 1, and so on, each running the one-layer body unchanged. Inputs
+    /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
+    /// N0, N1, ...]; outputs `out0`....
+    static func naxSgSource(layers: Int) -> String { naxSgPick(layers: layers) + naxSgBody }
+
+    /// `naxSgSource` with `naxSg128Body`.
+    static func naxSg128Source(layers: Int) -> String { naxSgPick(layers: layers) + naxSg128Body }
+
+    private static func naxSgKernel(name: String, layers: Int, source: String) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: source,
+            header: naxHeader,
+            ensureRowContiguous: true)
     }
 
     /// `naxSgSource` for one, two and three layers (index `layers - 1`).
     private static let naxSgKernels = (1 ... 3).map { layers in
-        MLXFast.metalKernel(
-            name: "bonsai_q8_prompt_matmul_nax_sg\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: naxSgSource(layers: layers),
-            header: naxHeader,
-            ensureRowContiguous: true)
+        naxSgKernel(name: "bonsai_q8_prompt_matmul_nax_sg\(layers)", layers: layers, source: naxSgSource(layers: layers))
+    }
+
+    /// `naxSg128Source` for one, two and three layers (index `layers - 1`).
+    private static let naxSg128Kernels = (1 ... 3).map { layers in
+        naxSgKernel(
+            name: "bonsai_q8_prompt_matmul_nax_sg128_\(layers)", layers: layers,
+            source: naxSg128Source(layers: layers))
     }
 
     /// `naxSg`: the per-simdgroup kernel matched at load (it then replaces
     /// the vector one); `naxSgShared`: its two- and three-layer forms did too.
     nonisolated(unsafe) private static var naxSg = false
     nonisolated(unsafe) private static var naxSgShared = false
+    /// The same for the 128-row kernel (`naxSg128Body`), which then takes
+    /// every row count that is a multiple of 128; `naxSg128Negative`: its
+    /// `NEG = 1` form matched too.
+    nonisolated(unsafe) private static var naxSg128 = false
+    nonisolated(unsafe) private static var naxSg128Shared = false
+    nonisolated(unsafe) private static var naxSg128Negative = false
 
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
-    /// one activation; every N a multiple of 64, `m` of 64.
+    /// one activation; every N a multiple of 64, `m` of 64 (of 128 with
+    /// `tile128`).
     private static func runSg(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool
+        m: Int, k: Int, negative: Bool, tile128: Bool = false
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
-        return naxSgKernels[layers.count - 1](
+        let threads = tile128 ? 256 : 128
+        return (tile128 ? naxSg128Kernels : naxSgKernels)[layers.count - 1](
             inputs, template: [("NEG", negative ? 1 : 0)],
-            grid: (ns.reduce(0, +) / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+            grid: (ns.reduce(0, +) / 64 * threads, m / (tile128 ? 128 : 64), 1), threadGroup: (threads, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
     }
 
@@ -2441,20 +2565,24 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Runs the kernels on a fixed, input-independent 128 x 128 x 512
-    /// problem (2 x 2 tiles, 4 groups) and compares output bits. First the
-    /// plain kernel's `NEG = 1` form against its `NEG = 0` form on offsets
-    /// that are the negated scales. On a NAX device then the per-simdgroup
-    /// tensor kernel (both forms, and its two- and three-layer forms on
-    /// column slices) against the plain kernel; failing that the vector
+    /// Runs the kernels on a fixed, input-independent 256 x 128 x 512
+    /// problem (2 x 2 tiles of 128 rows, 4 x 2 of 64, 4 groups) and compares
+    /// output bits. First the plain kernel's `NEG = 1` form against its
+    /// `NEG = 0` form on offsets that are the negated scales. On a NAX device
+    /// then the 128-row per-simdgroup tensor kernel (both forms, and its two-
+    /// and three-layer forms on column slices) against the plain kernel,
+    /// unless `DARKBLOOM_BONSAI_PROMPT_TILE128=0`; then the 64-row
+    /// per-simdgroup tensor kernel the same way; failing that the vector
     /// tensor kernel (both forms), else the record tensor kernel. Sets
-    /// `naxSg`, `naxSgShared`, `naxVector` and `negativeForms`; false when no
-    /// tensor kernel matches. A compile error (caught by a
-    /// scoped MLX error handler) counts as a mismatch.
+    /// `naxSg128`, `naxSg128Negative`, `naxSg128Shared`, `naxSg`,
+    /// `naxSgShared`, `naxVector` and `negativeForms`; false when no 64-row
+    /// tensor kernel matches (the 128-row kernel is then unused too). A
+    /// compile error (caught by a scoped MLX error handler) counts as a
+    /// mismatch.
     @discardableResult
     private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
-        let m = 128, n = 128, k = 512, kg = k / 128
+        let m = 256, n = 128, k = 512, kg = k / 128
         let codes = MLXArray((0 ..< m * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [m, k])
         let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
         let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
@@ -2472,11 +2600,11 @@ enum PromptInt8Matmul {
             eval(equal)
             return !checkFailed && equal.item(Bool.self)
         }
-        func sg(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>]) -> MLXArray {
+        func sg(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>], tile128: Bool = false) -> MLXArray {
             let outputs = runSg(
                 codes: codes, ascale: ascale, rsb: rsb,
                 layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
-                m: m, k: k, negative: negative)
+                m: m, k: k, negative: negative, tile128: tile128)
             return concatenated(outputs, axis: 1).view(dtype: .uint32)
         }
         var matched = false
@@ -2484,6 +2612,10 @@ enum PromptInt8Matmul {
         negativeForms = false
         naxSg = false
         naxSgShared = false
+        naxSg128 = false
+        naxSg128Shared = false
+        naxSg128Negative = false
+        var tile128Error = false
         withErrorHandler({ message in
             if !PromptInt8Matmul.checkFailed { PromptInt8Matmul.checkNote = String(message.prefix(160)) }
             PromptInt8Matmul.checkFailed = true
@@ -2496,6 +2628,18 @@ enum PromptInt8Matmul {
                 negativeForms = plainNeg
                 return
             }
+            if tile128Enabled, same(sg(biasesT, negative: false, [0 ..< n], tile128: true), plain) {
+                naxSg128 = true
+                naxSg128Negative = plainNeg && same(sg(negatedT, negative: true, [0 ..< n], tile128: true), plainNegated)
+                naxSg128Shared = same(sg(biasesT, negative: false, [0 ..< 64, 64 ..< 128], tile128: true), plain)
+                    && same(
+                        sg(biasesT, negative: false, [0 ..< 64, 64 ..< 128, 0 ..< 64], tile128: true),
+                        concatenated([plain, plain[0..., 0 ..< 64]], axis: 1))
+                if checkFailed { naxSg128Shared = false }
+            } else if checkFailed {
+                tile128Error = true
+            }
+            checkFailed = false
             if same(sg(biasesT, negative: false, [0 ..< n]), plain) {
                 matched = true
                 naxSg = true
@@ -2520,18 +2664,37 @@ enum PromptInt8Matmul {
                 matched = same(output(.nax, biasesT, vector: false, negative: false), plain)
             }
         }
+        if !matched { naxSg128 = false }
         if !checkFailed {
+            var tile128Note = ""
+            if nax {
+                let form = naxSg128Shared ? "per-simdgroup, shared" : "per-simdgroup"
+                let state = naxSg128 ? "\(form), offset skip \(naxSg128Negative ? "on" : "off")"
+                    : !tile128Enabled ? "off" : tile128Error ? "error" : "differs"
+                tile128Note = "; 128-row \(state)"
+            }
             checkNote = !matched ? "outputs differ"
-                : "bit-identical (\(nax ? (naxSg ? (naxSgShared ? "per-simdgroup, shared" : "per-simdgroup") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+                : "bit-identical (\(nax ? (naxSg ? (naxSgShared ? "per-simdgroup, shared" : "per-simdgroup") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off")\(tile128Note))"
         }
         return matched
     }
+
+    /// `DARKBLOOM_BONSAI_PROMPT_TILE128=0` keeps the 128-row kernel out of
+    /// the load-time check, so the 64-row kernels take every row count.
+    private static let tile128Enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_TILE128"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// Decided once, at the first packed module's init. A NAX device takes
     /// the tensor kernel only when it compiles and matches the plain kernel
     /// bit for bit; otherwise it keeps the record's float path. Any other
     /// device takes the plain kernel. `DARKBLOOM_BONSAI_INT8_PREFILL=0` keeps
-    /// the record's float path everywhere.
+    /// the record's float path everywhere; `=nax` (a test aid) takes the NAX
+    /// rule on any device, so a device without tensor units runs the tensor
+    /// kernels' load-time check (emulated) and falls back to the float path
+    /// when they do not match.
     static let route: Route = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_PREFILL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -2539,7 +2702,7 @@ enum PromptInt8Matmul {
         let chosen: Route
         if ["0", "false", "no", "off"].contains(value ?? "") {
             chosen = .off
-        } else if architectureHasNAX(architecture) {
+        } else if value == "nax" || architectureHasNAX(architecture) {
             chosen = checkKernels(nax: true) ? .nax : .off
         } else {
             checkKernels(nax: false)
@@ -2562,6 +2725,12 @@ enum PromptInt8Matmul {
         negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
+        if route == .nax && naxSg128 && activation.rows % 128 == 0 {
+            return runSg(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
+                negative: negative && naxSg128Negative, tile128: true)[0]
+        }
         if route == .nax && naxSg {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -2585,6 +2754,13 @@ enum PromptInt8Matmul {
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
         guard route != .off else { return nil }
+        if route == .nax, naxSg128, naxSg128Shared, activation.rows % 128 == 0, (2 ... 3).contains(layers.count) {
+            return runSg(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
+                m: activation.rows, k: activation.k,
+                negative: naxSg128Negative && layers.allSatisfy { $0.negative }, tile128: true)
+        }
         if route == .nax, naxSg, naxSgShared, (2 ... 3).contains(layers.count) {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
