@@ -4134,35 +4134,54 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             tokens, inputEmbeddings: nil, caches: attending,
             recurrentState: recurrentState, positionIds: positionIds,
             captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
         let logits: MLXArray
         verifyHeadTopTwo.value = nil
-        if let lmHead {
-            if !model.exactTargetVerify,
-                let head = lmHead as? HadamardQuantizedLinear,
-                let topTwo = head.topTwoRows(normalized)
+        if let lmHead,
+            !model.exactTargetVerify,
+            let head = lmHead as? HadamardQuantizedLinear,
+            let topTwo = head.topTwoRowsWithNorm(
+                hidden, normWeight: model.norm.weight, eps: model.norm.eps)
+        {
+            verifyHeadTopTwo.value = topTwo
+            if Qwen35InlineMTPAssistant.shortlistSize == nil,
+                ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
             {
-                verifyHeadTopTwo.value = topTwo
-                if Qwen35InlineMTPAssistant.shortlistSize == nil,
-                    ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
-                {
-                    logits = broadcast(
-                        normalized[0..., 0..., 0 ..< 1],
-                        to: [normalized.dim(0), normalized.dim(1), head.weight.dim(0)])
-                } else {
-                    logits = lmHead(normalized)
-                }
+                logits = broadcast(
+                    hidden[0..., 0..., 0 ..< 1],
+                    to: [hidden.dim(0), hidden.dim(1), head.weight.dim(0)])
             } else {
-                logits = model.exactTargetVerify
-                    ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                    : lmHead(normalized)
-            }
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
+                let normalized = model.norm(hidden)
+                logits = lmHead(normalized)
             }
         } else {
-            logits = model.embedTokens.asLinear(normalized)
+            let normalized = model.norm(hidden)
+            if let lmHead {
+                if !model.exactTargetVerify,
+                    let head = lmHead as? HadamardQuantizedLinear,
+                    let topTwo = head.topTwoRows(normalized)
+                {
+                    verifyHeadTopTwo.value = topTwo
+                    if Qwen35InlineMTPAssistant.shortlistSize == nil,
+                        ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+                    {
+                        logits = broadcast(
+                            normalized[0..., 0..., 0 ..< 1],
+                            to: [normalized.dim(0), normalized.dim(1), head.weight.dim(0)])
+                    } else {
+                        logits = lmHead(normalized)
+                    }
+                } else {
+                    logits = model.exactTargetVerify
+                        ? qwen35A3BExactW4G64Projection(lmHead, normalized)
+                        : lmHead(normalized)
+                }
+            } else if model.exactTargetVerify, normalized.dim(1) > 1 {
+                logits = qwen35A3BTimewiseProjection(normalized) {
+                    model.embedTokens.asLinear($0)
+                }
+            } else {
+                logits = model.embedTokens.asLinear(normalized)
+            }
         }
         return (logits, hidden)
     }

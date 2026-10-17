@@ -266,7 +266,8 @@ public struct SignedBlockHadamard {
         rotatedOutput: Bool = false, normOnly: Bool = false
     ) -> String {
         if normOnly {
-            return normQuantized4096Source(normalizedOutput: normalizedOutput)
+            return normQuantized4096Source(
+                normalizedOutput: normalizedOutput, rotatedOutput: rotatedOutput)
         }
         let valueRead = swiglu ? """
             const float4 g = in4[w];
@@ -425,7 +426,9 @@ public struct SignedBlockHadamard {
     /// `residualNormSource` forms it) and the codes of the rotated normalized
     /// row, optionally also writing the normalized row. The value entering the
     /// rotation is `(weight * (x * inv)) * sign`, as in the residual form.
-    private static func normQuantized4096Source(normalizedOutput: Bool) -> String {
+    private static func normQuantized4096Source(
+        normalizedOutput: Bool, rotatedOutput: Bool = false
+    ) -> String {
         let prefix = residualNormSource.replacingOccurrences(
             of: "(x + at))\n      + *((const device float4*)(residual + at));", with: "(x + at));")
         precondition(prefix != residualNormSource, "norm-only prefix not formed")
@@ -441,7 +444,8 @@ public struct SignedBlockHadamard {
             float4 val = (weight * (raw * norm_inv)) * s4[w];
             """
         let residualSource = quantized4096Source(
-            swiglu: false, residualNorm: true, normalizedOutput: normalizedOutput)
+            swiglu: false, residualNorm: true, normalizedOutput: normalizedOutput,
+            rotatedOutput: rotatedOutput)
         let residualRead = normalizedOutput ? """
             const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
             *((device float4*)(residual_out + in_offset) + w) = raw;
@@ -694,6 +698,13 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, normalizedOutput: true, normOnly: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
+    private static let normRotatedQuantized4096Kernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_norm_rot_4096_q8",
+        inputNames: ["x", "norm_weight", "epsilon", "signs"],
+        outputNames: ["codes", "ascale", "rsb", "rotated_out"],
+        source: quantized4096Source(swiglu: false, rotatedOutput: true, normOnly: true),
+        header: quantized4096Header, ensureRowContiguous: true)
+
     /// `quantizedForPrompt(rmsNorm(x, weight))` at prompt width in one kernel:
     /// `[codes, ascale, rsb]`, plus the normalized rows (the bits of
     /// `MLXFast.rmsNorm`) when `normalized`. Nil when the shape is not a
@@ -816,6 +827,33 @@ public struct SignedBlockHadamard {
             [x.reshaped([rows, width]), signs],
             template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
             grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
+        return (
+            PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            outputs[3])
+    }
+
+    /// `quantizedForVerifyWithRotated` fused with RMSNorm: normalizes `x` with `normWeight`
+    /// and `eps`, then rotates and quantizes to int8 verify activation and rotated FP32 tensor
+    /// in a single Metal dispatch.
+    func normQuantizedForVerifyWithRotated(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float
+    ) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
+        validate(x)
+        let rows = x.size / width
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            normWeight.dtype == .float32, normWeight.shape == [4096],
+            VerifyInt8Matmul.rowRange.contains(rows),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * 32
+        let outputs = Self.normRotatedQuantized4096Kernel(
+            [x.reshaped([rows, width]), normWeight, MLXArray([eps]), signs],
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+            grid: (256, tile, 1), threadGroup: (256, 1, 1),
             outputShapes: [[tile, width], [groups], [groups], x.shape],
             outputDTypes: [.int8, .float32, .float32, .float32])
         return (
@@ -4072,6 +4110,19 @@ extension HadamardQuantizedLinear {
             rotated, weight: weight, scales: scales, biases: biases!)
     }
 
+    public func topTwoRowsWithNorm(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
+        if x.ndim >= 1, x.dim(-1) == transform.width {
+            let rows = x.size / x.dim(-1)
+            if let exact = exactHeadTopTwoWithNorm(x, normWeight: normWeight, eps: eps, rows: rows) {
+                return exact
+            }
+        }
+        return nil
+    }
+
     /// `ExactVerifyHead` for this module: int8 screen, float rescore, full
     /// float top-2 for a row the margin does not settle. The first call at
     /// each row count is compared bit for bit with the full float top-2
@@ -4086,6 +4137,25 @@ extension HadamardQuantizedLinear {
             weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
             let (activation, rotated) = transform.quantizedForVerifyWithRotated(x)
         else { return nil }
+        return runExactHeadTopTwo(activation: activation, rotated: rotated, rows: rows)
+    }
+
+    private func exactHeadTopTwoWithNorm(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let range = ExactVerifyHead.rowRange, range.contains(rows),
+            ExactVerifyHead.verified[rows] != false,
+            gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
+            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
+            let (activation, rotated) = transform.normQuantizedForVerifyWithRotated(
+                x, normWeight: normWeight, eps: eps)
+        else { return nil }
+        return runExactHeadTopTwo(activation: activation, rotated: rotated, rows: rows)
+    }
+
+    private func runExactHeadTopTwo(
+        activation: PromptInt8Activation, rotated: MLXArray, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
@@ -4215,7 +4285,53 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         freeze()
     }
 
+    private static let lookup4096Kernel = MLXFast.metalKernel(
+        name: "hadamard_quantized_embedding_lookup_4096",
+        inputNames: ["indices", "ew", "es", "eb", "signs"],
+        outputNames: ["y"],
+        source: """
+            #pragma clang fp reassociate(off)
+            threadgroup float buf[256 * 17];
+            const short i = short(thread_position_in_threadgroup.x);
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const int64_t raw_tok = int64_t(indices[block_idx]);
+            const int64_t tok = raw_tok < 0 ? raw_tok + int64_t(ew_shape[0]) : raw_tok;
+            const uint q = ew[tok * 256 + i];
+            const half scale = es[tok * 32 + (i >> 3)];
+            const half bias = eb[tok * 32 + (i >> 3)];
+            float x_reg[16];
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              const uint8_t d = (q >> (2 * r)) & 0x03u;
+              const half deq = scale * d + bias;
+              x_reg[r] = float(deq);
+            }
+            dsr_wht4096(x_reg, buf, i);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              const uint idx = uint(i + 256 * r);
+              const float val = x_reg[r] * 0.015625f * signs[idx];
+              y[batch_idx + idx] = half(val);
+            }
+            """,
+        header: DraftStepRowKernels.header)
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if bits == 2, groupSize == 128, transform.blockSize == 4096, transform.width == 4096,
+            weight.dtype == .uint32, weight.ndim == 2, weight.dim(1) == 256,
+            scales.dtype == .float16, biases?.dtype == .float16, let biases,
+            x.size > 0, x.size <= Int(UInt32.max),
+            (x.dtype == .int32 || x.dtype == .uint32 || x.dtype == .int64),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        {
+            let idx32 = (x.dtype == .int32 ? x : x.asType(.int32)).reshaped([x.size])
+            return Self.lookup4096Kernel(
+                [idx32, weight, scales, biases, transform.draftSigns],
+                grid: (256, x.size, 1), threadGroup: (256, 1, 1),
+                outputShapes: [x.shape + [4096]],
+                outputDTypes: [.float16])[0]
+        }
         let indices = x.flattened()
         let rows = dequantized(
             weight[indices], scales: scales[indices],
