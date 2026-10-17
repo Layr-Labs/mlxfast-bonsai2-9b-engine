@@ -844,6 +844,44 @@ final class CBv2MTPRoundDriver {
         return context
     }
 
+    // MARK: Block-drafter confidence depth
+
+    /// Confidence tiers for a block drafter's per-round depth, highest first.
+    /// A round whose lowest carried target top-two margin clears `minimumMargin`
+    /// drafts `depth` tokens. The top tier uses the same margin as the prompt
+    /// lookup deep chain (`Qwen35MTP.promptLookupMissDeep`), so both features
+    /// read the target's confidence on one scale. The drafter's declared depth
+    /// is the ceiling; a tier deeper than it is a no-op through `clampPlanDepth`.
+    static let blockConfidenceTiers: [(minimumMargin: Double, depth: Int)] = [
+        (minimumMargin: 4, depth: 15),
+        (minimumMargin: 2, depth: 11),
+        (minimumMargin: 1, depth: 7),
+    ]
+    static let blockConfidenceFloorDepth = 3
+
+    /// Per-round draft depth for a block drafter, from the carried target
+    /// top-two margin of each row's last committed token. Returns nil (leave
+    /// the planned depth alone) for every other decoder and verification mode,
+    /// and when any row has no carried margin yet. The margin is host-resident
+    /// from the previous round's finalize, so this adds no GPU sync.
+    func blockConfidenceRoundDepth(for rows: [CBv2ScheduledRequest]) -> Int? {
+        guard config.verificationMode != .serialTarget,
+            drafter is any CBv2MTPBlockDrafter,
+            let fixed = config.fixedDraftTokens, fixed > 0, !rows.isEmpty
+        else { return nil }
+        var lowest = Double.infinity
+        for rec in rows {
+            guard let margin = carries[rec.id]?.previousTopTwoMargin, margin.isFinite else {
+                return nil
+            }
+            lowest = min(lowest, margin)
+        }
+        for tier in Self.blockConfidenceTiers where lowest >= tier.minimumMargin {
+            return min(tier.depth, fixed)
+        }
+        return min(Self.blockConfidenceFloorDepth, fixed)
+    }
+
     // MARK: Prompt lookup
 
     /// Depth of a drafted round (the lookup missed): the deeper chain when
