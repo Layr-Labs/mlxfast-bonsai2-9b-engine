@@ -480,10 +480,12 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
         }
-        replacedState.append(first)
-        replacedState.append(committedStorage)
-        replacedState.append(committedTransitionRetainedRoots)
-        if let deferredCommitted { replacedState.append(deferredCommitted) }
+        func retainReplacedState() {
+            replacedState.append(first)
+            replacedState.append(committedStorage)
+            replacedState.append(committedTransitionRetainedRoots)
+            if let deferredCommitted { replacedState.append(deferredCommitted) }
+        }
         func clearOlderTransitionRetention() {
             guard let retainedGeneration = committedTransitionGeneration,
                 generation > retainedGeneration
@@ -498,6 +500,7 @@ public final class CBv2RecurrentRequestState {
                     "captured commit requires keepPositions in 1...\(captured) "
                         + "(got \(String(describing: keepPositions)))")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
@@ -523,6 +526,7 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
             committed = [:]
@@ -557,6 +561,7 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "keepPositions is only valid for captured or prefix replay verify windows")
             }
+            retainReplacedState()
             clearOlderTransitionRetention()
             committed = first.layers
         }
