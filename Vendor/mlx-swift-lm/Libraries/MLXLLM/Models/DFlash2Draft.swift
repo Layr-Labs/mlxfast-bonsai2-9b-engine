@@ -1516,7 +1516,7 @@ enum DF2Fast {
         name: "df2_dyn_conv", inputNames: ["h", "dyn", "base", "res", "dsz"], outputNames: ["out"],
         source: """
             const uint i = thread_position_in_grid.x;
-            const int D = dsz[0]; const int L = dsz[1];
+            const int L = dsz[1];
             if (int(i) >= L * D) return;
             const int l = int(i) / D, c = int(i) % D, g = c / 16;
             const int dw = 4 * (D / 16);
@@ -1532,7 +1532,7 @@ enum DF2Fast {
         let D = h.dim(-1), L = h.size / D
         return conv(
             [h, dyn, base, residual ?? h, MLXArray([Int32(D), Int32(L)])],
-            template: [("PART", part), ("RES", residual == nil ? 0 : 1)],
+            template: [("D", D), ("PART", part), ("RES", residual == nil ? 0 : 1)],
             grid: ((L * D + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape], outputDTypes: [.float32])[0]
     }
