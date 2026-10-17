@@ -286,7 +286,7 @@ public struct SignedBlockHadamard {
             const uint ag_e = uint(base0) + 4u * uint(w);
             const uint ag_row = block_idx;
             const float4 attn = *((const device float4*)(x
-                + ((ag_e >> 8) * uint(VERIFY_ROWS) + ag_row) * 256u + (ag_e & 255u)));
+                + ((ag_e >> 8) * uint(ATTN_ROWS) + ag_row) * 256u + (ag_e & 255u)));
             const float4 g = *((const device float4*)(gate
                 + ag_row * 8192u + (ag_e >> 8) * 512u + 256u + (ag_e & 255u)));
             const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
@@ -464,7 +464,7 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, attentionGate: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `forward(attention * sigmoid(gate))` quantized for `VerifyInt8Matmul`,
+    /// `forward(attention * sigmoid(gate))` quantized for `VerifyInt8Matmul` or `PromptInt8Matmul`,
     /// for a gated full-attention output: `attention` is the `[1, 16, rows,
     /// 256]` attention result in its head-major layout and the gate is the
     /// second half of each 512-wide head of the `[1, rows, 8192]` query
@@ -474,51 +474,77 @@ public struct SignedBlockHadamard {
     func quantizedForVerifyAttentionGate(
         _ attention: MLXArray, queryProjection: MLXArray
     ) -> PromptInt8Activation? {
+        let rows = attention.dim(2)
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows)
+        let isPrompt = PromptInt8Matmul.applies(rows: rows)
         guard blockSize == 4096, width == 4096, attention.dtype == .float32,
             queryProjection.dtype == .float32, attention.ndim == 4, attention.dim(0) == 1,
             attention.dim(1) == 16, attention.dim(3) == 256,
-            queryProjection.size == attention.dim(2) * 8192,
-            VerifyInt8Matmul.rowRange.contains(attention.dim(2)),
+            queryProjection.size == rows * 8192,
+            (isVerify || isPrompt),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let rows = attention.dim(2)
-        let tile = VerifyInt8Matmul.tileRows
         let groups = rows * (width / 128)
-        let outputs = Self.attentionGateQuantized4096Kernel(
-            [attention, queryProjection.reshaped([rows, 8192]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups]],
-            outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        if isVerify {
+            let tile = VerifyInt8Matmul.tileRows
+            let outputs = Self.attentionGateQuantized4096Kernel(
+                [attention, queryProjection.reshaped([rows, 8192]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows), ("ATTN_ROWS", rows)],
+                grid: (256, tile, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[tile, width], [groups], [groups]],
+                outputDTypes: [.int8, .float32, .float32])
+            return PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        } else {
+            let outputs = Self.attentionGateQuantized4096Kernel(
+                [attention, queryProjection.reshaped([rows, 8192]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0), ("ATTN_ROWS", rows)],
+                grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, width], [groups], [groups]],
+                outputDTypes: [.int8, .float32, .float32])
+            return PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        }
     }
 
     /// `forward(silu(gate) * rmsNorm(x, weight))` quantized for
-    /// `VerifyInt8Matmul`, with the RMSNorm over 128-wide heads: the GDN
+    /// `VerifyInt8Matmul` or `PromptInt8Matmul`, with the RMSNorm over 128-wide heads: the GDN
     /// output gate, its norm and the out-projection rotation in one kernel.
     /// The values entering the rotation are bit-identical to MLX `rmsNorm`,
-    /// `silu` and the multiply. Nil when the shape is not a verify-width
+    /// `silu` and the multiply. Nil when the shape is not a verify- or prompt-width
     /// FP32 4096-wide input.
     func quantizedForVerifyGatedNorm(
         _ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
     ) -> PromptInt8Activation? {
         let rows = x.size / width
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows)
+        let isPrompt = PromptInt8Matmul.applies(rows: rows)
         guard blockSize == 4096, width == 4096, x.dtype == .float32, gate.dtype == .float32,
             x.size == gate.size, x.dim(-1) == 128 || x.dim(-1) == 4096,
             weight.dtype == .float32, weight.shape == [128],
-            VerifyInt8Matmul.rowRange.contains(rows), StreamOrDevice.default == StreamOrDevice.gpu
+            (isVerify || isPrompt), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
         let groups = rows * (width / 128)
-        let outputs = Self.gatedNormQuantized4096Kernel(
-            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups]],
-            outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        if isVerify {
+            let tile = VerifyInt8Matmul.tileRows
+            let outputs = Self.gatedNormQuantized4096Kernel(
+                [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+                grid: (256, tile, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[tile, width], [groups], [groups]],
+                outputDTypes: [.int8, .float32, .float32])
+            return PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        } else {
+            let outputs = Self.gatedNormQuantized4096Kernel(
+                [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+                grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, width], [groups], [groups]],
+                outputDTypes: [.int8, .float32, .float32])
+            return PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        }
     }
 
     private static let residualNormNormedQuantized4096Kernel = MLXFast.metalKernel(
@@ -528,10 +554,10 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `residualNorm` at verify width that also returns the normalized
+    /// `residualNorm` at verify or prompt width that also returns the normalized
     /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
     /// residual, weight)]`. The sum and the normalized values are the bits of
-    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify`
+    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify` / `quantizedForPrompt`
     /// on the normalized rows.
     func residualNormVerifyNormalized(
         _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
@@ -542,14 +568,24 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / width
-        guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        return Self.residualNormNormedQuantized4096Kernel(
-            [x, residual, weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        if VerifyInt8Matmul.rowRange.contains(rows) {
+            let tile = VerifyInt8Matmul.tileRows
+            return Self.residualNormNormedQuantized4096Kernel(
+                [x, residual, weight, MLXArray([eps]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+                grid: (256, tile, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
+                outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        }
+        if PromptInt8Matmul.applies(rows: rows) {
+            return Self.residualNormNormedQuantized4096Kernel(
+                [x, residual, weight, MLXArray([eps]), signs],
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+                grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape, x.shape],
+                outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        }
+        return nil
     }
 
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
@@ -810,7 +846,7 @@ private enum Float16ConstantQMV {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[x_ndim - 1];
+            const int K = x_shape[1];
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int out_row = tid.y * 8 + simd_gid * 4;
@@ -864,7 +900,7 @@ private enum Float16ConstantQMV {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint3 tid = threadgroup_position_in_grid;
-            const int K = x_shape[x_ndim - 1];
+            const int K = x_shape[1];
             const int N = w_shape[0];
             const int in_w = K / 4;
             const int in_g = K / 128;
@@ -1119,15 +1155,14 @@ private enum Float16ConstantQMV {
         let K = x.dim(-1)
         let rows = x.size / K
         let N = weight.dim(0)
-        // Shape metadata supplies K and N without allocating scalar tensor inputs. The kernels
-        // index x and y as flat row-major [rows, K] and [rows, N], so x and y keep their
-        // leading dimensions and the graph needs no reshape nodes around the call.
+        // Shape metadata supplies K and N without allocating scalar tensor inputs.
+        let inputs = [x.reshaped([rows, K]), weight, scales, biases]
         let outputs = rows == 1 ? 4 : outputsPerSimdgroup(rows: rows)
-        return (rows == 1 ? fast : Self.rows)(
-            [x, weight, scales, biases],
-            template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
+        let output = (rows == 1 ? fast : Self.rows)(
+            inputs, template: rows == 1 ? [] : [("rows", rows), ("outputs", outputs)],
             grid: (32, N / (2 * outputs) * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows, N]], outputDTypes: [.float32])[0]
+        return output.reshaped(Array(x.shape.dropLast()) + [N])
     }
 }
 
@@ -2052,7 +2087,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         public let normalized: MLXArray
     }
 
-    /// `x + delta`, its RMSNorm and the verify codes of the rotated norm in one
+    /// `x + delta`, its RMSNorm and the verify or prompt codes of the rotated norm in one
     /// kernel, with the rotation of `projections` (all must share it). Nil
     /// when the shapes, the packing or the route do not qualify; the caller
     /// then adds, normalizes and projects separately.
@@ -2060,20 +2095,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
         projections: [Linear]
     ) -> VerifyBoundary? {
-        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            VerifyInt8Matmul.rowRange.contains(x.size / 4096)
-        else { return nil }
+        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32 else { return nil }
+        let rows = x.size / 4096
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows) && VerifyInt8Matmul.route != .off
+        let isPrompt = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+        guard isVerify || isPrompt else { return nil }
+        let rowMultiple = isPrompt ? 64 : 32
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count, let first = packed.first,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % rowMultiple == 0
                     && $0.transform.isIdentical(to: first.transform)
             }),
             let outputs = first.transform.residualNormVerifyNormalized(
                 x, residual: delta, weight: weight, eps: eps)
         else { return nil }
-        let rows = x.size / 4096
         return VerifyBoundary(
             activation: PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
@@ -2085,11 +2122,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public static func boundaryProjections(
         _ boundary: VerifyBoundary, _ projections: [Linear]
     ) -> [MLXArray]? {
+        let rows = boundary.activation.rows
+        let isPrompt = PromptInt8Matmul.applies(rows: rows)
+        let rowMultiple = isPrompt ? 64 : 32
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % rowMultiple == 0
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
@@ -2097,9 +2137,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         for layer in packed {
             let (scalesT, biasesT) = layer.promptConstants.get(
                 scales: layer.scales, biases: layer.biases!)
-            guard let output = VerifyInt8Matmul.matmul(
-                boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
-            else { return nil }
+            let output: MLXArray?
+            if isPrompt {
+                output = PromptInt8Matmul.matmul(
+                    boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+            } else {
+                output = VerifyInt8Matmul.matmul(
+                    boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+            }
+            guard let output else { return nil }
             outputs.append(
                 output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)]))
         }
@@ -2187,7 +2233,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return rescored[1][argMax(rescored[0], axis: 0, keepDims: true)]
     }
 
-    /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify-width GDN
+    /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify- or prompt-width GDN
     /// output with 128-wide norm heads, with the gate, the norm and the input
     /// rotation formed in one quantizing kernel. Nil when the route, the
     /// packing or the shapes do not qualify; the caller then runs the
@@ -2195,34 +2241,56 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func callAfterGatedNorm(
         _ x: MLXArray, gate: MLXArray, normWeight: MLXArray, eps: Float
     ) -> MLXArray? {
-        guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
-            weight.dim(0) % 32 == 0, transform.width % 512 == 0, VerifyInt8Matmul.route != .off,
+        let rows = x.size / transform.width
+        let isPrompt = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows) && VerifyInt8Matmul.route != .off
+        let rowMultiple = isPrompt ? 64 : 32
+        guard (isPrompt || isVerify),
+            gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            weight.dim(0) % rowMultiple == 0, transform.width % 512 == 0,
             let activation = transform.quantizedForVerifyGatedNorm(
                 x, gate: gate, weight: normWeight, eps: eps)
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-        guard let output = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
-        else { return nil }
+        let output: MLXArray?
+        if isPrompt {
+            output = PromptInt8Matmul.matmul(
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        } else {
+            output = VerifyInt8Matmul.matmul(
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        }
+        guard let output else { return nil }
         let shaped = output.reshaped(Array(x.shape.dropLast(2)) + [weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
     }
 
-    /// `self(attention * sigmoid(gate))` for a verify-width gated attention
+    /// `self(attention * sigmoid(gate))` for a verify- or prompt-width gated attention
     /// output (see `quantizedForVerifyAttentionGate`), returned as `[1, rows,
     /// N]`. Nil when the route, the packing or the shapes do not qualify.
     public func callAfterAttentionGate(
         _ attention: MLXArray, queryProjection: MLXArray
     ) -> MLXArray? {
-        guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
-            weight.dim(0) % 32 == 0, transform.width % 512 == 0, VerifyInt8Matmul.route != .off,
+        let rows = attention.dim(2)
+        let isPrompt = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows) && VerifyInt8Matmul.route != .off
+        let rowMultiple = isPrompt ? 64 : 32
+        guard (isPrompt || isVerify),
+            gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            weight.dim(0) % rowMultiple == 0, transform.width % 512 == 0,
             let activation = transform.quantizedForVerifyAttentionGate(
                 attention, queryProjection: queryProjection)
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-        guard let output = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
-        else { return nil }
+        let output: MLXArray?
+        if isPrompt {
+            output = PromptInt8Matmul.matmul(
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        } else {
+            output = VerifyInt8Matmul.matmul(
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+        }
+        guard let output else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
     }
@@ -2261,6 +2329,39 @@ extension HadamardQuantizedLinear {
         guard rotated.dtype == .float32 else { return nil }
         return Float16ConstantQMV.topTwo(
             rotated, weight: weight, scales: scales, biases: biases!)
+    }
+
+    /// Fuses `hidden = x + delta`, `normed = rmsNorm(hidden, weight, eps)`, and
+    /// `rotated = transform(normed)` into one `residualNorm4096Kernel` dispatch,
+    /// returning `forwardRotated(rotated)`.
+    public func residualNormForward(
+        _ x: MLXArray, delta: MLXArray, weight normWeight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard gdnLayout == nil, readsFloat16ConstantsInPlace,
+            let outs = transform.residualNorm(
+                x, residual: delta, weight: normWeight, eps: eps, quantized: false),
+            outs[0].dtype == .float32
+        else { return nil }
+        return forwardRotated(outs[0])
+    }
+
+    /// Fuses `hidden = x + delta`, `normed = rmsNorm(hidden, weight, eps)`, and
+    /// `rotated = transform(normed)` into one `residualNorm4096Kernel` dispatch,
+    /// returning `hidden`, lazy `logits`, and `topTwo`.
+    public func residualNormForwardAndTopTwo(
+        _ x: MLXArray, delta: MLXArray, weight normWeight: MLXArray, eps: Float
+    ) -> (hidden: MLXArray, logits: MLXArray, topTwo: (ids: MLXArray, values: MLXArray)?)? {
+        guard gdnLayout == nil, readsFloat16ConstantsInPlace, bias == nil,
+            let outs = transform.residualNorm(
+                x, residual: delta, weight: normWeight, eps: eps, quantized: false)
+        else { return nil }
+        let rotated = outs[0]
+        let hidden = outs[1]
+        guard rotated.dtype == .float32 else { return nil }
+        let logits = forwardRotated(rotated)
+        let topTwo = Float16ConstantQMV.topTwo(
+            rotated, weight: weight, scales: scales, biases: biases!)
+        return (hidden, logits, topTwo)
     }
 }
 

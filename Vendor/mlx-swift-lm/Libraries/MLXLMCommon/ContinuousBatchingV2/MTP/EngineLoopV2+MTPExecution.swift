@@ -640,12 +640,13 @@ extension EngineLoopV2 {
                     stepEvalTargets.append(
                         contentsOf: stateful.evaluationTargets(for: requestState))
                 }
-                // Publish each mutable head-cache generation before
-                // constructing the next, so the GPU runs draft step d while
-                // the host builds step d + 1. This is nonblocking and joins
-                // the round's sole finalize fence.
-                asyncEval(stepEvalTargets)
-                if draftIndex == 0 { mtp.recordEarlyDraftSubmission() }
+                // Publish the first mutable head-cache generation before
+                // constructing a deeper generation. This is nonblocking and
+                // joins the round's sole finalize fence.
+                if draftIndex == 0 {
+                    asyncEval(stepEvalTargets)
+                    mtp.recordEarlyDraftSubmission()
+                }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = nextRows.count == 1 ? nextRows[0] : concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
