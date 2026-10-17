@@ -817,7 +817,6 @@ private enum Float16ConstantQMV {
             const int out_row = tid.y * 8 + simd_gid * 4;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
-            const device half* bi = biases + out_row * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
@@ -834,18 +833,16 @@ private enum Float16ConstantQMV {
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
                   accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                       + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
                 }
-                result[r] += s * accum + sum * b;
+                result[r] += s * (accum - sum);
               }
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             for (int r = 0; r < 4; r++) {
@@ -885,12 +882,11 @@ private enum Float16ConstantQMV {
     static let rowsAccumulate = """
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
-            const device half* bi = biases + out_row * in_g + simd_lid / 8;
             const device float4* xp = (const device float4*)(x + simd_lid * 16);
             float result[rows][outputs];
             for (int v = 0; v < rows; v++) for (int r = 0; r < outputs; r++) result[v][r] = 0;
             for (int k = 0; k < K; k += 512) {
-              float s4[outputs][4], b[outputs];
+              float s4[outputs][4];
               uint packed[outputs];
               for (int r = 0; r < outputs; r++) {
                 const float s = float(sc[r * in_g]);
@@ -898,17 +894,17 @@ private enum Float16ConstantQMV {
                 s4[r][1] = s * 0.25f;
                 s4[r][2] = s * 0.0625f;
                 s4[r][3] = s * 0.015625f;
-                b[r] = float(bi[r * in_g]);
                 packed[r] = *(const device uint*)(ws + r * in_w);
               }
               for (int i = 0; i < 4; i++) {
                 float wd[outputs][4];
                 for (int r = 0; r < outputs; r++) {
+                  const float bias = -s4[r][0];
                   const uint q = packed[r] >> (8 * i);
-                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), b[r]);
-                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), b[r]);
-                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), b[r]);
-                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), b[r]);
+                  wd[r][0] = fma(s4[r][0], float(q & 0x03u), bias);
+                  wd[r][1] = fma(s4[r][1], float(q & 0x0cu), bias);
+                  wd[r][2] = fma(s4[r][2], float(q & 0x30u), bias);
+                  wd[r][3] = fma(s4[r][3], float(q & 0xc0u), bias);
                 }
                 for (int v = 0; v < rows; v++) {
                   const float4 xv = xp[v * in_w + i];
@@ -922,7 +918,6 @@ private enum Float16ConstantQMV {
               }
               ws += 128;
               sc += 4;
-              bi += 4;
               xp += 128;
             }
             """
@@ -1445,7 +1440,7 @@ private enum DraftScreenQMV {
     /// the same per-lane layout and arithmetic, stopped after `P / 512` steps.
     static let partial = MLXFast.metalKernel(
         name: "hadamard_qmv_screen_f16_constants",
-        inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"],
+        inputNames: ["x", "w", "scales"], outputNames: ["y"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -1456,7 +1451,6 @@ private enum DraftScreenQMV {
             const int out_row = tid.y * 8 + simd_gid * 4;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
-            const device half* bi = biases + out_row * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
@@ -1466,25 +1460,23 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
                   accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                       + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
                 }
-                result[r] += s * accum + sum * b;
+                result[r] += s * (accum - sum);
               }
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             for (int r = 0; r < 4; r++) {
@@ -1497,7 +1489,7 @@ private enum DraftScreenQMV {
     /// screened row, and that row's index.
     static let rescore = MLXFast.metalKernel(
         name: "hadamard_qmv_screen_rescore_f16_constants",
-        inputNames: ["x", "w", "scales", "biases", "pick"], outputNames: ["y", "row"],
+        inputNames: ["x", "w", "scales", "pick"], outputNames: ["y", "row"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -1508,7 +1500,6 @@ private enum DraftScreenQMV {
             const int r = c * CH + int(pick[c]);
             const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
             const device half* sc = scales + r * in_g + simd_lid / 8;
-            const device half* bi = biases + r * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float result = 0;
             for (int k = 0; k < K; k += 512) {
@@ -1518,9 +1509,9 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               const uint packed_w = *(const device uint*)ws;
               float accum = 0;
@@ -1529,10 +1520,10 @@ private enum DraftScreenQMV {
                 accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                     + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
               }
-              result += float(*sc) * accum + sum * float(*bi);
+              const float s = float(*sc);
+              result += s * (accum - sum);
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             const float total = simd_sum(result);
@@ -2816,6 +2807,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify {
+            let codes = PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
+            if let multi = VerifyInt8Matmul.matmul(codes, layers: packed.map(\.verifyOperands)) {
+                let outputs = packed.enumerated().map { index, layer in
+                    let reshaped = multi[index].reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                    return layer.bias.map { reshaped + $0 } ?? reshaped
+                }
+                return (activation.last!, outputs)
+            }
+        }
         let outputs = packed.map { layer in
             if verify {
                 let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
@@ -2997,19 +2999,19 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public func screenedArgMax(_ x: MLXArray, width: Int, chunk: Int) -> MLXArray? {
         let K = transform.width
         let N = weight.dim(0)
-        guard readsFloat16ConstantsInPlace, bias == nil, gdnLayout == nil, let biases,
+        guard readsFloat16ConstantsInPlace, bias == nil, gdnLayout == nil,
             x.dtype == .float32, x.size == K, width > 0, width < K, width % 512 == 0,
             chunk > 0, N % chunk == 0, (N / chunk) % 2 == 0
         else { return nil }
         let rotated = transform(x).reshaped([1, K])
         let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases], template: [("P", width)],
+            [rotated, weight, scales], template: [("P", width)],
             grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
         let pick = argMax(partial.reshaped([blocks, chunk]), axis: -1)
         let rescored = DraftScreenQMV.rescore(
-            [rotated, weight, scales, biases, pick], template: [("CH", chunk)],
+            [rotated, weight, scales, pick], template: [("CH", chunk)],
             grid: (32, blocks, 1), threadGroup: (32, 2, 1),
             outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
         return rescored[1][argMax(rescored[0], axis: 0, keepDims: true)]
