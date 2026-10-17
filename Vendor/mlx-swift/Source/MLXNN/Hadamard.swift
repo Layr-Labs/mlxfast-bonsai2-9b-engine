@@ -817,7 +817,6 @@ private enum Float16ConstantQMV {
             const int out_row = tid.y * 8 + simd_gid * 4;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
-            const device half* bi = biases + out_row * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
@@ -834,18 +833,16 @@ private enum Float16ConstantQMV {
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
                   accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                       + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
                 }
-                result[r] += s * accum + sum * b;
+                result[r] += s * (accum - sum);
               }
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             for (int r = 0; r < 4; r++) {
@@ -1456,7 +1453,6 @@ private enum DraftScreenQMV {
             const int out_row = tid.y * 8 + simd_gid * 4;
             const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
             const device half* sc = scales + out_row * in_g + simd_lid / 8;
-            const device half* bi = biases + out_row * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float x_thread[16];
             float result[4] = {0, 0, 0, 0};
@@ -1466,25 +1462,23 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               for (int r = 0; r < 4; r++) {
                 const uint packed_w = *(const device uint*)(ws + r * in_w);
                 const float s = float(sc[r * in_g]);
-                const float b = float(bi[r * in_g]);
                 float accum = 0;
                 for (int i = 0; i < 4; i++) {
                   const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
                   accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                       + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
                 }
-                result[r] += s * accum + sum * b;
+                result[r] += s * (accum - sum);
               }
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             for (int r = 0; r < 4; r++) {
@@ -1508,7 +1502,6 @@ private enum DraftScreenQMV {
             const int r = c * CH + int(pick[c]);
             const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
             const device half* sc = scales + r * in_g + simd_lid / 8;
-            const device half* bi = biases + r * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
             float result = 0;
             for (int k = 0; k < K; k += 512) {
@@ -1518,9 +1511,9 @@ private enum DraftScreenQMV {
                 const float4 xv = xp4[i];
                 sum += xv.x + xv.y + xv.z + xv.w;
                 x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
               }
               const uint packed_w = *(const device uint*)ws;
               float accum = 0;
@@ -1529,10 +1522,10 @@ private enum DraftScreenQMV {
                 accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
                     + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
               }
-              result += float(*sc) * accum + sum * float(*bi);
+              const float s = float(*sc);
+              result += s * (accum - sum);
               ws += 128;
               sc += 4;
-              bi += 4;
               xp4 += 128;
             }
             const float total = simd_sum(result);
