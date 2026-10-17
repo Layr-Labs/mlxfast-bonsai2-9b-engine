@@ -1354,6 +1354,12 @@ enum DF2Fast {
         return v == "128" ? 128 : (v == "0" ? nil : 64)
     }()
 
+    /// W4 reduction partitions. Preserve an explicit shared override; the 8-bit fallback stays unchanged.
+    static let w4Split: Int = {
+        let env = ProcessInfo.processInfo.environment
+        return Int(env["DF2_W4_SPLIT"] ?? env["DF2_SPLIT"] ?? "4") ?? 4
+    }()
+
     final class W4Operands {
         let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
         init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
@@ -1557,6 +1563,7 @@ enum DF2Fast {
 
     /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
     static func w4Linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray?, group: Int) -> [MLXArray]? {
+        let split = w4Split
         let K = x.dim(-1)
         let rows = x.size / K
         // Each SIMD group prefetches its first K tile before entering the loop.
