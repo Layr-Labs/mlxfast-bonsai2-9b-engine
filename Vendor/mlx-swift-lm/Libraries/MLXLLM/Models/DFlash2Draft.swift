@@ -939,8 +939,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index])
-            // Hand each finished layer to the GPU while the next one is built.
-            if DF2Fast.on { asyncEval(h) }
+            // Hand off pairs of layers to amortize graph submission overhead.
+            // Always submit the last layer, including an odd-sized trunk.
+            if DF2Fast.on && ((index + 1) % 2 == 0 || index + 1 == layers.count) {
+                asyncEval(h)
+            }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
