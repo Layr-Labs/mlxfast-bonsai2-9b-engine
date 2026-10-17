@@ -1797,6 +1797,42 @@ extension Qwen35InlineMTPAssistant {
             Qwen35RegisterGatedSIMD.runStateOnly(
                 q: warmQ, k: warmQ, v: warmV, a: warmA, b: warmA,
                 aLog: warmLog, dtBias: warmLog, state: warmState))
+        // First-use kernels the warm requests above never reach. (1) The
+        // head's K/V-history rows (`appendHistoryKV`: fc, k_proj, v_proj)
+        // after several lookup rounds exceed the device's qmv batch limit and
+        // run the split-K quantized matmul plus its column-sum reduce; build
+        // them at widths past every device's limit. (2) The teacher-forced
+        // stepper's top-k over the vocabulary row (argPartition + takeAlong).
+        // Zero inputs, outputs discarded: no state or value changes.
+        if mtp.layers.count == 1 {
+            let hiddenSize = mtp.preFcNormHidden.weight.dim(0)
+            let attention = mtp.layers[0].selfAttn
+            for width in [8, 16, 32] {
+                let wide = MLXArray.zeros([1, width, 2 * hiddenSize], dtype: .float32)
+                let narrow = MLXArray.zeros([1, width, hiddenSize], dtype: .float32)
+                eval(mtp.fc(wide), attention.kProj(narrow), attention.vProj(narrow))
+            }
+        }
+        let vocabulary = target.vocabularySize
+        let topK = 8
+        if vocabulary > topK {
+            let row = MLXArray.zeros([1, vocabulary], dtype: .float32).reshaped([-1])
+            let ids = argPartition(row, kth: vocabulary - topK, axis: -1)[(vocabulary - topK)...]
+            let values = takeAlong(row, ids, axis: -1)
+            eval(ids.asType(.int32), values)
+        }
+        // (3) A float32 SliceUpdate whose input buffer is still referenced
+        // elsewhere cannot donate it, so it first vector-copies the whole
+        // input; at 64Ki elements or more that copy runs 2 elements per thread
+        // (`vn_copyfloat32float32`). The reshape shares `source`'s buffer,
+        // which keeps the input non-donatable here.
+        do {
+            let source = MLXArray.zeros([1 << 17], dtype: .float32)
+            eval(source)
+            let alias = source.reshaped([2, 1 << 16])
+            alias[0, 0 ..< 8] = MLXArray.zeros([8], dtype: .float32)
+            eval(alias, source)
+        }
         Stream().synchronize()
         Memory.clearCache()
     }
