@@ -171,6 +171,77 @@ final class Qwen35MTPDecoderLayer: Module {
     }
 }
 
+// Two independent RMS rows write directly into the concatenated FC input.
+// FP32 activations use MLX's four-elements-per-lane reduction layout.
+private enum Qwen35MTPNormPair {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_mtp_norm_pair",
+        inputNames: ["embedding", "hidden", "ew", "hw", "epsilon"],
+        outputNames: ["joined"],
+        source: """
+        #pragma clang fp reassociate(off)
+        const uint group = threadgroup_position_in_grid.x;
+        const uint row = group / 2;
+        const uint side = group % 2;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const device float* x = (side == 0 ? embedding : hidden) + row * WIDTH;
+        threadgroup float partial[32];
+        threadgroup float inverse[1];
+        float values[4];
+        float acc = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            const uint column = lid * 4 + i;
+            values[i] = column < WIDTH ? x[column] : 0.0f;
+            acc += values[i] * values[i];
+        }
+        acc = simd_sum(acc);
+        if (sg == 0) partial[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partial[sg] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            acc = simd_sum(partial[lane]);
+            if (lane == 0) inverse[0] = metal::precise::rsqrt(acc / float(WIDTH) + epsilon[side]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 4; ++i) {
+            const uint column = lid * 4 + i;
+            if (column < WIDTH) {
+                const float weight = side == 0 ? float(ew[column]) : float(hw[column]);
+                joined[row * (2 * WIDTH) + side * WIDTH + column] = weight * (values[i] * inverse[0]);
+            }
+        }
+        """)
+
+    static func apply(
+        embedding: MLXArray, hidden: MLXArray,
+        embeddingNorm: RMSNorm, hiddenNorm: RMSNorm
+    ) -> MLXArray? {
+        guard embedding.shape == hidden.shape, embedding.ndim > 0,
+              embedding.dtype == .float32, hidden.dtype == .float32,
+              [DType.float16, DType.float32].contains(embeddingNorm.weight.dtype),
+              [DType.float16, DType.float32].contains(hiddenNorm.weight.dtype)
+        else { return nil }
+        let width = embedding.dim(-1)
+        guard width > 0, width <= 4096, width % 4 == 0,
+              embeddingNorm.weight.shape == [width], hiddenNorm.weight.shape == [width],
+              embedding.size > 0
+        else { return nil }
+        let threads = ((width / 4 + 31) / 32) * 32
+        let rows = embedding.size / width
+        var shape = embedding.shape
+        shape[shape.count - 1] = 2 * width
+        return kernel(
+            [embedding, hidden, embeddingNorm.weight, hiddenNorm.weight,
+             MLXArray([embeddingNorm.eps, hiddenNorm.eps])],
+            template: [("WIDTH", width)],
+            grid: (rows * 2 * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [shape], outputDTypes: [.float32])[0]
+    }
+}
+
 // MARK: - MTPModule
 
 /// Multi-Token Prediction head for Qwen3.5/3.6.
@@ -228,9 +299,15 @@ final class Qwen35MTPModule: Module {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(entering(embeds))
-        let h = preFcNormHidden(entering(hidden))
-        var fused = fc(concatenated([e, h], axis: -1))
+        let enteringEmbedding = entering(embeds)
+        let enteringHidden = entering(hidden)
+        let joined = Qwen35MTPNormPair.apply(
+            embedding: enteringEmbedding, hidden: enteringHidden,
+            embeddingNorm: preFcNormEmbedding, hiddenNorm: preFcNormHidden
+        ) ?? concatenated([
+            preFcNormEmbedding(enteringEmbedding), preFcNormHidden(enteringHidden),
+        ], axis: -1)
+        var fused = fc(joined)
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -262,9 +339,15 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(entering(embeds))
-        let h = preFcNormHidden(entering(hidden))
-        let fused = fc(concatenated([e, h], axis: -1))
+        let enteringEmbedding = entering(embeds)
+        let enteringHidden = entering(hidden)
+        let joined = Qwen35MTPNormPair.apply(
+            embedding: enteringEmbedding, hidden: enteringHidden,
+            embeddingNorm: preFcNormEmbedding, hiddenNorm: preFcNormHidden
+        ) ?? concatenated([
+            preFcNormEmbedding(enteringEmbedding), preFcNormHidden(enteringHidden),
+        ], axis: -1)
+        let fused = fc(joined)
         let historyCount = fused.dim(1) - 1
         layers[0].appendHistoryKV(
             fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
