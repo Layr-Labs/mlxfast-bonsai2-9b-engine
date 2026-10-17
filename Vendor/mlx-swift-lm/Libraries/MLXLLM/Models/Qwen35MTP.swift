@@ -1430,14 +1430,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 /// byte-identical, into one contiguous draft-only head. The target's head and
 /// quantization are untouched; each draft step reads only the subset rows.
 final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
-    /// Half draft subset (leading 49,152 + trailing 512) — officially
-    /// validated sweet spot (9ff5316e sealed 2.30167, acceptance pinned
-    /// 0.8378, mismatch 0). Quarter cut falsified (d15bec94 2.24069, acc
-    /// 0.7583): [24_576, 49_152) carries accepted tokens. Halving N halves
-    /// the screened screen's row stream and every neural draft step's head
-    /// traffic. Guards hold: 49_664 % 32 == 0, 1,552 blocks even.
-    /// Out-of-subset proposals are rejected drafts, never wrong outputs.
-    static let leadingRows = 49_152
+    static let leadingRows = 98_304
     static let trailingRows = 512
 
     let head: HadamardQuantizedLinear
