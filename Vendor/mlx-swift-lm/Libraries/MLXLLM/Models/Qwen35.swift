@@ -382,7 +382,11 @@ private enum Qwen35FusedConvSilu {
 }
 
 private enum Qwen35RegisterGDN {
-    private static func source(valueRead: String) -> String {
+    /// Time steps of k, q, g and beta staged in threadgroup memory per
+    /// refill (4 KB for k and q at 128-wide heads) for prefill.
+    static let stagedSteps = 4
+
+    private static func source(valueRead: String, stageThreadgroup: Bool = false) -> String {
         """
         const uint T = q_shape[1];
         constexpr int R = 16;
@@ -419,7 +423,48 @@ private enum Qwen35RegisterGDN {
         }
         float kr[R];
         float qr[R];
+        \(stageThreadgroup ? """
+        // Every lane of the threadgroup works on the same head, so each
+        // step's k, q, g and beta are shared: they are staged in threadgroup
+        // memory once per TS steps with coalesced loads instead of being
+        // re-read from device memory by every lane at every step.
+        threadgroup float4 ks[TS][Dk / 4];
+        threadgroup float4 qs[TS][Dk / 4];
+        threadgroup float gs[TS];
+        threadgroup float bs[TS];
+        const uint ltid = thread_position_in_threadgroup.x;
+        const device float* kbase = k + (b_idx * T * Hk + hk_idx) * Dk;
+        const device float* qbase = q + (b_idx * T * Hk + hk_idx) * Dk;
+        const auto gbase = g + b_idx * T * Hv + hv_idx;
+        const auto bbase = beta + b_idx * T * Hv + hv_idx;
+        """ : "")
         for (int t = 0; t < T; ++t) {
+          \(stageThreadgroup ? """
+          const int s = t % TS;
+          if (s == 0) {
+            const int tn = min(TS, int(T) - t);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = ltid; idx < uint(tn) * (Dk / 4); idx += 128u) {
+              const uint ss = idx / (Dk / 4), jj = idx % (Dk / 4);
+              ks[ss][jj] = ((const device float4*)(kbase + (t + ss) * Hk * Dk))[jj];
+              qs[ss][jj] = ((const device float4*)(qbase + (t + ss) * Hk * Dk))[jj];
+            }
+            if (ltid < uint(tn)) {
+              gs[ltid] = gbase[(t + ltid) * Hv];
+              bs[ltid] = bbase[(t + ltid) * Hv];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          const float gt = gs[s];
+          const float bt = bs[s];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ks[s][(dk0 / 4) + j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = qs[s][(dk0 / 4) + j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          """ : """
           const float gt = g_[0];
           const float bt = beta_[0];
           #pragma clang loop unroll(full)
@@ -429,6 +474,7 @@ private enum Qwen35RegisterGDN {
             const float4 q4 = ((const device float4*)q_)[j];
             qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
           }
+          """)
           float kv[DVPL];
           float vt[DVPL];
           #pragma clang loop unroll(full)
@@ -484,7 +530,7 @@ private enum Qwen35RegisterGDN {
               y_[d] = out[d];
             }
           }
-          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+          \(stageThreadgroup ? "v_ += Hv * Dv; y_ += Hv * Dv;" : "q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;")
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
@@ -501,7 +547,7 @@ private enum Qwen35RegisterGDN {
         name: "qwen35_gdn_register_v3",
         inputNames: ["q", "k", "v", "g", "beta", "state_in"],
         outputNames: ["y", "state_out"],
-        source: source(valueRead: "vt[d] = v_[d];"))
+        source: source(valueRead: "vt[d] = v_[d];", stageThreadgroup: false))
 
     private static let valueKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_value_conv",
@@ -518,7 +564,7 @@ private enum Qwen35RegisterGDN {
             cv = fma(v[v_base + 3u * v_stride], cw4.w, cv);
             const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
             vt[d] = cv * (cv < 0.0f ? sig : 1.0f - sig);
-            """))
+            """, stageThreadgroup: true))
 
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
@@ -539,7 +585,7 @@ private enum Qwen35RegisterGDN {
         let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
         let result = valueKernel(
             [q, k, input, g, beta, state, weight],
-            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
+            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv), ("TS", stagedSteps)],
             grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])

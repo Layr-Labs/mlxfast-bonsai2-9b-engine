@@ -1791,7 +1791,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
     static let promptLookupMissDepth: Int? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
-            return 4
+            return 3
         }
         guard let value = Int(raw), value > 0 else { return nil }
         return value
@@ -2295,7 +2295,7 @@ extension Qwen35InlineMTPAssistant {
         // (5-row verify) and the shallow one (4-row verify), whatever the warm
         // prompt's margins are, so both drafted widths are built here.
         if let deep = Self.promptLookupMissDeep, let shallow = Self.promptLookupMissDepth {
-            warmMTPConfig.missDepthSchedule = [deep.depth, shallow]
+            warmMTPConfig.missDepthSchedule = [deep.depth, shallow, 2]
         }
         do {
             let engine = EngineV2(
