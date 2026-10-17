@@ -3499,6 +3499,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Finalization (deferred stop detection)
 
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        // The GPU is still running this step: free what the previous
+        // finalize's recurrent commits replaced (see `releaseReplacedState`).
+        for state in recurrentStates.values { state.releaseReplacedState() }
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.
