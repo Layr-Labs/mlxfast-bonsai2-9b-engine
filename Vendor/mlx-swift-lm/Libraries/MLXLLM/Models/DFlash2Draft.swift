@@ -506,24 +506,31 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries: MLXArray, contextKeys: MLXArray, contextValues: MLXArray
+        var queries: MLXArray
+        var contextKeys: MLXArray? = nil, contextValues: MLXArray? = nil
         var blockKeys: MLXArray, blockValues: MLXArray
         if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
         } else {
             (queries, blockKeys, blockValues) = (qProj(x), kProj(x), vProj(x))
         }
-        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
-            (contextKeys, contextValues) = (kv[0], kv[1])
-        } else {
-            (contextKeys, contextValues) = (kProj(context), vProj(context))
+        // A block with no new context rows (its context was absorbed ahead of
+        // it) attends to the cache as it stands; nothing is projected for it.
+        if contextLength > 0 {
+            if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+                (contextKeys, contextValues) = (kv[0], kv[1])
+            } else {
+                (contextKeys, contextValues) = (kProj(context), vProj(context))
+            }
         }
 
         queries = DF2Fast.rms(queries.reshaped(B, L, heads, -1), qNorm).transposed(0, 2, 1, 3)
-        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
+        if contextLength > 0 {
+            contextKeys = DF2Fast.rms(contextKeys!.reshaped(B, contextLength, kvHeads, -1), kNorm)
+                .transposed(0, 2, 1, 3)
+            contextValues = contextValues!.reshaped(B, contextLength, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+        }
         blockKeys = DF2Fast.rms(blockKeys.reshaped(B, L, kvHeads, -1), kNorm).transposed(0, 2, 1, 3)
         blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
@@ -531,12 +538,14 @@ private final class DFlash2Attention: Module {
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         queries = rope(queries, offset: blockOffset)
-        contextKeys = rope(contextKeys, offset: cache.offset)
+        if contextLength > 0 { contextKeys = rope(contextKeys!, offset: cache.offset) }
         blockKeys = rope(blockKeys, offset: blockOffset)
 
         // Only the CONTEXT keys and values enter the cache. The block's own keys
         // and values are concatenated for this forward and then dropped.
-        let (cachedKeys, cachedValues) = cache.update(keys: contextKeys, values: contextValues)
+        let (cachedKeys, cachedValues) =
+            contextLength > 0
+            ? cache.update(keys: contextKeys!, values: contextValues!) : Self.cachedKeysValues(cache)
         let cachedLength = cachedKeys.dim(2)
         let keys = concatenated([cachedKeys, blockKeys], axis: 2)
         let values = concatenated([cachedValues, blockValues], axis: 2)
@@ -558,6 +567,49 @@ private final class DFlash2Attention: Module {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
+    }
+
+    /// The CONTEXT half of `callAsFunction`, with no block: the same sliding
+    /// skip, the same k/v projections, norms, rotation at the cache's offset
+    /// and `cache.update`, in the same order on the same operands. A later
+    /// forward over the remaining rows continues the cache exactly where a
+    /// single combined pass would have put it, which is also how every
+    /// steady-state round already extends this cache.
+    /// The cache's keys and values exactly as `update` returns them, with no
+    /// rows added: both cache kinds' `state` is that slice.
+    private static func cachedKeysValues(_ cache: KVCache) -> (MLXArray, MLXArray) {
+        let state = cache.state
+        precondition(state.count == 2, "DFlash2: a block without context rows needs an absorbed cache")
+        return (state[0], state[1])
+    }
+
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+        var context = context
+        var contextLength = context.dim(1)
+        if let slidingWindow {
+            let skip = DFlash2SlidingMask.contextSkip(
+                contextLength: contextLength, slidingWindow: slidingWindow)
+            if skip > 0 {
+                context = context[0..., skip..., 0...]
+                contextLength = context.dim(1)
+                if let base = cache as? BaseKVCache {
+                    base.offset += skip
+                }
+            }
+        }
+        let B = context.dim(0)
+        var contextKeys: MLXArray, contextValues: MLXArray
+        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+            (contextKeys, contextValues) = (kv[0], kv[1])
+        } else {
+            (contextKeys, contextValues) = (kProj(context), vProj(context))
+        }
+        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
+            .transposed(0, 2, 1, 3)
+        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        contextKeys = rope(contextKeys, offset: cache.offset)
+        _ = cache.update(keys: contextKeys, values: contextValues)
     }
 }
 
@@ -725,6 +777,13 @@ private final class DFlash2DecoderLayer: Module {
                 dynamic: attentionTaps)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+    }
+
+    /// Context-only: nothing of the block runs (no norms, convolutions, MLP
+    /// or attention output), only the attention sub-layer's context keys and
+    /// values enter the cache.
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+        selfAttn.absorbContext(context, rope: rope, cache: cache)
     }
 }
 
@@ -935,7 +994,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
+        let context =
+            targetHidden.dim(1) == 0
+            ? MLXArray.zeros([targetHidden.dim(0), 0, config.hiddenSize], dtype: dtype)
+            : DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
 
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index])
@@ -946,6 +1008,26 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return DF2Fast.rms(h, norm)
+    }
+
+    /// Absorb committed context rows into the drafter's caches without
+    /// proposing: the context side of `hiddenStates` — the `fc` projection,
+    /// `hiddenNorm`, and each layer's context keys and values — on the same
+    /// operands in the same order, with no block forward. `blockContext` in
+    /// a later `propose` continues these caches exactly as a steady-state
+    /// round's incremental absorption does.
+    public func absorbContext(targetHidden: MLXArray, cache: [KVCache]) throws {
+        guard cache.count == layers.count else {
+            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
+        }
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+            throw DFlash2Error.targetHiddenSizeMismatch(
+                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
+        }
+        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
+        for (index, layer) in layers.enumerated() {
+            layer.absorbContext(context, rope: rope, cache: cache[index])
+        }
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
@@ -1378,7 +1460,6 @@ enum DF2Fast {
         let ru = group / 32  // packed uint4 per row and group
         let tw = group / 16  // unpacked uint4 per row and group
         var pick = """
-            const int K = ksz[0];
             int bx = int(threadgroup_position_in_grid.x);
             const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
             device float* out = out0; int N = ksz[2];
@@ -1500,7 +1581,7 @@ enum DF2Fast {
         let kernel = w4Kernels[layers.count - 1]
         let outs = kernel(
             inputs,
-            template: [("SPLIT", split)],
+            template: [("K", K), ("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
         let lead = Array(x.shape.dropLast())
