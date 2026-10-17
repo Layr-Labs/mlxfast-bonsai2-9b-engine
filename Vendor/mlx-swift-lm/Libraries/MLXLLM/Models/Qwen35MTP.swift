@@ -143,6 +143,28 @@ final class Qwen35MTPQuantizedLinear: QuantizedLinear {
     }
 }
 
+/// An MTP-head RMSNorm whose FP16 weight is widened to FP32 once, for the
+/// FP32 activations the head normalizes (the same values `rmsNorm` widens to
+/// on each call).
+final class Qwen35MTPWidenedRMSNorm: RMSNorm {
+    /// Boxed so `Module` reflection does not see a second parameter.
+    private final class Box { let weight: MLXArray; init(_ weight: MLXArray) { self.weight = weight } }
+    private let widened: Box
+
+    init(_ norm: RMSNorm) {
+        widened = Box(norm.weight.asType(.float32))
+        eval(widened.weight)
+        super.init(dimensions: norm.weight.dim(0), eps: norm.eps)
+        _ = try? update(
+            parameters: ModuleParameters.unflattened(["weight": norm.weight]), verify: [])
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        guard x.dtype == .float32, weight.dtype == .float16 else { return super.callAsFunction(x) }
+        return MLXFast.rmsNorm(x, weight: widened.weight, eps: eps)
+    }
+}
+
 // MARK: - Module-level MTP flag
 
 /// Controls whether Qwen3.5/3.6 model inits attach the MTP head.
@@ -618,6 +640,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(indexed), verify: [.all])
         eval(assistant.mtp)
         requantizeHeadLinears(in: assistant.mtp)
+        widenHeadNorms(in: assistant.mtp)
         // Warm after re-quantization, so the warm round compiles the
         // kernels of the head geometry the scored rounds run.
         assistant.warmEngineRound(serving: serving)
@@ -666,6 +689,26 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 // intermediate frees before the next module dequantizes.
                 eval(replacement)
                 return replacement
+            })
+    }
+
+    /// Every RMSNorm of the head holds FP16 weights and normalizes FP32
+    /// activations, so `rmsNorm` widened each weight to FP32 on every draft
+    /// step. Widen each once instead (exact); the normalization is unchanged.
+    private static func widenHeadNorms(in head: Qwen35MTPModule) {
+        quantize(
+            model: head,
+            filter: { path, module in
+                // `norm` is a plain stored module (not replaceable in place).
+                guard path != "norm", let norm = module as? RMSNorm,
+                    !(norm is Qwen35MTPWidenedRMSNorm),
+                    norm.weight.dtype == .float16
+                else { return nil }
+                return (64, 4, QuantizationMode.affine)
+            },
+            apply: { module, _, _, _ in
+                guard let norm = module as? RMSNorm else { return nil }
+                return Qwen35MTPWidenedRMSNorm(norm)
             })
     }
 
