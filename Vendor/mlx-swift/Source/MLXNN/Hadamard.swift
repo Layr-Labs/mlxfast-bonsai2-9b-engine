@@ -1646,6 +1646,64 @@ private enum DraftScreenQMV {
             }
             """)
 
+    /// `rescoreFast32` for blocks of `CH <= 32` rows (lanes past `CH` hold
+    /// no candidate).
+    static let rescoreFastChunk = MLXFast.metalKernel(
+        name: "hadamard_qmv_screen_rescore_fast_chunk_f16",
+        inputNames: ["x", "w", "scales", "partial"], outputNames: ["y", "row"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int K = x_shape[1];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
+            float best_v = int(simd_lid) < CH ? partial[c * CH + int(simd_lid)] : -INFINITY;
+            int best_i = int(simd_lid);
+            for (ushort offset = 16; offset > 0; offset >>= 1) {
+              const float other_v = simd_shuffle_xor(best_v, offset);
+              const int other_i = simd_shuffle_xor(best_i, offset);
+              if (other_v > best_v || (other_v == best_v && other_i < best_i)) {
+                best_v = other_v;
+                best_i = other_i;
+              }
+            }
+            const int r = c * CH + best_i;
+            const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
+            const device half* sc = scales + r * in_g + simd_lid / 8;
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float result = 0;
+            for (int k = 0; k < K; k += 512) {
+              float sum = 0;
+              float x_thread[16];
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
+              }
+              const uint packed_w = *(const device uint*)ws;
+              float accum = 0;
+              for (int i = 0; i < 4; i++) {
+                const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
+                accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
+                    + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
+              }
+              const float s = float(*sc);
+              result += s * accum + sum * (-s);
+              ws += 128;
+              sc += 4;
+              xp4 += 128;
+            }
+            const float total = simd_sum(result);
+            if (simd_lid == 0) {
+              y[c] = total;
+              row[c] = r;
+            }
+            """)
+
     /// Single-threadgroup final argmax + gather: finds the winning block across
     /// `y[0 ..< BLOCKS]`, resolves `win_row = row[best_c]`, and writes either
     /// `win_row` (`USE_IDS == 0`) or `ids[win_row]` (`USE_IDS == 1`).
@@ -3166,7 +3224,12 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
         let rescored: [MLXArray]
-        if chunk == 32 && promptConstants.negative {
+        if chunk < 32 && 32 % chunk == 0 && promptConstants.negative {
+            rescored = DraftScreenQMV.rescoreFastChunk(
+                [rotated, weight, scales, partial], template: [("CH", chunk)],
+                grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        } else if chunk == 32 && promptConstants.negative {
             rescored = DraftScreenQMV.rescoreFast32(
                 [rotated, weight, scales, partial],
                 grid: (32, blocks, 1), threadGroup: (32, 2, 1),
