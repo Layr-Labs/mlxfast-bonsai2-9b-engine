@@ -1135,7 +1135,7 @@ enum Qwen35FusedGDNVerify {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_verify_fused",
         inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out"],
+        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
         source: """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
@@ -1189,7 +1189,14 @@ enum Qwen35FusedGDNVerify {
             if (owns_qk) {
               #pragma clang loop unroll(full)
               for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
-                if (t < 3u + T) conv_in[t * C + c] = xin[t];
+                if (t < 3u + T) {
+                  conv_in[t * C + c] = xin[t];
+                  // The retained tail, detached: the bits of `x + 0` (-0 -> +0).
+                  if (t >= T) {
+                    const uint xb = as_type<uint>(xin[t]);
+                    conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+                  }
+                }
               }
             }
             #pragma clang loop unroll(full)
@@ -1213,7 +1220,12 @@ enum Qwen35FusedGDNVerify {
             const uint col = tid % uint(DVPT);
             const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
             for (uint t = tid / uint(DVPT); t < 3u + T; t += 128u / uint(DVPT)) {
-              conv_in[t * C + c] = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+              const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+              conv_in[t * C + c] = xv;
+              if (t >= T) {
+                const uint xb = as_type<uint>(xv);
+                conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+              }
             }
             for (uint p = tid / uint(DVPT); p < T; p += 128u / uint(DVPT)) {
               float acc = 0.0f;
@@ -1357,12 +1369,14 @@ enum Qwen35FusedGDNVerify {
         """,
         header: Qwen35RegisterGatedSIMD.gateHeader)
 
-    /// `(convIn, convOut, q, k, y, finalState)` of the verify window, or nil
-    /// when the shapes do not take the fused path.
+    /// `(convIn, convOut, q, k, y, finalState, convTail)` of the verify
+    /// window, or nil when the shapes do not take the fused path. `convTail`
+    /// is `convIn[:, S...] + 0` (the full-acceptance conv state) in its own
+    /// buffer.
     static func apply(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
         let C = qkv.dim(-1)
         guard convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
             qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
@@ -1385,9 +1399,9 @@ enum Qwen35FusedGDNVerify {
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], state.shape],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
-        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5])
+                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
     }
 }
 
@@ -2222,6 +2236,8 @@ final class Qwen35GatedDeltaNet: Module {
             out = recurrence.0
             let finalSsmState = recurrence.1
 
+            // The fused path has one row; capture only its tail buffer.
+            let fusedTail = fusedMiddle?.6
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
@@ -2288,7 +2304,9 @@ final class Qwen35GatedDeltaNet: Module {
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
                         fullAcceptanceRetainedRoots: [tape.convInput],
                         fullAcceptance: {
-                            let detachedConv = finalConv + MLXArray.zeros(
+                            // The fused kernel wrote these bits to their own
+                            // buffer; otherwise add zero to detach the tail.
+                            let detachedConv = fusedTail ?? finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
