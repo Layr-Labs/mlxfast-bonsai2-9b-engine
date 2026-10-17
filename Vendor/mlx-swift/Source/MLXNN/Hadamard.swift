@@ -1819,8 +1819,9 @@ enum ExactVerifyHead {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_XHEAD"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(value ?? "") { return nil }
-        if let value, let low = Int(value), (2 ... 8).contains(low) { return low ... 8 }
-        return 2 ... 8
+        let high = 16
+        if let value, let low = Int(value), (2 ... 8).contains(low) { return low ... high }
+        return 2 ... high
     }()
 
     /// `DARKBLOOM_BONSAI_XHEAD_CHECK=1`: every call is also checked against
@@ -2899,7 +2900,7 @@ enum PromptInt8Matmul {
 enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
 
-    static let rowRange = 2 ... 8
+    static let rowRange = 2 ... 16
     static let tileRows = 16
 
     private static let plainSource = """
@@ -3198,10 +3199,11 @@ enum VerifyInt8Matmul {
           }
         }
         const bool good = simd_all(ok);
-        float acc[8];
+        float acc[16];
         #pragma clang loop unroll(full)
-        for (int e = 0; e < 8; e++) { acc[e] = 0.0f; }
+        for (int e = 0; e < 16; e++) { acc[e] = 0.0f; }
         const int mr = min(mrow, ROWS - 1);
+        const int mr1 = min(mrow + 8, ROWS - 1);
         const device half* scol = scalesT + n0 + nb;
         const device half* bcol = biasesT + n0 + nb;
         const int j = int(lane & 7u);
@@ -3210,7 +3212,7 @@ enum VerifyInt8Matmul {
         threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
         uint32_t wv[8];
         half4 sA, sB, bA = half4(0.0h), bB = half4(0.0h);
-        float fa, frb;
+        float fa, frb, fa1 = 0.0f, frb1 = 0.0f;
         {
           const int gl = int(sg);
           #pragma clang loop unroll(full)
@@ -3223,6 +3225,7 @@ enum VerifyInt8Matmul {
           }
           fa = ascale[mr * Kg + gl];
           frb = rsb[mr * Kg + gl];
+          if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
         }
         for (int g = int(sg); g < Kg; g += 4) {
           #pragma clang loop unroll(full)
@@ -3232,7 +3235,7 @@ enum VerifyInt8Matmul {
           }
           const half4 cA = sA, cB = sB;
           const half4 dA = NEG ? -sA : bA, dB = NEG ? -sB : bB;
-          const float ca = fa, crb = frb;
+          const float ca = fa, crb = frb, ca1 = fa1, crb1 = frb1;
           if (g + 4 < Kg) {
             const int gl = g + 4;
             #pragma clang loop unroll(full)
@@ -3245,6 +3248,7 @@ enum VerifyInt8Matmul {
             }
             fa = ascale[mr * Kg + gl];
             frb = rsb[mr * Kg + gl];
+            if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           auto tA = A.template slice<128, 16>(g * 128, 0);
@@ -3255,6 +3259,12 @@ enum VerifyInt8Matmul {
             acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));
             const float t1 = float(cB[e]) * float(cT[8 + e]);
             acc[4 + e] = fma(float(dB[e]), crb, fma(ca, t1, acc[4 + e]));
+            if (ROWS > 8) {
+              const float t2 = float(cA[e]) * float(cT[4 + e]);
+              acc[8 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[8 + e]));
+              const float t3 = float(cB[e]) * float(cT[12 + e]);
+              acc[12 + e] = fma(float(dB[e]), crb1, fma(ca1, t3, acc[12 + e]));
+            }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -3264,6 +3274,13 @@ enum VerifyInt8Matmul {
           for (int e = 0; e < 4; e++) {
             red[mrow * 32 + nb + e] = acc[e];
             red[mrow * 32 + nb + 16 + e] = acc[4 + e];
+          }
+        }
+        if (ROWS > 8 && mrow + 8 < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) {
+            red[(mrow + 8) * 32 + nb + e] = acc[8 + e];
+            red[(mrow + 8) * 32 + nb + 16 + e] = acc[12 + e];
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

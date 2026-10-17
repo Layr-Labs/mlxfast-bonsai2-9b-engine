@@ -3,8 +3,8 @@
   "source": "pinned",
   "max_bytes": 2147483648,
   "spec": {
-    "decoder": "mtp",
+    "decoder": "dflash",
     "enabled": true,
-    "num_speculative_tokens": 6
+    "num_speculative_tokens": 15
   }
 }
