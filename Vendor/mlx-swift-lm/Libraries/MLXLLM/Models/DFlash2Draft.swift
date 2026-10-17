@@ -1344,10 +1344,12 @@ enum DF2Fast {
             for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
               const size_t base = (size_t)m * K + g * KG;
               float amax = 0.0f, sum = 0.0f;
+              float cached[KG];
               if (m < R) {
                 for (int u = 0; u < KG; u++) {
                   float a = float(x[base + u]);
                   if (SWIGLU) { const float b = float(x2[base + u]); a = a / (1.0f + metal::exp(-a)) * b; }
+                  cached[u] = a;
                   amax = max(amax, fabs(a)); sum += a;
                 }
               }
@@ -1357,11 +1359,7 @@ enum DF2Fast {
               for (int u = 0; u < KG / 4; u++) {
                 float4 v = float4(0.0f);
                 if (m < R) {
-                  for (int j = 0; j < 4; j++) {
-                    float t = float(x[base + 4 * u + j]);
-                    if (SWIGLU) { const float b = float(x2[base + 4 * u + j]); t = t / (1.0f + metal::exp(-t)) * b; }
-                    v[j] = t;
-                  }
+                  v = float4(cached[4 * u], cached[4 * u + 1], cached[4 * u + 2], cached[4 * u + 3]);
                 }
                 dst[u] = char4(int4(rint(v * ia)));
               }
