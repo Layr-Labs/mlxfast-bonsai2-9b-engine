@@ -649,13 +649,14 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `residualNorm` at verify width that also returns the normalized
-    /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
-    /// residual, weight)]`. The sum and the normalized values are the bits of
-    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify`
+    /// `residualNorm` at verify or prompt width that also returns the normalized
+    /// (unrotated) rows when `normalized` is true: `[codes, ascale, rsb, x + residual,
+    /// rmsNorm(x + residual, weight)]`. The sum and the normalized values are the bits of
+    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify` / `quantizedForPrompt`
     /// on the normalized rows.
     func residualNormVerifyNormalized(
-        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
+        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float,
+        normalized: Bool = true
     ) -> [MLXArray]? {
         guard blockSize == 4096, width == 4096, x.dtype == .float32,
             residual.dtype == .float32, residual.shape == x.shape,
@@ -663,14 +664,31 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / width
-        guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        return Self.residualNormNormedQuantized4096Kernel(
-            [x, residual, weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        let inputs = [x, residual, weight, MLXArray([eps]), signs]
+        if VerifyInt8Matmul.rowRange.contains(rows) {
+            let tile = VerifyInt8Matmul.tileRows
+            return Self.residualNormNormedQuantized4096Kernel(
+                inputs,
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+                grid: (256, tile, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
+                outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        }
+        guard rows >= 128, rows % 64 == 0, x.size <= Int(Int32.max) else { return nil }
+        if normalized {
+            return Self.residualNormNormedQuantized4096Kernel(
+                inputs,
+                template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+                grid: (256, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape, x.shape],
+                outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        }
+        return Self.residualNormQuantized4096Kernel(
+            inputs,
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+            grid: (256, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
     }
 
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
@@ -3758,26 +3776,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// then adds, normalizes and projects separately.
     public static func verifyBoundary(
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear]
+        projections: [Linear], normalized: Bool = true
     ) -> VerifyBoundary? {
-        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            VerifyInt8Matmul.rowRange.contains(x.size / 4096)
-        else { return nil }
+        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32 else { return nil }
+        let rows = x.size / 4096
+        let isVerify = VerifyInt8Matmul.rowRange.contains(rows) && VerifyInt8Matmul.route != .off
+        let isPrompt = !isVerify && PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+        guard isVerify || isPrompt else { return nil }
+        let align = isPrompt ? 64 : 32
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count, let first = packed.first,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % align == 0
                     && $0.transform.isIdentical(to: first.transform)
             }),
             let outputs = first.transform.residualNormVerifyNormalized(
-                x, residual: delta, weight: weight, eps: eps)
+                x, residual: delta, weight: weight, eps: eps,
+                normalized: isVerify || normalized)
         else { return nil }
-        let rows = x.size / 4096
         return VerifyBoundary(
             activation: PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
-            transform: first.transform, residual: outputs[3], normalized: outputs[4])
+            transform: first.transform, residual: outputs[3],
+            normalized: outputs.count > 4 ? outputs[4] : outputs[3])
     }
 
     /// `projections` applied to `boundary.normalized` from the boundary's
@@ -3785,19 +3807,24 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public static func boundaryProjections(
         _ boundary: VerifyBoundary, _ projections: [Linear]
     ) -> [MLXArray]? {
+        let rows = boundary.activation.rows
+        let isPrompt = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+        let align = isPrompt ? 64 : 32
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % align == 0
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
-        guard let outputs = VerifyInt8Matmul.matmul(
-            boundary.activation, layers: packed.map(\.verifyOperands))
+        let operands = packed.map(\.verifyOperands)
+        guard let outputs = isPrompt
+            ? PromptInt8Matmul.matmul(boundary.activation, layers: operands)
+            : VerifyInt8Matmul.matmul(boundary.activation, layers: operands)
         else { return nil }
         return zip(packed, outputs).map { layer, output in
-            output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
+            output.reshaped(Array(boundary.residual.shape.dropLast()) + [layer.weight.dim(0)])
         }
     }
 
@@ -4188,7 +4215,53 @@ public final class HadamardQuantizedEmbedding: Embedding, Quantized {
         freeze()
     }
 
+    private static let lookup4096Kernel = MLXFast.metalKernel(
+        name: "hadamard_quantized_embedding_lookup_4096",
+        inputNames: ["indices", "ew", "es", "eb", "signs"],
+        outputNames: ["y"],
+        source: """
+            #pragma clang fp reassociate(off)
+            threadgroup float buf[256 * 17];
+            const short i = short(thread_position_in_threadgroup.x);
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const int64_t raw_tok = int64_t(indices[block_idx]);
+            const int64_t tok = raw_tok < 0 ? raw_tok + int64_t(ew_shape[0]) : raw_tok;
+            const uint q = ew[tok * 256 + i];
+            const half scale = es[tok * 32 + (i >> 3)];
+            const half bias = eb[tok * 32 + (i >> 3)];
+            float x_reg[16];
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              const uint8_t d = (q >> (2 * r)) & 0x03u;
+              const half deq = scale * d + bias;
+              x_reg[r] = float(deq);
+            }
+            dsr_wht4096(x_reg, buf, i);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              const uint idx = uint(i + 256 * r);
+              const float val = x_reg[r] * 0.015625f * signs[idx];
+              y[batch_idx + idx] = half(val);
+            }
+            """,
+        header: DraftStepRowKernels.header)
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if bits == 2, groupSize == 128, transform.blockSize == 4096, transform.width == 4096,
+            weight.dtype == .uint32, weight.ndim == 2, weight.dim(1) == 256,
+            scales.dtype == .float16, biases?.dtype == .float16, let biases,
+            x.size > 0, x.size <= Int(UInt32.max),
+            (x.dtype == .int32 || x.dtype == .uint32 || x.dtype == .int64),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        {
+            let idx32 = (x.dtype == .int32 ? x : x.asType(.int32)).reshaped([x.size])
+            return Self.lookup4096Kernel(
+                [idx32, weight, scales, biases, transform.draftSigns],
+                grid: (256, x.size, 1), threadGroup: (256, 1, 1),
+                outputShapes: [x.shape + [4096]],
+                outputDTypes: [.float16])[0]
+        }
         let indices = x.flattened()
         let rows = dequantized(
             weight[indices], scales: scales[indices],
