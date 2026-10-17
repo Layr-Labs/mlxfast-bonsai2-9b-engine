@@ -1158,17 +1158,14 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
 
-    /// Drafted rounds whose carried target top-two logit margin is at least
-    /// 4 draft one token deeper (4 instead of 3). On the public prompt at a
-    /// uniform depth 4, such rounds (46% of drafted rounds) accepted all four
-    /// drafts 55% of the time, the others 27%. `QWEN35_PLD_MISS_DEEP=0` or
-    /// `off` keeps one drafted depth (local experiments only).
+    /// High-confidence rounds (carried target margin >= 3.5) expand draft depth
+    /// to 6 (the declared cap in mtp-head.manifest.json) to maximize speculative
+    /// yield on the M5's flat verify curve.
     static let promptLookupMissDeep: (depth: Int, minimumMargin: Double)? = {
         let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEEP"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let raw = raw, ["0", "false", "no", "off"].contains(raw) { return nil }
-        guard let missDepth = promptLookupMissDepth else { return nil }
-        return (depth: missDepth + 1, minimumMargin: 4)
+        return (depth: 6, minimumMargin: 3.5)
     }()
 
     public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? {
@@ -1654,7 +1651,7 @@ extension Qwen35InlineMTPAssistant {
         // (5-row verify) and the shallow one (4-row verify), whatever the warm
         // prompt's margins are, so both drafted widths are built here.
         if let deep = Self.promptLookupMissDeep, let shallow = Self.promptLookupMissDepth {
-            warmMTPConfig.missDepthSchedule = [deep.depth, shallow]
+            warmMTPConfig.missDepthSchedule = [deep.depth, shallow, 2]
         }
         do {
             let engine = EngineV2(
