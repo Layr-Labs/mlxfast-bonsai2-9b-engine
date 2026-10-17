@@ -3949,7 +3949,8 @@ extension HadamardQuantizedLinear {
             outputShapes: [[1, 1, K], [1, K]], outputDTypes: [.float32, .float32])
         let rotated = normed[1]
         let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases], template: [("P", width)],
+            [rotated, weight, scales, biases],
+            template: [("P", width), ("NEG", promptConstants.negative ? 1 : 0)],
             grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
