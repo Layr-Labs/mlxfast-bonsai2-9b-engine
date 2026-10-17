@@ -84,11 +84,14 @@ run on. Those tests exercise the transform, not a Gemma model.
   `./setup.sh`. Do not commit the token or print it.
 - At least 22 GiB of free disk space before the download starts. Change this
   limit with `MLXFAST_REFERENCE_MIN_FREE_GIB`.
-- macOS 14 or later. `Package.swift` sets that platform floor. CI builds on a
-  `macos-26` runner, and the Metal toolchain policy in `setup.sh` treats
-  macOS 26 as its own case.
+- macOS 14 or later. `Package.swift` sets that platform floor. The Metal
+  toolchain policy in `setup.sh` treats macOS 26 as its own case.
 - Swift 6, through Xcode or through the Xcode Command Line Tools.
   `Package.swift` declares `swift-tools-version: 6.3`.
+- Xcode 26.4.1 (build 17E202) for a build check that matches the ranked box.
+  The ranked runners build with Apple Swift 6.3.1 against the macOS 26.4 SDK,
+  on macOS 26.6.2. The hosted CI uses a newer Swift. See "The ranked box
+  toolchain".
 - The Xcode Metal Toolchain. `./setup.sh` tries to download it. The Command
   Line Tools alone carry no `metal` compiler, so a box that builds the metallib
   needs full Xcode. Install it, open it once, and accept the license with
@@ -535,6 +538,40 @@ before you tune.
 
 The local test runs a **single stream**. It uses a public golden. It prints a
 single-stream estimate.
+
+### The ranked box toolchain
+
+The ranked runners are four Apple M5 Max machines with 128 GB of unified
+memory. They build with this toolchain.
+
+| Component | Version |
+|---|---|
+| Xcode | 26.4.1 (build 17E202) |
+| Swift | Apple Swift 6.3.1 |
+| SDK | macOS 26.4 |
+| macOS | 26.6.2 |
+| Metal toolchain | `com.apple.dt.toolchain.Metal.32023.883` |
+
+The hosted CI job "swift build + test (hosted macOS, no GPU)" runs on the
+GitHub `macos-26` image. That image has Xcode 26.6 (build 17F113) and Apple
+Swift 6.3.3. A green hosted CI run does not prove that your code compiles on
+the ranked box.
+
+A ranked job builds your candidate in its Setup step, "Setup (toolchain, Metal
+kernels, pinned checkpoint)". A compile failure there fails the submission
+before any scoring.
+
+Build-check with Xcode 26.4.1 before you submit. Select it with
+`DEVELOPER_DIR` or with `sudo xcode-select -s`.
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode_26.4.1.app/Contents/Developer \
+  swift build --build-tests --force-resolved-versions
+```
+
+The time limit of the Swift type checker differs between compiler versions.
+When the 6.3.1 compiler reports a type-check timeout, split the long
+expression into sub-expressions.
 
 ### What each local mode checks
 
