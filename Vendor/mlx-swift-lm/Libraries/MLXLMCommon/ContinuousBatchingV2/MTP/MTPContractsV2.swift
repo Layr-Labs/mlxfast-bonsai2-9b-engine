@@ -428,9 +428,15 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         seedHidden: MLXArray,
         committedDraftTokens: MLXArray,
         committedTargetHidden: MLXArray)
+    /// The host value of the seed token the next `draftStep` (a round's
+    /// first) receives, which the engine already holds on the host. A
+    /// drafter may key host-side choices on it instead of reading the device
+    /// token back. Default: ignored.
+    func noteRoundSeed(_ token: Int32, requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPRequestStatefulDrafter {
+    public func noteRoundSeed(_ token: Int32, requestState: any CBv2MTPRequestState) {}
     public var draftShortlistSize: Int? { nil }
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int

@@ -997,6 +997,18 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         /// step of the round receives that hidden back and takes the row's
         /// precomputed embedding projection (`Qwen35MTPFusedDraftStep`).
         var fusedCarry: (hidden: MLXArray, row: MLXArray)?
+        /// The host value of the next round's seed token (`noteRoundSeed`):
+        /// a seed inside the draft vocabulary takes its precomputed
+        /// embedding projection on the round's first step.
+        var seedTokenHint: Int32?
+        /// False once a step of this round may have drafted outside the
+        /// draft vocabulary (a target shortlist).
+        var roundDraftsInVocab = true
+        /// The last committed draft tokens, all inside the draft vocabulary:
+        /// when they are the next round's whole history, it takes their
+        /// precomputed embedding projection rows.
+        var committedInVocab: MLXArray?
+        var tableSeeds = 0, liveSeeds = 0, tableHistoryRows = 0, liveHistoryRows = 0
 
         var cacheOffset: Int {
             guard let first = caches.first else { return 0 }
@@ -1049,6 +1061,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             roundTrustedTokens.removeAll(keepingCapacity: true)
             roundRoots.removeAll(keepingCapacity: true)
             fusedCarry = nil
+            roundDraftsInVocab = true
         }
 
         func clearAll() {
@@ -1060,6 +1073,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             roundTrustedTokens.removeAll(keepingCapacity: false)
             roundRoots.removeAll(keepingCapacity: false)
             fusedCarry = nil
+            seedTokenHint = nil
+            committedInVocab = nil
             roundBaseOffset = 0
             roundValidHistoryOffset = 0
             roundDraftSteps = 0
@@ -1336,6 +1351,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
 
         let isFirstStep = !state.roundInFlight
+        let seedHint = isFirstStep ? state.seedTokenHint : nil
+        state.seedTokenHint = nil
+        if shortlist != nil { state.roundDraftsInVocab = false }
         let feed: (tokens: MLXArray, hidden: MLXArray)
         if isFirstStep {
             feed = beginRound(tokens: tokens, hidden: hidden, state: state)
@@ -1348,7 +1366,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
         let draft: MLXArray
         let lastHidden: MLXArray
-        if shortlist == nil, let fused = fusedRowStep(feed: feed, state: state) {
+        if shortlist == nil, let fused = fusedRowStep(feed: feed, state: state, seed: seedHint) {
             (draft, lastHidden) = fused
         } else {
             let output =
@@ -1442,7 +1460,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// the K/V-only path. Nil, with nothing appended, when the fused step
     /// does not take these inputs.
     private func fusedRowStep(
-        feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState
+        feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState, seed: Int32? = nil
     ) -> (MLXArray, MLXArray)? {
         let rows = feed.tokens.dim(1)
         guard let step = fusedDraftStep, rows >= 1, feed.hidden.dim(1) == rows,
@@ -1452,13 +1470,38 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         let hidden = rows == 1 ? feed.hidden : feed.hidden[0..., (rows - 1)..., 0...]
         guard step.accepts(token: token, hidden: hidden, cache: state.caches[0]) else { return nil }
         if rows > 1 {
-            mtp.appendHistoryKV(
-                hidden: feed.hidden[0..., ..<(rows - 1), 0...],
-                nextTokenIds: feed.tokens[0..., ..<(rows - 1)],
-                embedTokens: target.model.embedTokens, cache: state.caches)
+            let historyHidden = feed.hidden[0..., ..<(rows - 1), 0...]
+            let historyTokens = feed.tokens[0..., ..<(rows - 1)]
+            // The history is exactly the last round's committed drafts
+            // (all draft-vocabulary tokens): their rows of the precomputed
+            // embedding projection plus fc's hidden half.
+            if state.roundTrustedTokens.count == 2, let committed = state.committedInVocab,
+                state.roundTrustedTokens[0] === committed, committed.dim(1) == rows - 1,
+                let projected = step.historyProjection(
+                    hidden: historyHidden, tokens: historyTokens,
+                    normHidden: { self.mtp.preFcNormHidden($0) })
+            {
+                mtp.layers[0].appendHistoryKV(projected, cache: state.caches[0])
+                state.tableHistoryRows += rows - 1
+            } else {
+                mtp.appendHistoryKV(
+                    hidden: historyHidden, nextTokenIds: historyTokens,
+                    embedTokens: target.model.embedTokens, cache: state.caches)
+                state.liveHistoryRows += rows - 1
+            }
         }
-        let carried = state.fusedCarry.flatMap { $0.hidden === hidden ? $0.row : nil }
+        var carried = state.fusedCarry.flatMap { $0.hidden === hidden ? $0.row : nil }
         state.fusedCarry = nil
+        // A round's first step: its token is the target's, known on the
+        // host; inside the draft vocabulary it takes that row's projection.
+        if carried == nil, let seed {
+            if let row = step.draftRow(of: seed) {
+                carried = MLXArray([row])
+                state.tableSeeds += 1
+            } else {
+                state.liveSeeds += 1
+            }
+        }
         if let fused = step.step(
             token: token, hidden: hidden, carriedRow: carried, cache: state.caches[0],
             fallbackScreen: { self.draftToken(hidden: $0, shortlist: nil) },
@@ -1536,6 +1579,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             "inline Qwen MTP committed drafts exceed confirmed target inputs")
 
         trim(state: state, to: state.roundValidHistoryOffset)
+        state.committedInVocab =
+            committedDraftCount > 0 && state.roundDraftsInVocab ? committedDraftTokens : nil
         if committedDraftCount > 0 {
             // These are pre-final-norm target verify hiddens, never speculative
             // assistant hiddens. Normalize exactly once, retain lazily, and
@@ -1573,6 +1618,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         // therefore never enters history itself), then the accepted drafts
         // with their target verify hiddens. Everything stays queued for the
         // next drafted round's trusted flush, each row exactly once.
+        state.committedInVocab = nil
         state.backlogHidden.append(targetFinalNorm(seedHidden))
         state.backlogTokens.append(seedToken)
         state.targetHiddenFrontier = nil
@@ -1610,7 +1656,17 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         guard let state = requestState as? RequestState, !state.isReleased else {
             return
         }
+        if state.tableSeeds + state.liveSeeds > 0 {
+            Qwen35MTPFusedDraftStep.log(
+                "MTPEMB table rows: round seeds \(state.tableSeeds) of "
+                    + "\(state.tableSeeds + state.liveSeeds); history rows \(state.tableHistoryRows) of "
+                    + "\(state.tableHistoryRows + state.liveHistoryRows)")
+        }
         state.clearAll()
+    }
+
+    public func noteRoundSeed(_ token: Int32, requestState: any CBv2MTPRequestState) {
+        (requestState as? RequestState)?.seedTokenHint = token
     }
 }
 
@@ -1889,6 +1945,11 @@ final class Qwen35MTPFusedDraftStep {
     /// fc's embedding half applied to every draft-head row's normalized
     /// embedding, `[rows, 4096]` FP16: `fc[:, :4096] · rmsNorm(embed(ids[r]))`.
     let embeddingProjection: MLXArray?
+    /// Host map token id -> draft-head row (-1 outside), its device copy,
+    /// and fc's hidden half as contiguous packed weights; with the table only.
+    let draftRows: [Int32]
+    let draftRowsDevice: MLXArray?
+    let fcHidden: (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
 
     init?(
         module: Qwen35MTPModule, configuration: Qwen35TextConfiguration,
@@ -1958,6 +2019,9 @@ final class Qwen35MTPFusedDraftStep {
         // path's FP16 lookup), FP32 RMSNorm, fc's embedding half.
         guard Self.projectsEmbeddings else {
             self.embeddingProjection = nil
+            self.draftRows = []
+            self.draftRowsDevice = nil
+            self.fcHidden = nil
             return
         }
         let started = Date()
@@ -1982,9 +2046,53 @@ final class Qwen35MTPFusedDraftStep {
         parts.removeAll()
         eval(projection)
         self.embeddingProjection = projection
+        var map = [Int32](repeating: -1, count: embed.shape.0)
+        for (row, id) in draftIds.asArray(Int32.self).enumerated()
+        where id >= 0 && Int(id) < map.count {
+            map[Int(id)] = Int32(row)
+        }
+        self.draftRows = map
+        let rowsDevice = MLXArray(map)
+        let hiddenHalf = (
+            weight: contiguous(fc.weight[0..., (H / 8)...]),
+            scales: contiguous(fc.scales[0..., (H / 128)...]),
+            biases: contiguous(fc.biases[0..., (H / 128)...]))
+        eval(rowsDevice, hiddenHalf.weight, hiddenHalf.scales, hiddenHalf.biases)
+        self.draftRowsDevice = rowsDevice
+        self.fcHidden = hiddenHalf
         Self.log(
             "MTPEMB draft embedding projection: \(draftIds.size) rows built at load in "
                 + "\(Int(Date().timeIntervalSince(started) * 1000)) ms")
+    }
+
+    /// The draft-head row of `token`, nil outside the draft vocabulary or
+    /// without the table.
+    func draftRow(of token: Int32) -> Int32? {
+        guard embeddingProjection != nil, token >= 0, Int(token) < draftRows.count else { return nil }
+        let row = draftRows[Int(token)]
+        return row >= 0 ? row : nil
+    }
+
+    /// fc's output for history rows whose tokens are all inside the draft
+    /// vocabulary: their precomputed embedding projection rows plus fc's
+    /// hidden half over `normHidden(hidden)` (`[1, rows, 4096]`, FP32).
+    func historyProjection(
+        hidden: MLXArray, tokens: MLXArray, normHidden: (MLXArray) -> MLXArray
+    ) -> MLXArray? {
+        let H = Self.hidden
+        guard let embeddingProjection, let draftRowsDevice, let fcHidden,
+            hidden.ndim == 3, hidden.dim(0) == 1, hidden.dim(2) == H,
+            tokens.ndim == 2, tokens.dim(1) == hidden.dim(1)
+        else { return nil }
+        let count = hidden.dim(1)
+        let rows = maximum(
+            take(draftRowsDevice, tokens.reshaped([count]).asType(.int32), axis: 0),
+            MLXArray(Int32(0)))
+        let projected = take(embeddingProjection, rows, axis: 0).asType(.float32)
+        let hiddenPart = quantizedMM(
+            normHidden(hidden), fcHidden.weight, scales: fcHidden.scales, biases: fcHidden.biases,
+            transpose: true, groupSize: 128, bits: 4, mode: .affine)
+        return hiddenPart.asType(.float32) + projected.reshaped([1, count, H])
     }
 
     /// Whether `step` takes these inputs (it may still decline the screen,

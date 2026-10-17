@@ -627,6 +627,9 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
                     }
+                    if draftIndex == 0 {
+                        stateful.noteRoundSeed(seedTokens[index], requestState: requestState)
+                    }
                     let result = stateful.draftStep(
                         tokens: currentTokens[index],
                         hidden: currentHidden[index],
