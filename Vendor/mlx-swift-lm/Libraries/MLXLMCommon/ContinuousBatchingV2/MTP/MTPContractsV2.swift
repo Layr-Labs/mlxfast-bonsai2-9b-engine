@@ -412,11 +412,6 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// rounds this shallower one. Default nil (drafted rounds keep the
     /// declared depth).
     var lookupMissDraftDepth: Int? { get }
-    /// A deeper chain for a drafted round whose carried target top-two
-    /// margin (the target's confidence in the token just committed) is at
-    /// least `minimumMargin` for every row: such rounds draft `depth` tokens,
-    /// the others `lookupMissDraftDepth`. Default nil (one drafted depth).
-    var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { get }
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -437,7 +432,6 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
     public var lookupDraftNgram: Int? { nil }
     public var lookupMissDraftDepth: Int? { nil }
-    public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { nil }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,
@@ -593,10 +587,6 @@ public struct CBv2MTPConfig: Sendable {
     /// Without it a depth of 8...16 would be clamped to 7 silently, and a leg
     /// would measure a depth it did not ask for.
     public let draftTokenCeiling: Int
-    /// Depths the first drafted (lookup-miss) rounds take, in order, before
-    /// the margin rule decides. Empty by default; the load-time warm engine
-    /// sets it so both drafted verify widths run before anything is timed.
-    public var missDepthSchedule: [Int] = []
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
