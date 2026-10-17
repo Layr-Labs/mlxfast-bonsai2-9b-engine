@@ -2490,7 +2490,10 @@ public class Qwen35TextModelInner: Module {
             }
             // Verify & Prefill: hand finished layers to the GPU while the rest
             // of the graph is still being built. Same graph and same kernels.
-            if (captureRecurrentWindow || !lastPositionOnly),
+            // A prompt forward that keeps only its last position (the
+            // stepper's timed prefill) is included: without it the GPU waits
+            // until the host has built all layers.
+            if (captureRecurrentWindow || !lastPositionOnly || inputs.dim(1) >= 64),
                 Self.submitsVerify(after: modelLayerIndex, of: layers.count)
             {
                 asyncEval(hiddenStates)
