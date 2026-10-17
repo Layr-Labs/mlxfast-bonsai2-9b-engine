@@ -1070,7 +1070,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// fused grouped dynamic convolution; fused top-16 and greedy selector.
 enum DF2Fast {
     static let on = ProcessInfo.processInfo.environment["DF2_FAST"] != "0"
-    static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
+    static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "4") ?? 4
     static let header = """
         #include <metal_tensor>
         #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
