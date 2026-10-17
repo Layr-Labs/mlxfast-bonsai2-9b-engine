@@ -3793,7 +3793,7 @@ public class Qwen35TextModelInner: Module {
     let dFlash2Tap = DFlash2TapSlot()
 
     /// Layers per early verify submission.
-    static let verifySubmitEvery = 4
+    static let verifySubmitEvery = 32
 
     /// Verify: submit after the first layer, so the GPU starts on the round
     /// while the host builds the rest, then after every `verifySubmitEvery`
