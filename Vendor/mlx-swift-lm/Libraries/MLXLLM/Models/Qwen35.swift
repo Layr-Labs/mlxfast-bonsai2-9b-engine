@@ -606,8 +606,10 @@ private enum Qwen35RegisterGatedSIMD {
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((const device float4*)k_)[j];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
-            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            if constexpr (!STATE_ONLY) {
+              const float4 q4 = ((const device float4*)q_)[j];
+              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            }
           }
           float kv[DVPL];
           float vt[DVPL];
@@ -644,21 +646,25 @@ private enum Qwen35RegisterGatedSIMD {
               state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
               state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
               state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
-              o0 = fma(state[d][4 * j], qr[4 * j], o0);
-              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
-              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
-              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              if constexpr (!STATE_ONLY) {
+                o0 = fma(state[d][4 * j], qr[4 * j], o0);
+                o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+                o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+                o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+              }
             }
             out[d] = (o0 + o1) + (o2 + o3);
           }
-          out[0] += simd_shuffle_xor(out[0], 4);
-          out[1] += simd_shuffle_xor(out[1], 4);
-          out[0] += simd_shuffle_xor(out[0], 2);
-          out[1] += simd_shuffle_xor(out[1], 2);
-          out[0] += simd_shuffle_xor(out[0], 1);
-          out[1] += simd_shuffle_xor(out[1], 1);
-          if (lane % LPD == 0) {
-            *((device float2*)y_) = float2(out[0], out[1]);
+          if constexpr (!STATE_ONLY) {
+            out[0] += simd_shuffle_xor(out[0], 4);
+            out[1] += simd_shuffle_xor(out[1], 4);
+            out[0] += simd_shuffle_xor(out[0], 2);
+            out[1] += simd_shuffle_xor(out[1], 2);
+            out[0] += simd_shuffle_xor(out[0], 1);
+            out[1] += simd_shuffle_xor(out[1], 1);
+            if (lane % LPD == 0) {
+              *((device float2*)y_) = float2(out[0], out[1]);
+            }
           }
           q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
         }
@@ -707,12 +713,13 @@ private enum Qwen35RegisterGatedSIMD {
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                     b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
-                    state: MLXArray) -> (MLXArray, MLXArray) {
+                    state: MLXArray, stateOnly: Bool = false) -> (MLXArray, MLXArray) {
         let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
         let Hv = v.dim(2), Dv = v.dim(3)
         let result = kernel(
             [q, k, v, a, b, aLog, dtBias, state],
-            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("STATE_ONLY", stateOnly)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
@@ -1051,7 +1058,8 @@ final class Qwen35GatedDeltaNet: Module {
 
     private func updateRecurrence(
         q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, mask: MLXArray?,
+        stateOnly: Bool = false
     ) -> (MLXArray, MLXArray) {
         guard mask == nil, headKDim == 128, headVDim == 128,
             q.dtype == .float32, k.dtype == .float32, v.dtype == .float32
@@ -1068,7 +1076,7 @@ final class Qwen35GatedDeltaNet: Module {
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
             return Qwen35RegisterGatedSIMD.run(
                 q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-                state: floatState)
+                state: floatState, stateOnly: stateOnly)
         }
         let beta = sigmoid(b).asType(.float32)
         let g = computeGatedDeltaG(aLog, a, dtBias)
@@ -1250,7 +1258,8 @@ final class Qwen35GatedDeltaNet: Module {
             aLog: aLog,
             dtBias: dtBias,
             state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
+            mask: tape.mask.map { $0[0..., rows] },
+            stateOnly: true
         ).1
         let boundaryConvView = tape.convInput[
             0...,
