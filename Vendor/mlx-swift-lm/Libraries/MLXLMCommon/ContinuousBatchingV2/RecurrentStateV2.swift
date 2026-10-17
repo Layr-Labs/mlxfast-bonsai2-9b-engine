@@ -276,7 +276,7 @@ public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
     public var materializedByteCount: Int {
-        var total = committed.isEmpty ? 0 : byteCount
+        var total = hasCommitted ? byteCount : 0
         let (retainedTotal, retainedOverflow) = total.addingReportingOverflow(
             committedTransitionRetainedByteCount)
         if retainedOverflow { return Int.max }
@@ -317,7 +317,29 @@ public final class CBv2RecurrentRequestState {
         let prefixReplay: [Int: CBv2RecurrentPrefixReplayStage]?
     }
 
-    private var committed: [Int: CBv2RecurrentLayerState] = [:]
+    /// Confirmed per-layer state. A verify-window commit records the
+    /// selection as `deferredCommitted` and builds its (lazy) arrays on first
+    /// read, normally the next `bind()`. The MTP engine finalizes a round,
+    /// submits the next round's draft chain and only then binds the target
+    /// for verification, so the host builds the strict-prefix replay graph
+    /// after the GPU already has the drafts instead of before. The arrays,
+    /// and the work they describe, are the same either way.
+    private var committedStorage: [Int: CBv2RecurrentLayerState] = [:]
+    private var deferredCommitted: (() -> [Int: CBv2RecurrentLayerState])?
+    private var committed: [Int: CBv2RecurrentLayerState] {
+        get {
+            if let make = deferredCommitted {
+                committedStorage = make()
+                deferredCommitted = nil
+            }
+            return committedStorage
+        }
+        set {
+            deferredCommitted = nil
+            committedStorage = newValue
+        }
+    }
+    private var hasCommitted: Bool { deferredCommitted != nil || !committedStorage.isEmpty }
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
@@ -386,7 +408,7 @@ public final class CBv2RecurrentRequestState {
     /// itself in `CBv2RecurrentCaptureGeometry` rather than inferring it
     /// from the scheduler's optimistically advanced token cursor.
     public func confirmedStateSnapshot() -> [Int: CBv2RecurrentLayerState]? {
-        guard !isReleased, !committed.isEmpty else { return nil }
+        guard !isReleased, hasCommitted else { return nil }
         return committed
     }
 
@@ -487,12 +509,13 @@ public final class CBv2RecurrentRequestState {
             }
             clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
+            committed = [:]
             if fullAcceptance {
-                committed = replay.mapValues { stage in
-                    stage.fullAcceptance?() ?? stage.finalState
+                deferredCommitted = {
+                    replay.mapValues { stage in stage.fullAcceptance?() ?? stage.finalState }
                 }
             } else {
-                committed = replay.mapValues { $0.replay(keep) }
+                deferredCommitted = { replay.mapValues { $0.replay(keep) } }
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []

@@ -2,6 +2,7 @@
 //
 // Finalize-time target-authoritative acceptance, streaming, and KV rollback.
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -14,6 +15,23 @@ extension EngineLoopV2 {
     /// production traffic (mass typically ≥0.99 at K=256) shortlisted while
     /// flat/uncertain positions fall back.
     static let mtpShortlistMassThresholdPPM: Int32 = 900_000
+
+    /// Wait for an array that `asyncEval` has already submitted by polling
+    /// its completion event instead of sleeping in Metal's blocking
+    /// `waitUntilSignaledValue`. The GPU has nothing queued behind the
+    /// round's acceptance packet, so the time between the packet's completion
+    /// and this thread resuming is idle GPU time on every round; a polled
+    /// wait resumes within microseconds where the blocking wait sometimes
+    /// takes a scheduler wake-up. The subsequent `asArray` then finds the
+    /// array available and copies it out. The poll is bounded: past the cap
+    /// the ordinary blocking read takes over (and reports any GPU error).
+    static func mtpPollUntilAvailable(_ array: MLXArray) {
+        var available = false
+        let start = DispatchTime.now().uptimeNanoseconds
+        while _mlx_array_is_available(&available, array.ctx) == 0, !available {
+            if DispatchTime.now().uptimeNanoseconds &- start > 1_000_000_000 { return }
+        }
+    }
 
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
@@ -68,6 +86,7 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        Self.mtpPollUntilAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
