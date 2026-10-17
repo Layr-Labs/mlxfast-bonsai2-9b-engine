@@ -544,7 +544,19 @@ private final class DFlash2Attention: Module {
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
+        var combinedKV: (k: MLXArray, v: MLXArray)? = nil
         if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
+            contextLength > 0, contextLength <= 16,
+            let fastCache = cache as? DFlash2LayerKVCache,
+            let allOut = DF2Fast.qkvAllNormRope(
+                q: queries, k: blockKeys, v: blockValues,
+                ck: contextKeys!, cv: contextValues!,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                L: L, C: contextLength, blockOffset: blockOffset, ctxOffset: fastCache.offset)
+        {
+            queries = allOut.0
+            combinedKV = (allOut.1, allOut.2)
+        } else if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
             let qkvOut = DF2Fast.qkvNormRope(
                 q: queries, k: blockKeys, v: blockValues,
                 qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
@@ -594,12 +606,21 @@ private final class DFlash2Attention: Module {
         let values: MLXArray
         let cachedLength: Int
         if let fastCache = cache as? DFlash2LayerKVCache {
-            let updated = fastCache.updateWithBlock(
-                contextKeys: contextKeys, contextValues: contextValues,
-                blockKeys: blockKeys, blockValues: blockValues)
-            keys = updated.keys
-            values = updated.values
-            cachedLength = updated.cachedLength
+            if let combinedKV {
+                let updated = fastCache.updateWithCombined(
+                    combinedKeys: combinedKV.k, combinedValues: combinedKV.v,
+                    C: contextLength, L: L)
+                keys = updated.keys
+                values = updated.values
+                cachedLength = updated.cachedLength
+            } else {
+                let updated = fastCache.updateWithBlock(
+                    contextKeys: contextKeys, contextValues: contextValues,
+                    blockKeys: blockKeys, blockValues: blockValues)
+                keys = updated.keys
+                values = updated.values
+                cachedLength = updated.cachedLength
+            }
         } else {
             let (cachedKeys, cachedValues) =
                 contextLength > 0
@@ -826,6 +847,37 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         }
         kBuf![.ellipsis, (end + C) ..< (end + C + L), 0...] = blockKeys
         vBuf![.ellipsis, (end + C) ..< (end + C + L), 0...] = blockValues
+        end += C
+        offset += C
+        let cachedLength = end - start
+        return (
+            kBuf![.ellipsis, start ..< (end + L), 0...],
+            vBuf![.ellipsis, start ..< (end + L), 0...],
+            cachedLength
+        )
+    }
+
+    func updateWithCombined(
+        combinedKeys: MLXArray, combinedValues: MLXArray, C: Int, L: Int
+    ) -> (keys: MLXArray, values: MLXArray, cachedLength: Int) {
+        let B = combinedKeys.dim(0)
+        let kvHeads = combinedKeys.dim(1)
+        let kDim = combinedKeys.dim(3)
+        let vDim = combinedValues.dim(3)
+
+        if C > 0, let maxW = maxWindowSize, end > start {
+            let valid = end - start
+            let trimSize = valid - maxW + 1
+            if trimSize > 0 {
+                start = Swift.min(end, start + trimSize)
+            }
+        }
+
+        ensureCapacity(
+            extra: C + L, B: B, kvHeads: kvHeads, kDim: kDim, vDim: vDim,
+            kDType: combinedKeys.dtype, vDType: combinedValues.dtype)
+        kBuf![.ellipsis, end ..< (end + C + L), 0...] = combinedKeys
+        vBuf![.ellipsis, end ..< (end + C + L), 0...] = combinedValues
         end += C
         offset += C
         let cachedLength = end - start
@@ -2278,6 +2330,118 @@ enum DF2Fast {
             outputShapes: [[1, 8, C, 128], [1, 8, C, 128]],
             outputDTypes: [.float32, .float32])
         return (outs[0], outs[1])
+    }
+
+    /// Fused `qNorm` + `kNorm` + `YarnRoPE` + `[1, S, H, 128] -> [1, H, S, 128]` transpose for BOTH
+    /// block `(queries, blockKeys, blockValues)` and context `(contextKeys, contextValues)`, producing
+    /// `queries` `[1, 32, L, 128]`, `combinedKeys` `[1, 8, C + L, 128]`, `combinedValues` `[1, 8, C + L, 128]`.
+    static let qkvAllNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_all_norm_rope",
+        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "inv_freqs", "params", "fparams"],
+        outputNames: ["q_out", "k_out", "v_out"],
+        source: """
+            const int L = params[0];
+            const int C = params[1];
+            const int offset = params[2];
+            const int CL = C + L;
+            const float eps = fparams[0];
+            const float mscale = fparams[1];
+            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            if (vecIdx >= 32 * L + 16 * CL) return;
+            const uint lane = thread_index_in_simdgroup;
+            const int d0 = int(lane);
+            const int d1 = d0 + 32;
+            if (vecIdx >= 32 * L + 8 * CL) {
+              const int vIdx = vecIdx - (32 * L + 8 * CL);
+              const int h = vIdx / CL;
+              const int t = vIdx % CL;
+              const device float* vsrc = (t < C) ? cv : bv;
+              const int s = (t < C) ? t : (t - C);
+              const size_t srcBase = ((size_t)s * 8 + h) * 128;
+              const size_t dstBase = ((size_t)h * CL + t) * 128;
+              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
+              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
+              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
+              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
+              return;
+            }
+            const bool isK = vecIdx >= 32 * L;
+            int h, t, s, H, S_out;
+            const device float* src;
+            const device float* w;
+            device float* dst;
+            float pos;
+            if (!isK) {
+              h = vecIdx / L;
+              s = vecIdx % L;
+              t = s;
+              H = 32;
+              S_out = L;
+              src = q;
+              w = qw;
+              dst = q_out;
+              pos = float(offset + C + s);
+            } else {
+              const int kIdx = vecIdx - 32 * L;
+              h = kIdx / CL;
+              t = kIdx % CL;
+              s = (t < C) ? t : (t - C);
+              H = 8;
+              S_out = CL;
+              src = (t < C) ? ck : bk;
+              w = kw;
+              dst = k_out;
+              pos = float(offset + t);
+            }
+            const size_t srcBase = ((size_t)s * H + h) * 128;
+            const size_t dstBase = ((size_t)h * S_out + t) * 128;
+            const float x0 = float(src[srcBase + d0]);
+            const float y0 = float(src[srcBase + d0 + 64]);
+            const float x1 = float(src[srcBase + d1]);
+            const float y1 = float(src[srcBase + d1 + 64]);
+            const float sq = simd_sum(x0 * x0 + y0 * y0 + x1 * x1 + y1 * y1);
+            const float scale = metal::precise::rsqrt(sq * (1.0f / 128.0f) + eps) * mscale;
+            const float nx0 = x0 * w[d0] * scale;
+            const float ny0 = y0 * w[d0 + 64] * scale;
+            const float nx1 = x1 * w[d1] * scale;
+            const float ny1 = y1 * w[d1 + 64] * scale;
+            const float th0 = pos * inv_freqs[d0];
+            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
+            const float th1 = pos * inv_freqs[d1];
+            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+            dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
+            dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
+            dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
+            dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            """)
+
+    static func qkvAllNormRope(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
+        L: Int, C: Int, blockOffset: Int, ctxOffset: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard on, L > 0, C > 0, blockOffset == ctxOffset + C,
+            qNorm.eps == kNorm.eps,
+            q.size == L * 32 * 128, k.size == L * 8 * 128, v.size == k.size,
+            ck.size == C * 8 * 128, cv.size == ck.size,
+            [q, k, v, ck, cv].allSatisfy({ $0.dtype == .float32 })
+        else { return nil }
+        let qw = normWeight(qNorm)
+        let kw = normWeight(kNorm)
+        let CL = C + L
+        let totalVecs = 32 * L + 16 * CL
+        let tgs = (totalVecs + 3) / 4
+        let outs = qkvAllNormRopeKernel(
+            [
+                q, k, v, ck, cv, qw, kw, ropeSpec.invFreqs,
+                MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
+                MLXArray([qNorm.eps, ropeSpec.mscale]),
+            ],
+            grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outs[0], outs[1], outs[2])
     }
 
     /// One part of `DFlash2GroupedDynamicCausalConv` (B = 1) in one kernel, plus an optional residual.
