@@ -520,6 +520,213 @@ private enum Qwen35RegisterGDN {
             vt[d] = cv * (cv < 0.0f ? sig : 1.0f - sig);
             """))
 
+    /// The prompt recurrence of `valueKernel` with the depthwise conv + SiLU
+    /// value computed once per channel and step: every 32 steps the
+    /// threadgroup fills a 32-step x 32-channel tile in parallel (each value
+    /// by one thread, the same fma chain, exp and divide as `valueKernel`),
+    /// instead of 8 lanes recomputing each value inside the serial step.
+    /// The recurrence itself is `valueKernel`'s, op for op, so y and the
+    /// state are bit-identical (custom kernels compile in Safe math mode).
+    private static let stagedValueKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_value_conv_staged",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "conv_weight"],
+        outputNames: ["y", "state_out"],
+        source: """
+        const uint T = q_shape[1];
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        auto g_ = g + b_idx * T * Hv + hv_idx;
+        auto beta_ = beta + b_idx * T * Hv + hv_idx;
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
+        float kr[R];
+        float qr[R];
+        constexpr int TS = 32;
+        threadgroup float vts[TS][32];
+        const uint ltid = sg * 32u + lane;
+        const uint vloc = sg * DVPS + (lane / LPD) * DVPL;
+        const uint ch_tg = 2u * Hk * Dk + hv_idx * Dv + threadgroup_position_in_grid.y * DVPT;
+        const uint v_stride = v_shape[2];
+        for (int t = 0; t < T; ++t) {
+          const int s = t % TS;
+          if (s == 0) {
+            const int tn = min(TS, int(T) - t);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = ltid; idx < uint(tn) * 32u; idx += 128u) {
+              const uint ss = idx / 32u, c = idx % 32u;
+              const uint channel = ch_tg + c;
+              const float4 cw4 = *((const device float4*)(conv_weight + channel * 4u));
+              const uint v_base = (b_idx * (T + 3u) + uint(t) + ss) * v_stride + channel;
+              float cv = fma(v[v_base], cw4.x, 0.0f);
+              cv = fma(v[v_base + v_stride], cw4.y, cv);
+              cv = fma(v[v_base + 2u * v_stride], cw4.z, cv);
+              cv = fma(v[v_base + 3u * v_stride], cw4.w, cv);
+              const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
+              vts[ss][c] = cv * (cv < 0.0f ? sig : 1.0f - sig);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          const float gt = g_[0];
+          const float bt = beta_[0];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((const device float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            vt[d] = vts[s][vloc + d];
+
+
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              kv[d] += simd_shuffle_xor(kv[d], o);
+            }
+          }
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              out[d] += simd_shuffle_xor(out[d], o);
+            }
+          }
+          if (lane % LPD == 0) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              y_[d] = out[d];
+            }
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+          }
+        }
+        """)
+
+    private static func dispatchValue(
+        _ k: MLXFast.MLXFastKernel, q: MLXArray, kk: MLXArray, input: MLXArray,
+        weight: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
+        let result = k(
+            [q, kk, input, g, beta, state, weight],
+            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
+            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
+    /// Load-time check, once per process per shape: the pipelined kernel must
+    /// reproduce `valueKernel`'s y and state bit for bit on a synthetic
+    /// input of the served shape (first call is the unmeasured warm prefill).
+    /// Any mismatch keeps `valueKernel`. `MLXFAST_GDN_PIPELINED=0` disables it.
+    nonisolated(unsafe) private static var pipelinedVerdict: [String: Bool] = [:]
+    private static let pipelinedLock = NSLock()
+    private static let pipelinedEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_PIPELINED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static func pipelinedMatches(Hk: Int, Hv: Int, convDim: Int) -> Bool {
+        guard pipelinedEnabled else { return false }
+        let key = "\(Hk)x\(Hv)x\(convDim)"
+        pipelinedLock.lock()
+        defer { pipelinedLock.unlock() }
+        if let verdict = pipelinedVerdict[key] { return verdict }
+        let T = 67
+        let key0 = MLXRandom.key(0x6d6e)
+        let parts = MLXRandom.split(key: key0, into: 7)
+        let q = MLXRandom.uniform(low: -0.2, high: 0.2, [1, T, Hk, 128], key: parts[0])
+        let kk = MLXRandom.uniform(low: -0.2, high: 0.2, [1, T, Hk, 128], key: parts[1])
+        let input = MLXRandom.uniform(low: -3, high: 3, [1, T + 3, convDim], key: parts[2])
+        let weight = MLXRandom.uniform(low: -0.7, high: 0.7, [convDim, 4, 1], key: parts[3])
+        let g = MLXRandom.uniform(low: 0.6, high: 1.0, [1, T, Hv], key: parts[4])
+        let beta = MLXRandom.uniform(low: 0.0, high: 1.0, [1, T, Hv], key: parts[5])
+        let state = MLXRandom.uniform(low: -1, high: 1, [1, Hv, 128, 128], key: parts[6])
+        let (y0, s0) = dispatchValue(
+            valueKernel, q: q, kk: kk, input: input, weight: weight, g: g, beta: beta, state: state)
+        let (y1, s1) = dispatchValue(
+            stagedValueKernel, q: q, kk: kk, input: input, weight: weight, g: g, beta: beta,
+            state: state)
+        let same = MLX.all(y0.view(dtype: .uint32) .== y1.view(dtype: .uint32))
+            .&& MLX.all(s0.view(dtype: .uint32) .== s1.view(dtype: .uint32))
+        let verdict = same.item(Bool.self)
+        pipelinedVerdict[key] = verdict
+        if !verdict {
+            FileHandle.standardError.write(
+                Data("qwen35 gdn: pipelined prompt recurrence mismatch, using value_conv\n".utf8))
+        }
+        return verdict
+    }
+
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
                     beta: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
@@ -536,13 +743,10 @@ private enum Qwen35RegisterGDN {
         q: MLXArray, k: MLXArray, input: MLXArray, weight: MLXArray,
         g: MLXArray, beta: MLXArray, state: MLXArray
     ) -> (MLXArray, MLXArray) {
-        let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = g.dim(2)
-        let result = valueKernel(
-            [q, k, input, g, beta, state, weight],
-            template: [("Dk", Dk), ("Dv", 128), ("Hk", Hk), ("Hv", Hv)],
-            grid: (128, 4, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, 128], state.shape], outputDTypes: [.float32, .float32])
-        return (result[0], result[1])
+        let kernel = pipelinedMatches(Hk: q.dim(2), Hv: g.dim(2), convDim: input.dim(2))
+            ? stagedValueKernel : valueKernel
+        return dispatchValue(
+            kernel, q: q, kk: k, input: input, weight: weight, g: g, beta: beta, state: state)
     }
 
 }
