@@ -109,7 +109,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
                 target: text.configuration.hiddenLayers)
         }
         try drafter.bind(target: text)
-        return Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        let assistant = Qwen35DFlash2Assistant(drafter: drafter, target: text)
+        assistant.warmEngineRound(serving: target)
+        // Once more at the resident's boot warm, after the runner has adopted
+        // the model, as the chain head's load does.
+        CBv2DeferredLoadWarm.register { [weak assistant] in
+            assistant?.warmEngineRound(serving: target)
+        }
+        return assistant
     }
 
     private static func qwen35TextTarget(
@@ -368,5 +375,111 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
         state(requestState).roots.removeAll(keepingCapacity: true)
+    }
+}
+
+// MARK: - Load-time engine round warm
+
+extension Qwen35DFlash2Assistant {
+    /// `DARKBLOOM_BONSAI_DFLASH_ROUND_WARM=0` skips `warmEngineRound`.
+    static let engineRoundWarmEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFLASH_ROUND_WARM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The track's declared block depth and the scored seed width.
+    static let warmDepth = 15
+    static let warmPromptRows = 512
+
+    /// Runs one short greedy request through a real `EngineV2` on throwaway
+    /// state, built as the worker's fixed build builds a scored DFlash leg
+    /// (contiguous, one stream, depth 15, the rectangular envelope of one
+    /// 16-column verify): the seed prefill and its context absorption, the
+    /// 16-row target verify, finalize and rollback, a few rounds deep.
+    ///
+    /// Nothing before a scored decode window runs an engine DFlash round:
+    /// the warm-up and timed prefills go through the teacher-forced stepper,
+    /// and each ranked leg's resident times exactly one window. So every
+    /// first-use cost of the round's target side (Metal pipeline builds for
+    /// the 16-row verify kernels, lazily built constants) fell inside that
+    /// window. The prompt is a fixed token pattern, greedy, so nothing
+    /// depends on any request's input; the engine, its caches and the
+    /// request state are released, the context tap is restored to how the
+    /// warm found it, and the buffer cache is drained before anything is
+    /// served.
+    func warmEngineRound(serving: any LanguageModel) {
+        guard Self.engineRoundWarmEnabled else { return }
+        let layerKinds: [CBv2LayerKind]
+        let caches: [any CBv2AttendingLayerCache]
+        let make: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache = {
+            index, kind in CBv2LayerCache(layerIndex: index, kind: kind)
+        }
+        if let model = serving as? Qwen35Model, let built = try? model.newCacheV2(makeLayerCache: make) {
+            (layerKinds, caches) = (model.cbv2LayerKinds, built)
+        } else if let model = serving as? Qwen35TextModel,
+            let built = try? model.newCacheV2(makeLayerCache: make)
+        {
+            (layerKinds, caches) = (model.cbv2LayerKinds, built)
+        } else {
+            return
+        }
+        let started = Date()
+        let wasArmed = target.dFlash2TapLayerIds != nil
+        guard (try? setBlockContextArmed(true)) != nil else { return }
+        defer { try? setBlockContextArmed(wasArmed) }
+        let depth = Self.warmDepth
+        let rows = Self.warmPromptRows
+        weak var released: EngineV2?
+        let warmMTPConfig = CBv2MTPConfig(
+            enabled: true,
+            maxDraftTokens: depth,
+            maxSpeculativeBatch: 1,
+            fixedDraftTokens: depth,
+            verificationMode: .automatic,
+            maxAutomaticRectangularTokens: 1 + depth,
+            draftTokenCeiling: CBv2MTPConfig.testedMaxBlockDraftTokens)
+        do {
+            let engine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(serving),
+                layerKinds: layerKinds,
+                backend: CBv2ContiguousKVBackend(
+                    config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30)),
+                cacheProvider: CBv2LayerCacheBank(caches: caches),
+                sampler: CBv2DefaultSampler(),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 1,
+                    prefillChunkSize: max(CBv2SchedulerConfig().prefillChunkSize, rows),
+                    maxWaiting: 1,
+                    enablePrefixCache: false),
+                mtpDrafter: self,
+                mtpConfig: warmMTPConfig)
+            released = engine
+            var request = CBv2Request(
+                id: CBv2RequestID(1),
+                promptTokens: (0 ..< rows).map { 100 + ($0 &* 7919) % 20_000 },
+                maxTokens: 2 + 3 * (1 + depth))
+            request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
+            request.stopTokens = []
+            let warmRequest = request
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                if let events = try? engine.submit(warmRequest) {
+                    for await _ in events {}
+                }
+                await engine.shutdown()
+                done.signal()
+            }
+            done.wait()
+        }
+        var waited = 0
+        while released != nil, waited < 500 {
+            usleep(1_000)
+            waited += 1
+        }
+        Stream().synchronize()
+        Memory.clearCache()
+        FileHandle.standardError.write(
+            "dflash round warm: \(Int(Date().timeIntervalSince(started) * 1000)) ms\n".data(using: .utf8)!)
     }
 }
