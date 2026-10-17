@@ -853,31 +853,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// width. The proposals run on a throwaway cache and are discarded; nothing
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
-        prepareTiledCodes()
         let cache = try makeCache()
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
-    }
-
-    /// Every launch grouping the fast path issues, for the tiled self-check, and the
-    /// linears whose stored codes no path reads once the tiled copy is adopted. `fc`,
-    /// `k_proj` and `v_proj` keep theirs: the prompt's context (more than 16 rows)
-    /// runs them through the stored-layout quantized matmul.
-    private func prepareTiledCodes() {
-        let selector = candidateSelector.hiddenProjection
-        var launches: [[Linear]] = [[fc], [selector]]
-        var unread: [Linear] = [selector]
-        for layer in layers {
-            let a = layer.selfAttn, m = layer.mlp
-            let kp = [layer.attentionConv.kernelProjection, layer.mlpConv.kernelProjection]
-            launches += [[a.qProj, a.kProj, a.vProj], [a.kProj, a.vProj], [a.oProj], [m.gate, m.up], [m.down]]
-            launches += kp.map { [$0] }
-            unread += [a.qProj, a.oProj, m.gate, m.up, m.down] + kp
-        }
-        DF2Fast.adoptTiled(launches: launches, unread: unread)
     }
 
     // MARK: The cache
@@ -1209,117 +1190,12 @@ enum DF2Fast {
             source: matmulSource(layers: layers), header: header, ensureRowContiguous: true)
     }
 
-    /// The record kernel over the tiled copy (`tiledOperands`): each (32-column block, group)
-    /// is one contiguous 1088-byte tile, the 1024 code bytes already int8 (`^ 0x80`) in the
-    /// `[32 columns][32 K]` order the kernel stages for the tensor op, then the 32 columns'
-    /// FP16 scales. A lane moves its 32 code bytes with two 16-byte loads. The bias term is
-    /// gone: every bias is -128 * scale, so the record's `fma(128, s, b)` is +0 and adds
-    /// nothing. Same tensor-op operands, same FP32 epilogue order: bitwise the record
-    /// (self-tested at load, `adoptTiled`).
-    static func tiledSource(layers: Int) -> String {
-        var pick = """
-            const int K = ksz[0];
-            int bx = int(threadgroup_position_in_grid.x);
-            const device uint32_t* w = w0; device float* out = out0; int N = ksz[2];
-
-            """
-        for l in 1 ..< layers {
-            pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
-        }
-        return pick + """
-            const int G = K / 32;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const uint tid = thread_position_in_threadgroup.x;
-            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-            threadgroup uint32_t bs[SPLIT][32 * 8];
-            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
-            auto tA0 = A.template slice<32, 16>(0, 0);
-            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
-            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
-            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
-              auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
-            }
-            float acc[16];
-            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; }
-            const int m0 = mrow, m1 = mrow + 8;
-            const device uint32_t* tiles = w + (size_t)bx * G * 272;
-            threadgroup uint32_t* sdst = bs[sg] + lane * 4;
-            const int so = 256 + nb / 2;
-            const device uint32_t* t0 = tiles + (size_t)sg * 272;
-            uint4 c0 = *(const device uint4*)(t0 + lane * 4), c1 = *(const device uint4*)(t0 + 128 + lane * 4);
-            uint2 h0 = *(const device uint2*)(t0 + so), h1 = *(const device uint2*)(t0 + so + 8);
-            for (int g = int(sg); g < G; g += SPLIT) {
-              *(threadgroup uint4*)sdst = c0;
-              *(threadgroup uint4*)(sdst + 128) = c1;
-              const float4 s0v = float4(df2_h2f(h0.x & 0xffffu), df2_h2f(h0.x >> 16), df2_h2f(h0.y & 0xffffu), df2_h2f(h0.y >> 16));
-              const float4 s1v = float4(df2_h2f(h1.x & 0xffffu), df2_h2f(h1.x >> 16), df2_h2f(h1.y & 0xffffu), df2_h2f(h1.y >> 16));
-              if (g + SPLIT < G) {
-                const device uint32_t* tn = tiles + (size_t)(g + SPLIT) * 272;
-                c0 = *(const device uint4*)(tn + lane * 4); c1 = *(const device uint4*)(tn + 128 + lane * 4);
-                h0 = *(const device uint2*)(tn + so); h1 = *(const device uint2*)(tn + so + 8);
-              }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
-              auto tA = A.template slice<32, 16>(g * 32, 0);
-              op.run(tA, Bt, cT);
-              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
-              for (int i = 0; i < 16; i++) {
-                const int j = (i & 3);
-                const float s = (i >> 3) ? s1v[j] : s0v[j];
-                const bool hi = (i >> 2) & 1;
-                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-              }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            threadgroup float red[SPLIT][16 * 32];
-            for (int i = 0; i < 16; i++) {
-              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
-              red[sg][m * 32 + n] = acc[i];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
-              float v = 0.0f;
-              for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
-              out[(size_t)(e >> 5) * N + bx * 32 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
-            }
-            """
-    }
-
-    /// FP16 bits -> FP32 with integer ops only, so an FP16 subnormal scale (the drafter has
-    /// them) converts exactly whatever the GPU's half conversion does with subnormals.
-    static let tiledHeader = header + """
-        inline float df2_h2f(uint h) {
-          const uint m = h & 0x7fffu;
-          const float v = m < 0x400u ? float(m) * 5.9604644775390625e-8f : as_type<float>((m << 13) + 0x38000000u);
-          return (h & 0x8000u) ? -v : v;
-        }
-
-        """
-
-    static let tiledMatmuls: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
-        MLXFast.metalKernel(
-            name: "df2_i8_tiled\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + ["ascale", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: tiledSource(layers: layers), header: tiledHeader, ensureRowContiguous: true)
-    }
-
-    /// One linear's matmul operands: the stored codes with FP32 scale and bias transposes
-    /// (record), or the tiled copy alone (`sT == nil`).
     final class Operands {
-        let w: MLXArray, sT: MLXArray?, bT: MLXArray?, n: Int, k: Int
-        init(w: MLXArray, sT: MLXArray?, bT: MLXArray?, n: Int, k: Int) {
+        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
         }
     }
-
-    /// Whether the fast path reads the tiled copies (set once, by `adoptTiled`).
-    nonisolated(unsafe) static var tiledOn = false
     nonisolated(unsafe) static var operandCache: [ObjectIdentifier: Operands] = [:]
     nonisolated(unsafe) static var baseCache: [ObjectIdentifier: MLXArray] = [:]
     nonisolated(unsafe) static var normCache: [ObjectIdentifier: MLXArray] = [:]
@@ -1339,98 +1215,17 @@ enum DF2Fast {
         return MLXFast.rmsNorm(x.asType(.float32), weight: weight, eps: norm.eps)
     }
 
-    static func eligible(_ layer: Linear) -> QuantizedLinear? {
-        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
-            q.biases != nil, q.bias == nil, q.weight.dim(0) % 32 == 0
-        else { return nil }
-        return q
-    }
-
-    static func recordOperands(_ q: QuantizedLinear) -> Operands {
-        let sT = contiguous(q.scales.asType(.float32).transposed())
-        let bT = contiguous(q.biases!.asType(.float32).transposed())
-        eval(sT, bT)
-        return Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
-    }
-
-    /// The tiled copy `[N/32, G, 272]` uint32 (`tiledSource`). The FP32 scales are FP16
-    /// values (Q8_0 block scales), narrowed here with integer ops: exact, subnormals included.
-    static func tiledOperands(_ q: QuantizedLinear) -> Operands {
-        let n = q.weight.dim(0), g = q.weight.dim(1) / 8
-        let codes = (q.weight ^ MLXArray(UInt32(0x8080_8080)))
-            .reshaped([n / 32, 32, g, 8]).transposed(0, 2, 1, 3).reshaped([n / 32, g, 256])
-        let bits = q.scales.asType(.float32).view(dtype: .uint32)
-        let magnitude = bits & MLXArray(UInt32(0x7fff_ffff))
-        let normal = (magnitude >> MLXArray(UInt32(13))) - MLXArray(UInt32(0x1_c000))
-        let subnormal = (abs(q.scales.asType(.float32)) * Float(16_777_216)).asType(.uint32)
-        let half = (which(magnitude .>= MLXArray(UInt32(0x3880_0000)), normal, subnormal)
-            | ((bits >> MLXArray(UInt32(16))) & MLXArray(UInt32(0x8000)))).asType(.uint16)
-        let scales = contiguous(half.reshaped([n / 32, 32, g]).transposed(0, 2, 1))
-            .view(dtype: .uint32)
-        let tiled = contiguous(concatenated([codes, scales], axis: 2))
-        eval(tiled)
-        return Operands(w: tiled, sT: nil, bT: nil, n: n, k: q.weight.dim(1) * 4)
-    }
-
     static func operands(_ layer: Linear) -> Operands? {
         if let o = operandCache[ObjectIdentifier(layer)] { return o }
-        guard let q = eligible(layer) else { return nil }
-        let o = tiledOn ? tiledOperands(q) : recordOperands(q)
+        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
+            let biases = q.biases, q.bias == nil, q.weight.dim(0) % 32 == 0
+        else { return nil }
+        let sT = contiguous(q.scales.asType(.float32).transposed())
+        let bT = contiguous(biases.asType(.float32).transposed())
+        eval(sT, bT)
+        let o = Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
         operandCache[ObjectIdentifier(layer)] = o
         return o
-    }
-
-    /// Build the tiled copy of every linear in `launches`, run each launch on one fixed
-    /// probe through the record kernel (stored codes) and the tiled kernel, and compare the
-    /// outputs bit for bit. All equal: the fast path reads the tiled copies from here on, and
-    /// the stored codes, scales and biases of `unread` are released. Any difference, or an
-    /// ineligible linear: the record path, nothing released. One stderr line either way.
-    static func adoptTiled(launches: [[Linear]], unread: [Linear]) {
-        tiledOn = false
-        guard on, ProcessInfo.processInfo.environment["DF2_TILED"] != "0" else { return }
-        var tiled: [ObjectIdentifier: Operands] = [:]
-        for layer in launches.joined() where tiled[ObjectIdentifier(layer)] == nil {
-            guard let q = eligible(layer) else {
-                report("off (ineligible linear)")
-                return
-            }
-            tiled[ObjectIdentifier(layer)] = tiledOperands(q)
-        }
-        var probes: [Int: MLXArray] = [:]
-        var mismatches = 0, values = 0
-        for group in launches {
-            let k = group[0].weight.dim(1) * 4
-            let x = probes[k] ?? MLXRandom.normal([16, k], key: MLXRandom.key(UInt64(7919 + k)))
-            probes[k] = x
-            guard let record = launch(x, group.map { recordOperands(eligible($0)!) }),
-                let candidate = launch(x, group.map { tiled[ObjectIdentifier($0)]! })
-            else {
-                report("off (launch refused)")
-                return
-            }
-            let differing = zip(record, candidate).map {
-                ($0.view(dtype: .uint32) .!= $1.view(dtype: .uint32)).asType(.int32).sum()
-            }
-            mismatches += stacked(differing).sum().item(Int.self)
-            values += record.reduce(0) { $0 + $1.size }
-        }
-        guard mismatches == 0 else {
-            report("off (\(mismatches) of \(values) probe outputs differ from the stored layout)")
-            return
-        }
-        for (key, o) in tiled { operandCache[key] = o }
-        tiledOn = true
-        for layer in unread {
-            guard let q = eligible(layer) else { continue }
-            q.weight._updateInternal(MLXArray.zeros([1], dtype: .uint32))
-            q.scales._updateInternal(MLXArray.zeros([1], dtype: .float32))
-            q.biases?._updateInternal(MLXArray.zeros([1], dtype: .float32))
-        }
-        report("on (\(launches.count) launches, \(values) probe outputs bitwise equal; \(unread.count) stored code sets released)")
-    }
-
-    private static func report(_ verdict: String) {
-        FileHandle.standardError.write(Data("[dflash2] tiled drafter codes \(verdict)\n".utf8))
     }
 
     /// Activation codes of x [.., K] (rows <= 16); `up` makes them silu(x) * up.
@@ -1448,26 +1243,263 @@ enum DF2Fast {
         return (o[0], o[1], o[2], rows)
     }
 
-    /// `layers(x)` (or of silu(x) * up) for sibling 8-bit g32 linears sharing x; nil when not eligible.
+    /// `layers(x)` (or of silu(x) * up) for sibling drafter linears sharing x; nil when not eligible.
     static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
         guard on, (1 ... 3).contains(layers.count) else { return nil }
+        if let group = w4Group, let y = w4Linears(x, layers, up: up, group: group) {
+            return y
+        }
         let ops = layers.compactMap { operands($0) }
-        guard ops.count == layers.count else { return nil }
-        return launch(x, ops, up: up)
-    }
-
-    /// One matmul launch over `ops` (all tiled or all record), x [.., K] with <= 16 rows.
-    static func launch(_ x: MLXArray, _ ops: [Operands], up: MLXArray? = nil) -> [MLXArray]? {
-        guard ops.allSatisfy({ $0.k == x.dim(-1) }), let (xq, ascale, xs, rows) = codes(x, up: up)
+        guard ops.count == layers.count, ops.allSatisfy({ $0.k == x.dim(-1) }),
+            let (xq, ascale, xs, rows) = codes(x, up: up)
         else { return nil }
         let ns = ops.map(\.n)
-        let dims = MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })
-        let record = ops.compactMap(\.sT).count == ops.count
-        guard record || ops.allSatisfy({ $0.sT == nil }) else { return nil }
-        let outs = (record ? matmuls : tiledMatmuls)[ops.count - 1](
-            record
-                ? [xq] + ops.map(\.w) + ops.compactMap(\.sT) + ops.compactMap(\.bT) + [ascale, xs, dims]
-                : [xq] + ops.map(\.w) + [ascale, dims],
+        let outs = matmuls[layers.count - 1](
+            [xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT)
+                + [ascale, xs, MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
+            template: [("SPLIT", split)],
+            grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+        let lead = Array(x.shape.dropLast())
+        return zip(outs, ns).map { $0.reshaped(lead + [$1]) }
+    }
+
+    // MARK: 4-bit drafter linears, re-quantized at load (drafter numerics only)
+
+    /// Input columns per 4-bit group (64 or 128); nil (`DF2_W4=0`) keeps the pinned 8-bit g32 codes.
+    static let w4Group: Int? = {
+        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "64"
+        return v == "128" ? 128 : (v == "0" ? nil : 64)
+    }()
+
+    final class W4Operands {
+        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
+            self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
+        }
+    }
+    nonisolated(unsafe) static var w4Cache: [ObjectIdentifier: W4Operands] = [:]
+
+    /// An in-memory 4-bit affine copy of one pinned linear (the file on disk is untouched), built once
+    /// at load: per group of `group` input columns, the range [lo, hi] shrunk toward zero by the factor
+    /// in {1, 0.95, ..., 0.75} with the least squared error against the pinned weights, then FP16
+    /// scale (hi - lo) / 15 and offset lo. Codes are row-major [N, K / 2]; a word holds k = 8j ... 8j + 3
+    /// in its low nibbles and k = 8j + 4 ... 8j + 7 in its high nibbles. Scales and offsets are [G, N].
+    static func w4Operands(_ layer: Linear, group: Int) -> W4Operands? {
+        if let o = w4Cache[ObjectIdentifier(layer)] { return o }
+        guard let q = layer as? QuantizedLinear, q.mode == .affine, let biases = q.biases, q.bias == nil
+        else { return nil }
+        let N = q.weight.dim(0)
+        let K = q.weight.dim(1) * 32 / q.bits
+        guard N % 32 == 0, K % group == 0 else { return nil }
+        let G = K / group
+        let w = dequantized(
+            q.weight, scales: q.scales, biases: biases, groupSize: q.groupSize, bits: q.bits,
+            dtype: .float32
+        ).reshaped([N, G, group])
+        let lo0 = w.min(axis: -1), hi0 = w.max(axis: -1)
+        var best: MLXArray? = nil
+        var lo = lo0, hi = hi0
+        for c: Float in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75] {
+            let l = lo0 * c, h = hi0 * c
+            let sc = which(h .> l, (h - l) / 15, Float(1)).asType(.float16).asType(.float32)
+            let bc = l.asType(.float16).asType(.float32)
+            let u = clip(
+                round((w - bc.expandedDimensions(axis: -1)) / sc.expandedDimensions(axis: -1)),
+                min: 0, max: 15)
+            let e = square(u * sc.expandedDimensions(axis: -1) + bc.expandedDimensions(axis: -1) - w)
+                .sum(axis: -1)
+            if let b0 = best {
+                let better = e .< b0
+                best = which(better, e, b0)
+                lo = which(better, l, lo)
+                hi = which(better, h, hi)
+            } else {
+                best = e
+            }
+            eval(best!, lo, hi)
+        }
+        let s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
+        let b = lo.asType(.float16).asType(.float32)
+        let u = clip(
+            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15
+        ).asType(.uint32).reshaped([N, K / 8, 2, 4])
+        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
+        let packed = (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
+        let sT = contiguous(s.asType(.float16).transposed())
+        let bT = contiguous(b.asType(.float16).transposed())
+        eval(packed, sT, bT)
+        let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
+        w4Cache[ObjectIdentifier(layer)] = o
+        return o
+    }
+
+    /// x [R, K] (or silu(x) * x2) -> int8 codes per row and per KG-column group, with the group's
+    /// scale and its unquantized sum (for the offset term).
+    static let quantG = MLXFast.metalKernel(
+        name: "df2_act_q8g", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
+        source: """
+            const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
+            const int m = int(threadgroup_position_in_grid.y);
+            for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
+              const size_t base = (size_t)m * K + g * KG;
+              float amax = 0.0f, sum = 0.0f;
+              if (m < R) {
+                for (int u = 0; u < KG; u++) {
+                  float a = float(x[base + u]);
+                  if (SWIGLU) { const float b = float(x2[base + u]); a = a / (1.0f + metal::exp(-a)) * b; }
+                  amax = max(amax, fabs(a)); sum += a;
+                }
+              }
+              const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
+              const float ia = 1.0f / a;
+              device char4* dst = (device char4*)(xq + base);
+              for (int u = 0; u < KG / 4; u++) {
+                float4 v = float4(0.0f);
+                if (m < R) {
+                  for (int j = 0; j < 4; j++) {
+                    float t = float(x[base + 4 * u + j]);
+                    if (SWIGLU) { const float b = float(x2[base + 4 * u + j]); t = t / (1.0f + metal::exp(-t)) * b; }
+                    v[j] = t;
+                  }
+                }
+                dst[u] = char4(int4(rint(v * ia)));
+              }
+              ascale[m * G + g] = m < R ? a : 0.0f;
+              xs[m * G + g] = sum;
+            }
+            """)
+
+    /// int8 activations x the 4-bit codes on the NAX tensor units, one 16 x 32 x `group` op per group:
+    /// each simdgroup stages its 32 x `group` tile as int8 (nibble - 8) in threadgroup memory, and the
+    /// epilogue adds s * a * C + (lo + 8 s) * sum(x) per group. 32 output columns per threadgroup,
+    /// SPLIT simdgroups over K, the codes of the next group prefetched in registers.
+    static func w4Source(layers: Int, group: Int) -> String {
+        let ru = group / 32  // packed uint4 per row and group
+        let tw = group / 16  // unpacked uint4 per row and group
+        var pick = """
+            const int K = ksz[0];
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
+            device float* out = out0; int N = ksz[2];
+
+            """
+        for l in 1 ..< layers {
+            pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+        }
+        return pick + """
+            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            const int G = K / \(group);
+            const int n0 = bx * 32;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_position_in_threadgroup.x;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, \(group), false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            threadgroup uint4 tiles[SPLIT * 32 * \(tw)];
+            threadgroup uint4* bs = tiles + sg * (32 * \(tw));
+            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs, dextents<int, 2>(\(group), 32));
+            auto tA0 = A.template slice<\(group), 16>(0, 0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            bool ok = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && ok; i++) {
+              auto ids = cT.get_multidimensional_index(i);
+              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+            }
+            float acc[16], accb[16];
+            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
+            const int m0 = mrow, m1 = mrow + 8;
+            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
+            const size_t rowU4 = (size_t)K / 32;
+            const device uint4* wsrc = (const device uint4*)w + (size_t)(n0 + lr) * rowU4 + lc;
+            uint4 wv[\(ru)];
+            for (int p = 0; p < \(ru); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + int(sg) * \(ru)]; }
+            for (int g = int(sg); g < G; g += SPLIT) {
+              for (int p = 0; p < \(ru); p++) {
+                const int r = lr + p * \(32 / ru);
+                const uint4 x = wv[p];
+                bs[r * \(tw) + 2 * lc] = uint4(LO(x.x), HI(x.x), LO(x.y), HI(x.y));
+                bs[r * \(tw) + 2 * lc + 1] = uint4(LO(x.z), HI(x.z), LO(x.w), HI(x.w));
+              }
+              if (g + SPLIT < G) { for (int p = 0; p < \(ru); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; } }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              auto tA = A.template slice<\(group), 16>(g * \(group), 0);
+              op.run(tA, Bt, cT);
+              const device half* sr = sT + (size_t)g * N + n0 + nb;
+              const device half* br = bT + (size_t)g * N + n0 + nb;
+              const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));
+              const float4 b0v = fma(float4(8.0f), s0v, float4(*(const device half4*)br));
+              const float4 b1v = fma(float4(8.0f), s1v, float4(*(const device half4*)(br + 16)));
+              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+              const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
+              for (int i = 0; i < 16; i++) {
+                const int j = (i & 3);
+                const float s = (i >> 3) ? s1v[j] : s0v[j];
+                const float b = (i >> 3) ? b1v[j] : b0v[j];
+                const bool hi = (i >> 2) & 1;
+                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                accb[i] = fma(b, hi ? x1 : x0, accb[i]);
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float* red = (threadgroup float*)tiles;
+            for (int i = 0; i < 16; i++) {
+              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+              red[sg * 512 + m * 32 + n] = acc[i] + accb[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            #undef LO
+            #undef HI
+            """
+    }
+
+    static let w4Kernels: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
+        let group = w4Group ?? 64
+        return MLXFast.metalKernel(
+            name: "df2_w4g\(group)_\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: w4Source(layers: layers, group: group), header: header, ensureRowContiguous: true)
+    }
+
+    /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
+    static func w4Linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray?, group: Int) -> [MLXArray]? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        // Each SIMD group prefetches its first K tile before entering the loop.
+        guard (1 ... 16).contains(rows), K % group == 0,
+            split > 0, K / group >= split
+        else { return nil }
+        let ops = layers.compactMap { w4Operands($0, group: group) }
+        guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
+        let G = K / group
+        let q = quantG(
+            [x.reshaped([rows, K]), (up ?? x).reshaped([rows, K]), MLXArray([Int32(K), Int32(rows)])],
+            template: [("SWIGLU", up == nil ? 0 : 1), ("KG", group)],
+            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[16 * K], [16 * G], [16 * G]],
+            outputDTypes: [.int8, .float32, .float32])
+        let ns = ops.map(\.n)
+        let sizes = MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        var inputs: [MLXArray] = [q[0]]
+        inputs += ops.map(\.w)
+        inputs += ops.map(\.sT)
+        inputs += ops.map(\.bT)
+        inputs += [q[1], q[2], sizes]
+        let kernel = w4Kernels[layers.count - 1]
+        let outs = kernel(
+            inputs,
             template: [("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
