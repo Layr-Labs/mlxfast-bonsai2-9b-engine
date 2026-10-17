@@ -499,25 +499,9 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// length once a round has finalized.
     func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int)
-
-    /// OPTIONAL (defaulted): absorb pending committed context rows into the
-    /// drafter's caches now, without proposing, and return the cache arrays
-    /// the caller must evaluate within the current step. The engine calls it
-    /// once per request, at the prompt-completion boundary, so the drafter's
-    /// prompt-context projection — a pure function of committed seed rows,
-    /// with no token drafted — runs inside `free_decode_begin`'s work instead
-    /// of opening the first timed decode round. A drafter that absorbs
-    /// lazily keeps the default and nothing changes.
-    func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
-    /// Lazy absorption is the default: the next `proposeBlock` projects the
-    /// pending rows itself, the parent behavior.
-    public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
-        []
-    }
-
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
     /// branch never reaches these, so a caller that does has taken the wrong

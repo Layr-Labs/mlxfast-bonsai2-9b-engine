@@ -180,30 +180,6 @@ extension EngineLoopV2 {
             committedObservationRows.append(
                 .init(id: row.rec.id, assistantState: state))
             committedObservationEvalTargets.append(hidden)
-            // PROMPT-COMPLETION boundary only: the sampling prefill chunk, or
-            // the explicit seed row when the carry is off. A block drafter
-            // absorbs the prompt context into its caches HERE, inside the
-            // begin step's evaluated work, so the first timed decode round
-            // starts from a warm drafter cache. Plain decode rows also
-            // sample, so `samples` alone would re-fire this on them; the
-            // prefill test keeps it to the one boundary per request. The
-            // returned cache arrays ride this step's evaluation targets —
-            // without them the absorption would stay a lazy graph and execute
-            // inside the decode window anyway.
-            // The chunk must END exactly at the prompt boundary with nothing
-            // generated yet: a preempted request's re-prefill replay also has
-            // a sampling non-decode chunk, but it ends past the prompt (it
-            // replays generated tokens) and the request has generated tokens.
-            let promptCount = row.rec.request.promptTokens.count
-            let completesPrompt =
-                row.rec.generatedTokenCount == 0
-                && row.start + row.count == promptCount
-                && ((row.samples && !row.isDecode)
-                    || (row.isSeed && row.start < promptCount))
-            if completesPrompt {
-                committedObservationEvalTargets.append(
-                    contentsOf: mtp.absorbCommittedContext(detachedState: state))
-            }
         }
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })

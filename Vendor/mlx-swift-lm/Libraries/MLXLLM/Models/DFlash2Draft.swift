@@ -559,41 +559,6 @@ private final class DFlash2Attention: Module {
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
     }
-
-    /// The CONTEXT half of `callAsFunction`, with no block: the same sliding
-    /// skip, the same k/v projections, norms, rotation at the cache's offset
-    /// and `cache.update`, in the same order on the same operands. A later
-    /// forward over the remaining rows continues the cache exactly where a
-    /// single combined pass would have put it, which is also how every
-    /// steady-state round already extends this cache.
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
-        var context = context
-        var contextLength = context.dim(1)
-        if let slidingWindow {
-            let skip = DFlash2SlidingMask.contextSkip(
-                contextLength: contextLength, slidingWindow: slidingWindow)
-            if skip > 0 {
-                context = context[0..., skip..., 0...]
-                contextLength = context.dim(1)
-                if let base = cache as? BaseKVCache {
-                    base.offset += skip
-                }
-            }
-        }
-        let B = context.dim(0)
-        var contextKeys: MLXArray, contextValues: MLXArray
-        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
-            (contextKeys, contextValues) = (kv[0], kv[1])
-        } else {
-            (contextKeys, contextValues) = (kProj(context), vProj(context))
-        }
-        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        contextKeys = rope(contextKeys, offset: cache.offset)
-        _ = cache.update(keys: contextKeys, values: contextValues)
-    }
 }
 
 // MARK: - The grouped dynamic causal convolution
@@ -761,13 +726,6 @@ private final class DFlash2DecoderLayer: Module {
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
         return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
     }
-
-    /// Context-only: nothing of the block runs (no norms, convolutions, MLP
-    /// or attention output), only the attention sub-layer's context keys and
-    /// values enter the cache.
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
-        selfAttn.absorbContext(context, rope: rope, cache: cache)
-    }
 }
 
 // MARK: - The candidate selector
@@ -895,12 +853,31 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// width. The proposals run on a throwaway cache and are discarded; nothing
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
+        prepareTiledCodes()
         let cache = try makeCache()
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
+    }
+
+    /// Every launch grouping the fast path issues, for the tiled self-check, and the
+    /// linears whose stored codes no path reads once the tiled copy is adopted. `fc`,
+    /// `k_proj` and `v_proj` keep theirs: the prompt's context (more than 16 rows)
+    /// runs them through the stored-layout quantized matmul.
+    private func prepareTiledCodes() {
+        let selector = candidateSelector.hiddenProjection
+        var launches: [[Linear]] = [[fc], [selector]]
+        var unread: [Linear] = [selector]
+        for layer in layers {
+            let a = layer.selfAttn, m = layer.mlp
+            let kp = [layer.attentionConv.kernelProjection, layer.mlpConv.kernelProjection]
+            launches += [[a.qProj, a.kProj, a.vProj], [a.kProj, a.vProj], [a.oProj], [m.gate, m.up], [m.down]]
+            launches += kp.map { [$0] }
+            unread += [a.qProj, a.oProj, m.gate, m.up, m.down] + kp
+        }
+        DF2Fast.adoptTiled(launches: launches, unread: unread)
     }
 
     // MARK: The cache
@@ -988,26 +965,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return DF2Fast.rms(h, norm)
-    }
-
-    /// Absorb committed context rows into the drafter's caches without
-    /// proposing: the context side of `hiddenStates` — the `fc` projection,
-    /// `hiddenNorm`, and each layer's context keys and values — on the same
-    /// operands in the same order, with no block forward. `blockContext` in
-    /// a later `propose` continues these caches exactly as a steady-state
-    /// round's incremental absorption does.
-    public func absorbContext(targetHidden: MLXArray, cache: [KVCache]) throws {
-        guard cache.count == layers.count else {
-            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
-        }
-        guard targetHidden.dim(-1) == config.targetHiddenSize else {
-            throw DFlash2Error.targetHiddenSizeMismatch(
-                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
-        }
-        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
-        for (index, layer) in layers.enumerated() {
-            layer.absorbContext(context, rope: rope, cache: cache[index])
-        }
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
@@ -1252,12 +1209,117 @@ enum DF2Fast {
             source: matmulSource(layers: layers), header: header, ensureRowContiguous: true)
     }
 
+    /// The record kernel over the tiled copy (`tiledOperands`): each (32-column block, group)
+    /// is one contiguous 1088-byte tile, the 1024 code bytes already int8 (`^ 0x80`) in the
+    /// `[32 columns][32 K]` order the kernel stages for the tensor op, then the 32 columns'
+    /// FP16 scales. A lane moves its 32 code bytes with two 16-byte loads. The bias term is
+    /// gone: every bias is -128 * scale, so the record's `fma(128, s, b)` is +0 and adds
+    /// nothing. Same tensor-op operands, same FP32 epilogue order: bitwise the record
+    /// (self-tested at load, `adoptTiled`).
+    static func tiledSource(layers: Int) -> String {
+        var pick = """
+            const int K = ksz[0];
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; device float* out = out0; int N = ksz[2];
+
+            """
+        for l in 1 ..< layers {
+            pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+        }
+        return pick + """
+            const int G = K / 32;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_position_in_threadgroup.x;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            threadgroup uint32_t bs[SPLIT][32 * 8];
+            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
+            auto tA0 = A.template slice<32, 16>(0, 0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            bool ok = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && ok; i++) {
+              auto ids = cT.get_multidimensional_index(i);
+              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+            }
+            float acc[16];
+            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; }
+            const int m0 = mrow, m1 = mrow + 8;
+            const device uint32_t* tiles = w + (size_t)bx * G * 272;
+            threadgroup uint32_t* sdst = bs[sg] + lane * 4;
+            const int so = 256 + nb / 2;
+            const device uint32_t* t0 = tiles + (size_t)sg * 272;
+            uint4 c0 = *(const device uint4*)(t0 + lane * 4), c1 = *(const device uint4*)(t0 + 128 + lane * 4);
+            uint2 h0 = *(const device uint2*)(t0 + so), h1 = *(const device uint2*)(t0 + so + 8);
+            for (int g = int(sg); g < G; g += SPLIT) {
+              *(threadgroup uint4*)sdst = c0;
+              *(threadgroup uint4*)(sdst + 128) = c1;
+              const float4 s0v = float4(df2_h2f(h0.x & 0xffffu), df2_h2f(h0.x >> 16), df2_h2f(h0.y & 0xffffu), df2_h2f(h0.y >> 16));
+              const float4 s1v = float4(df2_h2f(h1.x & 0xffffu), df2_h2f(h1.x >> 16), df2_h2f(h1.y & 0xffffu), df2_h2f(h1.y >> 16));
+              if (g + SPLIT < G) {
+                const device uint32_t* tn = tiles + (size_t)(g + SPLIT) * 272;
+                c0 = *(const device uint4*)(tn + lane * 4); c1 = *(const device uint4*)(tn + 128 + lane * 4);
+                h0 = *(const device uint2*)(tn + so); h1 = *(const device uint2*)(tn + so + 8);
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              auto tA = A.template slice<32, 16>(g * 32, 0);
+              op.run(tA, Bt, cT);
+              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+              for (int i = 0; i < 16; i++) {
+                const int j = (i & 3);
+                const float s = (i >> 3) ? s1v[j] : s0v[j];
+                const bool hi = (i >> 2) & 1;
+                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup float red[SPLIT][16 * 32];
+            for (int i = 0; i < 16; i++) {
+              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+              red[sg][m * 32 + n] = acc[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
+              out[(size_t)(e >> 5) * N + bx * 32 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+    }
+
+    /// FP16 bits -> FP32 with integer ops only, so an FP16 subnormal scale (the drafter has
+    /// them) converts exactly whatever the GPU's half conversion does with subnormals.
+    static let tiledHeader = header + """
+        inline float df2_h2f(uint h) {
+          const uint m = h & 0x7fffu;
+          const float v = m < 0x400u ? float(m) * 5.9604644775390625e-8f : as_type<float>((m << 13) + 0x38000000u);
+          return (h & 0x8000u) ? -v : v;
+        }
+
+        """
+
+    static let tiledMatmuls: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "df2_i8_tiled\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + ["ascale", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: tiledSource(layers: layers), header: tiledHeader, ensureRowContiguous: true)
+    }
+
+    /// One linear's matmul operands: the stored codes with FP32 scale and bias transposes
+    /// (record), or the tiled copy alone (`sT == nil`).
     final class Operands {
-        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
-        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
+        let w: MLXArray, sT: MLXArray?, bT: MLXArray?, n: Int, k: Int
+        init(w: MLXArray, sT: MLXArray?, bT: MLXArray?, n: Int, k: Int) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
         }
     }
+
+    /// Whether the fast path reads the tiled copies (set once, by `adoptTiled`).
+    nonisolated(unsafe) static var tiledOn = false
     nonisolated(unsafe) static var operandCache: [ObjectIdentifier: Operands] = [:]
     nonisolated(unsafe) static var baseCache: [ObjectIdentifier: MLXArray] = [:]
     nonisolated(unsafe) static var normCache: [ObjectIdentifier: MLXArray] = [:]
@@ -1277,17 +1339,98 @@ enum DF2Fast {
         return MLXFast.rmsNorm(x.asType(.float32), weight: weight, eps: norm.eps)
     }
 
+    static func eligible(_ layer: Linear) -> QuantizedLinear? {
+        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
+            q.biases != nil, q.bias == nil, q.weight.dim(0) % 32 == 0
+        else { return nil }
+        return q
+    }
+
+    static func recordOperands(_ q: QuantizedLinear) -> Operands {
+        let sT = contiguous(q.scales.asType(.float32).transposed())
+        let bT = contiguous(q.biases!.asType(.float32).transposed())
+        eval(sT, bT)
+        return Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
+    }
+
+    /// The tiled copy `[N/32, G, 272]` uint32 (`tiledSource`). The FP32 scales are FP16
+    /// values (Q8_0 block scales), narrowed here with integer ops: exact, subnormals included.
+    static func tiledOperands(_ q: QuantizedLinear) -> Operands {
+        let n = q.weight.dim(0), g = q.weight.dim(1) / 8
+        let codes = (q.weight ^ MLXArray(UInt32(0x8080_8080)))
+            .reshaped([n / 32, 32, g, 8]).transposed(0, 2, 1, 3).reshaped([n / 32, g, 256])
+        let bits = q.scales.asType(.float32).view(dtype: .uint32)
+        let magnitude = bits & MLXArray(UInt32(0x7fff_ffff))
+        let normal = (magnitude >> MLXArray(UInt32(13))) - MLXArray(UInt32(0x1_c000))
+        let subnormal = (abs(q.scales.asType(.float32)) * Float(16_777_216)).asType(.uint32)
+        let half = (which(magnitude .>= MLXArray(UInt32(0x3880_0000)), normal, subnormal)
+            | ((bits >> MLXArray(UInt32(16))) & MLXArray(UInt32(0x8000)))).asType(.uint16)
+        let scales = contiguous(half.reshaped([n / 32, 32, g]).transposed(0, 2, 1))
+            .view(dtype: .uint32)
+        let tiled = contiguous(concatenated([codes, scales], axis: 2))
+        eval(tiled)
+        return Operands(w: tiled, sT: nil, bT: nil, n: n, k: q.weight.dim(1) * 4)
+    }
+
     static func operands(_ layer: Linear) -> Operands? {
         if let o = operandCache[ObjectIdentifier(layer)] { return o }
-        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
-            let biases = q.biases, q.bias == nil, q.weight.dim(0) % 32 == 0
-        else { return nil }
-        let sT = contiguous(q.scales.asType(.float32).transposed())
-        let bT = contiguous(biases.asType(.float32).transposed())
-        eval(sT, bT)
-        let o = Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
+        guard let q = eligible(layer) else { return nil }
+        let o = tiledOn ? tiledOperands(q) : recordOperands(q)
         operandCache[ObjectIdentifier(layer)] = o
         return o
+    }
+
+    /// Build the tiled copy of every linear in `launches`, run each launch on one fixed
+    /// probe through the record kernel (stored codes) and the tiled kernel, and compare the
+    /// outputs bit for bit. All equal: the fast path reads the tiled copies from here on, and
+    /// the stored codes, scales and biases of `unread` are released. Any difference, or an
+    /// ineligible linear: the record path, nothing released. One stderr line either way.
+    static func adoptTiled(launches: [[Linear]], unread: [Linear]) {
+        tiledOn = false
+        guard on, ProcessInfo.processInfo.environment["DF2_TILED"] != "0" else { return }
+        var tiled: [ObjectIdentifier: Operands] = [:]
+        for layer in launches.joined() where tiled[ObjectIdentifier(layer)] == nil {
+            guard let q = eligible(layer) else {
+                report("off (ineligible linear)")
+                return
+            }
+            tiled[ObjectIdentifier(layer)] = tiledOperands(q)
+        }
+        var probes: [Int: MLXArray] = [:]
+        var mismatches = 0, values = 0
+        for group in launches {
+            let k = group[0].weight.dim(1) * 4
+            let x = probes[k] ?? MLXRandom.normal([16, k], key: MLXRandom.key(UInt64(7919 + k)))
+            probes[k] = x
+            guard let record = launch(x, group.map { recordOperands(eligible($0)!) }),
+                let candidate = launch(x, group.map { tiled[ObjectIdentifier($0)]! })
+            else {
+                report("off (launch refused)")
+                return
+            }
+            let differing = zip(record, candidate).map {
+                ($0.view(dtype: .uint32) .!= $1.view(dtype: .uint32)).asType(.int32).sum()
+            }
+            mismatches += stacked(differing).sum().item(Int.self)
+            values += record.reduce(0) { $0 + $1.size }
+        }
+        guard mismatches == 0 else {
+            report("off (\(mismatches) of \(values) probe outputs differ from the stored layout)")
+            return
+        }
+        for (key, o) in tiled { operandCache[key] = o }
+        tiledOn = true
+        for layer in unread {
+            guard let q = eligible(layer) else { continue }
+            q.weight._updateInternal(MLXArray.zeros([1], dtype: .uint32))
+            q.scales._updateInternal(MLXArray.zeros([1], dtype: .float32))
+            q.biases?._updateInternal(MLXArray.zeros([1], dtype: .float32))
+        }
+        report("on (\(launches.count) launches, \(values) probe outputs bitwise equal; \(unread.count) stored code sets released)")
+    }
+
+    private static func report(_ verdict: String) {
+        FileHandle.standardError.write(Data("[dflash2] tiled drafter codes \(verdict)\n".utf8))
     }
 
     /// Activation codes of x [.., K] (rows <= 16); `up` makes them silu(x) * up.
@@ -1309,13 +1452,22 @@ enum DF2Fast {
     static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
         guard on, (1 ... 3).contains(layers.count) else { return nil }
         let ops = layers.compactMap { operands($0) }
-        guard ops.count == layers.count, ops.allSatisfy({ $0.k == x.dim(-1) }),
-            let (xq, ascale, xs, rows) = codes(x, up: up)
+        guard ops.count == layers.count else { return nil }
+        return launch(x, ops, up: up)
+    }
+
+    /// One matmul launch over `ops` (all tiled or all record), x [.., K] with <= 16 rows.
+    static func launch(_ x: MLXArray, _ ops: [Operands], up: MLXArray? = nil) -> [MLXArray]? {
+        guard ops.allSatisfy({ $0.k == x.dim(-1) }), let (xq, ascale, xs, rows) = codes(x, up: up)
         else { return nil }
         let ns = ops.map(\.n)
-        let outs = matmuls[layers.count - 1](
-            [xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT)
-                + [ascale, xs, MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
+        let dims = MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })
+        let record = ops.compactMap(\.sT).count == ops.count
+        guard record || ops.allSatisfy({ $0.sT == nil }) else { return nil }
+        let outs = (record ? matmuls : tiledMatmuls)[ops.count - 1](
+            record
+                ? [xq] + ops.map(\.w) + ops.compactMap(\.sT) + ops.compactMap(\.bT) + [ascale, xs, dims]
+                : [xq] + ops.map(\.w) + [ascale, dims],
             template: [("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })

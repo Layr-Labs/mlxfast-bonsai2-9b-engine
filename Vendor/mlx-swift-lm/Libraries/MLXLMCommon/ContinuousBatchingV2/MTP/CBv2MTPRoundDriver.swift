@@ -702,26 +702,6 @@ final class CBv2MTPRoundDriver {
         stateful.observeCommittedTarget(observation, requestState: detachedState)
     }
 
-    /// `DARKBLOOM_BONSAI_DFLASH_PROMPT_IN_BEGIN=0` restores lazy absorption
-    /// (the first proposal projects the prompt context inside the first
-    /// decode round, the parent behavior).
-    static let dflashPromptAbsorbEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFLASH_PROMPT_IN_BEGIN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Seed-prefill boundary: a block drafter absorbs its pending prompt
-    /// context into its caches now, so the projection runs inside the begin
-    /// step's work. Returns the arrays the step must evaluate; a chain
-    /// drafter, a disabled switch, or an empty pending set return nothing.
-    func absorbCommittedContext(detachedState: any CBv2MTPRequestState) -> [MLXArray] {
-        guard Self.dflashPromptAbsorbEnabled,
-            let block = drafter as? any CBv2MTPBlockDrafter
-        else { return [] }
-        return block.absorbPendingContext(requestState: detachedState)
-    }
-
     func marginalDepth(
         for id: CBv2RequestID,
         offeredDepth: Int,
