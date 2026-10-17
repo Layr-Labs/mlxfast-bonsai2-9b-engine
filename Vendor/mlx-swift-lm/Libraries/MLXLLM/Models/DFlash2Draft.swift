@@ -319,6 +319,10 @@ public protocol DFlash2Target: AnyObject {
     /// The target's output projection, applied through the target's module. The
     /// drafter applies any config-level logit transform itself.
     func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray
+    /// The same output projection over the vocabulary prefix `0 ..< rows` only:
+    /// the target head's first `rows` output rows, through the same module type
+    /// and transform. Proposals only; the target's verify head stays full.
+    func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray
     /// Build, at load, the per-process state the target's `rows`-row verify head
     /// would otherwise build inside the first measured window. Never changes a token.
     func prepareDFlash2Verify(rows: Int)
@@ -326,6 +330,97 @@ public protocol DFlash2Target: AnyObject {
 
 extension DFlash2Target {
     public func prepareDFlash2Verify(rows: Int) {}
+    public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
+        logitsForDFlash2Hidden(hidden)
+    }
+}
+
+/// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 98304
+/// are the tokenizer's Latin, code and byte-level merges; the rows above are
+/// CJK and other scripts. A draft never reaches the output unverified: the
+/// target's full head checks every drafted token, so a narrower draft
+/// vocabulary changes only which tokens are proposed. `DF2_VOCAB=0` restores
+/// the full head.
+enum DF2Vocab {
+    static let rows: Int = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "") ?? 98304
+}
+
+/// The target head's prefix rows as one module, kept OFF the module tree (see
+/// `DFlash2TapSlot`). Its weight, scales and biases are row slices of the full
+/// head's arrays: views of the same buffers, no copy. Built once per head
+/// instance, at bind (load time), and kept only after a bitwise self-check.
+public final class DFlash2DraftHeadSlot {
+    private var source: ObjectIdentifier?
+    private var rows = 0
+    private var prefix: HadamardQuantizedLinear?
+
+    public init() {}
+
+    public func head(of full: HadamardQuantizedLinear, rows: Int) -> HadamardQuantizedLinear? {
+        if source == ObjectIdentifier(full), self.rows == rows { return prefix }
+        source = ObjectIdentifier(full)
+        self.rows = rows
+        prefix = nil
+        guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
+            rows > 0, rows < full.weight.dim(0)
+        else {
+            Self.report(rows, "off (head packing or row count does not qualify)")
+            return nil
+        }
+        guard
+            let candidate = try? HadamardQuantizedLinear(
+                weight: full.weight[0 ..< rows], scales: full.scales[0 ..< rows],
+                biases: biases[0 ..< rows], groupSize: full.groupSize, bits: full.bits,
+                transform: full.transform, gdnLayout: full.gdnLayout)
+        else {
+            Self.report(rows, "off (prefix module rejected)")
+            return nil
+        }
+        if let mismatch = Self.selfCheck(prefix: candidate, full: full, rows: rows) {
+            Self.report(rows, "off (\(mismatch); full head kept)")
+            return nil
+        }
+        Self.report(rows, "on (bitwise equal to the full head's first \(rows) columns, 15 rows, FP32 and BF16)")
+        prefix = candidate
+        return prefix
+    }
+
+    /// The prefix head against the full head's first `rows` output columns on a
+    /// fixed activation shaped like a proposal's (15 rows, a strided view of a
+    /// 16-row block), in FP32 (the fast drafter's hidden) and BF16 (the plain
+    /// drafter's). Nil when every bit matches, else the first difference found.
+    static func selfCheck(
+        prefix: HadamardQuantizedLinear, full: HadamardQuantizedLinear, rows: Int
+    ) -> String? {
+        let width = full.transform.width
+        let values = (0 ..< 16 * width).map { i -> Float in
+            let t = Double(i)
+            return Float(Foundation.sin(t * 0.7548776) * (1 + 0.5 * Foundation.cos(t * 0.0137)))
+        }
+        let block = MLXArray(values, [1, 16, width])
+        for dtype in [DType.float32, .bfloat16] {
+            let x = block.asType(dtype)[0..., 1..., 0...]
+            let p = prefix(x)
+            let f = full(x)[0..., 0..., 0 ..< rows]
+            guard p.shape == f.shape, p.dtype == f.dtype else {
+                return "\(dtype) shape or dtype differs"
+            }
+            let pf = contiguous(p.asType(.float32)).view(dtype: .uint32)
+            let ff = contiguous(f.asType(.float32)).view(dtype: .uint32)
+            let perRow = (pf .!= ff).asType(.int32).reshaped([-1, rows]).sum(axis: -1)
+            let counts = perRow.asArray(Int32.self)
+            let bad = counts.indices.filter { counts[$0] != 0 }
+            if !bad.isEmpty {
+                return "\(dtype): \(counts.reduce(0) { $0 + Int($1) }) values differ in rows "
+                    + bad.map(String.init).joined(separator: ",")
+            }
+        }
+        return nil
+    }
+
+    private static func report(_ rows: Int, _ state: String) {
+        FileHandle.standardError.write(Data("DF2 vocab prefix \(rows): \(state)\n".utf8))
+    }
 }
 
 /// Where a tower keeps its tap state, deliberately OFF the module tree.
@@ -1177,6 +1272,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
         }
         self.target = target
+        // Build the prefix head (and run its bitwise self-check) at load, on
+        // both drafter paths, so no proposal pays for it.
+        let rows = DF2Vocab.rows
+        if rows >= config.dflash.selectorTopK && rows < config.vocabularySize {
+            let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
+            eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
+        }
         if DF2Fast.on { try prepareFirstRound(target) }
     }
 
@@ -1362,7 +1464,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        var logits = target.logitsForDFlash2Hidden(hidden)
+        let rows = DF2Vocab.rows
+        var logits =
+            rows >= config.dflash.selectorTopK && rows < config.vocabularySize
+            ? target.draftLogitsForDFlash2Hidden(hidden, rows: rows)
+            : target.logitsForDFlash2Hidden(hidden)
         if config.dflash.outputMultiplier != 1 {
             logits = logits * config.dflash.outputMultiplier
         }
