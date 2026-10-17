@@ -7,6 +7,7 @@
 // a batch never touches this object (batch membership is just list membership
 // in `CBv2LayerCache.rows`).
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -151,8 +152,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
-        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        if keys!.ndim == 4, newKeys.ndim == 4, values!.ndim == 4, newValues.ndim == 4 {
+            keys = Self.sliceUpdate(keys!, newKeys, absoluteOffset ..< (absoluteOffset + n))
+            values = Self.sliceUpdate(values!, newValues, absoluteOffset ..< (absoluteOffset + n))
+        } else {
+            keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
+            values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        }
         absoluteOffset += n
 
         return (
@@ -200,6 +206,27 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     // MARK: - Private
+
+    /// `dst[..., range, :] = update` as one SliceUpdate on the 4-D update.
+    /// The subscript setter first drops the update's leading singleton axis
+    /// with a reshape, and a reshape of a strided update (the transposed
+    /// verify values) is a full copy before the slice-update copy. Same
+    /// primitive, same source elements, same bits.
+    private static func sliceUpdate(
+        _ dst: MLXArray, _ update: MLXArray, _ range: Range<Int>
+    ) -> MLXArray {
+        let start: [Int32] = [0, 0, Int32(range.lowerBound), 0]
+        let stop: [Int32] = [
+            Int32(dst.dim(0)), Int32(dst.dim(1)), Int32(range.upperBound), Int32(dst.dim(3)),
+        ]
+        let strides: [Int32] = [1, 1, 1, 1]
+        var result = mlx_array_new()
+        let rc = mlx_slice_update(
+            &result, dst.ctx, update.ctx, start, start.count, stop, stop.count,
+            strides, strides.count, StreamOrDevice.default.ctx)
+        precondition(rc == 0, "CBv2FullSequenceKV: mlx_slice_update failed (\(rc))")
+        return MLXArray(result)
+    }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
