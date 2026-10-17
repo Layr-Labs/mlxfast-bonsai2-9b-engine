@@ -412,6 +412,12 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// rounds this shallower one. Default nil (drafted rounds keep the
     /// declared depth).
     var lookupMissDraftDepth: Int? { get }
+    /// Verify rows appended after a lookup-miss round's drafted chain, filled
+    /// by the device-side history continuation (`CBv2MTPChainExtension`) up
+    /// to the declared depth. The drafter finalizes such a round with more
+    /// committed rows than it staged; they join its trusted history exactly
+    /// like a lookup round's. Default 0 (no extension).
+    var lookupMissExtensionDepth: Int { get }
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -432,6 +438,7 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
     public var lookupDraftNgram: Int? { nil }
     public var lookupMissDraftDepth: Int? { nil }
+    public var lookupMissExtensionDepth: Int { 0 }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,

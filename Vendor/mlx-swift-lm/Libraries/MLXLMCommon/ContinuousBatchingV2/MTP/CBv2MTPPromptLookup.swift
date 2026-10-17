@@ -9,6 +9,8 @@
 // proposal source differs, so the target still decides every emitted token.
 // Engine-thread confined, one index per request.
 
+import MLX
+
 /// Incremental n-gram index over one request's append-only host token
 /// history. An n-gram enters the index once `depth` committed tokens follow
 /// it, so a hit always proposes a full chain and never matches the row's own
@@ -72,5 +74,72 @@ final class CBv2MTPPromptLookupIndex {
             value = (value ^ UInt64(truncatingIfNeeded: token)) &* 0x0000_0100_0000_01b3
         }
         return value
+    }
+}
+
+/// Device-side continuation of a drafted chain from the row's own history.
+///
+/// A drafted round's chain ends with tokens the host has not seen yet, so the
+/// host index above cannot extend it. This kernel does the same kind of
+/// lookup on the device: over `history ++ chain` it finds the most recent
+/// earlier position whose trailing 3-gram, else 2-gram, else 1-gram equals
+/// the sequence's own last tokens, and proposes the tokens that followed it
+/// (periodically, when the occurrence is closer to the end than the
+/// extension is long). Without any occurrence it proposes the last token
+/// again. The proposals are ordinary drafts: target verification decides
+/// every emitted token, so a wrong guess costs only its verify row.
+enum CBv2MTPChainExtension {
+    private static let kernel = MLXFast.metalKernel(
+        name: "cbv2_mtp_chain_extension",
+        inputNames: ["history", "chain"], outputNames: ["extension"],
+        source: """
+            const int L = history_shape[0];
+            const int M = chain_shape[0];
+            const int T = L + M;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint lanes = threads_per_threadgroup.x;
+            #define CBV2_AT(i) ((i) < L ? history[(i)] : chain[(i) - L])
+            const int k1 = CBV2_AT(T - 1);
+            const int k2 = T >= 2 ? CBV2_AT(T - 2) : -1;
+            const int k3 = T >= 3 ? CBV2_AT(T - 3) : -1;
+            int best = -1;
+            for (int j = int(lane); j <= T - 2; j += int(lanes)) {
+                if (CBV2_AT(j) != k1) { continue; }
+                int level = 1;
+                if (j >= 1 && CBV2_AT(j - 1) == k2) {
+                    level = 2;
+                    if (j >= 2 && CBV2_AT(j - 2) == k3) { level = 3; }
+                }
+                best = max(best, level * T + j);
+            }
+            threadgroup int partial[32];
+            best = simd_max(best);
+            if (thread_index_in_simdgroup == 0) { partial[simdgroup_index_in_threadgroup] = best; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                const uint groups = (lanes + 31) / 32;
+                for (uint g = 0; g < groups; ++g) { best = max(best, partial[g]); }
+                if (best < 0) {
+                    for (int e = 0; e < E; ++e) { extension[e] = k1; }
+                } else {
+                    const int j = best % T;
+                    const int period = T - 1 - j;
+                    for (int e = 0; e < E; ++e) { extension[e] = CBV2_AT(j + 1 + e % period); }
+                }
+            }
+            #undef CBV2_AT
+            """)
+
+    /// `count` proposals [count] int32 continuing `history` (host tokens,
+    /// oldest first, ending with the round's seed) followed by `chain`, the
+    /// round's drafted tokens [M] int32.
+    static func extend(history: [Int], chain: MLXArray, count: Int) -> MLXArray {
+        precondition(count > 0 && !history.isEmpty, "CBv2 chain extension needs history and a count")
+        let historyArray = MLXArray(history.map { Int32(truncatingIfNeeded: $0) })
+        return kernel(
+            [historyArray, chain.asType(.int32).reshaped([-1])],
+            template: [("E", count)],
+            grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[count]], outputDTypes: [.int32])[0]
     }
 }
