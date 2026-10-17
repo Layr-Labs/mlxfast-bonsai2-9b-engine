@@ -202,12 +202,46 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 }
 
 public struct CBv2RecurrentLayerState {
-    public let conv: MLXArray?
-    public let ssm: MLXArray?
+    private let storedConv: MLXArray?
+    private let storedSSM: MLXArray?
+    /// Non-nil when this state is not built yet: reading `conv` or `ssm`
+    /// builds it once. A model forward that recognizes `deferred.inputs` can
+    /// compute the state inside its own kernel instead.
+    public let deferred: CBv2DeferredRecurrentLayerState?
+
+    public var conv: MLXArray? { deferred.map { $0.state.storedConv } ?? storedConv }
+    public var ssm: MLXArray? { deferred.map { $0.state.storedSSM } ?? storedSSM }
 
     public init(conv: MLXArray?, ssm: MLXArray?) {
-        self.conv = conv
-        self.ssm = ssm
+        self.storedConv = conv
+        self.storedSSM = ssm
+        self.deferred = nil
+    }
+
+    public init(deferred: CBv2DeferredRecurrentLayerState) {
+        self.storedConv = nil
+        self.storedSSM = nil
+        self.deferred = deferred
+    }
+}
+
+/// A layer state described by the inputs that produce it, built on first read.
+public final class CBv2DeferredRecurrentLayerState {
+    public let inputs: AnyObject
+    private var make: (() -> CBv2RecurrentLayerState)?
+    private var built: CBv2RecurrentLayerState?
+
+    public init(inputs: AnyObject, make: @escaping () -> CBv2RecurrentLayerState) {
+        self.inputs = inputs
+        self.make = make
+    }
+
+    public var state: CBv2RecurrentLayerState {
+        if let built { return built }
+        let state = make!()
+        built = state
+        make = nil
+        return state
     }
 }
 
@@ -237,7 +271,7 @@ public struct CBv2RecurrentPrefixReplayStage {
     public init(
         positions: Int,
         finalConv: MLXArray,
-        finalSSM: MLXArray,
+        finalSSM: MLXArray?,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -703,7 +737,7 @@ public final class CBv2RecurrentStateEvaluation {
         modelLayerIndex: Int,
         positions: Int,
         finalConv: MLXArray,
-        finalSSM: MLXArray,
+        finalSSM: MLXArray?,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,

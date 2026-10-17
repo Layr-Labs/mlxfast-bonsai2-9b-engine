@@ -1470,6 +1470,32 @@ enum Qwen35RegisterGatedSIMD {
     }
 }
 
+/// One GDN layer's committed state after `keep` rows of a fused verify window
+/// that stored no final state, held as the window's inputs: its input state,
+/// conv input, conv output (the value rows), normalized keys and gate inputs.
+final class Qwen35GDNReplayInputs {
+    let state: MLXArray
+    let convIn: MLXArray
+    let convOut: MLXArray
+    let k: MLXArray
+    let a: MLXArray
+    let b: MLXArray
+    let keep: Int
+
+    init(
+        state: MLXArray, convIn: MLXArray, convOut: MLXArray, k: MLXArray, a: MLXArray,
+        b: MLXArray, keep: Int
+    ) {
+        self.state = state
+        self.convIn = convIn
+        self.convOut = convOut
+        self.k = k
+        self.a = a
+        self.b = b
+        self.keep = keep
+    }
+}
+
 /// Verify-width GDN middle in one kernel: `Qwen35FusedConvSilu`,
 /// `Qwen35FusedQKNorm`, the contiguous copy of the value slice and
 /// `Qwen35RegisterGatedSIMD`. Each threadgroup of the recurrence (one value
@@ -1482,11 +1508,7 @@ enum Qwen35RegisterGatedSIMD {
 enum Qwen35FusedGDNVerify {
     static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
-        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+    private static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -1716,8 +1738,214 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
+        """
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+        source: source,
         header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `DARKBLOOM_BONSAI_GDN_FUSED_REPLAY=0` keeps the verify that stores its
+    /// final state, and the separate replay kernel after a partial acceptance.
+    static let replayEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDN_FUSED_REPLAY"] != "0"
+
+    /// The kernel above without the window's final-state and conv-tail stores.
+    /// With `REPLAY`, each threadgroup first runs `prev_a_shape[1]` (keep) rows
+    /// of the previous window from that window's input state, with
+    /// `Qwen35RegisterGatedSIMD.runReplay`'s recurrence text, stores the
+    /// result (the committed state) as `state_out`, and continues the scan
+    /// from it; the conv state is the previous conv input at row keep, as raw
+    /// bits, or with -0 -> +0 when keep is the whole window (the conv tail
+    /// that a full acceptance commits).
+    private static let replaySource: String = {
+        var s = source
+        func swap(_ from: String, _ to: String, count: Int = 1) {
+            precondition(
+                s.components(separatedBy: from).count == count + 1,
+                "qwen35 fused replay kernel source: \(from)")
+            s = s.replacingOccurrences(of: from, with: to)
+        }
+        let finalStore = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              device float4* s_out4
+            """
+        let parts = s.components(separatedBy: finalStore)
+        precondition(parts.count == 2, "qwen35 fused replay kernel source: final store")
+        s = parts[0]
+        swap(
+            "conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);", "",
+            count: 2)
+        swap("conv_state[t * C + c]", "QWEN35_CONV_STATE(t, c)", count: 2)
+        swap("conv_state[r * C + c]", "QWEN35_CONV_STATE(r, c)")
+        swap(
+            """
+            {
+              #pragma clang fp reassociate(off)
+              // Conv + SiLU
+            """,
+            """
+            const uint keep = REPLAY ? uint(prev_a_shape[1]) : 0u;
+            const bool keep_all = keep == uint(prev_k_shape[1]);
+            #define QWEN35_CONV_STATE(r, c) (REPLAY \\
+                ? qwen35_committed_conv(prev_conv_in[(keep + (r)) * C + (c)], keep_all) \\
+                : conv_state[(r) * C + (c)])
+            if (REPLAY) {
+              float negative_a = 0.0f;
+              float bias = 0.0f;
+              if (lane == 0) {
+                negative_a = -metal::precise::exp(a_log[hv_idx]);
+                bias = dt_bias[hv_idx];
+              }
+              const device float* k_ = prev_k + hk_idx * Dk + dk0;
+              const device float* v_ = prev_conv_out + 2 * Hk * Dk + hv_idx * Dv + dvbase;
+              const device float* a_ = prev_a + hv_idx;
+              const device float* bb_ = prev_b + hv_idx;
+              float kr[R];
+              for (uint t = 0; t < keep; ++t) {
+                float local_g = 0.0f, local_beta = 0.0f;
+                if (lane == 0) {
+                  local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);
+                  local_beta = qwen35_simd_gate_beta(bb_[0]);
+                }
+                const float gt = simd_broadcast(local_g, 0);
+                const float bt = simd_broadcast(local_beta, 0);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  const float4 k4 = ((const device float4*)k_)[j];
+                  kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+                }
+                float kv[DVPL];
+                float vt[DVPL];
+                const float2 v2 = *((const device float2*)v_);
+                vt[0] = v2.x; vt[1] = v2.y;
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < R / 4; ++j) {
+                    state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+                    state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+                    a0 = fma(state[d][4 * j], kr[4 * j], a0);
+                    a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+                    a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+                    a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+                  }
+                  kv[d] = (a0 + a1) + (a2 + a3);
+                }
+                kv[0] += simd_shuffle_xor(kv[0], 4);
+                kv[1] += simd_shuffle_xor(kv[1], 4);
+                kv[0] += simd_shuffle_xor(kv[0], 2);
+                kv[1] += simd_shuffle_xor(kv[1], 2);
+                kv[0] += simd_shuffle_xor(kv[0], 1);
+                kv[1] += simd_shuffle_xor(kv[1], 1);
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  const float delta = (vt[d] - kv[d]) * bt;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < R / 4; ++j) {
+                    state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+                    state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+                    state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+                    state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+                  }
+                }
+                k_ += Hk * Dk; v_ += C; a_ += Hv; bb_ += Hv;
+              }
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+                }
+              }
+            }
+            {
+              #pragma clang fp reassociate(off)
+              // Conv + SiLU
+            """)
+        return s
+    }()
+
+    private static let replayKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused_replay",
+        inputNames: [
+            "conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in",
+            "prev_conv_in", "prev_conv_out", "prev_k", "prev_a", "prev_b",
+        ],
+        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out"],
+        source: replaySource,
+        header: Qwen35RegisterGatedSIMD.gateHeader + """
+
+            inline float qwen35_committed_conv(float x, bool detach) {
+                const uint xb = as_type<uint>(x);
+                return as_type<float>(detach && xb == 0x80000000u ? 0u : xb);
+            }
+            """)
+
+    /// `(convIn, convOut, q, k, y, committedState)` of a verify window whose
+    /// kernel stores no final state. With `previous` (the last verify's
+    /// inputs and its accepted row count), the window starts from the state
+    /// after those rows, which the kernel computes and returns as
+    /// `committedState`; `convState` and `state` are not read. Without it,
+    /// the window starts from `convState` and `state` and `committedState` is
+    /// nil. Nil when the shapes do not take the fused path.
+    static func applyReplaying(
+        convState: MLXArray?, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray?, previous: Qwen35GDNReplayInputs?,
+        keyHeads: Int, valueHeads: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray?)? {
+        let C = qkv.dim(-1)
+        guard qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
+            C == 2 * keyHeads * 128 + valueHeads * 128,
+            valueHeads % keyHeads == 0, qkv.dtype == .float32,
+            convWeight.dtype == .float32, convWeight.shape == [C, 4, 1],
+            a.dtype == .float32, b.dtype == .float32, aLog.dtype == .float32,
+            dtBias.dtype == .float32,
+            a.shape == [1, qkv.dim(1), valueHeads], b.shape == a.shape,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let S = qkv.dim(1)
+        let stateShape = [1, valueHeads, 128, 128]
+        let inputs: [MLXArray]
+        if let previous {
+            let P = previous.k.dim(1)
+            guard previous.k.shape == [1, P, keyHeads, 128],
+                previous.convIn.shape == [1, P + 3, C], previous.convOut.shape == [1, P, C],
+                previous.a.shape == [1, P, valueHeads], previous.b.shape == previous.a.shape,
+                previous.state.shape == stateShape, (1 ... P).contains(previous.keep),
+                [previous.k, previous.convIn, previous.convOut, previous.a, previous.b,
+                    previous.state].allSatisfy({ $0.dtype == .float32 })
+            else { return nil }
+            inputs = [
+                previous.convIn, qkv, convWeight, a, b, aLog, dtBias, previous.state,
+                previous.convIn, previous.convOut, previous.k,
+                previous.a[0..., 0 ..< previous.keep], previous.b,
+            ]
+        } else {
+            guard let convState, let state, convState.shape == [1, 3, C],
+                convState.dtype == .float32, state.dtype == .float32, state.shape == stateShape
+            else { return nil }
+            inputs = [convState, qkv, convWeight, a, b, aLog, dtBias, state, convState, qkv, a, a, b]
+        }
+        let outputs = replayKernel(
+            inputs,
+            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern)),
+                ("REPLAY", previous == nil ? 0 : 1)],
+            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+            outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                [1, S, valueHeads, 128], previous == nil ? [1] : stateShape],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4],
+            previous == nil ? nil : outputs[5])
+    }
 
     /// `(convIn, convOut, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -2584,23 +2812,46 @@ final class Qwen35GatedDeltaNet: Module {
             (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, boundary: boundary)
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        let fusedEligible = !exactTargetVerify && conv1d.bias == nil && convKernelSize == 4
+            && headKDim == 128 && headVDim == 128
+        let fusedReplay = fusedEligible && Qwen35FusedGDNVerify.replayEnabled
+        // A committed state that the last fused verify left as its inputs:
+        // this verify's kernel replays the accepted rows instead of reading it.
+        let previous = fusedReplay && B == 1
+            ? recurrentState[0].inputState(modelLayerIndex: modelLayerIndex)?.deferred?.inputs
+                as? Qwen35GDNReplayInputs
+            : nil
+        let replayed = previous.flatMap { previous in
+            Qwen35FusedGDNVerify.applyReplaying(
+                convState: nil, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: nil, previous: previous,
+                keyHeads: numKHeads, valueHeads: numVHeads)
         }
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        let convState: MLXArray?
+        let ssmState: MLXArray
+        if let replayed {
+            convState = nil
+            ssmState = replayed.5!
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+        }
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -2608,17 +2859,30 @@ final class Qwen35GatedDeltaNet: Module {
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
         // Verify windows of 3 ... 8 rows: conv, SiLU, q/k norm and the scan
-        // in one kernel (`Qwen35FusedGDNVerify`), the same bits.
-        let fusedMiddle = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
-            || headKDim != 128 || headVDim != 128
-            ? nil : Qwen35FusedGDNVerify.apply(
+        // in one kernel (`Qwen35FusedGDNVerify`), the same bits. In the
+        // replay form the kernel stores no final state (nil here).
+        let fusedMiddle: (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray?, MLXArray?)?
+        if let replayed {
+            fusedMiddle = (replayed.0, replayed.1, replayed.2, replayed.3, replayed.4, nil, nil)
+        } else if !fusedEligible {
+            fusedMiddle = nil
+        } else if fusedReplay {
+            fusedMiddle = Qwen35FusedGDNVerify.applyReplaying(
                 convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: ssmState, previous: nil,
+                keyHeads: numKHeads, valueHeads: numVHeads
+            ).map { ($0.0, $0.1, $0.2, $0.3, $0.4, nil, nil) }
+        } else {
+            fusedMiddle = Qwen35FusedGDNVerify.apply(
+                convState: convState!, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState,
-                keyHeads: numKHeads, valueHeads: numVHeads)
+                keyHeads: numKHeads, valueHeads: numVHeads
+            ).map { ($0.0, $0.1, $0.2, $0.3, $0.4, $0.5, $0.6) }
+        }
         let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
             || convKernelSize != 4
-            ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
-        let convInput = fusedMiddle?.0 ?? fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
+            ? nil : Qwen35FusedConvSilu.apply(state: convState!, qkv: qkv, weight: conv1d.weight)
+        let convInput = fusedMiddle?.0 ?? fusedConv?.0 ?? concatenated([convState!, qkv], axis: 1)
         let convOut: MLXArray
         if let fusedMiddle {
             convOut = fusedMiddle.1
@@ -2640,25 +2904,32 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = fusedMiddle.map { ($0.4, $0.5) } ?? updateRecurrence(
-                q: qNormed,
-                k: kNormed,
-                v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
-                state: ssmState,
-                mask: nil)
+            let recurrence: (MLXArray, MLXArray?)
+            if let fusedMiddle {
+                recurrence = (fusedMiddle.4, fusedMiddle.5)
+            } else {
+                let unfused = updateRecurrence(
+                    q: qNormed,
+                    k: kNormed,
+                    v: v,
+                    a: a,
+                    b: b,
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: ssmState,
+                    mask: nil)
+                recurrence = (unfused.0, unfused.1)
+            }
             out = recurrence.0
             let finalSsmState = recurrence.1
+
 
             // The fused path has one row; capture only its tail buffer.
             let fusedTail = fusedMiddle?.6
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState[rowRange]
+                let finalSSM = finalSsmState?[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
                     q: qNormed[rowRange],
@@ -2679,8 +2950,9 @@ final class Qwen35GatedDeltaNet: Module {
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
-                let inputSSM =
-                    evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
+                // A replayed window's input state is this kernel's own output.
+                let inputSSM = replayed != nil
+                    ? nil : evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
                 if B > 1 || inputSSM == nil {
                     if let ssmPre = tape.ssmPre { roots.append(ssmPre) }
                 }
@@ -2705,9 +2977,37 @@ final class Qwen35GatedDeltaNet: Module {
                     }
                     return total
                 }
-                let materializedBytes = checkedByteCount(roots + [finalSSM])
+                let materializedBytes = checkedByteCount(roots + (finalSSM.map { [$0] } ?? []))
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
-                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                // Without a stored final state, a full acceptance also keeps
+                // the whole tape until the next verify replays it.
+                let fullAcceptanceRetainedRoots =
+                    finalSSM == nil ? strictReplayRoots : [tape.convInput]
+                let fullAcceptanceRetainedBytes = checkedByteCount(fullAcceptanceRetainedRoots)
+                // The committed state after `keep` rows, as this window's
+                // inputs: the next fused verify computes it in its kernel; any
+                // other reader builds it here, with the bits of the stored path.
+                let deferredState = { [unowned self] (keep: Int) -> CBv2RecurrentLayerState in
+                    let replayInputs = Qwen35GDNReplayInputs(
+                        state: tape.ssmPre!, convIn: tape.convInput, convOut: convOutBacking,
+                        k: tape.k, a: tape.a, b: tape.b, keep: keep)
+                    return CBv2RecurrentLayerState(deferred: CBv2DeferredRecurrentLayerState(
+                        inputs: replayInputs
+                    ) {
+                        guard keep == S else {
+                            return self.replayedPrefixState(tape: tape, committedRows: keep)
+                        }
+                        let ssm = Qwen35RegisterGatedSIMD.runReplay(
+                            q: tape.q, k: tape.k, v: tape.v, a: tape.a, b: tape.b,
+                            aLog: self.aLog, dtBias: self.dtBias, state: tape.ssmPre!,
+                            convInput: tape.convInput
+                        ).0
+                        return CBv2RecurrentLayerState(
+                            conv: finalConv + MLXArray.zeros(
+                                finalConv.shape, dtype: finalConv.dtype),
+                            ssm: ssm)
+                    })
+                }
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -2719,8 +3019,9 @@ final class Qwen35GatedDeltaNet: Module {
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
                         strictReplayRetainedRoots: strictReplayRoots,
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
-                        fullAcceptanceRetainedRoots: [tape.convInput],
+                        fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
                         fullAcceptance: {
+                            guard let finalSSM else { return deferredState(S) }
                             // The fused kernel wrote these bits to their own
                             // buffer; otherwise add zero to detach the tail.
                             let detachedConv = fusedTail ?? finalConv + MLXArray.zeros(
@@ -2729,8 +3030,10 @@ final class Qwen35GatedDeltaNet: Module {
                                 conv: detachedConv, ssm: finalSSM)
                         },
                         replay: { [unowned self] keepPositions in
-                            self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                            finalSSM == nil
+                                ? deferredState(keepPositions)
+                                : self.replayedPrefixState(
+                                    tape: tape, committedRows: keepPositions)
                         })
                 } catch {
                     preconditionFailure(
