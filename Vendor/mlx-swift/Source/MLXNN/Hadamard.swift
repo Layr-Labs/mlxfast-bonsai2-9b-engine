@@ -1570,7 +1570,7 @@ struct PromptInt8Activation {
 /// same number on both, and the epilogue is the same three roundings in the
 /// same order, with explicit `fma` so contraction cannot change it. The M2
 /// path (`plain`) therefore produces the M5 path's (`nax`) bits;
-/// `naxMatchesPlain` confirms it on the device before `nax` is used.
+/// `checkKernels` confirms it on the device before `nax` is used.
 enum PromptInt8Matmul {
     enum Route { case nax, plain, off }
 
@@ -1669,7 +1669,7 @@ enum PromptInt8Matmul {
           for (int b = 0; b < 2; b++) {
             const size_t nidx = (size_t)g * N + n0 + sn + 8 * b + fn;
             const float2 s2 = float2(*(const device half2*)(scalesT + nidx));
-            const float2 b2 = float2(*(const device half2*)(biasesT + nidx));
+            const float2 b2 = NEG ? -s2 : float2(*(const device half2*)(biasesT + nidx));
             #pragma clang loop unroll(full)
             for (int a = 0; a < 2; a++) {
               const auto e = c[a][b].thread_elements();
@@ -1788,6 +1788,90 @@ enum PromptInt8Matmul {
         }
         """
 
+    // `naxSource` with the same values reached by fewer instructions: each
+    // word's four planes go to threadgroup memory as one uint4 (the base is
+    // 16-word aligned; the same bytes at the same addresses), the four
+    // consecutive outputs i ... i + 3 of one row (c = 0 ... 3) leave as one
+    // float4 (nb and N are multiples of 4), and with `NEG = 1` (a module
+    // whose FP16 offsets are bit for bit its negated scales, checked at
+    // init) the offsets are `-s` instead of a second load, the same FP32
+    // value. The epilogue's arithmetic and order are unchanged.
+    static let naxVectorSource = """
+        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int n0 = int(threadgroup_position_in_grid.x) * 64;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        threadgroup uint32_t bs[2][64 * 128 / 4];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
+        auto tA0 = A.template slice<128, 64>(0, m0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        constexpr int CAP = 32;
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        const int nb = n0 + 16 * int(sg & 1) + fn;
+        const int mb = m0 + 16 * int(sg >> 1) + fm;
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
+        const int NQ = N / 4;
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
+        const int sc = int(tid >> 1); const int sh = int(tid & 1);
+        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        auto stage = [&](int g, int buf) {
+          const device uint4* src = (const device uint4*)(wrow + g * 8);
+          const uint4 v = *src;
+          threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint32_t wv = v[j];
+            *(threadgroup uint4*)(dst + 4 * j) = uint4(
+                wv & 0x03030303u, (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
+          }
+        };
+        stage(0, 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int g = 0; g < Kg; g++) {
+          const int cur = g & 1;
+          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
+          auto tA = A.template slice<128, 64>(g * 128, m0);
+          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
+          const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
+          const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
+          const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+          float as[4], rb[4];
+          as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
+          rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float t = s * float(cT[i]);
+            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i += 4) {
+          const int nh = (i >> 3) & 1;
+          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
+          *(device float4*)(out + (size_t)mm * N + nb + 32 * nh) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+        }
+        """
+
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_prompt_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -1796,19 +1880,40 @@ enum PromptInt8Matmul {
         header: naxHeader,
         ensureRowContiguous: true)
 
+    private static let naxVectorKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_nax_vector",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxVectorSource,
+        header: naxHeader,
+        ensureRowContiguous: true)
+
+    /// The tensor kernel the `nax` route runs: the vector form when it
+    /// matches the plain kernel at load, else the record form.
+    nonisolated(unsafe) private static var naxVector = false
+    /// The `NEG = 1` forms matched their `NEG = 0` twins at load.
+    nonisolated(unsafe) private static var negativeForms = false
+
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int,
+        vector: Bool, negative: Bool
     ) -> MLXArray {
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
+        let neg = [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
         if route == .nax {
+            if vector {
+                return naxVectorKernel(
+                    inputs, template: neg, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+            }
             return naxKernel(
                 inputs, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
         }
         return plainKernel(
-            inputs, grid: (n / 32 * 128, m / 32, 1), threadGroup: (128, 1, 1),
+            inputs, template: neg, grid: (n / 32 * 128, m / 32, 1), threadGroup: (128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
@@ -1826,36 +1931,64 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Compiles and runs the tensor kernel on a fixed, input-independent
-    /// 128 x 128 x 512 problem (2 x 2 tiles, 4 groups) and compares it bit for bit with the plain
-    /// kernel. False on a compile error (caught by a scoped MLX error
-    /// handler) or on any differing output.
-    private static func naxMatchesPlain() -> Bool {
+    /// Runs the kernels on a fixed, input-independent 128 x 128 x 512
+    /// problem (2 x 2 tiles, 4 groups) and compares output bits. First the
+    /// plain kernel's `NEG = 1` form against its `NEG = 0` form on offsets
+    /// that are the negated scales. On a NAX device then the vector tensor
+    /// kernel (both forms) against the plain kernel, else the record tensor
+    /// kernel against the plain kernel. Sets `naxVector` and `negativeForms`;
+    /// false when no tensor kernel matches. A compile error (caught by a
+    /// scoped MLX error handler) counts as a mismatch.
+    @discardableResult
+    private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
         let m = 128, n = 128, k = 512, kg = k / 128
         let codes = MLXArray((0 ..< m * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [m, k])
         let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
         let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
         let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
         let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
         let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
-        var same = false
+        func output(_ route: Route, _ offsets: MLXArray, vector: Bool, negative: Bool) -> MLXArray {
+            run(route, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, vector: vector, negative: negative)
+                .view(dtype: .uint32)
+        }
+        func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            let equal = MLX.all(a .== b)
+            eval(equal)
+            return !checkFailed && equal.item(Bool.self)
+        }
+        var matched = false
+        naxVector = false
+        negativeForms = false
         withErrorHandler({ message in
             if !PromptInt8Matmul.checkFailed { PromptInt8Matmul.checkNote = String(message.prefix(160)) }
             PromptInt8Matmul.checkFailed = true
         }) {
-            let plain = run(
-                .plain, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
-            let nax = run(
-                .nax, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
-            let equal = MLX.all(plain .== nax)
-            eval(equal)
-            if !checkFailed { same = equal.item(Bool.self) }
+            let plain = output(.plain, biasesT, vector: false, negative: false)
+            let plainNegated = output(.plain, negatedT, vector: false, negative: false)
+            let plainNeg = same(output(.plain, negatedT, vector: false, negative: true), plainNegated)
+            guard nax else {
+                matched = !checkFailed
+                negativeForms = plainNeg
+                return
+            }
+            if same(output(.nax, biasesT, vector: true, negative: false), plain) {
+                matched = true
+                naxVector = true
+                negativeForms = plainNeg && same(output(.nax, negatedT, vector: true, negative: true), plainNegated)
+            } else {
+                checkFailed = false
+                matched = same(output(.nax, biasesT, vector: false, negative: false), plain)
+            }
         }
-        if !checkFailed { checkNote = same ? "bit-identical" : "outputs differ" }
-        return !checkFailed && same
+        if !checkFailed {
+            checkNote = !matched ? "outputs differ"
+                : "bit-identical (\(nax ? (naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+        }
+        return matched
     }
 
     /// Decided once, at the first packed module's init. A NAX device takes
@@ -1871,8 +2004,9 @@ enum PromptInt8Matmul {
         if ["0", "false", "no", "off"].contains(value ?? "") {
             chosen = .off
         } else if architectureHasNAX(architecture) {
-            chosen = naxMatchesPlain() ? .nax : .off
+            chosen = checkKernels(nax: true) ? .nax : .off
         } else {
+            checkKernels(nax: false)
             chosen = .plain
         }
         FileHandle.standardError.write(
@@ -1885,14 +2019,18 @@ enum PromptInt8Matmul {
     /// has at most 7 rows), in whole 64-row tiles.
     static func applies(rows: Int) -> Bool { rows >= 128 && rows % 64 == 0 }
 
+    /// `negative`: the module's offsets are its negated scales
+    /// (`PromptInt8Constants.negative`).
     static func matmul(
-        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
+        negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
             weight: weight, scalesT: scalesT, biasesT: biasesT,
-            m: activation.rows, k: activation.k, n: weight.dim(0))
+            m: activation.rows, k: activation.k, n: weight.dim(0),
+            vector: naxVector, negative: negative && negativeForms)
     }
 }
 
@@ -1914,7 +2052,7 @@ enum PromptInt8Matmul {
 /// simdgroup's threadgroup buffer) and finds each element's (m, n) through
 /// `get_multidimensional_index`, so it assumes no fragment layout. `plain`
 /// gets C from FP32 FMAs and lane shuffles. Same integers, same FP32 steps in
-/// the same order: the same bits, which `naxMatchesPlain` checks on the device
+/// the same order: the same bits, which `checkKernels` checks on the device
 /// before `nax` is used.
 enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
@@ -1977,7 +2115,7 @@ enum VerifyInt8Matmul {
             }
             if (j < ROWS) {
               const float s = float(scalesT[(size_t)g * N + n0 + n]);
-              const float bb = float(biasesT[(size_t)g * N + n0 + n]);
+              const float bb = NEG ? -s : float(biasesT[(size_t)g * N + n0 + n]);
               const float tt = s * cm;
               acc[t] = fma(bb, rb, fma(a, tt, acc[t]));
             }
@@ -2090,6 +2228,97 @@ enum VerifyInt8Matmul {
         }
         """
 
+    // `naxSource` with the same values reached by fewer instructions: the
+    // simdgroup partials are summed and stored four columns at a time (the
+    // same `((p0 + p1) + p2) + p3` per element, contraction off; n0 and N
+    // are multiples of 32), and with `NEG = 1` (offsets bit for bit the
+    // negated scales, checked at init) each lane's offset is `-s` instead
+    // of a second load, the same FP16 value.
+    static let naxVectorSource = """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = ksz[0]; const int N = ksz[2];
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+        threadgroup uint32_t bs[4][32 * 32];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
+        constexpr int CAP = 16;
+        const int cap = int(cT.get_capacity());
+        short em[CAP], en[CAP];
+        bool live[CAP];
+        float acc[CAP];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) {
+          em[i] = 16; en[i] = 0;
+          if (i < cap) {
+            auto ids = cT.get_multidimensional_index(i);
+            en[i] = short(ids[0]); em[i] = short(ids[1]);
+          }
+          live[i] = simd_any(em[i] < ROWS);
+          acc[i] = 0.0f;
+        }
+        const int j = int(lane & 7u);
+        const int c = int(lane >> 3);
+        const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
+        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
+        uint32_t wv[8];
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + int(sg) * 8]; }
+        for (int g = int(sg); g < Kg; g += 4) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) {
+            const uint32_t v = wv[t];
+            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+          }
+          const half sv = scalesT[(size_t)g * N + n0 + lane];
+          const half2 sb = half2(sv, NEG ? -sv : biasesT[(size_t)g * N + n0 + lane]);
+          const int lr = min(int(lane), ROWS - 1);
+          const float2 ar = lane < uint(ROWS) ? float2(ascale[lr * Kg + g], rsb[lr * Kg + g]) : float2(0.0f);
+          if (g + 4 < Kg) {
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + (g + 4) * 8]; }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          op.run(tA, B, cT);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < CAP; i++) {
+            if (live[i]) {
+              const half2 s2 = simd_shuffle(sb, ushort(en[i]));
+              const float2 a2 = simd_shuffle(ar, ushort(em[i] & 15));
+              const float t = float(s2.x) * float(cT[i]);
+              acc[i] = fma(float(s2.y), a2.y, fma(a2.x, t, acc[i]));
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup float* red = (threadgroup float*)bs[sg];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < CAP; i++) {
+          if (em[i] < ROWS) { red[em[i] * 32 + en[i]] = acc[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup float4* r0 = (const threadgroup float4*)bs[0];
+        const threadgroup float4* r1 = (const threadgroup float4*)bs[1];
+        const threadgroup float4* r2 = (const threadgroup float4*)bs[2];
+        const threadgroup float4* r3 = (const threadgroup float4*)bs[3];
+        for (int e = int(tid); e < ROWS * 8; e += 128) {
+          float4 v = r0[e] + r1[e];
+          v = v + r2[e];
+          v = v + r3[e];
+          *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = cap == CAP ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_verify_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -2098,13 +2327,31 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    private static let naxVectorKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_vector",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxVectorSource,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
+    /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
+    nonisolated(unsafe) private static var naxVector = false
+    nonisolated(unsafe) private static var negativeForms = false
+
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int,
+        vector: Bool, negative: Bool
     ) -> MLXArray {
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
-        return (route == .nax ? naxKernel : plainKernel)(
-            [codes, weight, scalesT, biasesT, ascale, rsb, dims], template: [("ROWS", m)],
+        let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
+        let rows = [("ROWS", m)] as [(String, any KernelTemplateArg)]
+        let neg = rows + [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
+        let kernel = route == .nax ? (vector ? naxVectorKernel : naxKernel) : plainKernel
+        return kernel(
+            inputs, template: route == .nax && !vector ? rows : neg,
             grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
@@ -2112,11 +2359,14 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Runs both kernels on a fixed, input-independent 4 x 64 x 1024 problem
-    /// (two threadgroups, two groups per simdgroup) and compares them bit for
-    /// bit. False on a compile error (caught by a scoped MLX error handler) or
-    /// on any differing output.
-    private static func naxMatchesPlain() -> Bool {
+    /// Runs the kernels on a fixed, input-independent 4 x 64 x 1024 problem
+    /// (two threadgroups, two groups per simdgroup) and compares output
+    /// bits, as `PromptInt8Matmul.checkKernels`: the plain `NEG = 1` form
+    /// against `NEG = 0` on negated-scale offsets, then on a NAX device the
+    /// vector tensor kernel (both forms), else the record tensor kernel,
+    /// against the plain kernel.
+    @discardableResult
+    private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
         let m = 4, n = 64, k = 1024, kg = k / 128
         let codes = MLXArray(
@@ -2125,25 +2375,48 @@ enum VerifyInt8Matmul {
         let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
         let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
         let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
         let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
         let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
-        var same = false
+        func output(_ route: Route, _ offsets: MLXArray, vector: Bool, negative: Bool) -> MLXArray {
+            run(route, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, vector: vector, negative: negative)
+                .view(dtype: .uint32)
+        }
+        func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            let equal = MLX.all(a .== b)
+            eval(equal)
+            return !checkFailed && equal.item(Bool.self)
+        }
+        var matched = false
+        naxVector = false
+        negativeForms = false
         withErrorHandler({ message in
             if !VerifyInt8Matmul.checkFailed { VerifyInt8Matmul.checkNote = String(message.prefix(160)) }
             VerifyInt8Matmul.checkFailed = true
         }) {
-            let plain = run(
-                .plain, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
-            let nax = run(
-                .nax, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                scalesT: scalesT, biasesT: biasesT, m: m, k: k, n: n)
-            let equal = MLX.all(plain .== nax)
-            eval(equal)
-            if !checkFailed { same = equal.item(Bool.self) }
+            let plain = output(.plain, biasesT, vector: false, negative: false)
+            let plainNegated = output(.plain, negatedT, vector: false, negative: false)
+            let plainNeg = same(output(.plain, negatedT, vector: false, negative: true), plainNegated)
+            guard nax else {
+                matched = !checkFailed
+                negativeForms = plainNeg
+                return
+            }
+            if same(output(.nax, biasesT, vector: true, negative: false), plain) {
+                matched = true
+                naxVector = true
+                negativeForms = plainNeg && same(output(.nax, negatedT, vector: true, negative: true), plainNegated)
+            } else {
+                checkFailed = false
+                matched = same(output(.nax, biasesT, vector: false, negative: false), plain)
+            }
         }
-        if !checkFailed { checkNote = same ? "bit-identical" : "outputs differ" }
-        return !checkFailed && same
+        if !checkFailed {
+            checkNote = !matched ? "outputs differ"
+                : "bit-identical (\(nax ? (naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+        }
+        return matched
     }
 
     /// Decided once, at the first packed module's init. A NAX device takes
@@ -2160,8 +2433,9 @@ enum VerifyInt8Matmul {
         if ["0", "false", "no", "off"].contains(value ?? "") {
             chosen = .off
         } else if value == "nax" || PromptInt8Matmul.architectureHasNAX(architecture) {
-            chosen = naxMatchesPlain() ? .nax : .off
+            chosen = checkKernels(nax: true) ? .nax : .off
         } else {
+            checkKernels(nax: false)
             chosen = .plain
         }
         FileHandle.standardError.write(
@@ -2171,13 +2445,15 @@ enum VerifyInt8Matmul {
     }()
 
     static func matmul(
-        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
+        negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
             weight: weight, scalesT: scalesT, biasesT: biasesT,
-            m: activation.rows, k: activation.k, n: weight.dim(0))
+            m: activation.rows, k: activation.k, n: weight.dim(0),
+            vector: naxVector, negative: negative && negativeForms)
     }
 }
 
@@ -2186,6 +2462,11 @@ enum VerifyInt8Matmul {
 /// module parameter tree.
 final class PromptInt8Constants {
     private var transposed: (MLXArray, MLXArray)?
+    /// Every FP16 offset is bit for bit its negated scale, so the int8
+    /// kernels may use `-s` for the offset (`NEG = 1`). Read once at init.
+    let negative: Bool
+
+    init(negative: Bool) { self.negative = negative }
 
     func get(scales: MLXArray, biases: MLXArray) -> (MLXArray, MLXArray) {
         if let transposed { return transposed }
@@ -2234,10 +2515,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         }
         self.gdnLayout = gdnLayout
         self.transform = transform
-        self.readsFloat16ConstantsInPlace =
+        let inPlace =
             bits == 2 && groupSize == 128 && scales.dtype == .float16
             && biases?.dtype == .float16 && transform.width % 512 == 0
             && weight.dim(0) % 8 == 0
+        self.readsFloat16ConstantsInPlace = inPlace
+        var negative = false
+        if inPlace, transform.blockSize == 4096, let biases {
+            let flipped = scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))
+            negative = MLX.all(biases.view(dtype: .uint16) .== flipped).item(Bool.self)
+        }
+        self.promptConstants = PromptInt8Constants(negative: negative)
         super.init(
             weight: weight, bias: bias, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
@@ -2251,7 +2539,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
     let readsFloat16ConstantsInPlace: Bool
 
-    private let promptConstants = PromptInt8Constants()
+    private let promptConstants: PromptInt8Constants
     let exactHeadBounds = ExactVerifyHeadBounds()
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
@@ -2264,7 +2552,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = PromptInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
     }
@@ -2304,7 +2593,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 let codes = PromptInt8Activation(
                     codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
                 let output = VerifyInt8Matmul.matmul(
-                    codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
+                    codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: layer.promptConstants.negative)!
                     .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
                 return layer.bias.map { output + $0 } ?? output
             }
@@ -2313,7 +2603,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let codes = PromptInt8Activation(
                 codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
             let output = PromptInt8Matmul.matmul(
-                codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
+                codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                negative: layer.promptConstants.negative)!
                 .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
@@ -2341,7 +2632,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let (scalesT, biasesT) = layer.promptConstants.get(
                 scales: layer.scales, biases: layer.biases!)
             let output = PromptInt8Matmul.matmul(
-                activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)!
+                activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                negative: layer.promptConstants.negative)!
                 .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
@@ -2406,7 +2698,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let (scalesT, biasesT) = layer.promptConstants.get(
                 scales: layer.scales, biases: layer.biases!)
             guard let output = VerifyInt8Matmul.matmul(
-                boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+                boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                negative: layer.promptConstants.negative)
             else { return nil }
             outputs.append(
                 output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)]))
@@ -2437,7 +2730,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 let (scalesT, biasesT) = layer.promptConstants.get(
                     scales: layer.scales, biases: layer.biases!)
                 guard let output = VerifyInt8Matmul.matmul(
-                    activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT)
+                    activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: layer.promptConstants.negative)
                 else { return layer(x) }
                 let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
                 return layer.bias.map { reshaped + $0 } ?? reshaped
@@ -2463,7 +2757,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
     }
@@ -2510,7 +2805,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)
         else { return nil }
         let shaped = output.reshaped(Array(x.shape.dropLast(2)) + [weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
@@ -2529,7 +2825,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
@@ -2591,7 +2888,8 @@ extension HadamardQuantizedLinear {
         else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT)
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)
         else { return nil }
         let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
         let result = ExactVerifyHead.run(
