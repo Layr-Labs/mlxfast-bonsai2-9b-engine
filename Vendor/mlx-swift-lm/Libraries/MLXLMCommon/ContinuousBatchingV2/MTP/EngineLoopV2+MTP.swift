@@ -57,7 +57,7 @@ extension EngineLoopV2 {
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
-                counts: verify.rows.map { (id: $0.id, count: 1 + verify.k) })
+                counts: verify.rows.map { (id: $0.id, count: 1 + (verify.chainDepth ?? verify.k)) })
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 

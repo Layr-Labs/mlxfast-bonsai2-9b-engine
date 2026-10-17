@@ -145,6 +145,11 @@ final class CBv2MTPRoundInFlight {
         let blockContext: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Non-nil for a sibling window: its first `1 + chainDepth` columns
+        /// are the seed and the head's chain, and the next `chainDepth` are
+        /// sibling leaves, sibling `s` the head's runner-up for chain column
+        /// `s + 1`. `k` counts every proposal (`2 * chainDepth`).
+        var chainDepth: Int? = nil
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

@@ -498,6 +498,7 @@ extension EngineLoopV2 {
         }
         var seedTokens: [Int32] = []
         var carryHiddens: [MLXArray] = []
+        var siblingChainDepth: Int? = nil
         // Each capture paired with the row it was gathered from, so
         // `mtpFreezeCaptures` can fence it against that row's own storage.
         var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
@@ -652,6 +653,25 @@ extension EngineLoopV2 {
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
             }
+            // Sibling leaves: each head step's runner-up is verified at that
+            // step's position beside its draft (`CBv2MTPVerifyTree`), so a
+            // rejected draft whose runner-up is the target's token still
+            // confirms one more token from the sibling's own target row.
+            if batch == 1, k >= 2, stateful.proposesSiblingAlternates,
+                let state = rowMetadata[0].assistantState,
+                verifyRows[0].rec.request.positionState == nil,
+                verifyRows[0].rec.request.maxTokens - verifyRows[0].rec.generatedTokenCount
+                    > 2 * k + 1
+            {
+                // At most 8 verify rows (the exact head's widest call): the
+                // seed, the chain, and siblings for its first columns.
+                let alternates = stateful.roundAlternates(for: state)
+                let siblings = min(k, 7 - k)
+                if alternates.count == k, siblings >= 1 {
+                    draftSteps.append(contentsOf: alternates.prefix(siblings))
+                    siblingChainDepth = k
+                }
+            }
             // Submit the completed chain while the host constructs target
             // verification. Existing owners and the finalize fence retain it.
             if k > 1, StreamOrDevice.default == StreamOrDevice.gpu {
@@ -692,8 +712,11 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        CBv2MTPVerifyTree.chainRows = siblingChainDepth.map { 1 + $0 }
+        defer { CBv2MTPVerifyTree.chainRows = nil }
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
+        CBv2MTPVerifyTree.chainRows = nil
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -707,7 +730,7 @@ extension EngineLoopV2 {
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
-            k: k,
+            k: draftSteps.count,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
             draftIDs: draftIDs,
@@ -718,6 +741,7 @@ extension EngineLoopV2 {
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.chainDepth = siblingChainDepth
         return result
     }
 

@@ -2790,6 +2790,52 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return rescored[1][argMax(rescored[0], axis: 0, keepDims: true)]
     }
 
+    /// `screenedArgMax` plus a runner-up: the best full-width score among
+    /// every block's two leading-input finalists other than the winner. Both
+    /// are local row indices `[1]`; the runner-up is a proposal only.
+    public func screenedTopTwo(
+        _ x: MLXArray, width: Int, chunk: Int
+    ) -> (best: MLXArray, second: MLXArray)? {
+        let K = transform.width
+        let N = weight.dim(0)
+        guard readsFloat16ConstantsInPlace, bias == nil, gdnLayout == nil, let biases,
+            x.dtype == .float32, x.size == K, width > 0, width < K, width % 512 == 0,
+            chunk > 0, N % chunk == 0, (N / chunk) % 2 == 0
+        else { return nil }
+        let rotated = transform(x).reshaped([1, K])
+        let partial = DraftScreenQMV.partial(
+            [rotated, weight, scales, biases], template: [("P", width)],
+            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[N]], outputDTypes: [.float32])[0]
+        let blocks = N / chunk
+        let pick = argMax(partial.reshaped([blocks, chunk]), axis: -1)
+        let rescored = DraftScreenQMV.rescore(
+            [rotated, weight, scales, biases, pick], template: [("CH", chunk)],
+            grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        let bestBlock = argMax(rescored[0], axis: 0, keepDims: true)
+        let best = rescored[1][bestBlock]
+        // Runner-up: every block's first and second leading-input finalists,
+        // rescored at full width, minus the winner's row.
+        let blockScores = partial.reshaped([blocks, chunk])
+        let runnerPick = argMax(
+            MLX.where(
+                MLXArray(Int32(0) ..< Int32(chunk)).reshaped(1, chunk)
+                    .== pick.asType(.int32).reshaped(blocks, 1),
+                MLXArray(-Float.infinity), blockScores),
+            axis: -1)
+        let runner = DraftScreenQMV.rescore(
+            [rotated, weight, scales, biases, runnerPick], template: [("CH", chunk)],
+            grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        let values = concatenated([rescored[0], runner[0]], axis: 0)
+        let rows = concatenated([rescored[1], runner[1]], axis: 0)
+        let masked = MLX.where(rows .== best, MLXArray(-Float.infinity), values)
+        let second = rows[argMax(masked, axis: 0, keepDims: true)]
+        return (best, second)
+    }
+
+
     /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify-width GDN
     /// output with 128-wide norm heads, with the gate, the norm and the input
     /// rotation formed in one quantizing kernel. Nil when the route, the

@@ -417,6 +417,49 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if keepMask == nil, let chainRows = CBv2MTPVerifyTree.chainRows,
+            L > chainRows, L - chainRows < chainRows, window(of: kind) == nil,
+            !kind.isBidirectional, sinks == nil, softcap == nil
+        {
+            // Sibling verify window: the chain queries attend exactly as a
+            // chain-only window (its KV prefix ends before the siblings'
+            // slots); sibling s sees the prefix through chain row s and its
+            // own slot, which holds its keys at chain row s + 1's position.
+            let siblings = L - chainRows
+            let kL = cachedKeys.dim(2)
+            let chainKeys = cachedKeys[0..., 0..., 0 ..< (kL - siblings), 0...]
+            let chainValues = cachedValues[0..., 0..., 0 ..< (kL - siblings), 0...]
+            let chainQueries = queries[0..., 0..., 0 ..< chainRows, 0...]
+            let chainOut: MLXArray
+            if allowNativeVectorBatch,
+                canBatchSerialQueriesWithNativeVector(
+                    kind: kind, queries: chainQueries, keys: chainKeys, values: chainValues,
+                    sinks: nil, softcap: nil, keepMask: nil)
+            {
+                chainOut = attend(
+                    queries: chainQueries, keys: chainKeys, values: chainValues, scale: scale,
+                    L: chainRows, kL: kL - siblings, window: nil, sinks: nil, softcap: nil)
+            } else {
+                chainOut = attendSerialQueries(
+                    queries: chainQueries, keys: chainKeys, values: chainValues,
+                    newTokenCount: chainRows, window: nil, scale: scale,
+                    sinks: nil, softcap: nil, keepMask: nil)
+            }
+            let first = kL - L
+            let key = MLXArray(Int32(0) ..< Int32(kL)).reshaped(1, kL)
+            let sibling = MLXArray(Int32(0) ..< Int32(siblings)).reshaped(siblings, 1)
+            let visible = (key .<= (sibling + Int32(first)))
+                .|| (key .== (sibling + Int32(first + chainRows)))
+            let siblingQueries = queries[0..., 0..., chainRows..., 0...]
+            let siblingKeys =
+                cachedKeys.dtype == queries.dtype ? cachedKeys : cachedKeys.asType(queries.dtype)
+            let siblingValues =
+                cachedValues.dtype == queries.dtype ? cachedValues : cachedValues.asType(queries.dtype)
+            let siblingOut = MLXFast.scaledDotProductAttention(
+                queries: siblingQueries, keys: siblingKeys, values: siblingValues,
+                scale: scale, mask: .array(visible))
+            return concatenated([chainOut, siblingOut], axis: 2)
+        }
         if let keepMask {
             precondition(
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),

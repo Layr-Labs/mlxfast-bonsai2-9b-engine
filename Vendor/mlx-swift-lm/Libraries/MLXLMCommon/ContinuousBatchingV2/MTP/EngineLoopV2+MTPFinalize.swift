@@ -93,6 +93,9 @@ extension EngineLoopV2 {
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
+        // A sibling window's chain is what the scheduler advanced for; the
+        // sibling columns exist only in the verify window and its KV rows.
+        let chainK = verify.chainDepth ?? k
         var anyRejected = false
 
         struct RowOutcome {
@@ -101,6 +104,10 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            /// Tokens this row confirms before stop/length truncation.
+            let emittedTokens: [Int]
+            /// Accepted sibling leaf `s` (it took chain column `s + 1`'s place).
+            let sibling: Int?
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -133,12 +140,28 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
-            while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            var sibling: Int? = nil
+            let emittedTokens: [Int]
+            if let chain = verify.chainDepth {
+                while accepted < chain, targets[accepted] == drafts[accepted] { accepted += 1 }
+                if accepted < k - chain, drafts[chain + accepted] == targets[accepted] {
+                    // The runner-up at the first rejected column is the
+                    // target's token there; its sibling row's target follows.
+                    sibling = accepted
+                    emittedTokens = Array(targets[0 ... accepted]) + [targets[1 + chain + accepted]]
+                    accepted += 1
+                } else {
+                    emittedTokens = Array(targets[0 ... accepted])
+                }
+            } else {
+                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+                emittedTokens = Array(targets[0 ... accepted])
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
                 rec.request.maxTokens - rec.generatedTokenCount)
-            if let stopIndex = targets[..<naturalEmitted].firstIndex(where: {
+            if let stopIndex = emittedTokens[..<naturalEmitted].firstIndex(where: {
                 rec.request.stopTokens.contains($0)
             }) {
                 naturalEmitted = stopIndex + 1
@@ -150,7 +173,9 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    emittedTokens: emittedTokens,
+                    sibling: sibling))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -163,9 +188,9 @@ extension EngineLoopV2 {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
             let observedDrafts =
                 commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
+                ? commonEmitted : min(chainK, stepAccepted + 1)
             mtp.recordStepAcceptance(
-                drafted: k,
+                drafted: chainK,
                 accepted: stepAccepted,
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket,
@@ -178,7 +203,7 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.emittedTokens.prefix(commonEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.
@@ -217,9 +242,19 @@ extension EngineLoopV2 {
                 packet.reconcile(
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
-            let rejected = (1 + k) - confirmed
+            let rejected = (1 + chainK) - confirmed
+            let storageRejected = (1 + k) - confirmed
+            let siblingConfirmed = outcome.sibling.flatMap { confirmed == $0 + 2 ? $0 : nil }
             if let evaluations = verify.recurrentEvaluations[id] {
-                if evaluations.count == 1, evaluations[0].isCaptured {
+                if let siblingConfirmed, evaluations.count == 1, evaluations[0].isCaptured {
+                    do {
+                        try evaluations[0].commit(
+                            keepPositions: siblingConfirmed + 1, sibling: siblingConfirmed)
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 sibling MTP finalization failed for \(id): \(error)")
+                    }
+                } else if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
                     // accepted prefix commits by device-side selection of the
                     // captured state at position `confirmed`; zero confirmed
@@ -251,8 +286,21 @@ extension EngineLoopV2 {
                     }
                 }
             }
-            if rejected > 0 {
-                for sequence in metadata.storageRows { sequence.rollback(rejected) }
+            if let siblingConfirmed {
+                // Move the accepted sibling's K/V (written at its own slot
+                // after the chain) to the position it takes, chain column
+                // `siblingConfirmed + 1`, then drop everything after it.
+                for sequence in metadata.storageRows {
+                    let snapshot = sequence.snapshot()
+                    let slot = snapshot.offset - (1 + k) + (1 + chainK + siblingConfirmed)
+                    let siblingKeys = snapshot.keys[.ellipsis, slot ..< (slot + 1), 0...]
+                    let siblingValues = snapshot.values[.ellipsis, slot ..< (slot + 1), 0...]
+                    sequence.rollback(storageRejected + 1)
+                    _ = sequence.update(keys: siblingKeys, values: siblingValues)
+                }
+                anyRejected = true
+            } else if storageRejected > 0 {
+                for sequence in metadata.storageRows { sequence.rollback(storageRejected) }
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
@@ -283,9 +331,19 @@ extension EngineLoopV2 {
                         0 ..< committedDraftCount,
                         0...]
                 }
-                let committedDraftTokens = verify.draftIDs[
-                    batchIndex ..< batchIndex + 1,
-                    0 ..< committedDraftCount]
+                let committedDraftTokens: MLXArray
+                if let siblingConfirmed, committedDraftCount == siblingConfirmed + 1 {
+                    let leaf = verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        (chainK + siblingConfirmed) ..< (chainK + siblingConfirmed + 1)]
+                    committedDraftTokens = siblingConfirmed == 0 ? leaf : concatenated([
+                        verify.draftIDs[batchIndex ..< batchIndex + 1, 0 ..< siblingConfirmed], leaf,
+                    ], axis: 1)
+                } else {
+                    committedDraftTokens = verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount]
+                }
                 if let carry = metadata.lookupCarry {
                     // A lookup round staged nothing. The carry transition
                     // its skipped first draft step would have consumed joins
@@ -337,7 +395,7 @@ extension EngineLoopV2 {
             // Per-request timing: this verify row confirmed at the step's
             // readback-done instant (already read by `finalize`).
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
-            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            rec.recordMTPRound(drafted: chainK, accepted: observedAccepted)
             if confirmed > 0 {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
@@ -349,7 +407,7 @@ extension EngineLoopV2 {
             // a consumer checks is
             // `numComputedAfter == tokensCountAfter - 1`.
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                drafted: chainK, accepted: observedAccepted, emitted: confirmed,
                 lookup: metadata.lookupCarry != nil,
                 audit: CBv2MTPRoundAuditRecord(
                     requestID: id.raw,
@@ -364,12 +422,12 @@ extension EngineLoopV2 {
                     numComputedAfter: rec.numComputedTokens,
                     generatedAfter: rec.generatedTokenCount,
                     finishReason: finishReason.map { String(describing: $0) }))
-            let rejectionObserved = accepted < k && confirmed > accepted
+            let rejectionObserved = accepted < chainK && confirmed > accepted
             let acceptanceTruncated =
-                !rejectionObserved && confirmed <= accepted && confirmed < k
+                !rejectionObserved && confirmed <= accepted && confirmed < chainK
             mtp.observeRequestAcceptance(
                 id: id,
-                draftedDepth: k,
+                draftedDepth: chainK,
                 acceptedDepth: observedAccepted,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
@@ -389,8 +447,9 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                let hiddenColumn = siblingConfirmed.map { 1 + chainK + $0 }
+                    ?? CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears

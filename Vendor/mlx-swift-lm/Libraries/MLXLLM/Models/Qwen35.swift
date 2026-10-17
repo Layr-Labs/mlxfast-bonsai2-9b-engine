@@ -719,6 +719,265 @@ private enum Qwen35RegisterGatedSIMD {
     }
 }
 
+/// `Qwen35RegisterGatedSIMD` over a verify window whose first `M` rows are a
+/// chain and whose remaining rows are sibling leaves: sibling `s` replaces
+/// chain row `s + 1` and branches from the state after chain row `s`. Chain
+/// rows run exactly as in `Qwen35RegisterGatedSIMD` and the returned state is
+/// the state after the chain. Each sibling's output is the same step
+/// arithmetic from its branch state, evaluated without writing the state.
+private enum Qwen35RegisterGatedSIMDSiblings {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_gate_simd_siblings",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: """
+        const uint T = q_shape[1];
+        const uint NS = T - M;
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 4;
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        const device float* v_ = v + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        const device float* a_ = a + b_idx * T * Hv + hv_idx;
+        const device float* bb_ = b + b_idx * T * Hv + hv_idx;
+        float negative_a = 0.0f;
+        float bias = 0.0f;
+        if (lane == 0) {
+          negative_a = -metal::precise::exp(a_log[hv_idx]);
+          bias = dt_bias[hv_idx];
+        }
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
+        float kr[R];
+        float qr[R];
+        for (int t = 0; t < int(M); ++t) {
+          float local_g = 0.0f, local_beta = 0.0f;
+          if (lane == 0) {
+            local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);
+            local_beta = qwen35_simd_gate_beta(bb_[0]);
+          }
+          const float gt = simd_broadcast(local_g, 0);
+          const float bt = simd_broadcast(local_beta, 0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((const device float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          const float2 v2 = *((const device float2*)v_);
+          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          kv[0] += simd_shuffle_xor(kv[0], 4);
+          kv[1] += simd_shuffle_xor(kv[1], 4);
+          kv[0] += simd_shuffle_xor(kv[0], 2);
+          kv[1] += simd_shuffle_xor(kv[1], 2);
+          kv[0] += simd_shuffle_xor(kv[0], 1);
+          kv[1] += simd_shuffle_xor(kv[1], 1);
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          out[0] += simd_shuffle_xor(out[0], 4);
+          out[1] += simd_shuffle_xor(out[1], 4);
+          out[0] += simd_shuffle_xor(out[0], 2);
+          out[1] += simd_shuffle_xor(out[1], 2);
+          out[0] += simd_shuffle_xor(out[0], 1);
+          out[1] += simd_shuffle_xor(out[1], 1);
+          if (lane % LPD == 0) {
+            *((device float2*)y_) = float2(out[0], out[1]);
+          }
+          if (uint(t) < NS) {
+            // Sibling t: a leaf alternative to chain row t + 1, branching from
+            // the state after chain row t. The same step arithmetic as a
+            // chain row, evaluated without writing the state.
+            const uint sr = M + uint(t);
+            const uint rel = sr - uint(t);
+            const device float* sq_ = q_ + rel * Hk * Dk;
+            const device float* sk_ = k_ + rel * Hk * Dk;
+            const device float* sv_ = v_ + rel * Hv * Dv;
+            device float* sy_ = y_ + rel * Hv * Dv;
+            float slocal_g = 0.0f, slocal_beta = 0.0f;
+            if (lane == 0) {
+              slocal_g = qwen35_simd_gate_decay(a_[rel * Hv], bias, negative_a);
+              slocal_beta = qwen35_simd_gate_beta(bb_[rel * Hv]);
+            }
+            const float sgt = simd_broadcast(slocal_g, 0);
+            const float sbt = simd_broadcast(slocal_beta, 0);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              const float4 k4 = ((const device float4*)sk_)[j];
+              kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+              const float4 q4 = ((const device float4*)sq_)[j];
+              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            }
+            float skv[DVPL];
+            float svt[DVPL];
+            const float2 sv2 = *((const device float2*)sv_);
+            svt[0] = sv2.x; svt[1] = sv2.y;
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float s0 = state[d][4 * j] * sgt;
+                const float s1 = state[d][4 * j + 1] * sgt;
+                const float s2 = state[d][4 * j + 2] * sgt;
+                const float s3 = state[d][4 * j + 3] * sgt;
+                a0 = fma(s0, kr[4 * j], a0);
+                a1 = fma(s1, kr[4 * j + 1], a1);
+                a2 = fma(s2, kr[4 * j + 2], a2);
+                a3 = fma(s3, kr[4 * j + 3], a3);
+              }
+              skv[d] = (a0 + a1) + (a2 + a3);
+            }
+            skv[0] += simd_shuffle_xor(skv[0], 4);
+            skv[1] += simd_shuffle_xor(skv[1], 4);
+            skv[0] += simd_shuffle_xor(skv[0], 2);
+            skv[1] += simd_shuffle_xor(skv[1], 2);
+            skv[0] += simd_shuffle_xor(skv[0], 1);
+            skv[1] += simd_shuffle_xor(skv[1], 1);
+            float sout[DVPL];
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              const float delta = (svt[d] - skv[d]) * sbt;
+              float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                const float s0 = fma(kr[4 * j], delta, state[d][4 * j] * sgt);
+                const float s1 = fma(kr[4 * j + 1], delta, state[d][4 * j + 1] * sgt);
+                const float s2 = fma(kr[4 * j + 2], delta, state[d][4 * j + 2] * sgt);
+                const float s3 = fma(kr[4 * j + 3], delta, state[d][4 * j + 3] * sgt);
+                o0 = fma(s0, qr[4 * j], o0);
+                o1 = fma(s1, qr[4 * j + 1], o1);
+                o2 = fma(s2, qr[4 * j + 2], o2);
+                o3 = fma(s3, qr[4 * j + 3], o3);
+              }
+              sout[d] = (o0 + o1) + (o2 + o3);
+            }
+            sout[0] += simd_shuffle_xor(sout[0], 4);
+            sout[1] += simd_shuffle_xor(sout[1], 4);
+            sout[0] += simd_shuffle_xor(sout[0], 2);
+            sout[1] += simd_shuffle_xor(sout[1], 2);
+            sout[0] += simd_shuffle_xor(sout[0], 1);
+            sout[1] += simd_shuffle_xor(sout[1], 1);
+            if (lane % LPD == 0) {
+              *((device float2*)sy_) = float2(sout[0], sout[1]);
+            }
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y_ += Hv * Dv; a_ += Hv; bb_ += Hv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+          }
+        }
+        """,
+        header: """
+        inline float qwen35_simd_gate_decay(float a, float bias, float negative_a) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const float x = a + bias;
+            float sp;
+            if (metal::isnan(x)) {
+                sp = metal::numeric_limits<float>::quiet_NaN();
+            } else {
+                const float maximum = metal::max(x, 0.0f);
+                const float minimum = metal::min(x, 0.0f);
+                constexpr float infinity = metal::numeric_limits<float>::infinity();
+                if (minimum == -infinity || maximum == infinity) {
+                    sp = maximum;
+                } else {
+                    const float z = metal::exp(minimum - maximum);
+                    const float xp1 = 1.0f + z;
+                    const float logarithm = xp1 == metal::numeric_limits<float>::max()
+                        ? metal::numeric_limits<float>::max()
+                        : (xp1 == 1.0f ? z : z * (metal::log(xp1) / (xp1 - 1.0f)));
+                    sp = maximum + logarithm;
+                }
+            }
+            return metal::precise::exp(negative_a * sp);
+        }
+
+        inline float qwen35_simd_gate_beta(float b) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const float y = 1.0f / (1.0f + metal::exp(metal::abs(b)));
+            return b < 0.0f ? y : 1.0f - y;
+        }
+        """)
+
+    static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
+                    b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                    state: MLXArray, chainRows: Int) -> (MLXArray, MLXArray) {
+        let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        precondition(chainRows >= 1 && T - chainRows <= chainRows - 1,
+            "Qwen35 sibling recurrence needs one chain parent per sibling")
+        let result = kernel(
+            [q, k, v, a, b, aLog, dtBias, state],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("M", chainRows)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -1261,6 +1520,53 @@ final class Qwen35GatedDeltaNet: Module {
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
+    /// The register recurrence over a sibling verify window (see
+    /// `Qwen35RegisterGatedSIMDSiblings`), or nil outside its fast-path shapes.
+    private func updateRecurrenceWithSiblings(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        state: MLXArray?, chainRows: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard headKDim == 128, headVDim == 128, q.dim(1) <= 16,
+            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            a.dtype == .float32, b.dtype == .float32,
+            aLog.dtype == .float32, dtBias.dtype == .float32
+        else { return nil }
+        let initial = state ?? MLXArray.zeros(
+            [q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
+        let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+        return Qwen35RegisterGatedSIMDSiblings.run(
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: floatState, chainRows: chainRows)
+    }
+
+    /// The recurrent state after chain rows `0 ..< keep` of a sibling verify
+    /// window followed by one sibling leaf (its transformed recurrence inputs
+    /// and its conv input row `x`), replayed from the pre-verify state.
+    private func replayedSiblingState(
+        tape: ArraysCache.PrefixReplayTape, keep: Int,
+        sibling: (q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray, x: MLXArray)
+    ) -> CBv2RecurrentLayerState {
+        precondition(keep >= 1 && keep < tape.rowCount, "Qwen35 invalid sibling replay")
+        let rows = 0 ..< keep
+        let ssm = updateRecurrence(
+            q: concatenated([tape.q[0..., rows, 0...], sibling.q], axis: 1),
+            k: concatenated([tape.k[0..., rows, 0...], sibling.k], axis: 1),
+            v: concatenated([tape.v[0..., rows, 0...], sibling.v], axis: 1),
+            a: concatenated([tape.a[0..., rows, 0...], sibling.a], axis: 1),
+            b: concatenated([tape.b[0..., rows, 0...], sibling.b], axis: 1),
+            aLog: aLog,
+            dtBias: dtBias,
+            state: tape.ssmPre,
+            mask: nil
+        ).1
+        // The last conv inputs of the committed sequence: the two before the
+        // sibling's position, then the sibling's own projection row.
+        let conv = concatenated(
+            [tape.convInput[0..., (keep + 1) ..< (keep + tape.convStateRows), 0...], sibling.x],
+            axis: 1)
+        return CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+    }
+
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
     /// from the exact pre-verify state and transformed recurrence inputs.
     /// Call only after every GDN layer has passed `canReplayPrefix`.
@@ -1483,12 +1789,42 @@ final class Qwen35GatedDeltaNet: Module {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
+        // Sibling verify window: chain rows first, then sibling leaves (see
+        // `CBv2MTPVerifyTree`). Chain rows take exactly the chain-only path.
+        let chainRows: Int? = CBv2MTPVerifyTree.chainRows.flatMap {
+            !exactTargetVerify && B == 1 && S >= 3 && $0 >= 2 && S > $0 && S - $0 < $0 ? $0 : nil
+        }
+        let M = chainRows ?? S
+        let chainQKV = chainRows == nil ? qkv : qkv[0..., 0 ..< M, 0...]
         let fusedConv = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
-            ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
-        let convInput = fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
+            ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: chainQKV, weight: conv1d.weight)
+        let convInput = fusedConv?.0 ?? concatenated([convState, chainQKV], axis: 1)
+        var siblingQKV: MLXArray? = nil
+        var siblingConvOut: MLXArray? = nil
+        if let chainRows {
+            // Sibling s replaces chain row s + 1: its window is the three conv
+            // inputs before that row, then its own projection.
+            let count = S - chainRows
+            let sibling = qkv[0..., chainRows ..< S, 0...]
+            let windows = concatenated(
+                (0 ..< count).map { convInput[0..., (1 + $0) ..< (1 + $0 + nKeep), 0...] },
+                axis: 0)
+            let rows = sibling.reshaped(count, 1, -1)
+            if conv1d.bias == nil, convKernelSize == 4,
+                let fused = Qwen35FusedConvSilu.apply(state: windows, qkv: rows, weight: conv1d.weight)
+            {
+                siblingConvOut = fused.1.reshaped(1, count, -1)
+            } else {
+                siblingConvOut = silu(conv1d(concatenated([windows, rows], axis: 1)))
+                    .reshaped(1, count, -1)
+            }
+            siblingQKV = sibling
+        }
         let convOut: MLXArray
         if let fusedConv {
-            convOut = fusedConv.1
+            convOut = siblingConvOut.map { concatenated([fusedConv.1, $0], axis: 1) } ?? fusedConv.1
+        } else if chainRows != nil {
+            convOut = concatenated([silu(conv1d(convInput)), siblingConvOut!], axis: 1)
         } else if exactTargetVerify, S > 1 {
             convOut = silu(concatenated(
                 (0 ..< S).map { position in
@@ -1504,33 +1840,44 @@ final class Qwen35GatedDeltaNet: Module {
 
         let out: MLXArray
         if S >= 3 {
-            let recurrence = updateRecurrence(
-                q: qNormed,
-                k: kNormed,
-                v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
-                state: ssmState,
-                mask: nil)
+            let recurrence: (MLXArray, MLXArray)
+            if let chainRows, let siblings = updateRecurrenceWithSiblings(
+                q: qNormed, k: kNormed, v: v, a: a, b: b, state: ssmState, chainRows: chainRows)
+            {
+                recurrence = siblings
+            } else {
+                precondition(chainRows == nil, "Qwen35 sibling verify window needs the register recurrence")
+                recurrence = updateRecurrence(
+                    q: qNormed,
+                    k: kNormed,
+                    v: v,
+                    a: a,
+                    b: b,
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: ssmState,
+                    mask: nil)
+            }
             out = recurrence.0
             let finalSsmState = recurrence.1
+            func chain(_ x: MLXArray) -> MLXArray {
+                chainRows == nil ? x : x[0..., 0 ..< M]
+            }
 
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
-                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
+                let finalConv = convInput[rowRange, M ..< (M + nKeep), 0...]
                 let finalSSM = finalSsmState[rowRange]
                 let tape = ArraysCache.PrefixReplayTape(
                     convInput: convInput[rowRange],
-                    q: qNormed[rowRange],
-                    k: kNormed[rowRange],
-                    v: v[rowRange],
-                    a: a[rowRange],
-                    b: b[rowRange],
+                    q: chain(qNormed[rowRange]),
+                    k: chain(kNormed[rowRange]),
+                    v: chain(v[rowRange]),
+                    a: chain(a[rowRange]),
+                    b: chain(b[rowRange]),
                     ssmPre: ssmState[rowRange],
                     mask: nil,
-                    rowCount: S,
+                    rowCount: M,
                     convStateRows: nKeep)
                 // Count unique additional buffers retained by this stage.
                 // `finalConv` aliases `convInput` until full acceptance detaches
@@ -1551,6 +1898,24 @@ final class Qwen35GatedDeltaNet: Module {
                     // The pending baseline already charges this state. After
                     // strict acceptance it becomes an additional replay input.
                     strictReplayRoots.append(inputSSM)
+                }
+                var siblingReplay: ((Int, Int) -> CBv2RecurrentLayerState)? = nil
+                if let chainRows, let siblingQKV {
+                    let sq = qNormed[rowRange, chainRows...]
+                    let sk = kNormed[rowRange, chainRows...]
+                    let sv = v[rowRange, chainRows...]
+                    let sa = a[rowRange, chainRows...]
+                    let sb = b[rowRange, chainRows...]
+                    let sx = siblingQKV[rowRange]
+                    siblingReplay = { [unowned self] keep, sibling in
+                        self.replayedSiblingState(
+                            tape: tape, keep: keep,
+                            sibling: (sq[0..., sibling ..< sibling + 1], sk[0..., sibling ..< sibling + 1],
+                                      sv[0..., sibling ..< sibling + 1], sa[0..., sibling ..< sibling + 1],
+                                      sb[0..., sibling ..< sibling + 1], sx[0..., sibling ..< sibling + 1]))
+                    }
+                    roots.append(contentsOf: [sq, sk, sv, sa, sb, sx])
+                    strictReplayRoots.append(contentsOf: [sq, sk, sv, sa, sb, sx])
                 }
 
                 func checkedByteCount(_ arrays: [MLXArray]) -> Int {
@@ -1573,7 +1938,7 @@ final class Qwen35GatedDeltaNet: Module {
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
-                        positions: S,
+                        positions: M,
                         finalConv: finalConv,
                         finalSSM: finalSSM,
                         materializedByteCount: materializedBytes,
@@ -1591,7 +1956,8 @@ final class Qwen35GatedDeltaNet: Module {
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
                                 tape: tape, committedRows: keepPositions)
-                        })
+                        },
+                        siblingReplay: siblingReplay)
                 } catch {
                     preconditionFailure(
                         "Qwen35 CBv2 compact replay stage failed at layer "
@@ -1781,6 +2147,20 @@ final class Qwen35Attention: Module {
         if let positionIds {
             (queries, keys) = mrope.apply(
                 queries: queries, keys: keys, positionIds: positionIds)
+        } else if let chainRows = CBv2MTPVerifyTree.chainRows, B == 1,
+            L > chainRows, L - chainRows < chainRows
+        {
+            // Sibling verify window: sibling s sits at chain row s + 1's
+            // position, so the siblings' positions run from offset + 1.
+            let offsets = cache.positionOffsets + 0
+            queries = concatenated([
+                rope(queries[0..., 0..., 0 ..< chainRows, 0...], offset: offsets),
+                rope(queries[0..., 0..., chainRows..., 0...], offset: offsets + 1),
+            ], axis: 2)
+            keys = concatenated([
+                rope(keys[0..., 0..., 0 ..< chainRows, 0...], offset: offsets),
+                rope(keys[0..., 0..., chainRows..., 0...], offset: offsets + 1),
+            ], axis: 2)
         } else {
             let offsets = cache.positionOffsets + 0
             queries = rope(queries, offset: offsets)

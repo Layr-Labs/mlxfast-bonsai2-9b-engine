@@ -233,6 +233,9 @@ public struct CBv2RecurrentPrefixReplayStage {
     /// rejectable exact-tail copies out of the verify graph.
     fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
+    /// State after chain rows `0 ..< keep` followed by sibling leaf `s` (a
+    /// sibling verify window). nil when the window carried no siblings.
+    fileprivate let siblingReplay: ((_ keep: Int, _ sibling: Int) -> CBv2RecurrentLayerState)?
 
     public init(
         positions: Int,
@@ -245,7 +248,8 @@ public struct CBv2RecurrentPrefixReplayStage {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
-        replay: @escaping (Int) -> CBv2RecurrentLayerState
+        replay: @escaping (Int) -> CBv2RecurrentLayerState,
+        siblingReplay: ((Int, Int) -> CBv2RecurrentLayerState)? = nil
     ) throws {
         guard positions >= 2 else {
             throw CBv2RecurrentStateError.lifecycleViolation(
@@ -268,6 +272,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
         self.fullAcceptance = fullAcceptance
         self.replay = replay
+        self.siblingReplay = siblingReplay
     }
 }
 
@@ -463,7 +468,9 @@ public final class CBv2RecurrentRequestState {
         bindingOpen = false
     }
 
-    fileprivate func commit(generation: UInt64, keepPositions: Int? = nil) throws {
+    fileprivate func commit(
+        generation: UInt64, keepPositions: Int? = nil, sibling: Int? = nil
+    ) throws {
         guard !isReleased, let first = pending.first, first.id == generation else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
@@ -506,6 +513,32 @@ public final class CBv2RecurrentRequestState {
             else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
+            }
+            if let sibling {
+                guard replay.values.allSatisfy({ $0.siblingReplay != nil }), keep < positions
+                else {
+                    throw CBv2RecurrentStateError.lifecycleViolation(
+                        "sibling commit on a window without sibling replay")
+                }
+                clearOlderTransitionRetention()
+                committed = [:]
+                deferredCommitted = { replay.mapValues { $0.siblingReplay!(keep, sibling) } }
+                var retainedBytes = 0
+                var retainedRoots: [MLXArray] = []
+                for index in replay.keys.sorted() {
+                    guard let stage = replay[index] else { continue }
+                    let (sum, overflow) = retainedBytes.addingReportingOverflow(
+                        stage.strictReplayRetainedByteCount)
+                    retainedBytes = overflow ? Int.max : sum
+                    retainedRoots.append(contentsOf: stage.strictReplayRetainedRoots)
+                }
+                if retainedBytes > 0 || !retainedRoots.isEmpty {
+                    committedTransitionGeneration = generation
+                    committedTransitionRetainedByteCount = retainedBytes
+                    committedTransitionRetainedRoots = retainedRoots
+                }
+                pending.removeFirst()
+                return
             }
             clearOlderTransitionRetention()
             let fullAcceptance = keep == positions
@@ -688,7 +721,8 @@ public final class CBv2RecurrentStateEvaluation {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
-        replay: @escaping (Int) -> CBv2RecurrentLayerState
+        replay: @escaping (Int) -> CBv2RecurrentLayerState,
+        siblingReplay: ((Int, Int) -> CBv2RecurrentLayerState)? = nil
     ) throws {
         guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(
@@ -717,7 +751,8 @@ public final class CBv2RecurrentStateEvaluation {
             fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
             fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
             fullAcceptance: fullAcceptance,
-            replay: replay)
+            replay: replay,
+            siblingReplay: siblingReplay)
     }
 
     @discardableResult
@@ -767,6 +802,19 @@ public final class CBv2RecurrentStateEvaluation {
                 "captured commit on a non-captured recurrent transaction")
         }
         try owner.commit(generation: generation, keepPositions: keepPositions)
+        finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
+    }
+
+    /// Commit chain rows `0 ..< keepPositions` followed by sibling leaf
+    /// `sibling` of a sibling verify window.
+    public func commit(keepPositions: Int, sibling: Int) throws {
+        guard evaluated, !finalized, !stagedPrefixReplay.isEmpty else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "sibling commit on a non-replay recurrent transaction")
+        }
+        try owner.commit(generation: generation, keepPositions: keepPositions, sibling: sibling)
         finalized = true
         staged.removeAll(keepingCapacity: false)
         stagedPrefixReplay.removeAll(keepingCapacity: false)

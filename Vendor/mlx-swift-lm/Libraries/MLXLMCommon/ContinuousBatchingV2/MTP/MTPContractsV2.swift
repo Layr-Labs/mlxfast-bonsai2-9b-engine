@@ -417,6 +417,13 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// least `minimumMargin` for every row: such rounds draft `depth` tokens,
     /// the others `lookupMissDraftDepth`. Default nil (one drafted depth).
     var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { get }
+    /// True when every head step of a drafted round also proposes a
+    /// runner-up token, returned by `roundAlternates(for:)` in step order.
+    /// The engine verifies each runner-up as a sibling leaf of that step's
+    /// draft (same position, same parent). Default false.
+    var proposesSiblingAlternates: Bool { get }
+    /// The current round's runner-up proposals, one `[1]` int32 per head step.
+    func roundAlternates(for requestState: any CBv2MTPRequestState) -> [MLXArray]
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -438,6 +445,8 @@ extension CBv2MTPRequestStatefulDrafter {
     public var lookupDraftNgram: Int? { nil }
     public var lookupMissDraftDepth: Int? { nil }
     public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { nil }
+    public var proposesSiblingAlternates: Bool { false }
+    public func roundAlternates(for requestState: any CBv2MTPRequestState) -> [MLXArray] { [] }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,
@@ -813,4 +822,13 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.generatedAfter = generatedAfter
         self.finishReason = finishReason
     }
+}
+
+/// Layout of the MTP verify forward being built (engine thread only).
+public enum CBv2MTPVerifyTree {
+    /// Chain rows (seed plus head drafts) at the front of the verify window
+    /// when the rows after them are sibling leaves: sibling `s` is an
+    /// alternative token for chain row `s + 1`, at that row's position, with
+    /// chain rows `0 ... s` as its history. nil for an ordinary chain window.
+    nonisolated(unsafe) public static var chainRows: Int? = nil
 }
