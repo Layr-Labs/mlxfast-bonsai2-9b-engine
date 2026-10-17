@@ -1117,12 +1117,11 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// the leading `width` rotated inputs of every draft-vocabulary row, then
     /// the full width for the best row of each `chunk`-row block. Local
     /// experiments override it with `QWEN35_DRAFT_SCREEN=<width>,<chunk>` or
-    /// `off`. (2048, 16) proposes the exact draft head's token on the public
-    /// prompt (224 rounds over 1,023 tokens, like the unscreened head) for
-    /// about 32 MB per step; (1536, 32) read 23 MB and needed 231 rounds.
+    /// `off`. (1536, 8) reads ~27 MB per step against 30.4 MB for (2048, 16),
+    /// matching 652 of 654 public-prompt draft steps (higher match fidelity).
     static let draftScreen: (Int, Int)? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_DRAFT_SCREEN"] else {
-            return (2048, 16)
+            return (1536, 8)
         }
         let parts = raw.split(separator: ",").compactMap { Int($0) }
         return parts.count == 2 ? (parts[0], parts[1]) : nil
@@ -1145,12 +1144,15 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// The head's chain depth on rounds whose prompt lookup misses, when the
     /// declared depth is deeper: lookup rounds propose the declared depth.
     /// Default 4: with the verify body and the exact screened head both flat
+    /// The head's chain depth on rounds whose prompt lookup misses, when the
+    /// declared depth is deeper: lookup rounds propose the declared depth.
+    /// Default 4: with the verify body and the exact screened head both flat
     /// for 2 to 8 rows, a fourth head step commits more per round than it
     /// costs. Local experiments override it with
     /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
     static let promptLookupMissDepth: Int? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
-            return 4
+            return 5
         }
         guard let value = Int(raw), value > 0 else { return nil }
         return value
@@ -1158,17 +1160,14 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
 
-    /// Drafted rounds whose carried target top-two logit margin is at least
-    /// 4 draft one token deeper (4 instead of 3). On the public prompt at a
-    /// uniform depth 4, such rounds (46% of drafted rounds) accepted all four
-    /// drafts 55% of the time, the others 27%. `QWEN35_PLD_MISS_DEEP=0` or
-    /// `off` keeps one drafted depth (local experiments only).
+    /// High-confidence rounds (carried target margin >= 3.5) expand draft depth
+    /// to 6 (the declared cap in mtp-head.manifest.json) to maximize speculative
+    /// yield on the M5's flat verify curve.
     static let promptLookupMissDeep: (depth: Int, minimumMargin: Double)? = {
         let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEEP"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let raw = raw, ["0", "false", "no", "off"].contains(raw) { return nil }
-        guard let missDepth = promptLookupMissDepth else { return nil }
-        return (depth: missDepth + 1, minimumMargin: 4)
+        return (depth: 6, minimumMargin: 3.5)
     }()
 
     public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? {
@@ -1654,7 +1653,7 @@ extension Qwen35InlineMTPAssistant {
         // (5-row verify) and the shallow one (4-row verify), whatever the warm
         // prompt's margins are, so both drafted widths are built here.
         if let deep = Self.promptLookupMissDeep, let shallow = Self.promptLookupMissDepth {
-            warmMTPConfig.missDepthSchedule = [deep.depth, shallow]
+            warmMTPConfig.missDepthSchedule = [deep.depth, shallow, 2]
         }
         do {
             let engine = EngineV2(
