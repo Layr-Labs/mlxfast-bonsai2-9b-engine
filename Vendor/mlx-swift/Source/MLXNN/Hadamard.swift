@@ -494,7 +494,7 @@ public struct SignedBlockHadamard {
             queryProjection.dtype == .float32, attention.ndim == 4, attention.dim(0) == 1,
             attention.dim(1) == 16, attention.dim(3) == 256,
             queryProjection.size == attention.dim(2) * 8192,
-            VerifyInt8Matmul.rowRange.contains(attention.dim(2)),
+            VerifyInt8Matmul.accepts(rows: attention.dim(2)),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = attention.dim(2)
@@ -523,7 +523,7 @@ public struct SignedBlockHadamard {
         guard blockSize == 4096, width == 4096, x.dtype == .float32, gate.dtype == .float32,
             x.size == gate.size, x.dim(-1) == 128 || x.dim(-1) == 4096,
             weight.dtype == .float32, weight.shape == [128],
-            VerifyInt8Matmul.rowRange.contains(rows), StreamOrDevice.default == StreamOrDevice.gpu
+            VerifyInt8Matmul.accepts(rows: rows), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let tile = VerifyInt8Matmul.tileRows
         let groups = rows * (width / 128)
@@ -558,7 +558,7 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / width
-        guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
+        guard VerifyInt8Matmul.accepts(rows: rows) else { return nil }
         let tile = VerifyInt8Matmul.tileRows
         return Self.residualNormNormedQuantized4096Kernel(
             [x, residual, weight, MLXArray([eps]), signs],
@@ -587,7 +587,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         let inputs = [x, residual, weight, MLXArray([eps]), signs]
         if verifyRows > 0 {
-            guard verifyRows == rows, VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
+            guard verifyRows == rows, VerifyInt8Matmul.accepts(rows: rows) else { return nil }
             let tile = VerifyInt8Matmul.tileRows
             return Self.residualNormQuantized4096Kernel(
                 inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
@@ -640,7 +640,7 @@ public struct SignedBlockHadamard {
     func quantizedForVerify(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
         validate(x)
         let rows = x.size / width
-        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
+        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.accepts(rows: rows),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         if let up, up.shape != x.shape || up.dtype != x.dtype { return nil }
@@ -662,7 +662,7 @@ public struct SignedBlockHadamard {
     func quantizedForVerifyWithRotated(_ x: MLXArray) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
         validate(x)
         let rows = x.size / width
-        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
+        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.accepts(rows: rows),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let tile = VerifyInt8Matmul.tileRows
@@ -2270,7 +2270,103 @@ enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
 
     static let rowRange = 2 ... 8
+    /// Rows 9...16 fill the same 16-row activation tile the rotation already
+    /// writes, but only the generic and vector tensor kernels index all 16
+    /// output rows; the fast kernel and the plain twin are 8-row forms and
+    /// never take a wide call. Wide eligibility is its own on-device check
+    /// (`wideChecked`): a wide failure keeps narrow acceleration untouched.
+    /// `DARKBLOOM_BONSAI_INT8_VERIFY_WIDE=0` keeps wide rows on the record's
+    /// float paths unconditionally.
+    static let wideRowRange = 9 ... 16
     static let tileRows = 16
+
+    /// The single row gate every entry point uses: the record's 2...8 as
+    /// before, and 9...16 only where the tensor route is up, the wide check
+    /// passed on this device, and the environment does not veto it.
+    static func accepts(rows: Int) -> Bool {
+        if rowRange.contains(rows) { return true }
+        return wideRowRange.contains(rows) && route == .nax && wideChecked
+    }
+
+    /// Wide eligibility, decided once on first use: the environment switch,
+    /// then a split-reference bit-check at 12 and 16 rows. Row independence
+    /// makes the reference exact: the plain kernel over rows 0-7 and over
+    /// rows 8-15 (as its own 8-row tile with its own constant slice) is the
+    /// wide kernel's output row for row, bit for bit.
+    nonisolated(unsafe) private static var wideNote = "not run"
+    nonisolated(unsafe) private static var wideFailed = false
+    static let wideChecked: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_WIDE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            wideNote = "disabled by environment"
+            return false
+        }
+        guard route == .nax else {
+            wideNote = "no tensor route"
+            return false
+        }
+        var ok = true
+        wideFailed = false
+        withErrorHandler({ message in
+            if !VerifyInt8Matmul.wideFailed {
+                VerifyInt8Matmul.wideNote = String(message.prefix(160))
+            }
+            VerifyInt8Matmul.wideFailed = true
+        }) {
+            for rows in [12, 16] where ok && !VerifyInt8Matmul.wideFailed {
+                ok = wideMatchesSplitPlain(rows: rows)
+            }
+        }
+        if wideFailed { ok = false }
+        FileHandle.standardError.write(
+            Data(("bonsai int8 verify wide: " + wideNote + "\n").utf8))
+        return ok
+    }()
+
+    private static func wideMatchesSplitPlain(rows: Int) -> Bool {
+        let k = 1024, n = 64, kg = k / 128
+        // rows real rows of distinct nonzero codes in a 16-row tile; the
+        // remainder zero, as the verify rotation writes its padding.
+        var codeValues = [Int8](repeating: 0, count: tileRows * k)
+        for i in 0 ..< rows * k {
+            codeValues[i] = Int8(truncatingIfNeeded: (i * 29 + 7) % 255 - 127)
+        }
+        let codes = MLXArray(codeValues, [tileRows, k])
+        let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 5) &* 2_654_435_761) }, [n, k / 16])
+        let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+        let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let ascaleValues = (0 ..< rows * kg).map { Float(1 + $0 % 11) / 256 }
+        let rsbValues = (0 ..< rows * kg).map { Float($0 % 17 - 8) / 64 }
+        let wide = run(
+            .nax, codes: codes, ascale: MLXArray(ascaleValues), rsb: MLXArray(rsbValues),
+            weight: weight, scalesT: scalesT, biasesT: biasesT,
+            m: rows, k: k, n: n, vector: naxVector, negative: false)
+        // Split plain reference: rows 0-7 in place, rows 8+ re-tiled at the
+        // front of their own buffer with their own constant slice.
+        let lowRows = min(rows, 8)
+        let low = run(
+            .plain, codes: codes, ascale: MLXArray(Array(ascaleValues[0 ..< lowRows * kg])),
+            rsb: MLXArray(Array(rsbValues[0 ..< lowRows * kg])),
+            weight: weight, scalesT: scalesT, biasesT: biasesT,
+            m: lowRows, k: k, n: n, vector: false, negative: false)
+        var highValues = [Int8](repeating: 0, count: tileRows * k)
+        for i in 0 ..< (rows - 8) * k { highValues[i] = codeValues[8 * k + i] }
+        let high = run(
+            .plain, codes: MLXArray(highValues, [tileRows, k]),
+            ascale: MLXArray(Array(ascaleValues[(8 * kg)...])),
+            rsb: MLXArray(Array(rsbValues[(8 * kg)...])),
+            weight: weight, scalesT: scalesT, biasesT: biasesT,
+            m: rows - 8, k: k, n: n, vector: false, negative: false)
+        let reference = concatenated([low, high], axis: 0)
+        let equal = MLX.all(
+            wide.view(dtype: .uint32) .== reference.view(dtype: .uint32))
+        eval(equal)
+        let same = equal.item(Bool.self)
+        wideNote = same
+            ? "bit-identical at \(rows) rows" : "outputs differ at \(rows) rows"
+        return same
+    }
 
     private static let plainSource = """
         #pragma clang fp contract(off)
@@ -2861,6 +2957,16 @@ enum VerifyInt8Matmul {
         negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
+        if wideRowRange.contains(activation.rows) {
+            // Wide rows take only the 16-row-capable tensor forms; the fast
+            // kernel and the plain twin are 8-row forms.
+            guard route == .nax, wideChecked else { return nil }
+            return run(
+                .nax, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                weight: weight, scalesT: scalesT, biasesT: biasesT,
+                m: activation.rows, k: activation.k, n: weight.dim(0),
+                vector: naxVector, negative: negative && negativeForms)
+        }
         if route == .nax && naxFast {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -2884,7 +2990,8 @@ enum VerifyInt8Matmul {
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
         guard route != .off else { return nil }
-        if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
+        if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count),
+            !wideRowRange.contains(activation.rows) {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
@@ -3015,7 +3122,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard x.ndim >= 2, x.dim(-1) == 4096 else { return nil }
         let rows = x.size / 4096
         let quantized = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
-        let verify = !quantized && x.dtype == .float32 && VerifyInt8Matmul.rowRange.contains(rows)
+        let verify = !quantized && x.dtype == .float32 && VerifyInt8Matmul.accepts(rows: rows)
             && VerifyInt8Matmul.route != .off
         guard (1 ... 16).contains(rows) || quantized else { return nil }
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
@@ -3102,7 +3209,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         projections: [Linear]
     ) -> VerifyBoundary? {
         guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            VerifyInt8Matmul.rowRange.contains(x.size / 4096)
+            VerifyInt8Matmul.accepts(rows: x.size / 4096)
         else { return nil }
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count, let first = packed.first,
@@ -3157,7 +3264,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
 
         // Route 1: VerifyInt8Matmul when rows in 2 ... 8 and route != .off
-        if VerifyInt8Matmul.rowRange.contains(rows), VerifyInt8Matmul.route != .off,
+        if VerifyInt8Matmul.accepts(rows: rows), VerifyInt8Matmul.route != .off,
             packed.allSatisfy({ $0.weight.dim(0) % 32 == 0 }),
             let activation = first.transform.quantizedForVerify(x)
         {
@@ -3188,7 +3295,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// input, the packing or the device does not take it.
     private func verifyInt8Forward(_ x: MLXArray, up: MLXArray? = nil) -> MLXArray? {
         guard readsFloat16ConstantsInPlace, transform.blockSize == 4096, x.dtype == .float32,
-            x.ndim >= 1, VerifyInt8Matmul.rowRange.contains(x.size / x.dim(-1)),
+            x.ndim >= 1, VerifyInt8Matmul.accepts(rows: x.size / x.dim(-1)),
             weight.dim(0) % 32 == 0, transform.width % 512 == 0, VerifyInt8Matmul.route != .off,
             let activation = transform.quantizedForVerify(gdnLayout.map { $0(x) } ?? x, up: up)
         else { return nil }

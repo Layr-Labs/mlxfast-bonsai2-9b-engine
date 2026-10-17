@@ -373,11 +373,15 @@ final class CBv2MTPRoundDriver {
                 config.maxSpeculativeBatch = 1
             }
         }
-        // Prompt lookup stands in for a CHAIN drafter at a fixed declared
-        // depth only. The adaptive controller and the marginal policy never
-        // run there, so lookup rounds cannot skew what they learn.
+        // Prompt lookup stands in for a fixed declared depth only. The
+        // adaptive controller and the marginal policy never run there, so
+        // lookup rounds cannot skew what they learn. A BLOCK drafter takes
+        // lookup rounds too: it stages nothing speculative and absorbs every
+        // committed row through its pending context, so a skipped proposal
+        // is caught up by the next one (`proposeBlock` reads the whole
+        // accumulated pending window).
         let lookupNgram =
-            (config.fixedDraftTokens ?? 0) > 0 && !(drafter is any CBv2MTPBlockDrafter)
+            (config.fixedDraftTokens ?? 0) > 0
             ? (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupDraftNgram : nil
         self.lookupNgram = lookupNgram.flatMap { $0 > 0 ? $0 : nil }
         let missDepth =

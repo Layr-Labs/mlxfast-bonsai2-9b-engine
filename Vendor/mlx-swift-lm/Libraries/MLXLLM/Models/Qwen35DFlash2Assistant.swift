@@ -279,6 +279,31 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         return tokens
     }
 
+    /// Prompt-lookup opt-in, same n-gram width as the MTP head's default.
+    /// A lookup round proposes the declared depth with no drafter forward;
+    /// this drafter stages nothing speculative, so the only bookkeeping a
+    /// skipped proposal needs is the committed rows entering `pending`
+    /// below, exactly as a drafted round's `finalizeRound` queues them.
+    public var lookupDraftNgram: Int? { 6 }
+
+    /// Complete a lookup round exactly as `finalizeRound` completes a
+    /// drafted one: the confirmed hidden rows from the block tap join the
+    /// pending context the next `proposeBlock` absorbs. The chain seam's
+    /// seed-transition arguments do not apply to block context — the tapped
+    /// `committedTargetHidden` is the whole of what this drafter needs, and
+    /// `seedToken`/`seedHidden` are the narrow carry pair, not tap rows.
+    public func commitLookupRound(
+        requestState: any CBv2MTPRequestState,
+        seedToken: MLXArray,
+        seedHidden: MLXArray,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray
+    ) {
+        let state = self.state(requestState)
+        state.roots.removeAll(keepingCapacity: true)
+        append(committedTargetHidden, to: requestState)
+    }
+
     public func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int
     ) {
@@ -289,7 +314,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
-        return state.caches.flatMap { $0.innerState() } + state.roots
+        // Pending context rows are included so a run of lookup rounds (no
+        // proposal, so no absorption) still materializes its queued rows
+        // through the round fence instead of accumulating a lazy chain.
+        return state.caches.flatMap { $0.innerState() } + state.roots + state.pending
     }
 
     /// A round's confirmed columns become the next block's context.
