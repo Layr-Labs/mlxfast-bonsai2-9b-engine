@@ -1540,6 +1540,279 @@ enum ExactVerifyHead {
             """ + Float16ConstantQMV.topTwoFinalizeSource,
         header: Float16ConstantQMV.topTwoHeader)
 
+    /// `select` spread over `blocks` threadgroups per row. The top-2 order is
+    /// a strict total order and the blocks partition the ids, so the merged
+    /// top-2 of the block top-2s is the row's top-2; each candidate's float
+    /// value is one simdgroup's `rowsAccumulate` at one row and one output
+    /// row, as in `select`. So `selectScan`, `selectRescore` and
+    /// `selectMerge` write `select`'s outputs: the same `flag` and `info`,
+    /// and the same pair on every row that is not flagged (a flagged row's
+    /// pair is not read).
+    static let blocks = 64
+    static let blockThreads = 256
+
+    /// Per (row, block): the int8 top-2 of the block's logits and whether
+    /// one is not finite. Each thread visits its ids in ascending order.
+    static let selectScan = MLXFast.metalKernel(
+        name: "hadamard_xhead_select_scan",
+        inputNames: ["logits"],
+        outputNames: ["part_ids", "part_values", "part_meta"],
+        source: """
+            const uint block = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const int quads = NV / (4 * BLOCKS);
+            const uint first = block * uint(quads) * 4u;
+            const device float4* lq = (const device float4*)(logits + size_t(row) * size_t(NV) + first);
+            threadgroup hadamard_top2 scratch[THREADS / 32];
+            threadgroup int scratch_bad[THREADS / 32];
+            hadamard_top2 local = hadamard_top2_empty();
+            bool bad = false;
+            for (int q = int(lane); q < quads; q += THREADS) {
+              const float4 v4 = lq[q];
+              for (int i = 0; i < 4; i++) {
+                const float v = v4[i];
+                bad = bad || !isfinite(v);
+                if (local.count == 2 && !(v > local.second_value)) continue;
+                hadamard_top2_insert(local, v, first + uint(q) * 4u + uint(i));
+              }
+            }
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+              hadamard_top2 other;
+              other.first_value = simd_shuffle_down(local.first_value, stride);
+              other.second_value = simd_shuffle_down(local.second_value, stride);
+              other.first_id = simd_shuffle_down(local.first_id, stride);
+              other.second_id = simd_shuffle_down(local.second_id, stride);
+              other.count = simd_shuffle_down(local.count, stride);
+              if (simd_lid < stride) hadamard_top2_merge(local, other);
+            }
+            const int any_bad = simd_max(bad ? 1 : 0);
+            if (simd_lid == 0) { scratch[simd_gid] = local; scratch_bad[simd_gid] = any_bad; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              int b = scratch_bad[0];
+              for (uint s = 1; s < THREADS / 32; s++) {
+                hadamard_top2_merge(local, scratch[s]);
+                b |= scratch_bad[s];
+              }
+              const uint p = row * uint(BLOCKS) + block;
+              part_ids[p * 2] = int(local.first_id);
+              part_ids[p * 2 + 1] = int(local.second_id);
+              part_values[p * 2] = local.first_value;
+              part_values[p * 2 + 1] = local.second_value;
+              part_meta[p] = b | int(local.count << 1);
+            }
+            """,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// Per (row, block): merges the row's block top-2s into its int8 top-2,
+    /// forms E and tau with `select`'s arithmetic, collects the block's ids
+    /// with `L8 >= tau`, rescores them with `select`'s float text and writes
+    /// their float top-2, the block's candidate count, a non-finite flag and
+    /// the row's bad flag. A block over `CAP` candidates rescores nothing:
+    /// its row is flagged.
+    static let selectRescore = MLXFast.metalKernel(
+        name: "hadamard_xhead_select_rescore",
+        inputNames: [
+            "logits", "ascale", "bounds", "x", "w", "scales", "biases",
+            "part_ids", "part_values", "part_meta",
+        ],
+        outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
+        source: """
+            const uint block = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const int K = x_shape[1];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            threadgroup atomic_int cand_count;
+            threadgroup int cand_ids[CAP];
+            threadgroup float cand_values[CAP];
+            threadgroup float shared_tau[2];
+            threadgroup int shared_bad;
+            if (lane == 0) atomic_store_explicit(&cand_count, 0, memory_order_relaxed);
+            if (simd_gid == 0) {
+              hadamard_top2 local = hadamard_top2_empty();
+              int pbad = 0;
+              for (uint pb = simd_lid; pb < uint(BLOCKS); pb += 32) {
+                const uint p = row * uint(BLOCKS) + pb;
+                const int meta = part_meta[p];
+                hadamard_top2 o;
+                o.first_value = part_values[p * 2];
+                o.second_value = part_values[p * 2 + 1];
+                o.first_id = uint(part_ids[p * 2]);
+                o.second_id = uint(part_ids[p * 2 + 1]);
+                o.count = uint(meta >> 1);
+                hadamard_top2_merge(local, o);
+                pbad |= meta & 1;
+              }
+              for (uint stride = 16; stride > 0; stride >>= 1) {
+                hadamard_top2 other;
+                other.first_value = simd_shuffle_down(local.first_value, stride);
+                other.second_value = simd_shuffle_down(local.second_value, stride);
+                other.first_id = simd_shuffle_down(local.first_id, stride);
+                other.second_id = simd_shuffle_down(local.second_id, stride);
+                other.count = simd_shuffle_down(local.count, stride);
+                if (simd_lid < stride) hadamard_top2_merge(local, other);
+              }
+              pbad = simd_max(pbad);
+              if (simd_lid == 0) {
+                float e = 0.0f;
+                for (int g = 0; g < in_g; g++) {
+                  e += ascale[row * uint(in_g) + uint(g)]
+                      * (bounds[g] * (0.5f + 127.0f * 3.0e-5f) + bounds[in_g + g] * 1.0e-5f);
+                }
+                e *= 1.001f;
+                const float t = local.second_value - 2.0f * e;
+                shared_tau[0] = t - (fabs(t) * 2.4e-7f + 1.0e-30f);
+                shared_tau[1] = e;
+                shared_bad = (pbad != 0 || local.count < 2 || !isfinite(e) || !isfinite(t)) ? 1 : 0;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float tau = shared_tau[0];
+            const int quads = NV / (4 * BLOCKS);
+            const uint first = block * uint(quads) * 4u;
+            const device float4* lq = (const device float4*)(logits + size_t(row) * size_t(NV) + first);
+            for (int q = int(lane); q < quads; q += THREADS) {
+              const float4 v4 = lq[q];
+              for (int i = 0; i < 4; i++) {
+                if (v4[i] >= tau) {
+                  const int slot = atomic_fetch_add_explicit(&cand_count, 1, memory_order_relaxed);
+                  if (slot < CAP) cand_ids[slot] = int(first + uint(q) * 4u + uint(i));
+                }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int count = atomic_load_explicit(&cand_count, memory_order_relaxed);
+            const int used = count > CAP ? 0 : count;
+            for (int c = int(simd_gid); c < used; c += THREADS / 32) {
+              const int out_row = cand_ids[c];
+              constexpr int rows = 1;
+              constexpr int outputs = 1;
+            """ + Float16ConstantQMV.rowsAccumulate.replacingOccurrences(
+                of: "(x + simd_lid", with: "(x + size_t(row) * size_t(K) + simd_lid"
+            ).replacingOccurrences(
+                of: "b[r] = float(bi[r * in_g]);", with: "b[r] = NEG ? -s : float(bi[r * in_g]);"
+            ) + """
+              const float total = simd_sum(result[0][0]);
+              if (simd_lid == 0) cand_values[c] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+              hadamard_top2 best = hadamard_top2_empty();
+              bool nonfinite = false;
+              for (int c = 0; c < used; c++) {
+                nonfinite = nonfinite || !isfinite(cand_values[c]);
+                hadamard_top2_insert(best, cand_values[c], uint(cand_ids[c]));
+              }
+              const uint p = row * uint(BLOCKS) + block;
+              blk_ids[p * 2] = int(best.first_id);
+              blk_ids[p * 2 + 1] = int(best.second_id);
+              blk_values[p * 2] = best.first_value;
+              blk_values[p * 2 + 1] = best.second_value;
+              blk_meta[p * 4] = count;
+              blk_meta[p * 4 + 1] = int(best.count);
+              blk_meta[p * 4 + 2] = nonfinite ? 1 : 0;
+              blk_meta[p * 4 + 3] = shared_bad;
+              if (block == 0) row_e[row] = shared_tau[1];
+            }
+            """,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// One simdgroup per row: `select`'s pair, `flag` and `info` from the
+    /// block results.
+    static let selectMerge = MLXFast.metalKernel(
+        name: "hadamard_xhead_select_merge",
+        inputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
+        outputNames: ["sel_ids", "sel_values", "flag", "info"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint simd_lid = thread_index_in_simdgroup;
+            hadamard_top2 best = hadamard_top2_empty();
+            int count = 0, nonfinite = 0, bad = 0;
+            for (uint pb = simd_lid; pb < uint(BLOCKS); pb += 32) {
+              const uint p = row * uint(BLOCKS) + pb;
+              count += blk_meta[p * 4];
+              const int valid = blk_meta[p * 4 + 1];
+              nonfinite |= blk_meta[p * 4 + 2];
+              bad |= blk_meta[p * 4 + 3];
+              if (valid > 0) hadamard_top2_insert(best, blk_values[p * 2], uint(blk_ids[p * 2]));
+              if (valid > 1) hadamard_top2_insert(best, blk_values[p * 2 + 1], uint(blk_ids[p * 2 + 1]));
+            }
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+              hadamard_top2 other;
+              other.first_value = simd_shuffle_down(best.first_value, stride);
+              other.second_value = simd_shuffle_down(best.second_value, stride);
+              other.first_id = simd_shuffle_down(best.first_id, stride);
+              other.second_id = simd_shuffle_down(best.second_id, stride);
+              other.count = simd_shuffle_down(best.count, stride);
+              if (simd_lid < stride) hadamard_top2_merge(best, other);
+            }
+            count = simd_sum(count);
+            nonfinite = simd_max(nonfinite);
+            bad = simd_max(bad);
+            if (simd_lid == 0) {
+              const bool fallback = bad != 0 || count > CAP || nonfinite != 0 || best.count < 2;
+              sel_ids[row * 2] = int(best.first_id);
+              sel_ids[row * 2 + 1] = int(best.second_id);
+              sel_values[row * 2] = best.first_value;
+              sel_values[row * 2 + 1] = best.second_value;
+              flag[row] = fallback ? 1 : 0;
+              info[row * 2] = row_e[row];
+              info[row * 2 + 1] = float(count);
+            }
+            """,
+        header: Float16ConstantQMV.topTwoHeader)
+
+    /// `select`'s outputs through the three block kernels.
+    static func parallelSelect(
+        logits: MLXArray, ascale: MLXArray, bounds: MLXArray, x: MLXArray,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int, negative: Bool
+    ) -> [MLXArray] {
+        let N = weight.dim(0)
+        let template: [(String, any KernelTemplateArg)] = [
+            ("CAP", cap), ("THREADS", blockThreads), ("BLOCKS", blocks), ("NV", N),
+            ("NEG", negative ? 1 : 0),
+        ]
+        let parts = selectScan(
+            [logits], template: [("THREADS", blockThreads), ("BLOCKS", blocks), ("NV", N)],
+            grid: (blocks * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
+            outputShapes: [[rows, blocks, 2], [rows, blocks, 2], [rows, blocks]],
+            outputDTypes: [.int32, .float32, .int32])
+        let blk = selectRescore(
+            [logits, ascale, bounds, x, weight, scales, biases, parts[0], parts[1], parts[2]],
+            template: template,
+            grid: (blocks * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
+            outputShapes: [[rows, blocks, 2], [rows, blocks, 2], [rows, blocks, 4], [rows]],
+            outputDTypes: [.int32, .float32, .int32, .float32])
+        return selectMerge(
+            blk, template: [("CAP", cap), ("BLOCKS", blocks)],
+            grid: (rows * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
+            outputDTypes: [.int32, .float32, .int32, .float32])
+    }
+
+    /// `DARKBLOOM_BONSAI_XHEAD_PARALLEL=0` keeps the one-threadgroup-per-row
+    /// `select`.
+    static let parallelOn: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_XHEAD_PARALLEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Row counts whose first parallel select matched `select` (true) or
+    /// not (false: that row count keeps `select`).
+    nonisolated(unsafe) static var parallelVerified: [Int: Bool] = [:]
+
+    static func parallelApplies(rows: Int, N: Int) -> Bool {
+        parallelOn && parallelVerified[rows] != false && N % (4 * blocks) == 0
+    }
+
     /// `DARKBLOOM_BONSAI_XHEAD=0` keeps the record's head (float top-2 at 2-4
     /// rows, int8 logits at 5-8); `=5` takes this path at 5-8 rows only.
     static let rowRange: ClosedRange<Int>? = {
@@ -1570,17 +1843,21 @@ enum ExactVerifyHead {
     static func run(
         rotated: MLXArray, logits: MLXArray, ascale: MLXArray, bounds: MLXArray,
         weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int,
-        negative: Bool = false, force: Bool = false
+        negative: Bool = false, force: Bool = false, parallel: Bool = false
     ) -> (ids: MLXArray, values: MLXArray, flag: MLXArray, info: MLXArray) {
         let K = rotated.dim(-1)
         let N = weight.dim(0)
         let x = rotated.reshaped([rows, K])
-        let selected = select(
-            [logits, ascale, bounds, x, weight, scales, biases],
-            template: [("CAP", cap), ("THREADS", threads), ("NEG", negative ? 1 : 0)],
-            grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
-            outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
-            outputDTypes: [.int32, .float32, .int32, .float32])
+        let selected = parallel
+            ? parallelSelect(
+                logits: logits, ascale: ascale, bounds: bounds, x: x, weight: weight,
+                scales: scales, biases: biases, rows: rows, negative: negative)
+            : select(
+                [logits, ascale, bounds, x, weight, scales, biases],
+                template: [("CAP", cap), ("THREADS", threads), ("NEG", negative ? 1 : 0)],
+                grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
+                outputDTypes: [.int32, .float32, .int32, .float32])
         let flag = force ? MLXArray(Array(repeating: Int32(1), count: rows)) : selected[2]
         let outputs = 4
         let span = 2 * outputs * Float16ConstantQMV.topTwoBlocks
@@ -3788,12 +4065,42 @@ extension HadamardQuantizedLinear {
             negative: promptConstants.negative)
         else { return nil }
         let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
-        let result = ExactVerifyHead.run(
+        let parallel = ExactVerifyHead.parallelApplies(rows: rows, N: weight.dim(0))
+        var result = ExactVerifyHead.run(
             rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
             weight: weight, scales: scales, biases: biases!, rows: rows,
-            negative: promptConstants.negative)
+            negative: promptConstants.negative, parallel: parallel)
         let first = ExactVerifyHead.verified[rows] == nil
-        guard first || ExactVerifyHead.checkEveryCall else { return (result.ids, result.values) }
+        let firstParallel = parallel && ExactVerifyHead.parallelVerified[rows] == nil
+        guard first || firstParallel || ExactVerifyHead.checkEveryCall else {
+            return (result.ids, result.values)
+        }
+        if parallel {
+            // The block select against the one-threadgroup select: the same
+            // flags and (E, |S|) on every row, the same pair on every row
+            // that is not flagged, and the same final top-2.
+            let serial = ExactVerifyHead.run(
+                rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
+                weight: weight, scales: scales, biases: biases!, rows: rows,
+                negative: promptConstants.negative)
+            eval([result.ids, result.values, result.flag, result.info,
+                  serial.ids, serial.values, serial.flag, serial.info])
+            let match = ExactVerifyHead.sameBits((result.ids, result.values), (serial.ids, serial.values))
+                && result.flag.asArray(Int32.self) == serial.flag.asArray(Int32.self)
+                && result.info.asArray(Float.self).map(\.bitPattern)
+                    == serial.info.asArray(Float.self).map(\.bitPattern)
+            if !match, ExactVerifyHead.checkEveryCall {
+                ExactVerifyHead.log("XHEAD CHECK FAILED rows \(rows): parallel select differs from select")
+                preconditionFailure("XHEAD parallel select check failed at rows \(rows)")
+            }
+            if firstParallel {
+                ExactVerifyHead.parallelVerified[rows] = match
+                ExactVerifyHead.log(
+                    "XHEAD parallel select rows \(rows): \(match ? "on" : "MISMATCH, select kept")")
+            }
+            if !match { result = serial }
+            if !first && !ExactVerifyHead.checkEveryCall { return (result.ids, result.values) }
+        }
         let full = ExactVerifyHead.run(
             rotated: rotated, logits: logits, ascale: activation.ascale, bounds: bounds,
             weight: weight, scales: scales, biases: biases!, rows: rows,
