@@ -2877,6 +2877,238 @@ enum PromptInt8Matmul {
     }
 }
 
+/// A gate/up projection pair of one prompt activation in one launch that
+/// stores `silu(gate) * up` and never the two outputs (cf. the CUDA track's
+/// ff900d02). A threadgroup runs the record kernel's K loop and per-group
+/// epilogue over the gate weights, then over the up weights, for the same
+/// output tile: every gate and up element is the record kernel's bits. It
+/// then stores `(g * sigmoid_g) * u` with the SwiGLU quantizer's own stable
+/// sigmoid, so the plain quantizer's `h * sign` is that quantizer's
+/// `((g * sigmoid_g) * u) * sign`. Engaged only when a load-time trial finds
+/// the quantized codes and group constants bit-identical to the two-layer
+/// launch followed by the SwiGLU quantizer.
+/// `DARKBLOOM_BONSAI_PREFILL_GLU=0` keeps the record path.
+extension PromptInt8Matmul {
+    enum GLUForm { case nax, plain }
+
+    /// One pass of a record kernel body over the given weights, in its own
+    /// scope; the caller closes the scope after copying `acc` out.
+    private static func gluPass(_ body: String, weight: String, scales: String, biases: String) -> String {
+        """
+        {
+          const device uint32_t* w = \(weight);
+          const device half* scalesT = \(scales);
+          const device half* biasesT = \(biases);
+        \(body)
+        """
+    }
+
+    private static let gluEpilogueSigmoid = """
+        const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+        const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
+        const float4 v = (g * sigmoid_g) * u;
+        """
+
+    /// `naxSgBody` run over w0 (gate) into `accg`, then over w1 (up) into
+    /// `accu`; the store writes the SwiGLU value to `out0`.
+    static let naxSgGLUSource: String = {
+        let body = naxSgBody
+        guard let passStart = body.range(of: "const device uint32_t* wrow"),
+            let storeStart = body.range(of: "const int mb = m0 + sm + fm;")
+        else { preconditionFailure("prefill GLU: per-simdgroup body markers not found") }
+        let prelude = String(body[..<passStart.lowerBound])
+        let pass = String(body[passStart.lowerBound ..< storeStart.lowerBound])
+        precondition(pass.contains("float acc[32];") && !prelude.contains("acc["), "prefill GLU: accumulator layout moved")
+        let copyOut = { (name: String) in
+            "  #pragma clang loop unroll(full)\n  for (int i = 0; i < 32; i++) { \(name)[i] = acc[i]; }\n}\n"
+        }
+        return """
+            const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
+            const int bx = int(threadgroup_position_in_grid.x);
+
+            """ + prelude + "float accg[32];\nfloat accu[32];\n"
+            + gluPass(pass, weight: "w0", scales: "s0", biases: "b0") + copyOut("accg")
+            + gluPass(pass, weight: "w1", scales: "s1", biases: "b1") + copyOut("accu")
+            + """
+            const int mb = m0 + sm + fm;
+            const int nbo = n0 + sn + fn;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 32; i += 4) {
+              const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+              const float4 g = float4(accg[i], accg[i + 1], accg[i + 2], accg[i + 3]);
+              const float4 u = float4(accu[i], accu[i + 1], accu[i + 2], accu[i + 3]);
+            \(gluEpilogueSigmoid)
+              *(device float4*)(out0 + (size_t)mm * N + nbo + 16 * ((i >> 3) & 1)) = good ? v : float4(as_type<float>(0x7fc00000u));
+            }
+            """
+    }()
+
+    /// `plainSource` run over w0 into `accg`, then over w1 into `accu`.
+    static let plainGLUSource: String = {
+        let body = plainSource
+        guard let passStart = body.range(of: "float acc[2][2][2];"),
+            let storeIndex = body.range(of: "const size_t o = (size_t)(m0 + sm + 8 * a + fm) * N"),
+            let storeStart = body.range(
+                of: "#pragma clang loop unroll(full)\nfor (int a = 0; a < 2; a++) {", options: .backwards,
+                range: passStart.upperBound ..< storeIndex.lowerBound)
+        else { preconditionFailure("prefill GLU: plain body markers not found") }
+        let prelude = String(body[..<passStart.lowerBound])
+        let pass = String(body[passStart.lowerBound ..< storeStart.lowerBound])
+        let copyOut = { (name: String) in
+            """
+              #pragma clang loop unroll(full)
+              for (int a = 0; a < 2; a++) {
+                #pragma clang loop unroll(full)
+                for (int b = 0; b < 2; b++) { \(name)[a][b][0] = acc[a][b][0]; \(name)[a][b][1] = acc[a][b][1]; }
+              }
+            }
+
+            """
+        }
+        return prelude + "float accg[2][2][2];\nfloat accu[2][2][2];\n"
+            + gluPass(pass, weight: "w0", scales: "s0", biases: "b0") + copyOut("accg")
+            + gluPass(pass, weight: "w1", scales: "s1", biases: "b1") + copyOut("accu")
+            + """
+            #pragma clang loop unroll(full)
+            for (int a = 0; a < 2; a++) {
+              #pragma clang loop unroll(full)
+              for (int b = 0; b < 2; b++) {
+                const size_t o = (size_t)(m0 + sm + 8 * a + fm) * N + n0 + sn + 8 * b + fn;
+                const float4 g = float4(accg[a][b][0], accg[a][b][1], 0.0f, 0.0f);
+                const float4 u = float4(accu[a][b][0], accu[a][b][1], 0.0f, 0.0f);
+            \(gluEpilogueSigmoid)
+                out0[o] = v.x;
+                out0[o + 1] = v.y;
+              }
+            }
+            """
+    }()
+
+    private static let gluInputs = ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz"]
+
+    private static let naxGLUKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_nax_sg_glu",
+        inputNames: gluInputs, outputNames: ["out0"],
+        source: naxSgGLUSource, header: naxHeader, ensureRowContiguous: true)
+
+    private static let plainGLUKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_plain_glu",
+        inputNames: gluInputs, outputNames: ["out0"],
+        source: plainGLUSource, header: constantIndexSource, ensureRowContiguous: true)
+
+    typealias GLUOperands = (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)
+
+    private static func runGLU(
+        _ form: GLUForm, _ activation: PromptInt8Activation, gate: GLUOperands, up: GLUOperands
+    ) -> MLXArray {
+        let m = activation.rows, k = activation.k, n = gate.weight.dim(0)
+        let negative = negativeForms && gate.negative && up.negative
+        let inputs = [
+            activation.codes, gate.weight, up.weight, gate.scalesT, up.scalesT,
+            gate.biasesT, up.biasesT, activation.ascale, activation.rsb,
+            MLXArray([Int32(k), Int32(m), Int32(n)]),
+        ]
+        let template = [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
+        switch form {
+        case .nax:
+            return naxGLUKernel(
+                inputs, template: template, grid: (n / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        case .plain:
+            return plainGLUKernel(
+                inputs, template: template, grid: (n / 32 * 128, m / 32, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
+    }
+
+    nonisolated(unsafe) private static var gluCheckFailed = false
+    nonisolated(unsafe) private static var gluNote = "not run"
+
+    /// The quantized input of the down projection both ways on a fixed,
+    /// input-independent problem (128 rows, K 512, 4096 features, both
+    /// offset forms): the two-layer launch then the SwiGLU quantizer, against
+    /// the GLU launch then the plain quantizer. Codes and both group
+    /// constants must match bit for bit.
+    private static func checkGLU(_ form: GLUForm) -> Bool {
+        gluCheckFailed = false
+        let m = 128, n = 4096, k = 512, kg = k / 128
+        let codes = MLXArray((0 ..< m * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [m, k])
+        func weights(_ salt: UInt64) -> MLXArray {
+            MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: (UInt64($0) &+ salt) &* 2_654_435_761) },
+                [n, k / 16])
+        }
+        let wg = weights(1)
+        let wu = weights(7919)
+        let scalesG = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+        let scalesU = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 11) / 1024) }, [kg, n])
+        let biasesG = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let biasesU = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 5) / 512) }, [kg, n])
+        func negated(_ s: MLXArray) -> MLXArray {
+            (s.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        }
+        let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 2048 }, [m * kg])
+        let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+        let activation = PromptInt8Activation(codes: codes, ascale: ascale, rsb: rsb, rows: m, k: k)
+        let signs: [Float] = (0 ..< 4096).map { (($0 &* 2_654_435_761) >> 7) & 1 == 0 ? 1 : -1 }
+        guard let transform = try? SignedBlockHadamard(blockSize: 4096, signs: signs) else { return false }
+        var matched = false
+        withErrorHandler({ message in
+            if !PromptInt8Matmul.gluCheckFailed { PromptInt8Matmul.gluNote = String(message.prefix(160)) }
+            PromptInt8Matmul.gluCheckFailed = true
+        }) {
+            matched = [false, true].allSatisfy { negative in
+                let gate: GLUOperands = (wg, scalesG, negative ? negated(scalesG) : biasesG, negative)
+                let up: GLUOperands = (wu, scalesU, negative ? negated(scalesU) : biasesU, negative)
+                guard let pair = matmul(activation, layers: [gate, up]),
+                    let base = transform.quantizedForPrompt(pair[0], up: pair[1]),
+                    let fused = transform.quantizedForPrompt(runGLU(form, activation, gate: gate, up: up))
+                else { return false }
+                let codesEqual = MLX.all(base.codes .== fused.codes)
+                let scalesEqual = MLX.all(base.ascale.view(dtype: .uint32) .== fused.ascale.view(dtype: .uint32))
+                let offsetsEqual = MLX.all(base.rsb.view(dtype: .uint32) .== fused.rsb.view(dtype: .uint32))
+                let live = MLX.any(base.codes .!= MLXArray(Int8(0)))
+                eval(codesEqual, scalesEqual, offsetsEqual, live)
+                return !gluCheckFailed && codesEqual.item(Bool.self) && scalesEqual.item(Bool.self)
+                    && offsetsEqual.item(Bool.self) && live.item(Bool.self)
+            }
+        }
+        if !gluCheckFailed { gluNote = matched ? "bit-identical (\(form) kernel)" : "outputs differ" }
+        return matched
+    }
+
+    /// Decided once, at the first packed module's init, after `route`.
+    static let gluForm: GLUForm? = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_GLU"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let form: GLUForm?
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            form = nil
+            gluNote = "off by environment"
+        } else if route == .nax && naxSg {
+            form = checkGLU(.nax) ? .nax : nil
+        } else if route == .plain {
+            form = checkGLU(.plain) ? .plain : nil
+        } else {
+            form = nil
+            gluNote = "no eligible prompt route"
+        }
+        FileHandle.standardError.write(
+            "prefill glu: \(form.map { "\($0)" } ?? "off") (\(gluNote))\n".data(using: .utf8)!)
+        return form
+    }()
+
+    /// `silu(gate(x)) * up(x)` for one prompt activation in one launch, or nil
+    /// when the GLU launch is not engaged or the shapes do not take it.
+    static func glu(_ activation: PromptInt8Activation, gate: GLUOperands, up: GLUOperands) -> MLXArray? {
+        guard let form = gluForm, gate.weight.shape == up.weight.shape,
+            gate.scalesT.shape == up.scalesT.shape, gate.weight.dim(0) % 64 == 0,
+            activation.rows % 64 == 0
+        else { return nil }
+        return runGLU(form, activation, gate: gate, up: up)
+    }
+}
+
 /// Verify-width packed matmul (an MTP verify: 2 to 8 rows) on the int8
 /// activation codes of `PromptInt8Matmul`, split over K inside a threadgroup
 /// (27b 320ec19a's verify split-K on tensor units, built integer-exact).
@@ -3621,6 +3853,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            _ = PromptInt8Matmul.gluForm
         }
     }
 
@@ -3708,6 +3941,46 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return layer.bias.map { output + $0 } ?? output
         }
         return (activation.last!, outputs)
+    }
+
+    /// The prompt-width dense MLP after the attention residual:
+    /// `down(silu(gate(n)) * up(n))` with `n = rmsNorm(x + residual)`, the
+    /// residual add, norm and rotation in one kernel (as in
+    /// `sharedResidualNormProjections`), gate and up in one GLU launch
+    /// (`PromptInt8Matmul.glu`) and down quantized from the stored product.
+    /// Nil, with nothing built, unless every step takes its integer route.
+    public static func sharedResidualNormGLU(
+        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float,
+        gate: Linear, up: Linear, down: Linear
+    ) -> (residual: MLXArray, output: MLXArray)? {
+        guard PromptInt8Matmul.gluForm != nil, x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32
+        else { return nil }
+        let rows = x.size / 4096
+        guard PromptInt8Matmul.applies(rows: rows), PromptInt8Matmul.route != .off,
+            !VerifyInt8Matmul.rowRange.contains(rows),
+            let gate = gate as? HadamardQuantizedLinear, let up = up as? HadamardQuantizedLinear,
+            let down = down as? HadamardQuantizedLinear,
+            [gate, up].allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
+            }),
+            gate.transform.isIdentical(to: up.transform),
+            gate.weight.shape == up.weight.shape, gate.scales.shape == up.scales.shape,
+            rows * gate.weight.dim(0) <= Int(Int32.max),
+            down.readsFloat16ConstantsInPlace, down.gdnLayout == nil, down.transform.blockSize == 4096,
+            down.transform.width == gate.weight.dim(0), down.transform.width % 512 == 0,
+            down.weight.dim(0) % 64 == 0,
+            let activation = gate.transform.residualNorm(
+                x, residual: residual, weight: weight, eps: eps, quantized: true, verifyRows: 0)
+        else { return nil }
+        let codes = PromptInt8Activation(
+            codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
+        guard let product = PromptInt8Matmul.glu(codes, gate: gate.verifyOperands, up: up.verifyOperands),
+            let projected = down.promptInt8Forward(product.reshaped(Array(x.shape.dropLast()) + [gate.weight.dim(0)]))
+        else {
+            preconditionFailure("prefill GLU: a qualified MLP lost its integer route after the boundary")
+        }
+        return (activation.last!, down.bias.map { projected + $0 } ?? projected)
     }
 
     /// `sharedPromptProjections(rmsNorm(x, weight), projections)` with the

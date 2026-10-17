@@ -3428,6 +3428,13 @@ final class Qwen35DecoderLayer: Module {
                     exactTargetVerify: exactTargetVerify)
             }
         }
+        if !lastPositionOnly, !exactTargetVerify, let dense = mlp as? Qwen3NextMLP,
+            let fused = HadamardQuantizedLinear.sharedResidualNormGLU(
+                x, residual: r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
+                gate: dense.gateProj, up: dense.upProj, down: dense.downProj)
+        {
+            return fused.residual + fused.output
+        }
         if (!lastPositionOnly || x.dim(1) == 1), let dense = mlp as? Qwen3NextMLP,
             let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
                 x, residual: r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
