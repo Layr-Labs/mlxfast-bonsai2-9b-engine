@@ -66,6 +66,25 @@ public struct SignedBlockHadamard {
             const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
             """
 
+    private static let normSource = """
+
+            threadgroup float norm_sums[32];
+            const uint norm_lane = thread_index_in_simdgroup;
+            const uint norm_sg = simdgroup_index_in_threadgroup;
+            for (uint part = 0; part < 4; ++part) {
+              const uint at = batch_idx + (uint(i) + part * 256u) * 4u;
+              const float4 value = *((const device float4*)(x + at));
+              float square_sum = 0.0f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 4; ++j) square_sum += value[j] * value[j];
+              square_sum = simd_sum(square_sum);
+              if (norm_lane == 0) norm_sums[norm_sg + part * 8u] = square_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float norm_total = simd_sum(norm_sums[norm_lane]);
+            const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
+            """
+
     private static func fused4096Source(residualNorm: Bool) -> String {
         let prefix = residualNorm ? residualNormSource : ""
         let valueRead = residualNorm ? """
@@ -263,7 +282,7 @@ public struct SignedBlockHadamard {
     private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
         attentionGate: Bool = false, normalizedOutput: Bool = false,
-        rotatedOutput: Bool = false
+        rotatedOutput: Bool = false, rmsNorm: Bool = false
     ) -> String {
         let valueRead = swiglu ? """
             const float4 g = in4[w];
@@ -272,7 +291,7 @@ public struct SignedBlockHadamard {
             const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
             float4 val = ((g * sigmoid_g) * u) * s4[w];
             """ : "float4 val = in4[w] * s4[w];"
-        let prefix = residualNorm ? residualNormSource : gatedNorm ? gatedNormSource : ""
+        let prefix = rmsNorm ? normSource : residualNorm ? residualNormSource : gatedNorm ? gatedNormSource : ""
         let rotatedWrite = rotatedOutput ? """
             device float4* rot4 = (device float4*)(rotated_out + batch_idx + uint(base0));
             #pragma clang loop unroll(full)
@@ -280,7 +299,10 @@ public struct SignedBlockHadamard {
               rot4[w] = float4(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
             }
             """ : ""
-        let inputRead = residualNorm && normalizedOutput ? """
+        let inputRead = rmsNorm ? """
+            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+            float4 val = (weight * (in4[w] * norm_inv)) * s4[w];
+            """ : residualNorm && normalizedOutput ? """
             const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
             *((device float4*)(residual_out + in_offset) + w) = raw;
             const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
@@ -461,6 +483,13 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, rotatedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
+    private static let normQuantized4096RotatedKernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_norm_4096_q8_rot",
+        inputNames: ["x", "norm_weight", "epsilon", "signs"],
+        outputNames: ["codes", "ascale", "rsb", "rotated_out"],
+        source: quantized4096Source(swiglu: false, rotatedOutput: true, rmsNorm: true),
+        header: quantized4096Header, ensureRowContiguous: true)
+
     private static let quantizedSwiGLU4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_swiglu_4096_q8",
         inputNames: ["x", "up", "signs"], outputNames: ["codes", "ascale", "rsb"],
@@ -569,6 +598,81 @@ public struct SignedBlockHadamard {
             outputDTypes: [.int8, .float32, .float32, .float32, .float32])
     }
 
+    /// `residualNormVerifyNormalized` at prompt width (`PromptInt8Matmul`
+    /// rows): the same kernel, one threadgroup per row, with the prompt
+    /// constant order (`VERIFY_ROWS` 0). Returns `[codes, ascale, rsb, x +
+    /// residual, rmsNorm(x + residual, weight)]`; the codes and constants are
+    /// those of `quantizedForPrompt` on the normalized rows.
+    func residualNormPromptNormalized(
+        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
+    ) -> [MLXArray]? {
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            residual.dtype == .float32, residual.shape == x.shape,
+            weight.dtype == .float32, weight.shape == [4096], x.size > 0,
+            x.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let rows = x.size / width
+        guard PromptInt8Matmul.applies(rows: rows) else { return nil }
+        return Self.residualNormNormedQuantized4096Kernel(
+            [x, residual, weight, MLXArray([eps]), signs],
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+            grid: (256, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape, x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+    }
+
+    /// Whether `residualNormPromptNormalized` gives, bit for bit, MLX's add,
+    /// `MLXFast.rmsNorm` and `quantizedForPrompt` of the normalized rows, on
+    /// synthetic rows at widths 512 and 128. Run once, at load.
+    nonisolated(unsafe) private static var boundaryCheckFailed = false
+    nonisolated(unsafe) private static var boundaryCheckNote = "ok"
+
+    func promptBoundaryMatchesSeparate() -> (Bool, String) {
+        Self.boundaryCheckFailed = false
+        Self.boundaryCheckNote = "ok"
+        var note: String? = nil
+        var matched = false
+        withErrorHandler({ message in
+            if !SignedBlockHadamard.boundaryCheckFailed {
+                SignedBlockHadamard.boundaryCheckNote = String(message.prefix(160))
+            }
+            SignedBlockHadamard.boundaryCheckFailed = true
+        }) {
+            for (trial, rows) in [512, 128].enumerated() {
+                let key = MLXRandom.key(UInt64(41 + trial))
+                let keys = MLXRandom.split(key: key, into: 3)
+                let x = MLXRandom.normal([1, rows, 4096], key: keys[0]) * Float(4 + 20 * trial)
+                let delta = MLXRandom.normal([1, rows, 4096], key: keys[1]) * 0.75
+                let weight = MLXRandom.uniform(Float(0.05) ..< Float(2.5), [4096], key: keys[2])
+                let eps: Float = 1e-6
+                guard let fused = residualNormPromptNormalized(x, residual: delta, weight: weight, eps: eps)
+                else { note = "route not taken at rows \(rows)"; return }
+                let sum = x + delta
+                let normed = MLXFast.rmsNorm(sum, weight: weight, eps: eps)
+                guard let separate = quantizedForPrompt(normed)
+                else { note = "separate route not taken at rows \(rows)"; return }
+                let pairs: [(MLXArray, MLXArray)] = [
+                    (fused[0].view(dtype: .uint8), separate.codes.view(dtype: .uint8)),
+                    (fused[1].view(dtype: .uint32), separate.ascale.view(dtype: .uint32)),
+                    (fused[2].view(dtype: .uint32), separate.rsb.view(dtype: .uint32)),
+                    (fused[3].view(dtype: .uint32), sum.view(dtype: .uint32)),
+                    (fused[4].view(dtype: .uint32), normed.view(dtype: .uint32)),
+                ]
+                for (index, (a, b)) in pairs.enumerated() {
+                    let equal = a.shape == b.shape ? MLX.all(a .== b) : MLXArray(false)
+                    eval(equal)
+                    if Self.boundaryCheckFailed { return }
+                    if !equal.item(Bool.self) {
+                        note = "output \(index) differs at rows \(rows)"
+                        return
+                    }
+                }
+            }
+            matched = !Self.boundaryCheckFailed
+        }
+        return (matched, note ?? Self.boundaryCheckNote)
+    }
+
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_residual_norm_4096_q8",
         inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
@@ -670,6 +774,33 @@ public struct SignedBlockHadamard {
         let groups = rows * (width / 128)
         let outputs = Self.quantized4096RotatedKernel(
             [x.reshaped([rows, width]), signs],
+            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
+        return (
+            PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            outputs[3])
+    }
+
+    /// `quantizedForVerifyWithRotated` with RMSNorm fused directly into the
+    /// initial Hadamard butterfly pass: eliminates the DRAM round-trip between
+    /// final layer activations and the verification quantizer.
+    func normQuantizedForVerifyWithRotated(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float
+    ) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
+        validate(x)
+        let rows = x.size / width
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            normWeight.dtype == .float32, normWeight.shape == [width],
+            VerifyInt8Matmul.rowRange.contains(rows),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let outputs = Self.normQuantized4096RotatedKernel(
+            [x.reshaped([rows, width]), normWeight, MLXArray([eps]), signs],
             template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
             grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
             outputShapes: [[tile, width], [groups], [groups], x.shape],
@@ -3183,6 +3314,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            if transform.width == 4096 { _ = Self.promptBoundaryEnabled(transform) }
         }
     }
 
@@ -3237,6 +3369,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify, let verifyOutputs = VerifyInt8Matmul.matmul(
+            PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+            layers: packed.map(\.verifyOperands))
+        {
+            let outputs = zip(packed, verifyOutputs).map { layer, output in
+                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { reshaped + $0 } ?? reshaped
+            }
+            return (activation.last!, outputs)
+        }
         let promptOutputs = quantized && !verify
             ? PromptInt8Matmul.matmul(
                 PromptInt8Activation(
@@ -3293,6 +3436,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public struct VerifyBoundary {
         let activation: PromptInt8Activation
         let transform: SignedBlockHadamard
+        /// Prompt-width codes (`PromptInt8Matmul` order) rather than verify.
+        var prompt = false
         /// `x + delta`, the residual stream entering the layer.
         public let residual: MLXArray
         /// `rmsNorm(x + delta, weight)`.
@@ -3327,6 +3472,66 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             transform: first.transform, residual: outputs[3], normalized: outputs[4])
     }
 
+    nonisolated(unsafe) private static var promptBoundaryChecked: Bool?
+
+    /// The prompt-width boundary kernel passed its load-time bit check
+    /// against the separate add, RMSNorm and quantization (once per process;
+    /// `DARKBLOOM_BONSAI_PROMPT_BOUNDARY=0` turns it off).
+    static func promptBoundaryEnabled(_ transform: SignedBlockHadamard) -> Bool {
+        if let promptBoundaryChecked { return promptBoundaryChecked }
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_BOUNDARY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let enabled: Bool
+        let note: String
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            (enabled, note) = (false, "disabled")
+        } else if PromptInt8Matmul.route == .off {
+            (enabled, note) = (false, "int8 prompt route off")
+        } else {
+            (enabled, note) = transform.promptBoundaryMatchesSeparate()
+        }
+        promptBoundaryChecked = enabled
+        FileHandle.standardError.write(
+            "prompt boundary: \(enabled ? "fused" : "separate") (check: \(note))\n"
+                .data(using: .utf8)!)
+        return enabled
+    }
+
+    /// Rows at which `promptBoundary` can apply.
+    public static func promptBoundaryApplies(rows: Int) -> Bool {
+        PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+            && promptBoundaryChecked == true
+    }
+
+    /// `verifyBoundary` at prompt width: `x + delta`, its RMSNorm and the
+    /// prompt codes of the rotated norm in one kernel, each the bits of the
+    /// separate add, `rmsNorm` and `quantizedForPrompt`. Nil when the rows,
+    /// the packing, the route or the load-time check do not qualify; the
+    /// caller then adds, normalizes and projects separately.
+    public static func promptBoundary(
+        _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
+        projections: [Linear]
+    ) -> VerifyBoundary? {
+        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32,
+            promptBoundaryApplies(rows: x.size / 4096)
+        else { return nil }
+        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
+        guard packed.count == projections.count, let first = packed.first,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
+                    && $0.transform.isIdentical(to: first.transform)
+            }),
+            let outputs = first.transform.residualNormPromptNormalized(
+                x, residual: delta, weight: weight, eps: eps)
+        else { return nil }
+        let rows = x.size / 4096
+        return VerifyBoundary(
+            activation: PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
+            transform: first.transform, prompt: true, residual: outputs[3], normalized: outputs[4])
+    }
+
     /// `projections` applied to `boundary.normalized` from the boundary's
     /// codes. Nil when a projection's packing or rotation differs.
     public static func boundaryProjections(
@@ -3336,10 +3541,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard packed.count == projections.count,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096
+                    && $0.weight.dim(0) % (boundary.prompt ? 64 : 32) == 0
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
+        if boundary.prompt {
+            return packed.map { layer in
+                let (scalesT, biasesT) = layer.promptConstants.get(
+                    scales: layer.scales, biases: layer.biases!)
+                return PromptInt8Matmul.matmul(
+                    boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: layer.promptConstants.negative)!
+                    .reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
+            }
+        }
         guard let outputs = VerifyInt8Matmul.matmul(
             boundary.activation, layers: packed.map(\.verifyOperands))
         else { return nil }
@@ -3534,13 +3750,22 @@ extension HadamardQuantizedLinear {
     /// FP32 rows (`ExactVerifyHead`; at 2 to 4 rows also the fused top-2).
     /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
     /// module or shape has no exact path.
-    public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
+    public func topTwoRows(
+        _ x: MLXArray,
+        fusedNorm: (normWeight: MLXArray, eps: Float)? = nil
+    ) -> (ids: MLXArray, values: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
         if x.ndim >= 1, x.dim(-1) == transform.width {
             let rows = x.size / x.dim(-1)
-            if let exact = exactHeadTopTwo(x, rows: rows) { return exact }
+            if let exact = exactHeadTopTwo(x, rows: rows, fusedNorm: fusedNorm) { return exact }
         }
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        let normX: MLXArray
+        if let fusedNorm {
+            normX = MLXFast.rmsNorm(x, weight: fusedNorm.normWeight, eps: fusedNorm.eps)
+        } else {
+            normX = x
+        }
+        let rotated = transform(gdnLayout.map { $0(normX) } ?? normX)
         guard rotated.dtype == .float32 else { return nil }
         let rows = rotated.size / rotated.dim(-1)
         if (5 ... 8).contains(rows), ExactVerifyHead.verified[rows] == false { return nil }
@@ -3554,14 +3779,22 @@ extension HadamardQuantizedLinear {
     /// (and, at 2-4 rows, with `Float16ConstantQMV.topTwo`); on a mismatch
     /// that row count keeps the record's head.
     private func exactHeadTopTwo(
-        _ x: MLXArray, rows: Int
+        _ x: MLXArray, rows: Int,
+        fusedNorm: (normWeight: MLXArray, eps: Float)? = nil
     ) -> (ids: MLXArray, values: MLXArray)? {
         guard let range = ExactVerifyHead.rowRange, range.contains(rows),
             ExactVerifyHead.verified[rows] != false,
             gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
-            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            let (activation, rotated) = transform.quantizedForVerifyWithRotated(x)
+            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off
         else { return nil }
+        let pair: (activation: PromptInt8Activation, rotated: MLXArray)?
+        if let fusedNorm {
+            pair = transform.normQuantizedForVerifyWithRotated(
+                x, normWeight: fusedNorm.normWeight, eps: fusedNorm.eps)
+        } else {
+            pair = transform.quantizedForVerifyWithRotated(x)
+        }
+        guard let (activation, rotated) = pair else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
@@ -3949,8 +4182,7 @@ extension HadamardQuantizedLinear {
             outputShapes: [[1, 1, K], [1, K]], outputDTypes: [.float32, .float32])
         let rotated = normed[1]
         let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases],
-            template: [("P", width), ("NEG", promptConstants.negative ? 1 : 0)],
+            [rotated, weight, scales, biases], template: [("P", width)],
             grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk

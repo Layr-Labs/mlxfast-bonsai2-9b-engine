@@ -1147,7 +1147,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// about 32 MB per step; (1536, 32) read 23 MB and needed 231 rounds.
     static let draftScreen: (Int, Int)? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_DRAFT_SCREEN"] else {
-            return (2048, 32)
+            return (2048, 16)
         }
         let parts = raw.split(separator: ",").compactMap { Int($0) }
         return parts.count == 2 ? (parts[0], parts[1]) : nil
