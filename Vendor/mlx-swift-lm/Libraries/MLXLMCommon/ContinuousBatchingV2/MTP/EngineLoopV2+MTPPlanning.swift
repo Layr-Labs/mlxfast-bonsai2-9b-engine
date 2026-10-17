@@ -219,11 +219,15 @@ extension EngineLoopV2 {
         // Prompt lookup proposes the declared depth only where every row's
         // newest n-gram recurs; otherwise the drafter runs a shorter chain,
         // since its acceptance falls off with depth while a lookup's does not.
+        // A drafted round goes one token deeper when the target was confident
+        // in the token it just committed (carried top-two margin).
         if let missDepth = mtp.lookupMissDepth, mtp.planDepth > missDepth,
             !eligibleRows.isEmpty,
             !eligibleRows.allSatisfy({ mtp.lookupDraft(for: $0, depth: mtp.planDepth) != nil })
         {
-            mtp.clampPlanDepth(to: missDepth, reason: "lookup_miss")
+            mtp.clampPlanDepth(
+                to: mtp.lookupMissRoundDepth(for: eligibleRows, missDepth: missDepth),
+                reason: "lookup_miss")
         }
         if mtp.planDepth > 0 {
             let eligibleIDs = Set(eligibleRows.map(\.id))

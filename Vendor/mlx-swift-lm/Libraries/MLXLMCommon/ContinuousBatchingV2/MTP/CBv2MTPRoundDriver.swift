@@ -265,6 +265,16 @@ final class CBv2MTPRoundDriver {
     let lookupNgram: Int?
     /// Depth of a round whose lookup misses, or nil to keep the declared one.
     let lookupMissDepth: Int?
+    /// Deeper drafted depth and the carried-margin threshold that selects it,
+    /// or nil to keep one drafted depth.
+    let lookupMissDeep: (depth: Int, minimumMargin: Double)?
+    private var missDepthSchedule: [Int]
+    /// The current plan took the schedule's first entry, and a round that
+    /// plan launched consumed its carry. An entry is dropped only after a
+    /// drafted round launched with it: the seed step and a re-plan of the
+    /// same step plan without launching one.
+    private var missDepthScheduleArmed = false
+    private var missDepthScheduleLaunched = false
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -370,11 +380,21 @@ final class CBv2MTPRoundDriver {
             (config.fixedDraftTokens ?? 0) > 0 && !(drafter is any CBv2MTPBlockDrafter)
             ? (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupDraftNgram : nil
         self.lookupNgram = lookupNgram.flatMap { $0 > 0 ? $0 : nil }
-        self.lookupMissDepth =
+        let missDepth =
             (lookupNgram ?? 0) <= 0
             ? nil
             : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissDraftDepth
                 .flatMap { $0 > 0 && $0 < (config.fixedDraftTokens ?? 0) ? $0 : nil }
+        self.lookupMissDepth = missDepth
+        self.lookupMissDeep =
+            missDepth == nil
+            ? nil
+            : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissDeepDraft
+                .flatMap {
+                    $0.depth > (missDepth ?? 0) && $0.depth < (config.fixedDraftTokens ?? 0)
+                        && $0.minimumMargin.isFinite ? $0 : nil
+                }
+        self.missDepthSchedule = config.missDepthSchedule
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
         self.config = config
         self.drafter = drafter
@@ -455,6 +475,7 @@ final class CBv2MTPRoundDriver {
         plannedDecodeRows: Int, canSpeculate: Bool,
         rowIDs: [CBv2RequestID]? = nil
     ) {
+        missDepthScheduleArmed = false
         if let rowIDs, depthController.usesCommittedDecodeBaseline {
             let changedCohort = Set(rowIDs) != Set(goodputPlanRows)
             if changedCohort {
@@ -607,7 +628,9 @@ final class CBv2MTPRoundDriver {
     /// Take the row's carry for a launching round (a fresh one is stored at
     /// the round's finalize, or the row seeds again).
     func consumeCarry(for id: CBv2RequestID) -> CBv2MTPCarry? {
-        carries.removeValue(forKey: id)
+        let carry = carries.removeValue(forKey: id)
+        if missDepthScheduleArmed, carry != nil { missDepthScheduleLaunched = true }
+        return carry
     }
 
     func storeCarry(
@@ -797,6 +820,29 @@ final class CBv2MTPRoundDriver {
     }
 
     // MARK: Prompt lookup
+
+    /// Depth of a drafted round (the lookup missed): the deeper chain when
+    /// every row's carried target top-two margin clears the threshold, else
+    /// `missDepth`. The margin is the target's own, already on the host from
+    /// the previous round's finalize, so the choice is deterministic and
+    /// adds no sync. A row with no margin yet (its first round) stays shallow.
+    func lookupMissRoundDepth(for rows: [CBv2ScheduledRequest], missDepth: Int) -> Int {
+        let deepest = lookupMissDeep?.depth ?? missDepth
+        if missDepthScheduleLaunched, !missDepthSchedule.isEmpty {
+            missDepthSchedule.removeFirst()
+        }
+        missDepthScheduleLaunched = false
+        if let depth = missDepthSchedule.first {
+            missDepthScheduleArmed = true
+            return min(max(depth, 1), deepest)
+        }
+        guard let deep = lookupMissDeep, !rows.isEmpty else { return missDepth }
+        let allConfident = rows.allSatisfy { rec in
+            guard let margin = carries[rec.id]?.previousTopTwoMargin else { return false }
+            return margin >= deep.minimumMargin
+        }
+        return allConfident ? deep.depth : missDepth
+    }
 
     /// The `depth` tokens that followed the most recent earlier occurrence of
     /// the row's newest `lookupNgram` committed tokens, or nil. Only the

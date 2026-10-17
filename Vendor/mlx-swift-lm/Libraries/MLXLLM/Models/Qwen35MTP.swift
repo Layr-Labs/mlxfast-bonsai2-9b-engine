@@ -1059,6 +1059,23 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var lookupMissDraftDepth: Int? { Self.promptLookupMissDepth }
 
+    /// Drafted rounds whose carried target top-two logit margin is at least
+    /// 4 draft one token deeper (4 instead of 3). On the public prompt at a
+    /// uniform depth 4, such rounds (46% of drafted rounds) accepted all four
+    /// drafts 55% of the time, the others 27%. `QWEN35_PLD_MISS_DEEP=0` or
+    /// `off` keeps one drafted depth (local experiments only).
+    static let promptLookupMissDeep: (depth: Int, minimumMargin: Double)? = {
+        let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEEP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let raw = raw, ["0", "false", "no", "off"].contains(raw) { return nil }
+        guard let missDepth = promptLookupMissDepth else { return nil }
+        return (depth: missDepth + 1, minimumMargin: 4)
+    }()
+
+    public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? {
+        Self.promptLookupMissDeep
+    }
+
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
@@ -1431,9 +1448,12 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 /// quantization are untouched; each draft step reads only the subset rows.
 final class Qwen35MTPDraftVocabulary: @unchecked Sendable {
     /// Half draft subset (leading 49,152 + trailing 512) — officially
-    /// validated sweet spot (acceptance pinned 0.8378, mismatch 0).
-    /// Halving N halves the screened screen's row stream and every
-    /// neural draft step's head traffic.
+    /// validated sweet spot (9ff5316e sealed 2.30167, acceptance pinned
+    /// 0.8378, mismatch 0). Quarter cut falsified (d15bec94 2.24069, acc
+    /// 0.7583): [24_576, 49_152) carries accepted tokens. Halving N halves
+    /// the screened screen's row stream and every neural draft step's head
+    /// traffic. Guards hold: 49_664 % 32 == 0, 1,552 blocks even.
+    /// Out-of-subset proposals are rejected drafts, never wrong outputs.
     static let leadingRows = 49_152
     static let trailingRows = 512
 
@@ -1482,7 +1502,8 @@ extension Qwen35InlineMTPAssistant {
     /// the scored seed width. At the declared depth the engine runs two round
     /// shapes: a prompt-lookup hit verifies 1 + 6 rows, a miss drafts a
     /// depth-3 chain with the head and verifies 1 + 3 rows
-    /// (`promptLookupMissDepth`).
+    /// (`promptLookupMissDepth`), or a depth-4 chain and 1 + 4 rows when the
+    /// target's carried margin is high (`promptLookupMissDeep`).
     static let warmDepth = 6
     static let warmPromptRows = 512
     /// The period of the second warm prompt: its newest n-gram always recurs,
@@ -1521,6 +1542,20 @@ extension Qwen35InlineMTPAssistant {
         let depth = Self.warmDepth
         let rows = Self.warmPromptRows
         weak var released: EngineV2?
+        var warmMTPConfig = CBv2MTPConfig(
+            enabled: true,
+            maxDraftTokens: depth,
+            maxSpeculativeBatch: 1,
+            fixedDraftTokens: depth,
+            verificationMode: .automatic,
+            maxAutomaticRectangularTokens: 1 + depth,
+            draftTokenCeiling: CBv2MTPConfig.testedMaxDraftTokens)
+        // The first request's first two drafted rounds run the deep chain
+        // (5-row verify) and the shallow one (4-row verify), whatever the warm
+        // prompt's margins are, so both drafted widths are built here.
+        if let deep = Self.promptLookupMissDeep, let shallow = Self.promptLookupMissDepth {
+            warmMTPConfig.missDepthSchedule = [deep.depth, shallow]
+        }
         do {
             let engine = EngineV2(
                 model: CBv2SteppableLanguageModelAdapter(serving),
@@ -1535,14 +1570,7 @@ extension Qwen35InlineMTPAssistant {
                     maxWaiting: 1,
                     enablePrefixCache: false),
                 mtpDrafter: self,
-                mtpConfig: CBv2MTPConfig(
-                    enabled: true,
-                    maxDraftTokens: depth,
-                    maxSpeculativeBatch: 1,
-                    fixedDraftTokens: depth,
-                    verificationMode: .automatic,
-                    maxAutomaticRectangularTokens: 1 + depth,
-                    draftTokenCeiling: CBv2MTPConfig.testedMaxDraftTokens))
+                mtpConfig: warmMTPConfig)
             released = engine
             // Two greedy requests, one after the other: a non-repeating
             // pattern, whose rounds miss the lookup and run the head's chain
