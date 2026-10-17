@@ -3507,6 +3507,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let tokens = step.sampledTokens {
             host = tokens.asArray(Int32.self)
             CBv2CoreInstrumentation.recordHostSync()
+            CBv2SideQueue.settle()
         } else if !step.evalTargets.isEmpty {
             eval(step.evalTargets)
             CBv2CoreInstrumentation.recordHostSync()

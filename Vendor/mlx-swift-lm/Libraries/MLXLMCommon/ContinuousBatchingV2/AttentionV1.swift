@@ -787,11 +787,27 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
-            let output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
-                mask: maskMode(
-                    L: L, kL: kL, window: window, bidirectional: bidirectional),
-                sinks: sinks)
+            let output: MLXArray
+            if sinks == nil, window == nil, !bidirectional,
+                (9...16).contains(L), queries.shape == [1, 16, L, 256],
+                attentionKeys.shape == [1, 4, kL, 256], attentionValues.shape == attentionKeys.shape,
+                queries.dtype == .float32
+            {
+                let folded = (queries * scale).reshaped([1, 4, 4 * L, 256])
+                let scores = matmul(folded, attentionKeys.swappedAxes(-1, -2))
+                    .reshaped([1, 4, 4, L, kL])
+                let keep = boolMask(L: L, kL: kL, window: nil)!
+                let probabilities = softmax(
+                    MLX.where(keep, scores, -Float.greatestFiniteMagnitude), axis: -1, precise: true)
+                output = matmul(probabilities.reshaped([1, 4, 4 * L, kL]), attentionValues)
+                    .reshaped([1, 16, L, 256])
+            } else {
+                output = MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
+                    mask: maskMode(
+                        L: L, kL: kL, window: window, bidirectional: bidirectional),
+                    sinks: sinks)
+            }
             if let metadata {
                 metadata.finish(
                     storage: ["visible_keys": .init(keys), "visible_values": .init(values)],

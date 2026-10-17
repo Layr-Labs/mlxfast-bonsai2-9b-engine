@@ -303,6 +303,11 @@ extension EngineLoopV2 {
                         committedDraftTokens: committedDraftTokens,
                         committedTargetHidden: committedHidden)
                 }
+                if let block = stateful as? any CBv2MTPBlockDrafter {
+                    block.reconcileNextBlock(
+                        confirmed: confirmed, anchor: finishReason == nil ? kept.last : nil,
+                        requestState: state)
+                }
             }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)

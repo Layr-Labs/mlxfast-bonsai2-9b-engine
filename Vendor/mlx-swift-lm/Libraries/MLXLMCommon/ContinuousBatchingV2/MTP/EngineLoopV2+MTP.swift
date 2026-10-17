@@ -62,6 +62,18 @@ extension EngineLoopV2 {
         mtp.recordSeedSteps(graph.seedRows.count)
 
         asyncEval(graph.asyncEvalTargets)
+        if let verify = graph.verify, verify.rows.count == 1,
+            let block = mtp.blockDrafter, let context = verify.blockContext,
+            let state = verify.rows[0].assistantState,
+            let rec = scheduler.record(for: verify.rows[0].id),
+            rec.request.stopStrings.isEmpty,
+            rec.request.maxTokens - rec.generatedTokenCount > verify.k + 1
+        {
+            let targets = block.prepareNextBlock(
+                acceptancePacket: verify.acceptancePacket, depth: verify.k,
+                verifyContext: context, requestState: state)
+            if !targets.isEmpty { asyncEval(targets) }
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)

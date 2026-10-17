@@ -511,8 +511,9 @@ public final class CBv2RecurrentRequestState {
             let fullAcceptance = keep == positions
             committed = [:]
             if fullAcceptance {
+                let fullCommits = replay.mapValues { ($0.finalState, $0.fullAcceptance) }
                 deferredCommitted = {
-                    replay.mapValues { stage in stage.fullAcceptance?() ?? stage.finalState }
+                    fullCommits.mapValues { $0.1?() ?? $0.0 }
                 }
             } else {
                 deferredCommitted = { replay.mapValues { $0.replay(keep) } }

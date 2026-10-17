@@ -436,6 +436,115 @@ public enum DFlash2SlidingMask {
     }
 }
 
+/// The same sliding mask is reused by layers with equal geometry.
+final class DFlash2SlidingMaskMemo {
+    private var key: [Int]?
+    private var cached: MLXArray?
+
+    var retainedArrays: [MLXArray] { cached.map { [$0] } ?? [] }
+
+    func mask(
+        contextLength: Int, blockLength: Int, slidingWindow: Int, isCausal: Bool
+    ) -> MLXArray {
+        let requested = [contextLength, blockLength, slidingWindow, isCausal ? 1 : 0]
+        if let cached, key == requested { return cached }
+        let made = DFlash2SlidingMask.make(
+            contextLength: contextLength, blockLength: blockLength,
+            slidingWindow: slidingWindow, isCausal: isCausal)
+        key = requested
+        cached = made
+        return made
+    }
+}
+
+/// Stack Q8 rows without changing packed words, scales, or biases.
+private final class DFlash2QuantizedStack {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let ends: [Int]
+
+    init?(_ layers: [Linear]) {
+        let pieces = layers.compactMap { $0 as? QuantizedLinear }
+        guard pieces.count == layers.count, let first = pieces.first,
+            pieces.allSatisfy({
+                $0.bits == 8 && $0.groupSize == 32 && $0.mode == .affine && $0.bias == nil
+                    && $0.weight.dtype == .uint32 && $0.weight.ndim == 2
+                    && $0.weight.dim(1) == first.weight.dim(1)
+                    && $0.scales.dtype == .float32 && $0.scales.ndim == 2
+                    && $0.scales.dim(1) == first.scales.dim(1)
+                    && $0.biases?.dtype == .float32 && $0.biases?.shape == $0.scales.shape
+            })
+        else { return nil }
+        var ends = [0]
+        for piece in pieces { ends.append(ends.last! + piece.weight.dim(0)) }
+        self.ends = ends
+        weight = concatenated(pieces.map { $0.weight }, axis: 0)
+        scales = concatenated(pieces.map { $0.scales }, axis: 0)
+        biases = concatenated(pieces.map { $0.biases! }, axis: 0)
+        eval(weight, scales, biases)
+        for (index, piece) in pieces.enumerated() {
+            let rows = ends[index] ..< ends[index + 1]
+            piece.update(parameters: ModuleParameters.unflattened([
+                "weight": weight[rows, 0...], "scales": scales[rows, 0...],
+                "biases": biases[rows, 0...],
+            ]))
+        }
+    }
+
+    private init(weight: MLXArray, scales: MLXArray, biases: MLXArray, ends: [Int]) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.ends = ends
+        eval(weight, scales, biases)
+    }
+
+    func droppingFirst() -> DFlash2QuantizedStack {
+        let start = ends[1]
+        return DFlash2QuantizedStack(
+            weight: weight[start..., 0...], scales: scales[start..., 0...],
+            biases: biases[start..., 0...], ends: ends.dropFirst().map { $0 - start })
+    }
+
+    func product(_ x: MLXArray) -> MLXArray {
+        quantizedMM(
+            x, weight, scales: scales, biases: biases,
+            transpose: true, groupSize: 32, bits: 8)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> [MLXArray] {
+        let wide = product(x)
+        return (0 ..< ends.count - 1).map { wide[.ellipsis, ends[$0] ..< ends[$0 + 1]] }
+    }
+}
+
+private enum DFlash2StackedSwiGLU {
+    static func apply(_ wide: MLXArray) -> MLXArray {
+        let width = wide.dim(-1) / 2
+        return kernel(
+            [wide], template: [("WIDTH", width)],
+            grid: (wide.size / 2, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [Array(wide.shape.dropLast()) + [width]],
+            outputDTypes: [.float32])[0]
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "dflash2_stacked_q8_swiglu", inputNames: ["wide"], outputNames: ["out"],
+        source: """
+            #pragma clang fp contract(off)
+            const uint i = thread_position_in_grid.x;
+            const uint row = i / WIDTH;
+            const uint col = i % WIDTH;
+            const float gate = wide[row * (2 * WIDTH) + col];
+            const float up = wide[row * (2 * WIDTH) + WIDTH + col];
+            const float y = 1 / (1 + metal::exp(metal::abs(gate)));
+            const float sigmoid = gate < 0 ? y : 1 - y;
+            const float activated = gate * sigmoid;
+            out[i] = activated * up;
+            """)
+}
+
 // MARK: - Attention
 
 private final class DFlash2Attention: Module {
@@ -450,6 +559,9 @@ private final class DFlash2Attention: Module {
     @ModuleInfo(key: "k_proj") var kProj: Linear
     @ModuleInfo(key: "v_proj") var vProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
+    private var blockStack: DFlash2QuantizedStack?
+    private var contextStack: DFlash2QuantizedStack?
+
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
@@ -474,11 +586,17 @@ private final class DFlash2Attention: Module {
         super.init()
     }
 
+    func prepareStacks() {
+        blockStack = DFlash2QuantizedStack([qProj, kProj, vProj])
+        contextStack = blockStack?.droppingFirst()
+    }
+
     /// - Parameters:
     ///   - x: the block, `[B, blockLength, hidden]`.
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -499,11 +617,13 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        let block = blockStack?(x)
+        let contextProjection = contextStack?(context)
+        var queries = block?[0] ?? qProj(x)
+        var contextKeys = contextProjection?[0] ?? kProj(context)
+        var contextValues = contextProjection?[1] ?? vProj(context)
+        var blockKeys = block?[1] ?? kProj(x)
+        var blockValues = block?[2] ?? vProj(x)
 
         queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
         contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
@@ -529,7 +649,7 @@ private final class DFlash2Attention: Module {
 
         var mask: MLXArray?
         if let slidingWindow {
-            mask = DFlash2SlidingMask.make(
+            mask = masks.mask(
                 contextLength: cachedLength,
                 blockLength: L,
                 slidingWindow: slidingWindow,
@@ -542,6 +662,82 @@ private final class DFlash2Attention: Module {
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
+}
+
+/// Preserve each operation's dtype, including BF16 input with FP32 taps.
+private enum DFlash2GroupedConvKernel {
+    static func apply(
+        hidden: MLXArray, projection: MLXArray, base: MLXArray,
+        groupSize: Int, tap: Int, residual: MLXArray? = nil
+    ) -> MLXArray? {
+        guard hidden.ndim == 3, base.ndim == 3 else { return nil }
+        let batch = hidden.dim(0), length = hidden.dim(1), width = hidden.dim(2)
+        let kernelSize = base.dim(1), groups = width / groupSize
+        let types: [DType] = [.bfloat16, .float16, .float32]
+        guard batch > 0, length > 0, width % 256 == 0,
+            types.contains(hidden.dtype), types.contains(projection.dtype),
+            types.contains(base.dtype), base.shape == [2, kernelSize, width],
+            projection.shape == [batch, length, 2 * kernelSize * groups],
+            residual.map({ $0.shape == hidden.shape && types.contains($0.dtype) }) ?? true
+        else { return nil }
+        let convType = hidden.dtype == projection.dtype ? hidden.dtype : .float32
+        let outType = residual.map { $0.dtype == convType ? convType : .float32 } ?? convType
+        let template: [(String, any KernelTemplateArg)] = [
+            ("H", hidden.dtype), ("D", projection.dtype), ("B", base.dtype),
+            ("P", convType), ("OutT", outType), ("KS", kernelSize),
+            ("GS", groupSize), ("TAP", tap),
+        ]
+        let inputs = [hidden, projection, base] + (residual.map { [$0] } ?? [])
+        return (residual == nil ? plain : added)(
+            inputs, template: template, grid: (width, length, batch),
+            threadGroup: (256, 1, 1), outputShapes: [hidden.shape],
+            outputDTypes: [outType])[0]
+    }
+
+    private static let header = """
+        template <typename H, typename D, typename B, typename P, int KS, int GS, int TAP>
+        inline P dflash2_grouped_conv_exact(
+            const device H* h, const device D* dyn, const device B* base,
+            uint b, uint l, uint c, uint L, uint W) {
+        #pragma clang fp contract(off)
+          const uint G = W / GS;
+          const uint g = c / GS;
+          const size_t row = size_t(b) * L + l;
+          P out = P(0.0f);
+          for (int o = 0; o < KS; ++o) {
+            const H v = l >= uint(o) ? h[(row - o) * W + c] : H(0.0f);
+            const H kb = H(base[(size_t(TAP) * KS + o) * W + c]);
+            const H kv = H(kb * v);
+            if (o == 0) out = P(H(H(0.0f) + kv));
+            else out = P(out + P(kv));
+            const P d = P(dyn[row * (2 * KS * G) + (size_t(TAP) * KS + o) * G + g]);
+            const P dv = P(d * P(v));
+            out = P(out + dv);
+          }
+          return out;
+        }
+        """
+
+    private static let source = """
+        #pragma clang fp contract(off)
+        const uint c = thread_position_in_grid.x;
+        const uint l = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        const uint W = threads_per_grid.x;
+        const uint L = threads_per_grid.y;
+        const size_t i = (size_t(b) * L + l) * W + c;
+        const P conv = dflash2_grouped_conv_exact<H, D, B, P, KS, GS, TAP>(
+            h, dyn, base, b, l, c, L, W);
+        """
+
+    private static let plain = MLXFast.metalKernel(
+        name: "dflash2_grouped_conv_exact", inputNames: ["h", "dyn", "base"],
+        outputNames: ["out"], source: source + "\nout[i] = OutT(conv);\n",
+        header: header)
+    private static let added = MLXFast.metalKernel(
+        name: "dflash2_grouped_conv_exact_residual", inputNames: ["h", "dyn", "base", "res"],
+        outputNames: ["out"], source: source + "\nout[i] = OutT(res[i]) + OutT(conv);\n",
+        header: header)
 }
 
 // MARK: - The grouped dynamic causal convolution
@@ -608,7 +804,14 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     /// The first tap. Returns the convolved input and the dynamic taps the
     /// matching ``finish(_:dynamic:)`` needs.
     func prepare(_ hidden: MLXArray) -> (MLXArray, MLXArray) {
-        let dynamic = kernelProjection(hidden)
+        let projection = kernelProjection(hidden)
+        if let fused = DFlash2GroupedConvKernel.apply(
+            hidden: hidden, projection: projection, base: baseKernel,
+            groupSize: groupSize, tap: 0)
+        {
+            return (fused, projection)
+        }
+        let dynamic = projection
             .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
         return (
             Self.convolve(
@@ -616,20 +819,36 @@ final class DFlash2GroupedDynamicCausalConv: Module {
                 dynamic: dynamic[0..., 0..., 0, 0..., 0...],
                 base: baseKernel[0],
                 groupSize: groupSize),
-            dynamic[0..., 0..., 1, 0..., 0...]
+            projection
         )
     }
 
     /// The second tap, over the sub-layer's output.
-    func finish(_ hidden: MLXArray, dynamic: MLXArray) -> MLXArray {
-        Self.convolve(
-            hidden: hidden, dynamic: dynamic, base: baseKernel[1], groupSize: groupSize)
+    func finish(_ hidden: MLXArray, projection: MLXArray, residual: MLXArray) -> MLXArray {
+        if let fused = DFlash2GroupedConvKernel.apply(
+            hidden: hidden, projection: projection, base: baseKernel,
+            groupSize: groupSize, tap: 1, residual: residual)
+        {
+            return fused
+        }
+        let dynamic = projection
+            .reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
+        return residual + Self.convolve(
+            hidden: hidden, dynamic: dynamic[0..., 0..., 1, 0..., 0...],
+            base: baseKernel[1], groupSize: groupSize)
     }
 }
 
 // MARK: - The decoder layer
 
+private let dflash2SwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    compile(shapeless: true) { gate, up in
+        (gate * MLX.sigmoid(gate)) * up
+    }
+}()
+
 private final class DFlash2MLP: Module, UnaryLayer {
+    private var gateUpStack: DFlash2QuantizedStack?
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
@@ -641,8 +860,18 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
+    func prepareStack() {
+        gateUpStack = DFlash2QuantizedStack([gate, up])
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        if let gateUpStack {
+            return down(DFlash2StackedSwiGLU.apply(gateUpStack.product(x)))
+        }
+        let g = gate(x), u = up(x)
+        let activated = g.dtype == .float32 && u.dtype == .float32
+            ? dflash2SwiGLU(g, u) : silu(g) * u
+        return down(activated)
     }
 }
 
@@ -673,17 +902,112 @@ private final class DFlash2DecoderLayer: Module {
         super.init()
     }
 
+    func prepareStacks() {
+        selfAttn.prepareStacks()
+        mlp.prepareStack()
+    }
+
     func callAsFunction(
-        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
+        _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
+        masks: DFlash2SlidingMaskMemo
     ) -> MLXArray {
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
-        let attended = x
-            + attentionConv.finish(
-                selfAttn(attentionInput, context: context, rope: rope, cache: cache),
-                dynamic: attentionTaps)
+        let attended = attentionConv.finish(
+            selfAttn(attentionInput, context: context, rope: rope, cache: cache, masks: masks),
+            projection: attentionTaps, residual: x)
         let (mlpInput, mlpTaps) = mlpConv.prepare(postAttentionLayerNorm(attended))
-        return attended + mlpConv.finish(mlp(mlpInput), dynamic: mlpTaps)
+        return mlpConv.finish(mlp(mlpInput), projection: mlpTaps, residual: attended)
     }
+}
+
+/// A lossless, inference-only resident copy of one BF16 codebook. The
+/// checkpoint is verified before its registered payload is replaced.
+private final class DFlash2PackedCodebook {
+    let packed: MLXArray
+    let lookup: MLXArray
+    let rows: Int
+    let width: Int
+
+    init?(_ source: MLXArray) throws {
+        guard source.dtype == .bfloat16, source.ndim == 2,
+            source.dim(1) % 8 == 0, source.size > 0 else { return nil }
+        rows = source.dim(0)
+        width = source.dim(1)
+        let bits = source.view(dtype: .uint16).asArray(UInt16.self)
+        var codes = [UInt16](repeating: .max, count: 65536)
+        var values = [UInt16]()
+        var words = [UInt32](repeating: 0, count: bits.count / 8 * 3)
+        for i in stride(from: 0, to: bits.count, by: 8) {
+            var block: UInt64 = 0
+            let out = i / 8 * 3
+            for j in 0 ..< 8 {
+                let value = Int(bits[i + j])
+                if codes[value] == .max {
+                    guard values.count < 4096 else { return nil }
+                    codes[value] = UInt16(values.count)
+                    values.append(bits[i + j])
+                }
+                block |= UInt64(codes[value]) << ((j % 2) * 12)
+                if j % 2 == 1 {
+                    let shift = (j / 2 * 24) % 32
+                    let word = j / 2 * 24 / 32
+                    words[out + word] |= UInt32(truncatingIfNeeded: block << shift)
+                    if shift > 8 {
+                        words[out + word + 1] |= UInt32(block >> (32 - shift))
+                    }
+                    block = 0
+                }
+            }
+        }
+        packed = MLXArray(words)
+        lookup = MLXArray(values)
+        let restored = materialize().view(dtype: .uint16)
+        let exact = MLX.all(restored .== source.view(dtype: .uint16))
+        try withError { eval(exact) }
+        guard exact.item(Bool.self) else { return nil }
+    }
+
+    func gather(_ ids: MLXArray, floatOutput: Bool = false) -> MLXArray {
+        let shape = ids.shape + [width]
+        let output = Self.gatherKernel(
+            [packed, lookup, ids.asType(.uint32).reshaped(-1)],
+            template: [("WIDTH", width), ("FLOAT_OUTPUT", floatOutput)],
+            grid: (ids.size * width / 2, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [shape], outputDTypes: [floatOutput ? .float32 : .uint16])[0]
+        return floatOutput ? output : output.view(dtype: .bfloat16)
+    }
+
+    func materialize() -> MLXArray {
+        gather(MLXArray(UInt32(0) ..< UInt32(rows)))
+    }
+
+    private static let gatherKernel = MLXFast.metalKernel(
+        name: "dflash2_codebook_pack12_gather_widen",
+        inputNames: ["packed", "lookup", "ids"], outputNames: ["out"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i >= uint(ids_shape[0]) * (WIDTH / 2)) return;
+            const uint index = ids[i / (WIDTH / 2)] * (WIDTH / 2) + i % (WIDTH / 2);
+            const uint bit = (index & 3u) * 24u;
+            const uint word = (index >> 2u) * 3u + (bit >> 5u);
+            const uint shift = bit & 31u;
+            uint codes = packed[word] >> shift;
+            if (shift > 8u) codes |= packed[word + 1u] << (32u - shift);
+            const ushort2 values(lookup[codes & 4095u], lookup[(codes >> 12u) & 4095u]);
+            if constexpr (FLOAT_OUTPUT) {
+                const float2 widened(cast_to<float>(uint16_to_bfloat16(values.x)),
+                                     cast_to<float>(uint16_to_bfloat16(values.y)));
+                reinterpret_cast<device float2*>(out)[i] = widened;
+            } else {
+                reinterpret_cast<device ushort2*>(out)[i] = values;
+            }
+            """)
+}
+
+/// This plain holder keeps the lookup arrays off Module reflection.
+private final class DFlash2CodebookCopies {
+    var predecessor: DFlash2PackedCodebook?
+    var successor: DFlash2PackedCodebook?
 }
 
 // MARK: - The candidate selector
@@ -695,6 +1019,7 @@ private final class DFlash2DecoderLayer: Module {
 /// not here.
 final class DFlash2CandidateSelector: Module {
     let topK: Int
+    private let codebookCopies = DFlash2CodebookCopies()
 
     @ParameterInfo(key: "predecessor_codebook") var predecessorCodebook: MLXArray
     @ParameterInfo(key: "successor_codebook") var successorCodebook: MLXArray
@@ -713,6 +1038,24 @@ final class DFlash2CandidateSelector: Module {
         super.init()
     }
 
+    /// Called only after strict checkpoint loading. The two registered keys
+    /// remain present; their inference payloads become packed UInt32 words.
+    func preparePackedCodebooks() {
+        codebookCopies.predecessor = try? DFlash2PackedCodebook(predecessorCodebook)
+        codebookCopies.successor = try? DFlash2PackedCodebook(successorCodebook)
+        if let copy = codebookCopies.predecessor {
+            predecessorCodebook._updateInternal(copy.packed)
+        }
+        if let copy = codebookCopies.successor {
+            successorCodebook._updateInternal(copy.packed)
+        }
+    }
+
+    // Packed words are parameters; these lookup tables have separate buffers.
+    var residencyLookupArrays: [MLXArray] {
+        [codebookCopies.predecessor?.lookup, codebookCopies.successor?.lookup].compactMap { $0 }
+    }
+
     /// The greedy path.
     ///
     /// - Parameters:
@@ -722,10 +1065,29 @@ final class DFlash2CandidateSelector: Module {
     /// - Returns: the selected token at each position, `[B, L]`.
     func selectGreedy(hidden: MLXArray, logits: MLXArray, anchor: MLXArray) -> MLXArray {
         let vocabularySize = logits.dim(-1)
-        let candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
-            0..., 0..., (vocabularySize - topK)...]
+        let candidates: MLXArray
+        if topK == 16, vocabularySize % 512 == 0,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        {
+            let blocks = vocabularySize / 512
+            let tiled = logits.reshaped([-1, blocks, 512])
+            let local = argPartition(tiled, kth: 512 - topK, axis: -1)[
+                0..., 0..., (512 - topK)...]
+            let offsets = MLXArray((0 ..< blocks).map { UInt32($0 * 512) })
+                .reshaped([1, blocks, 1])
+            let ids = (local + offsets).reshaped([-1, blocks * topK])
+            let values = takeAlong(tiled, local, axis: -1).reshaped([-1, blocks * topK])
+            let selected = argPartition(values, kth: blocks * topK - topK, axis: -1)[
+                0..., (blocks * topK - topK)...]
+            candidates = takeAlong(ids, selected, axis: -1)
+                .reshaped(Array(logits.shape.dropLast()) + [topK])
+        } else {
+            candidates = argPartition(logits, kth: vocabularySize - topK, axis: -1)[
+                0..., 0..., (vocabularySize - topK)...]
+        }
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
+        let floatCodebookOutput = projected.dtype == .float32
 
         var predecessor = anchor
         var path = [MLXArray]()
@@ -733,10 +1095,12 @@ final class DFlash2CandidateSelector: Module {
         for position in 0 ..< hidden.dim(1) {
             let positionCandidates = candidates[0..., position, 0...]
             let edges =
-                (take(predecessorCodebook, predecessor, axis: 0)
+                ((codebookCopies.predecessor?.gather(predecessor, floatOutput: floatCodebookOutput)
+                    ?? take(predecessorCodebook, predecessor, axis: 0))
                     .expandedDimensions(axis: 1)
                     * projected[0..., position, 0...].expandedDimensions(axis: 1)
-                    * take(successorCodebook, positionCandidates, axis: 0))
+                    * (codebookCopies.successor?.gather(positionCandidates, floatOutput: floatCodebookOutput)
+                        ?? take(successorCodebook, positionCandidates, axis: 0)))
                 .sum(axis: -1)
             let selected = (unary[0..., position, 0...] + edges).argMax(axis: -1)
             predecessor = takeAlong(
@@ -752,6 +1116,12 @@ final class DFlash2CandidateSelector: Module {
 // MARK: - The drafter
 
 public final class DFlash2DraftModel: Module, @unchecked Sendable {
+    private static let submitFirstLayer: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_FIRST_SUBMIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     public let config: DFlash2Configuration
 
     @ModuleInfo(key: "fc") public var fc: Linear
@@ -878,8 +1248,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let context = hiddenNorm(fc(targetHidden.asType(dtype)))
 
+        let masks = DFlash2SlidingMaskMemo()
         for (index, layer) in layers.enumerated() {
-            h = layer(h, context: context, rope: rope, cache: cache[index])
+            h = layer(h, context: context, rope: rope, cache: cache[index], masks: masks)
+            if index == 0, Self.submitFirstLayer { asyncEval(h) }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
@@ -929,6 +1301,44 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             hidden: hidden,
             logits: try logits(hidden),
             anchor: MLXArray(anchor.map { Int32($0) }))
+    }
+
+    /// Build only the first layer before readback; finish after exact adoption.
+    public func prepareNextBlock(
+        anchor: MLXArray, targetHidden: MLXArray, cache: [KVCache], blockSize: Int
+    ) throws -> (leading: MLXArray, retained: [MLXArray], finish: () throws -> MLXArray) {
+        guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
+        guard let target else { throw DFlash2Error.notBound }
+        guard cache.count == layers.count else {
+            throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
+        }
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+            throw DFlash2Error.targetHiddenSizeMismatch(
+                expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
+        }
+        let batch = anchor.size
+        let masks = MLXArray(Array(
+            repeating: Int32(config.maskTokenId), count: batch * (blockSize - 1)))
+            .reshaped([batch, blockSize - 1])
+        let block = concatenated(
+            [anchor.asType(.int32).reshaped([batch, 1]), masks], axis: 1)
+        var h = target.embedTokensForDFlash2(block).asType(dtype)
+        if config.dflash.inputEmbeddingScale != 1 {
+            h = h * config.dflash.inputEmbeddingScale
+        }
+        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let memo = DFlash2SlidingMaskMemo()
+        let leading = layers[0](h, context: context, rope: rope, cache: cache[0], masks: memo)
+        if Self.submitFirstLayer { asyncEval(leading) }
+        return (leading, [leading, context, anchor] + memo.retainedArrays, { [self] in
+            var h = leading
+            for (index, layer) in layers.enumerated().dropFirst() {
+                h = layer(h, context: context, rope: rope, cache: cache[index], masks: memo)
+            }
+            let hidden = norm(h[0..., 1..., 0...])
+            return candidateSelector.selectGreedy(
+                hidden: hidden, logits: try logits(hidden), anchor: anchor.reshaped([batch]))
+        })
     }
 
     // MARK: Loading
@@ -989,6 +1399,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         try drafter.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        weights.removeAll()
+        drafter.candidateSelector.preparePackedCodebooks()
+        for layer in drafter.layers { layer.prepareStacks() }
         eval(drafter)
         return drafter
     }

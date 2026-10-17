@@ -49,6 +49,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     public let drafter: DFlash2DraftModel
     private let target: Qwen35TextModel
+    private let residencyArrays: [MLXArray]
 
     /// How many context rows the drafter can hold. A drafter whose layers all
     /// slide keeps `sliding_window - 1` of them, so older rows are dropped
@@ -62,6 +63,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// window. Serial per-column verification would add k target forwards to a
     /// round whose whole point is that there is only one.
     public var requiredVerificationMode: CBv2MTPVerificationMode? { .rectangular }
+    public var prefersBatchedRectangularAttention: Bool { true }
 
     /// The engine's block ceiling. The drafter was trained at `block_size`,
     /// and the reference lets a caller ask for a larger block: the extra
@@ -82,6 +84,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         self.drafter = drafter
         self.target = target
         self.contextRowLimit = drafter.contextRowLimit
+        self.residencyArrays = drafter.parameters().flattened().map { $0.1 }
+            + drafter.candidateSelector.residencyLookupArrays
+        CBv2ResidencyPrefetch.prepare()
     }
 
     // MARK: - Loading
@@ -128,8 +133,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func setBlockContextArmed(_ armed: Bool) throws {
         if armed {
             try target.armDFlash2Tap(layerIds: drafter.config.targetLayerIds)
+            CBv2ResidencyPrefetch.arm(residencyArrays)
         } else {
             target.dFlash2TapLayerIds = nil
+            CBv2ResidencyPrefetch.disarm()
         }
     }
 
@@ -139,10 +146,39 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     // MARK: - Request state
 
+    private static let nextBlockEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_NEXT_BLOCK"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    final class NextBlock {
+        let caches: [any KVCache]
+        let retained: [MLXArray]
+        let finish: () throws -> MLXArray
+        let depth: Int
+        let confirmed: Int
+        let observedRows: Int
+        var anchor: Int?
+
+        init(caches: [any KVCache], retained: [MLXArray], finish: @escaping () throws -> MLXArray, depth: Int,
+             confirmed: Int, observedRows: Int) {
+            self.caches = caches
+            self.retained = retained
+            self.finish = finish
+            self.depth = depth
+            self.confirmed = confirmed
+            self.observedRows = observedRows
+        }
+    }
+
     /// One request's drafter cache and the committed context rows it has not
     /// absorbed yet.
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
+        var promptDraft: [Int32]?
+        var nextBlock: NextBlock?
+        var lastConfirmed: Int?
         /// Committed context rows the next block will consume, oldest first.
         var pending: [MLXArray] = []
         var pendingRows = 0
@@ -167,7 +203,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var stagedInputCount: Int { 0 }
 
         var materializedBytes: Int {
-            let arrays = caches.flatMap { $0.innerState() } + pending + roots
+            let nextArrays = nextBlock.map {
+                $0.caches.flatMap { $0.innerState() } + $0.retained
+            } ?? []
+            let arrays = caches.flatMap { $0.innerState() } + pending + roots + nextArrays
             return arrays.reduce(0) { total, array in
                 let (next, overflow) = total.addingReportingOverflow(array.nbytes)
                 return overflow ? Int.max : next
@@ -201,6 +240,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
 
         func clearAll() {
+            promptDraft = nil
+            nextBlock = nil
+            lastConfirmed = nil
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
@@ -234,6 +276,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         _ observation: CBv2MTPCommittedTargetObservation,
         requestState: any CBv2MTPRequestState
     ) {
+        state(requestState).nextBlock = nil
         append(observation.hidden, to: requestState)
     }
 
@@ -252,11 +295,44 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     // MARK: - Proposing
 
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {
+        let state = self.state(requestState)
+        precondition(!state.isReleased)
+        if let limit = contextRowLimit, state.pendingRows > limit - (depth + 1) {
+            state.promptDraft = nil
+        } else {
+            state.promptDraft = CBv2PromptLookupDraft.continuation(
+                history: history, promptLength: promptLength, depth: depth)
+        }
+        if state.promptDraft != nil { state.nextBlock = nil }
+    }
+
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
         guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
+        if let ids = state.promptDraft {
+            precondition(ids.count == depth)
+            let tokens = MLXArray(ids).reshaped([1, depth])
+            state.roots.append(tokens)
+            return tokens
+        }
+        if let next = state.nextBlock {
+            state.nextBlock = nil
+            if next.depth == depth, next.confirmed == state.pendingRows,
+                next.observedRows == state.observedRows, next.anchor == anchor
+            {
+                let tokens = try next.finish()
+                state.caches = next.caches
+                state.absorbPending()
+                state.roots.append(tokens)
+                return tokens
+            }
+        }
         let context =
             state.pending.count == 1
             ? state.pending[0] : concatenated(state.pending, axis: 1)
@@ -279,6 +355,45 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         return tokens
     }
 
+    public func prepareNextBlock(
+        acceptancePacket packet: MLXArray, depth: Int, verifyContext: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        let state = self.state(requestState)
+        guard Self.nextBlockEnabled, !state.isReleased, state.promptDraft == nil,
+            state.nextBlock == nil, state.cacheSeeded, state.pending.isEmpty,
+            packet.dtype == .int32, packet.ndim == 1, packet.size == 2 * depth + 1,
+            verifyContext.shape == [1, depth + 1, drafter.config.targetHiddenSize]
+        else { return [] }
+        let confirmed = min(state.lastConfirmed ?? (depth + 1), depth + 1)
+        let context = verifyContext[0..., 0 ..< confirmed, 0...].asType(drafter.dtype)
+        let caches = state.caches.map { $0.copy() }
+        let anchor = packet[depth + confirmed - 1].reshaped([1])
+        guard let prepared = try? drafter.prepareNextBlock(
+            anchor: anchor, targetHidden: context, cache: caches, blockSize: depth + 1)
+        else { return [] }
+        state.nextBlock = NextBlock(
+            caches: caches, retained: prepared.retained, finish: prepared.finish,
+            depth: depth, confirmed: confirmed,
+            observedRows: state.observedRows + confirmed)
+        return [prepared.leading]
+    }
+
+    public func reconcileNextBlock(
+        confirmed: Int, anchor: Int?, requestState: any CBv2MTPRequestState
+    ) {
+        let state = self.state(requestState)
+        state.lastConfirmed = confirmed
+        guard let next = state.nextBlock, let anchor,
+            next.confirmed == confirmed, next.observedRows == state.observedRows,
+            state.pendingRows == confirmed
+        else {
+            state.nextBlock = nil
+            return
+        }
+        next.anchor = anchor
+    }
+
     public func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int
     ) {
@@ -290,6 +405,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
         return state.caches.flatMap { $0.innerState() } + state.roots
+            + (state.promptDraft == nil ? [] : state.pending)
     }
 
     /// A round's confirmed columns become the next block's context.
@@ -306,6 +422,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         committedTargetHidden: MLXArray
     ) {
         let state = self.state(requestState)
+        state.promptDraft = nil
         state.roots.removeAll(keepingCapacity: true)
         append(committedTargetHidden, to: requestState)
     }
@@ -314,6 +431,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// the proposal absorbed were committed before it ran, and the proposal
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        state(requestState).roots.removeAll(keepingCapacity: true)
+        let state = self.state(requestState)
+        state.promptDraft = nil
+        state.nextBlock = nil
+        state.roots.removeAll(keepingCapacity: true)
     }
 }

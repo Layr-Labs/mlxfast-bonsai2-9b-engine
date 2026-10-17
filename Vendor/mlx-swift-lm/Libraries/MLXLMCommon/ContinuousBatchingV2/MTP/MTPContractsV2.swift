@@ -412,11 +412,6 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// rounds this shallower one. Default nil (drafted rounds keep the
     /// declared depth).
     var lookupMissDraftDepth: Int? { get }
-    /// A deeper chain for a drafted round whose carried target top-two
-    /// margin (the target's confidence in the token just committed) is at
-    /// least `minimumMargin` for every row: such rounds draft `depth` tokens,
-    /// the others `lookupMissDraftDepth`. Default nil (one drafted depth).
-    var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { get }
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -437,7 +432,6 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
     public var lookupDraftNgram: Int? { nil }
     public var lookupMissDraftDepth: Int? { nil }
-    public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { nil }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,
@@ -478,6 +472,11 @@ extension CBv2MTPRequestStatefulDrafter {
 /// engine fills both from `blockContextHidden()` rather than from the
 /// target's pre-norm last hidden.
 public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
+    /// Prepare a block proposal from the current request's host token history.
+    func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState)
+
     /// Turn the target's context tap on or off. The engine calls this exactly
     /// once per engine build, so a leg that does not speculate pays nothing
     /// for a drafter that is merely resident.
@@ -495,6 +494,17 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray
 
+    /// Build a possible next block on private state while this verify runs.
+    /// The returned roots are submitted after the current verify's roots.
+    func prepareNextBlock(
+        acceptancePacket: MLXArray, depth: Int, verifyContext: MLXArray,
+        requestState: any CBv2MTPRequestState) -> [MLXArray]
+
+    /// Authorize adoption only for the exact confirmed prefix and next anchor.
+    /// A nil anchor means that the request finished at this boundary.
+    func reconcileNextBlock(
+        confirmed: Int, anchor: Int?, requestState: any CBv2MTPRequestState)
+
     /// Align the drafter's own context cache with the target's committed
     /// length once a round has finalized.
     func trimBlockState(
@@ -502,6 +512,20 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 }
 
 extension CBv2MTPBlockDrafter {
+    public func prepareNextBlock(
+        acceptancePacket: MLXArray, depth: Int, verifyContext: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] { [] }
+
+    public func reconcileNextBlock(
+        confirmed: Int, anchor: Int?, requestState: any CBv2MTPRequestState
+    ) {}
+
+    public func prepareDraft(
+        history: [Int], promptLength: Int, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) {}
+
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
     /// branch never reaches these, so a caller that does has taken the wrong
@@ -593,10 +617,6 @@ public struct CBv2MTPConfig: Sendable {
     /// Without it a depth of 8...16 would be clamped to 7 silently, and a leg
     /// would measure a depth it did not ask for.
     public let draftTokenCeiling: Int
-    /// Depths the first drafted (lookup-miss) rounds take, in order, before
-    /// the margin rule decides. Empty by default; the load-time warm engine
-    /// sets it so both drafted verify widths run before anything is timed.
-    public var missDepthSchedule: [Int] = []
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -812,5 +832,49 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.numComputedAfter = numComputedAfter
         self.generatedAfter = generatedAfter
         self.finishReason = finishReason
+    }
+}
+
+/// Match only the current request's prompt; the target verifies every proposal.
+/// A longest match of at least 16 tokens must have an unambiguous continuation.
+public enum CBv2PromptLookupDraft {
+    /// `DARKBLOOM_PROMPT_LOOKUP=0` uses the pinned drafter for every round.
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_PROMPT_LOOKUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    public static func continuation(history: [Int], promptLength: Int, depth: Int) -> [Int32]? {
+        guard enabled else { return nil }
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard depth >= 1, prompt >= 16 + depth, count >= 16 else { return nil }
+        let longest = min(64, count - depth, prompt - depth)
+        guard longest >= 16 else { return nil }
+        var best = 15
+        var chosenEnd: Int?
+        var ambiguous = false
+        for end in 16 ... (prompt - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
+            }
+            guard length >= 16, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
+            }
+        }
+        guard let chosenEnd, !ambiguous else { return nil }
+        return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
     }
 }
