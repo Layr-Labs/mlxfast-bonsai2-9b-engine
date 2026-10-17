@@ -1115,12 +1115,15 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     /// Screened draft argmax (`HadamardQuantizedLinear.screenedArgMax`):
     /// the leading `width` rotated inputs of every draft-vocabulary row, then
-    /// the full width for the best row of each `chunk`-row block. Local
-    /// experiments override it with `QWEN35_DRAFT_SCREEN=<width>,<chunk>` or
-    /// `off`.
+    /// the full width for the best row of each `chunk`-row block. Default
+    /// (1024, 8): it picks the exact draft argmax on more steps than (1536,
+    /// 32) and reads fewer bytes (the narrower partial pass outweighs the
+    /// four times as many rescored rows), and chunk 8 keeps the fused
+    /// argmax-plus-rescore kernel. Local experiments override it with
+    /// `QWEN35_DRAFT_SCREEN=<width>,<chunk>` or `off`.
     static let draftScreen: (Int, Int)? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_DRAFT_SCREEN"] else {
-            return (1536, 32)
+            return (1024, 8)
         }
         let parts = raw.split(separator: ",").compactMap { Int($0) }
         return parts.count == 2 ? (parts[0], parts[1]) : nil

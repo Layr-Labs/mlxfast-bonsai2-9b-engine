@@ -1586,12 +1586,16 @@ private enum DraftScreenQMV {
             }
             """)
 
-    /// Fused `argMax(partial.reshaped([blocks, 32]), axis: -1)` + `rescore`
-    /// when `CH == 32` and `biases == -scales`: each 32-lane simdgroup reduces
-    /// its 32 `partial` values in registers via 5 `simd_shuffle_xor` steps and
+    /// Fused `argMax(partial.reshaped([blocks, CH]), axis: -1)` + `rescore`
+    /// for `CH` a power of two up to 32 when `biases == -scales`: lane `i <
+    /// CH` of each 32-lane simdgroup holds `partial[c * CH + i]` (the other
+    /// lanes hold -inf), 5 `simd_shuffle_xor` steps reduce them in registers
+    /// with the lower index winning a tie, as `argMax` does, and the simdgroup
     /// immediately rescores the winning row `r` without reading `biases`.
-    static let rescoreFast32 = MLXFast.metalKernel(
-        name: "hadamard_qmv_screen_rescore_fast32_f16",
+    /// Same arithmetic as `rescore` with `NEG`, so `y` and `row` are bitwise
+    /// equal to the unfused pair.
+    static let rescoreFast = MLXFast.metalKernel(
+        name: "hadamard_qmv_screen_rescore_fast_f16",
         inputNames: ["x", "w", "scales", "partial"], outputNames: ["y", "row"],
         source: """
             const uint simd_gid = simdgroup_index_in_threadgroup;
@@ -1600,7 +1604,7 @@ private enum DraftScreenQMV {
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
-            float best_v = partial[c * 32 + int(simd_lid)];
+            float best_v = int(simd_lid) < CH ? partial[c * CH + int(simd_lid)] : -INFINITY;
             int best_i = int(simd_lid);
             for (ushort offset = 16; offset > 0; offset >>= 1) {
               const float other_v = simd_shuffle_xor(best_v, offset);
@@ -1610,7 +1614,7 @@ private enum DraftScreenQMV {
                 best_i = other_i;
               }
             }
-            const int r = c * 32 + best_i;
+            const int r = c * CH + best_i;
             const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
             const device half* sc = scales + r * in_g + simd_lid / 8;
             const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
@@ -3166,9 +3170,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
         let rescored: [MLXArray]
-        if chunk == 32 && promptConstants.negative {
-            rescored = DraftScreenQMV.rescoreFast32(
-                [rotated, weight, scales, partial],
+        if chunk <= 32 && 32 % chunk == 0 && promptConstants.negative {
+            rescored = DraftScreenQMV.rescoreFast(
+                [rotated, weight, scales, partial], template: [("CH", chunk)],
                 grid: (32, blocks, 1), threadGroup: (32, 2, 1),
                 outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
         } else {
