@@ -235,6 +235,49 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
+            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                let committedHidden: MLXArray
+                if let blockContext = verify.blockContext {
+                    committedHidden = blockContext[
+                        batchIndex ..< batchIndex + 1,
+                        CBv2MTPBlockContextIndex.confirmedColumns(
+                            confirmed: confirmed, verifyWidth: targetWidth),
+                        0...]
+                } else {
+                    committedHidden = verify.lastHidden[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount,
+                        0...]
+                }
+                let committedDraftTokens = verify.draftIDs[
+                    batchIndex ..< batchIndex + 1,
+                    0 ..< committedDraftCount]
+                if let carry = metadata.lookupCarry {
+                    stateful.commitLookupRound(
+                        requestState: state,
+                        seedToken: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
+                        seedHidden: carry.hidden,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                } else {
+                    stateful.finalizeRound(
+                        requestState: state,
+                        confirmedInputTokens: 1 + committedDraftCount,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                    if finishReason == nil, confirmed > 0, mtp.lookupNgram == nil,
+                        verify.rows.count == 1,
+                        rec.request.maxTokens - rec.generatedTokenCount >= k,
+                        let block = mtp.blockDrafter
+                    {
+                        block.prestageBlock(
+                            anchor: kept[confirmed - 1], depth: k, requestState: state)
+                    }
+                }
+            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -273,54 +316,6 @@ extension EngineLoopV2 {
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
-            let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                let state = metadata.assistantState
-            {
-                // Target KV/recurrent truth is committed first. The assistant
-                // receives only accepted draft inputs and their trusted target
-                // hidden rows; every speculative head suffix is discarded.
-                //
-                // A BLOCK drafter's next block reads the tapped context of
-                // exactly the columns this round CONFIRMED — the reference's
-                // `hidden = hidden[:, :accepted + 1, :]`. That is one column
-                // wider than the chain drafter's accepted-draft slice,
-                // because the correction token's own position is context for
-                // the next block.
-                let committedHidden: MLXArray
-                if let blockContext = verify.blockContext {
-                    committedHidden = blockContext[
-                        batchIndex ..< batchIndex + 1,
-                        CBv2MTPBlockContextIndex.confirmedColumns(
-                            confirmed: confirmed, verifyWidth: targetWidth),
-                        0...]
-                } else {
-                    committedHidden = verify.lastHidden[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount,
-                        0...]
-                }
-                let committedDraftTokens = verify.draftIDs[
-                    batchIndex ..< batchIndex + 1,
-                    0 ..< committedDraftCount]
-                if let carry = metadata.lookupCarry {
-                    // A lookup round staged nothing. The carry transition
-                    // its skipped first draft step would have consumed joins
-                    // trusted history ahead of the same accepted rows.
-                    stateful.commitLookupRound(
-                        requestState: state,
-                        seedToken: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
-                        seedHidden: carry.hidden,
-                        committedDraftTokens: committedDraftTokens,
-                        committedTargetHidden: committedHidden)
-                } else {
-                    stateful.finalizeRound(
-                        requestState: state,
-                        confirmedInputTokens: 1 + committedDraftCount,
-                        committedDraftTokens: committedDraftTokens,
-                        committedTargetHidden: committedHidden)
-                }
-            }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
