@@ -68,6 +68,29 @@ public struct SignedBlockHadamard {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """
 
+    private static let normSource = """
+
+            threadgroup float norm_sums[32];
+            threadgroup float norm_inv[1];
+            const uint norm_lane = thread_index_in_simdgroup;
+            const uint norm_sg = simdgroup_index_in_threadgroup;
+            for (uint part = 0; part < 4; ++part) {
+              const uint at = batch_idx + (uint(i) + part * 256u) * 4u;
+              const float4 value = *((const device float4*)(x + at));
+              float square_sum = 0.0f;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 4; ++j) square_sum += value[j] * value[j];
+              square_sum = simd_sum(square_sum);
+              if (norm_lane == 0) norm_sums[norm_sg + part * 8u] = square_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (norm_sg == 0) {
+              const float total = simd_sum(norm_sums[norm_lane]);
+              if (norm_lane == 0) norm_inv[0] = metal::precise::rsqrt(total / 4096.0f + epsilon[0]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+
     private static func fused4096Source(residualNorm: Bool) -> String {
         let prefix = residualNorm ? residualNormSource : ""
         let valueRead = residualNorm ? """
@@ -262,7 +285,7 @@ public struct SignedBlockHadamard {
     private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
         attentionGate: Bool = false, normalizedOutput: Bool = false,
-        rotatedOutput: Bool = false
+        rotatedOutput: Bool = false, rmsNorm: Bool = false
     ) -> String {
         let valueRead = swiglu ? """
             const float4 g = in4[w];
@@ -271,7 +294,7 @@ public struct SignedBlockHadamard {
             const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
             float4 val = ((g * sigmoid_g) * u) * s4[w];
             """ : "float4 val = in4[w] * s4[w];"
-        let prefix = residualNorm ? residualNormSource : gatedNorm ? gatedNormSource : ""
+        let prefix = rmsNorm ? normSource : residualNorm ? residualNormSource : gatedNorm ? gatedNormSource : ""
         let rotatedWrite = rotatedOutput ? """
             device float4* rot4 = (device float4*)(rotated_out + batch_idx + uint(base0));
             #pragma clang loop unroll(full)
@@ -279,7 +302,10 @@ public struct SignedBlockHadamard {
               rot4[w] = float4(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
             }
             """ : ""
-        let inputRead = residualNorm && normalizedOutput ? """
+        let inputRead = rmsNorm ? """
+            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+            float4 val = (weight * (in4[w] * norm_inv[0])) * s4[w];
+            """ : residualNorm && normalizedOutput ? """
             const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
             *((device float4*)(residual_out + in_offset) + w) = raw;
             const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
@@ -458,6 +484,13 @@ public struct SignedBlockHadamard {
         name: "signed_block_hadamard_4096_q8_rot",
         inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb", "rotated_out"],
         source: quantized4096Source(swiglu: false, rotatedOutput: true),
+        header: quantized4096Header, ensureRowContiguous: true)
+
+    private static let normQuantized4096RotatedKernel = MLXFast.metalKernel(
+        name: "signed_block_hadamard_norm_4096_q8_rot",
+        inputNames: ["x", "norm_weight", "epsilon", "signs"],
+        outputNames: ["codes", "ascale", "rsb", "rotated_out"],
+        source: quantized4096Source(swiglu: false, rotatedOutput: true, rmsNorm: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
     private static let quantizedSwiGLU4096Kernel = MLXFast.metalKernel(
@@ -669,6 +702,33 @@ public struct SignedBlockHadamard {
         let groups = rows * (width / 128)
         let outputs = Self.quantized4096RotatedKernel(
             [x.reshaped([rows, width]), signs],
+            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
+        return (
+            PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            outputs[3])
+    }
+
+    /// `quantizedForVerifyWithRotated` with RMSNorm fused directly into the
+    /// initial Hadamard butterfly pass: eliminates the DRAM round-trip between
+    /// final layer activations and the verification quantizer.
+    func normQuantizedForVerifyWithRotated(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float
+    ) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
+        validate(x)
+        let rows = x.size / width
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            normWeight.dtype == .float32, normWeight.shape == [width],
+            VerifyInt8Matmul.rowRange.contains(rows),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let outputs = Self.normQuantized4096RotatedKernel(
+            [x.reshaped([rows, width]), normWeight, MLXArray([eps]), signs],
             template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
             grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
             outputShapes: [[tile, width], [groups], [groups], x.shape],
@@ -3028,6 +3088,17 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if verify, let verifyOutputs = VerifyInt8Matmul.matmul(
+            PromptInt8Activation(
+                codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+            layers: packed.map(\.verifyOperands))
+        {
+            let outputs = zip(packed, verifyOutputs).map { layer, output in
+                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { reshaped + $0 } ?? reshaped
+            }
+            return (activation.last!, outputs)
+        }
         let outputs = packed.map { layer in
             if verify {
                 let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
@@ -3327,13 +3398,22 @@ extension HadamardQuantizedLinear {
     /// FP32 rows (`ExactVerifyHead`; at 2 to 4 rows also the fused top-2).
     /// Returns `[rows, 2]` int32 ids and float32 values, or nil when this
     /// module or shape has no exact path.
-    public func topTwoRows(_ x: MLXArray) -> (ids: MLXArray, values: MLXArray)? {
+    public func topTwoRows(
+        _ x: MLXArray,
+        fusedNorm: (normWeight: MLXArray, eps: Float)? = nil
+    ) -> (ids: MLXArray, values: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil else { return nil }
         if x.ndim >= 1, x.dim(-1) == transform.width {
             let rows = x.size / x.dim(-1)
-            if let exact = exactHeadTopTwo(x, rows: rows) { return exact }
+            if let exact = exactHeadTopTwo(x, rows: rows, fusedNorm: fusedNorm) { return exact }
         }
-        let rotated = transform(gdnLayout.map { $0(x) } ?? x)
+        let normX: MLXArray
+        if let fusedNorm {
+            normX = MLXFast.rmsNorm(x, weight: fusedNorm.normWeight, eps: fusedNorm.eps)
+        } else {
+            normX = x
+        }
+        let rotated = transform(gdnLayout.map { $0(normX) } ?? normX)
         guard rotated.dtype == .float32 else { return nil }
         let rows = rotated.size / rotated.dim(-1)
         if (5 ... 8).contains(rows), ExactVerifyHead.verified[rows] == false { return nil }
@@ -3347,14 +3427,22 @@ extension HadamardQuantizedLinear {
     /// (and, at 2-4 rows, with `Float16ConstantQMV.topTwo`); on a mismatch
     /// that row count keeps the record's head.
     private func exactHeadTopTwo(
-        _ x: MLXArray, rows: Int
+        _ x: MLXArray, rows: Int,
+        fusedNorm: (normWeight: MLXArray, eps: Float)? = nil
     ) -> (ids: MLXArray, values: MLXArray)? {
         guard let range = ExactVerifyHead.rowRange, range.contains(rows),
             ExactVerifyHead.verified[rows] != false,
             gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
-            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
-            let (activation, rotated) = transform.quantizedForVerifyWithRotated(x)
+            weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off
         else { return nil }
+        let pair: (activation: PromptInt8Activation, rotated: MLXArray)?
+        if let fusedNorm {
+            pair = transform.normQuantizedForVerifyWithRotated(
+                x, normWeight: fusedNorm.normWeight, eps: fusedNorm.eps)
+        } else {
+            pair = transform.quantizedForVerifyWithRotated(x)
+        }
+        guard let (activation, rotated) = pair else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
