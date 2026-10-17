@@ -1548,7 +1548,7 @@ enum ExactVerifyHead {
     /// `selectMerge` write `select`'s outputs: the same `flag` and `info`,
     /// and the same pair on every row that is not flagged (a flagged row's
     /// pair is not read).
-    static let blocks = 64
+    static let blocks = 32
     static let blockThreads = 256
 
     /// Per (row, block): the int8 top-2 of the block's logits and whether
