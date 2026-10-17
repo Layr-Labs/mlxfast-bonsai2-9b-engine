@@ -279,6 +279,56 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         return tokens
     }
 
+    /// Absorb every pending committed row into the drafter's caches now,
+    /// without proposing. The next `proposeBlock` then projects only the rows
+    /// committed after this call — the same incremental continuation every
+    /// steady-state round already performs. Called by the engine at the end
+    /// of the seed prefill so the prompt-context projection runs inside
+    /// `free_decode_begin`'s work instead of the first timed decode round.
+    /// Returns the cache arrays the caller must evaluate within that step; an
+    /// empty pending set returns nothing and changes nothing.
+    public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
+        let state = self.state(requestState)
+        // The LAST pending row stays behind: `proposeBlock` requires a
+        // non-empty pending set (its context tensor feeds the block forward),
+        // and the first round's one-row projection is the steady state's own
+        // per-round cost. Absorbing fewer than two rows moves nothing.
+        guard state.pendingRows > 1 else { return [] }
+        // A prompt at or past the sliding window would put the held-back
+        // row's later one-row update across the rotating ring's wrap, where
+        // the mask's chronological assumption no longer holds. Such a prompt
+        // keeps the parent's lazy single-pass absorption, which handles the
+        // wrap correctly.
+        if let window = drafter.config.slidingWindow {
+            guard state.pendingRows < window else { return [] }
+        }
+        let context =
+            state.pending.count == 1
+            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        let rows = context.dim(1)
+        if !state.cacheSeeded {
+            // Identical seeding to `proposeBlock`: the cache sits where the
+            // retained context actually starts.
+            for cache in state.caches {
+                guard let base = cache as? BaseKVCache else { continue }
+                base.offset = state.firstPendingPosition
+            }
+            state.cacheSeeded = true
+        }
+        do {
+            try drafter.absorbContext(
+                targetHidden: context[0..., ..<(rows - 1), 0...], cache: state.caches)
+        } catch {
+            // Fail open: the rows stay pending and the next proposal absorbs
+            // them lazily, exactly the parent behavior.
+            return []
+        }
+        state.pending = [context[0..., (rows - 1)..., 0...]]
+        state.pendingRows = 1
+        let evalTargets = state.caches.flatMap { $0.innerState() }
+        return evalTargets
+    }
+
     public func trimBlockState(
         _ requestState: any CBv2MTPRequestState, toCommittedLength committed: Int
     ) {
