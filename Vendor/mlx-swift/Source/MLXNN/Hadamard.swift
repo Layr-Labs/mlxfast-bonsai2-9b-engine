@@ -3296,12 +3296,86 @@ enum VerifyInt8Matmul {
         }
         """
 
-    /// `naxFastBody` for `layers` sibling projections of one activation in
-    /// one dispatch: threadgroups x < N0 / 32 take layer 0, the next N1 / 32
-    /// layer 1, and so on, each running the one-layer body unchanged. Inputs
-    /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
-    /// N0, N1, ...]; outputs `out0`....
-    static func naxFastSource(layers: Int) -> String {
+    /// `naxFastBody` with the stored 2-bit words read 16 bytes per lane:
+    /// lane l reads words 4 * (l & 1) ... + 3 of the group in rows (l >> 1)
+    /// and (l >> 1) + 16, two uint4 loads per group instead of eight uint32
+    /// loads (16 rows x 32 B per instruction instead of 4 rows x 32 B), one
+    /// group ahead as before. Each word is expanded by the same expression
+    /// into the same threadgroup slot (row * 8 + word), so the tensor op sees
+    /// the record's staged tile and everything after it is unchanged. The
+    /// four stores of a lane rotate by (l >> 1) & 3 to spread banks.
+    static let naxWideBody: String = {
+        func swap(_ body: String, _ old: String, _ new: String, count: Int) -> String {
+            let found = body.components(separatedBy: old).count - 1
+            precondition(found == count, "naxWideBody: fragment found \(found) times, expected \(count)")
+            return body.replacingOccurrences(of: old, with: new)
+        }
+        var body = swap(
+            naxFastBody,
+            """
+            const int j = int(lane & 7u);
+            const int c = int(lane >> 3);
+            const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
+            threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
+            uint32_t wv[8];
+            """,
+            """
+            const int wr = int(lane >> 1);
+            const int wh = int(lane & 1u);
+            const int rot = wr & 3;
+            const device uint4* wrow = (const device uint4*)(w + (size_t)(n0 + wr) * KW) + wh;
+            threadgroup uint4* wdst = (threadgroup uint4*)bs[sg] + wr * 8 + wh * 4;
+            uint4 wq[2];
+            """, count: 1)
+        body = swap(
+            body,
+            """
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+            """,
+            """
+              wq[0] = wrow[gl * 2];
+              wq[1] = wrow[(size_t)(4 * KW) + gl * 2];
+            """, count: 1)
+        body = swap(
+            body,
+            """
+                #pragma clang loop unroll(full)
+                for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+            """,
+            """
+                wq[0] = wrow[gl * 2];
+                wq[1] = wrow[(size_t)(4 * KW) + gl * 2];
+            """, count: 1)
+        return swap(
+            body,
+            """
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 8; t++) {
+                const uint32_t v = wv[t];
+                dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+              }
+            """,
+            """
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 2; t++) {
+                const uint4 q = wq[t];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < 4; u++) {
+                  const int r = (u + rot) & 3;
+                  const uint32_t v = r == 0 ? q.x : r == 1 ? q.y : r == 2 ? q.z : q.w;
+                  wdst[128 * t + r] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+                }
+              }
+            """, count: 1)
+    }()
+
+    /// `naxFastBody` (or `naxWideBody`) for `layers` sibling projections of
+    /// one activation in one dispatch: threadgroups x < N0 / 32 take layer 0,
+    /// the next N1 / 32 layer 1, and so on, each running the one-layer body
+    /// unchanged. Inputs `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`,
+    /// `ksz` = [K, rows, N0, N1, ...]; outputs `out0`....
+    static func naxFastSource(layers: Int, wide: Bool = false) -> String {
         var pick = """
             #pragma clang fp contract(off)
             #pragma clang fp reassociate(off)
@@ -3317,7 +3391,7 @@ enum VerifyInt8Matmul {
         for l in 1 ..< layers {
             pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); scalesT = s\(l); biasesT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + naxFastBody
+        return pick + (wide ? naxWideBody : naxFastBody)
     }
 
     private static let naxKernel = MLXFast.metalKernel(
@@ -3348,14 +3422,34 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
 
+    /// `naxFastSource(layers:wide: true)` for one, two and three layers.
+    private static let naxWideKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_nax_wide\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxFastSource(layers: layers, wide: true),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
     /// `naxFast`: the fast kernel matched (it then replaces the vector one);
     /// `naxShared`: its two- and three-layer forms matched too.
+    /// `naxWide`: the wide-load forms of every fast kernel in use matched
+    /// the plain kernel at 4 rows and the fast kernel at 16 rows (they then
+    /// replace the fast ones). `DARKBLOOM_BONSAI_INT8_VERIFY_WIDE=0` keeps
+    /// the fast kernels.
     nonisolated(unsafe) private static var naxVector = false
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
     nonisolated(unsafe) private static var naxShared = false
+    nonisolated(unsafe) private static var naxWide = false
+    private static let wideAllowed = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_WIDE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
 
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
@@ -3377,14 +3471,14 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool
+        m: Int, k: Int, negative: Bool, wide: Bool
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
         let template = [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
-        return naxFastKernels[layers.count - 1](
+        return (wide ? naxWideKernels : naxFastKernels)[layers.count - 1](
             inputs, template: template,
             grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -3423,18 +3517,27 @@ enum VerifyInt8Matmul {
             eval(equal)
             return !checkFailed && equal.item(Bool.self)
         }
-        func fast(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>]) -> MLXArray {
+        // All 16 rows live, for the wide kernels' 16-row check.
+        let codes16 = MLXArray(
+            (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 53 + 29) % 255 - 127) }, [tileRows, k])
+        let ascale16 = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+        let rsb16 = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+        func fast(
+            _ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>], wide: Bool = false, full: Bool = false
+        ) -> MLXArray {
             let outputs = runFast(
-                codes: codes, ascale: ascale, rsb: rsb,
+                codes: full ? codes16 : codes, ascale: full ? ascale16 : ascale, rsb: full ? rsb16 : rsb,
                 layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
-                m: m, k: k, negative: negative)
+                m: full ? tileRows : m, k: k, negative: negative, wide: wide)
             return concatenated(outputs, axis: 1).view(dtype: .uint32)
         }
         var matched = false
+        var wideError: String?
         naxVector = false
         negativeForms = false
         naxFast = false
         naxShared = false
+        naxWide = false
         withErrorHandler({ message in
             if !VerifyInt8Matmul.checkFailed { VerifyInt8Matmul.checkNote = String(message.prefix(160)) }
             VerifyInt8Matmul.checkFailed = true
@@ -3447,6 +3550,29 @@ enum VerifyInt8Matmul {
                 negativeForms = plainNeg
                 return
             }
+            // The wide kernels against the plain kernel at 4 rows (as the
+            // fast ones), then against the fast kernels at 16 rows, the
+            // verify width the plain kernel does not cover; every form in use.
+            func wideMatches() -> Bool {
+                let forms: [(MLXArray, Bool)] = [(biasesT, false)] + (negativeForms ? [(negatedT, true)] : [])
+                let splits: [[Range<Int>]] =
+                    [[0 ..< n]] + (naxShared ? [[0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]] : [])
+                let exponent = MLXArray(UInt32(0x7f80_0000))
+                for (offsets, negative) in forms {
+                    let base = negative ? plainNegated : plain
+                    for columns in splits {
+                        let expected = columns.count == 3 ? concatenated([base, base[0..., 0 ..< 32]], axis: 1) : base
+                        guard same(fast(offsets, negative: negative, columns, wide: true), expected) else { return false }
+                        let record = fast(offsets, negative: negative, columns, full: true)
+                        let finite = MLX.all((record & exponent) .!= exponent)
+                        eval(finite)
+                        guard !checkFailed, finite.item(Bool.self),
+                            same(fast(offsets, negative: negative, columns, wide: true, full: true), record)
+                        else { return false }
+                    }
+                }
+                return true
+            }
             if same(fast(biasesT, negative: false, [0 ..< n]), plain) {
                 matched = true
                 naxFast = true
@@ -3458,6 +3584,14 @@ enum VerifyInt8Matmul {
                 if checkFailed {
                     checkFailed = false
                     naxShared = false
+                }
+                if wideAllowed {
+                    naxWide = wideMatches()
+                    if checkFailed {
+                        wideError = String(checkNote.prefix(80))
+                        checkFailed = false
+                        naxWide = false
+                    }
                 }
                 return
             }
@@ -3473,7 +3607,7 @@ enum VerifyInt8Matmul {
         }
         if !checkFailed {
             checkNote = !matched ? "outputs differ"
-                : "bit-identical (\(nax ? (naxFast ? (naxShared ? "fast, shared" : "fast") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+                : "bit-identical (\(nax ? (naxFast ? (naxShared ? "fast, shared" : "fast") + (naxWide ? ", wide" : wideAllowed ? ", wide differs" + (wideError.map { ": " + $0 } ?? "") : ", wide off") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
         }
         return matched
     }
@@ -3512,7 +3646,7 @@ enum VerifyInt8Matmul {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms)[0]
+                negative: negative && negativeForms, wide: naxWide)[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -3536,7 +3670,7 @@ enum VerifyInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative })
+                negative: negativeForms && layers.allSatisfy { $0.negative }, wide: naxWide)
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
