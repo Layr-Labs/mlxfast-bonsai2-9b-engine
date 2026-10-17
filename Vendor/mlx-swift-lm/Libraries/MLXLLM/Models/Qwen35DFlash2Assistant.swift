@@ -152,6 +152,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// The caches start at the first pending row's position, which is not
         /// zero when the prompt was longer than the context window.
         var cacheSeeded = false
+        /// Every pending row was absorbed ahead of the first block, so that
+        /// block runs with no new context rows.
+        var contextAbsorbed = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var isReleased = false
@@ -256,9 +259,13 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
-        guard !state.pending.isEmpty else { throw DFlash2Error.emptyBlockContext }
+        guard !state.pending.isEmpty || state.contextAbsorbed else {
+            throw DFlash2Error.emptyBlockContext
+        }
         let context =
-            state.pending.count == 1
+            state.pending.isEmpty
+            ? MLXArray.zeros([1, 0, drafter.config.targetHiddenSize], dtype: drafter.dtype)
+            : state.pending.count == 1
             ? state.pending[0] : concatenated(state.pending, axis: 1)
         if !state.cacheSeeded {
             // The cache must sit where the retained context actually starts.
@@ -275,8 +282,54 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             anchor: [anchor], targetHidden: context, cache: state.caches,
             blockSize: depth + 1)
         state.absorbPending()
+        state.contextAbsorbed = false
         state.roots.append(tokens)
         return tokens
+    }
+
+    /// Absorb every pending committed row into the drafter's caches now,
+    /// without proposing. The next `proposeBlock` then projects only the rows
+    /// committed after this call — the same incremental continuation every
+    /// steady-state round already performs. Called by the engine at the end
+    /// of the seed prefill so the prompt-context projection runs inside
+    /// `free_decode_begin`'s work instead of the first timed decode round.
+    /// Returns the cache arrays the caller must evaluate within that step; an
+    /// empty pending set returns nothing and changes nothing.
+    public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
+        let state = self.state(requestState)
+        // EVERY pending row is absorbed, in the one pass the first block would
+        // have run over them: the same rows through the same projections, so
+        // the caches hold the bits the lazy path would have put there, and
+        // the first block then runs with no new context rows.
+        guard state.pendingRows > 0 else { return [] }
+        // A prompt at or past the sliding window keeps the parent's lazy
+        // single-pass absorption.
+        if let window = drafter.config.slidingWindow {
+            guard state.pendingRows < window else { return [] }
+        }
+        let context =
+            state.pending.count == 1
+            ? state.pending[0] : concatenated(state.pending, axis: 1)
+        if !state.cacheSeeded {
+            // Identical seeding to `proposeBlock`: the cache sits where the
+            // retained context actually starts.
+            for cache in state.caches {
+                guard let base = cache as? BaseKVCache else { continue }
+                base.offset = state.firstPendingPosition
+            }
+            state.cacheSeeded = true
+        }
+        do {
+            try drafter.absorbContext(targetHidden: context, cache: state.caches)
+        } catch {
+            // Fail open: the rows stay pending and the next proposal absorbs
+            // them lazily, exactly the parent behavior.
+            return []
+        }
+        state.absorbPending()
+        state.contextAbsorbed = true
+        let evalTargets = state.caches.flatMap { $0.innerState() }
+        return evalTargets
     }
 
     public func trimBlockState(
