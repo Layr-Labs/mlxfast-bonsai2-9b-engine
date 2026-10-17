@@ -967,8 +967,21 @@ enum CBv2AttentionV1 {
 /// cross-simdgroup code (lane l = class l). Outputs are the bits of
 /// `MLXFast.scaledDotProductAttention(..., mask: .causal)`.
 enum CBv2VerifyVectorAttention {
-    /// Key classes per partial threadgroup.
-    private static let classesPerGroup = 2
+    /// Key classes per partial threadgroup: 2, except 1 on a GPU whose
+    /// parsed generation is below MLX's `is_nax_available` rule (as in
+    /// `PromptInt8Matmul.architectureHasNAX`), where 64 * L threads can
+    /// exceed the pipeline's limit (384 on an M2 at L = 7). A name that
+    /// does not parse keeps 2. Each simdgroup computes the same (class,
+    /// query) state either way, so the outputs are the same bits.
+    private static let classesPerGroup: Int = {
+        let name = GPU.deviceInfo().architecture
+        guard let range = name.range(of: "applegpu_g") else { return 2 }
+        let tail = name[range.upperBound...]
+        let digits = tail.prefix(while: { $0.isNumber })
+        guard let gen = Int(digits) else { return 2 }
+        let variant = tail.dropFirst(digits.count).first
+        return gen >= (variant == "p" ? 18 : 17) ? 2 : 1
+    }()
 
     private static let partial = MLXFast.metalKernel(
         name: "cbv2_verify_sdpa_partial",

@@ -1702,6 +1702,9 @@ extension Qwen35InlineMTPAssistant {
     /// request's input; the engine, its caches and the request state are
     /// released and the buffer cache is drained before anything is served.
     func warmEngineRound(serving: any LanguageModel) {
+        // Resolve the fused draft step here, at load, so its embedding
+        // projection table is built before any timed window.
+        _ = fusedDraftStep
         guard Self.engineRoundWarmEnabled else { return }
         let layerKinds: [CBv2LayerKind]
         let caches: [any CBv2AttendingLayerCache]
@@ -1827,7 +1830,7 @@ extension Qwen35InlineMTPAssistant {
 /// draft may differ from the module path's; the target verifies every token.
 /// `QWEN35_DRAFT_FUSED=0` keeps the module path; `QWEN35_DRAFT_EMBED_PROJECTION=0`
 /// skips the precomputed embedding projection (~400 MB FP16 for the 49,664-row
-/// draft head), so every step runs 1-2 (local A/B only).
+/// draft head, built at load by `warmEngineRound`), so every step runs 1-2.
 final class Qwen35MTPFusedDraftStep {
     static func environmentFlag(_ name: String) -> Bool {
         let raw = ProcessInfo.processInfo.environment[name]?
@@ -1835,7 +1838,11 @@ final class Qwen35MTPFusedDraftStep {
         return !["0", "false", "no", "off"].contains(raw ?? "")
     }
     static let enabled = environmentFlag("QWEN35_DRAFT_FUSED")
-    static let projectsEmbeddings = ProcessInfo.processInfo.environment["QWEN35_DRAFT_EMBED_PROJECTION"] == "1"
+    static let projectsEmbeddings = environmentFlag("QWEN35_DRAFT_EMBED_PROJECTION")
+    nonisolated(unsafe) private static var carriedLogged = false
+    static func log(_ message: String) {
+        FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    }
 
     struct Packed {
         let weight: MLXArray
@@ -1953,6 +1960,7 @@ final class Qwen35MTPFusedDraftStep {
             self.embeddingProjection = nil
             return
         }
+        let started = Date()
         let halfWeight = fc.weight[0..., ..<(H / 8)]
         let halfScales = fc.scales[0..., ..<(H / 128)].asType(.float32)
         let halfOffsets = fc.biases[0..., ..<(H / 128)].asType(.float32)
@@ -1974,6 +1982,9 @@ final class Qwen35MTPFusedDraftStep {
         parts.removeAll()
         eval(projection)
         self.embeddingProjection = projection
+        Self.log(
+            "MTPEMB draft embedding projection: \(draftIds.size) rows built at load in "
+                + "\(Int(Date().timeIntervalSince(started) * 1000)) ms")
     }
 
     /// Whether `step` takes these inputs (it may still decline the screen,
@@ -2029,6 +2040,10 @@ final class Qwen35MTPFusedDraftStep {
         let fused: MLXArray
         if let carriedRow, let embeddingProjection, carriedRow.dtype == .int32, carriedRow.size == 1 {
             guard let storage = appendStorage(cache) else { return nil }
+            if !Self.carriedLogged {
+                Self.carriedLogged = true
+                Self.log("MTPEMB draft embedding projection: carried step taken")
+            }
             fused = Qwen35MTPFusedKernels.matvecCarried(
                 [hidden.reshaped([H]), hiddenNorm, eps, fc.weight, fc.scales, fc.biases,
                  embeddingProjection, carriedRow],
