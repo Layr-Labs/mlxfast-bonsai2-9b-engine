@@ -3387,16 +3387,26 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
                 layers: packed.map(\.verifyOperands))
             : nil
+        let verifyOutputs = verify
+            ? VerifyInt8Matmul.matmul(
+                PromptInt8Activation(
+                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+                layers: packed.map(\.verifyOperands))
+            : nil
         let outputs = packed.enumerated().map { index, layer in
             if verify {
-                let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
-                let codes = PromptInt8Activation(
-                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
-                let output = VerifyInt8Matmul.matmul(
-                    codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
-                    negative: layer.promptConstants.negative)!
-                    .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
-                return layer.bias.map { output + $0 } ?? output
+                guard let output = verifyOutputs?[index] else {
+                    let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
+                    let codes = PromptInt8Activation(
+                        codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
+                    let single = VerifyInt8Matmul.matmul(
+                        codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                        negative: layer.promptConstants.negative)!
+                        .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                    return layer.bias.map { single + $0 } ?? single
+                }
+                let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+                return layer.bias.map { reshaped + $0 } ?? reshaped
             }
             if !quantized { return layer.forwardRotated(activation[0]) }
             let output = promptOutputs![index]
