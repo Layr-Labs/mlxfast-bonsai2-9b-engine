@@ -1436,9 +1436,13 @@ enum PromptInt8Matmul {
         const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
         const int sc = int(tid >> 1); const int sh = int(tid & 1);
         const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v = *src;
+        // Software-pipelined staging: group g + 1's words, loaded during
+        // group g - 1, are written to the free buffer while group g + 2's
+        // load is issued, so no load waits in front of the matmul. The group
+        // constants are read before the matmul for the same reason. Loads
+        // move; every value and operation is unchanged.
+        auto load = [&](int g) -> uint4 { return *((const device uint4*)(wrow + g * 8)); };
+        auto store = [&](uint4 v, int buf) {
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
           #pragma clang loop unroll(full)
           for (int j = 0; j < 4; j++) {
@@ -1449,17 +1453,21 @@ enum PromptInt8Matmul {
             dst[4 * j + 3] = (wv >> 6) & 0x03030303u;
           }
         };
-        stage(0, 0);
+        store(load(0), 0);
+        uint4 pending = Kg > 1 ? load(1) : uint4(0u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int g = 0; g < Kg; g++) {
           const int cur = g & 1;
-          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 64>(g * 128, m0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
+          if (g + 1 < Kg) {
+            store(pending, cur ^ 1);
+            if (g + 2 < Kg) { pending = load(g + 2); }
+          }
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
           const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);
           const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
           const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
+          auto tA = A.template slice<128, 64>(g * 128, m0);
+          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
           float as[4], rb[4];
           as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
           rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
@@ -1735,21 +1743,36 @@ enum VerifyInt8Matmul {
         const int c = int(lane >> 3);
         const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
         threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
-        uint32_t wv[8];
+        // Weight words are loaded two groups ahead and the group constants
+        // one group ahead, so each simdgroup keeps more bytes in flight.
+        // Only load timing moves; every value and operation is unchanged.
+        const int lr = min(int(lane), ROWS - 1);
+        uint32_t wv[8], wn[8];
         #pragma clang loop unroll(full)
         for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + int(sg) * 8]; }
+        if (int(sg) + 4 < Kg) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) { wn[t] = wcol[(size_t)(4 * t) * KW + (int(sg) + 4) * 8]; }
+        }
+        half2 sbn = half2(scalesT[(size_t)sg * N + n0 + lane], biasesT[(size_t)sg * N + n0 + lane]);
+        float2 arn = lane < uint(ROWS) ? float2(ascale[lr * Kg + int(sg)], rsb[lr * Kg + int(sg)]) : float2(0.0f);
         for (int g = int(sg); g < Kg; g += 4) {
           #pragma clang loop unroll(full)
           for (int t = 0; t < 8; t++) {
             const uint32_t v = wv[t];
             dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
           }
-          const half2 sb = half2(scalesT[(size_t)g * N + n0 + lane], biasesT[(size_t)g * N + n0 + lane]);
-          const int lr = min(int(lane), ROWS - 1);
-          const float2 ar = lane < uint(ROWS) ? float2(ascale[lr * Kg + g], rsb[lr * Kg + g]) : float2(0.0f);
-          if (g + 4 < Kg) {
+          const half2 sb = sbn;
+          const float2 ar = arn;
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) { wv[t] = wn[t]; }
+          if (g + 8 < Kg) {
             #pragma clang loop unroll(full)
-            for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + (g + 4) * 8]; }
+            for (int t = 0; t < 8; t++) { wn[t] = wcol[(size_t)(4 * t) * KW + (g + 8) * 8]; }
+          }
+          if (g + 4 < Kg) {
+            sbn = half2(scalesT[(size_t)(g + 4) * N + n0 + lane], biasesT[(size_t)(g + 4) * N + n0 + lane]);
+            arn = lane < uint(ROWS) ? float2(ascale[lr * Kg + g + 4], rsb[lr * Kg + g + 4]) : float2(0.0f);
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           auto tA = A.template slice<128, 16>(g * 128, 0);
