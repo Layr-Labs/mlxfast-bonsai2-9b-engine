@@ -27,6 +27,22 @@ public struct CBv2ContiguousBackendConfig: Sendable {
     }
 }
 
+/// A request's engine is assembled first (`free_decode_begin` builds one
+/// before its seed forward), and a GPU left idle starts its first command
+/// buffer late. One scalar add committed as the assembly begins starts that
+/// wake-up while the CPU assembles the engine and builds the prompt graph,
+/// ahead of the first real submission. Nothing reads it, and it touches no
+/// cache, weight or model state. `DARKBLOOM_BONSAI_GPU_WAKE=0` turns it off.
+enum CBv2GPUWake {
+    static let enabled = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GPU_WAKE"]?.lowercased() ?? "")
+
+    static func now() {
+        guard enabled else { return }
+        asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1)))
+    }
+}
+
 /// Factory + accounting for per-sequence contiguous KV state.
 ///
 /// Thread-safe: the live-row registry is lock-protected (`makeSequenceState`
@@ -61,6 +77,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     private var liveBytesCapacity: Int
 
     public init(config: CBv2ContiguousBackendConfig) {
+        CBv2GPUWake.now()
         self.config = config
         self.liveBytesCapacity = config.bytesCapacity
     }
