@@ -3002,12 +3002,171 @@ enum VerifyInt8Matmul {
         }
         """
 
+    /// One group of `naxPrefBody` from register slot `s`: stage the slot's
+    /// weight words, take its constants, refill the slot with group `gc + 8`,
+    /// then the fast body's tensor op and epilogue, unchanged.
+    private static func naxPrefStep(_ s: Int) -> String {
+        """
+              {
+                #pragma clang loop unroll(full)
+                for (int t = 0; t < 8; t++) {
+                  const uint32_t v = wv\(s)[t];
+                  dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+                }
+                const half4 cA = sA\(s), cB = sB\(s);
+                const half4 dA = NEG ? -sA\(s) : bA\(s), dB = NEG ? -sB\(s) : bB\(s);
+                const float ca = fa\(s), crb = frb\(s);
+                if (gc + 8 < Kg) {
+                  const int gl = gc + 8;
+                  #pragma clang loop unroll(full)
+                  for (int t = 0; t < 8; t++) { wv\(s)[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+                  sA\(s) = *(const device half4*)(scol + (size_t)gl * N);
+                  sB\(s) = *(const device half4*)(scol + (size_t)gl * N + 16);
+                  if (!NEG) {
+                    bA\(s) = *(const device half4*)(bcol + (size_t)gl * N);
+                    bB\(s) = *(const device half4*)(bcol + (size_t)gl * N + 16);
+                  }
+                  fa\(s) = ascale[mr * Kg + gl];
+                  frb\(s) = rsb[mr * Kg + gl];
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                auto tA = A.template slice<128, 16>(gc * 128, 0);
+                op.run(tA, B, cT);
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 4; e++) {
+                  const float t0 = float(cA[e]) * float(cT[e]);
+                  acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));
+                  const float t1 = float(cB[e]) * float(cT[8 + e]);
+                  acc[4 + e] = fma(float(dB[e]), crb, fma(ca, t1, acc[4 + e]));
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+              }
+
+        """
+    }
+
+    /// `naxFastBody` with two groups of weight words, scales, offsets and row
+    /// constants in flight per simdgroup instead of one: two register slots
+    /// hold groups `g` and `g + 4`, and each group, once staged, refills its
+    /// slot with group `g + 8`. The loop is unrolled by two so no slot is
+    /// copied into another (a copy would wait for the load). Each simdgroup
+    /// still folds groups `sg, sg + 4, ...` in ascending order with the same
+    /// tensor op and epilogue, and the partials are summed as in
+    /// `naxFastBody`, so every output has the fast body's bits.
+    static let naxPrefBody: String = {
+        let head = """
+            const int Kg = K / 128;
+            const int KW = K / 16;
+            const int n0 = bx * 32;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_position_in_threadgroup.x;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            threadgroup uint32_t bs[4][32 * 32];
+            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, 32));
+            auto tA0 = A.template slice<128, 16>(0, 0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            const int cap = int(cT.get_capacity());
+            bool ok = cap == 16;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 16; i++) {
+              if (i < cap) {
+                auto ids = cT.get_multidimensional_index(i);
+                ok = ok && int(ids[1]) == mrow + 8 * ((i >> 2) & 1) && int(ids[0]) == nb + (i & 3) + 16 * (i >> 3);
+              }
+            }
+            const bool good = simd_all(ok);
+            float acc[8];
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 8; e++) { acc[e] = 0.0f; }
+            const int mr = min(mrow, ROWS - 1);
+            const device half* scol = scalesT + n0 + nb;
+            const device half* bcol = biasesT + n0 + nb;
+            const int j = int(lane & 7u);
+            const int c = int(lane >> 3);
+            const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
+            threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
+            uint32_t wv0[8], wv1[8];
+            half4 sA0, sB0, bA0 = half4(0.0h), bB0 = half4(0.0h);
+            half4 sA1 = half4(0.0h), sB1 = half4(0.0h), bA1 = half4(0.0h), bB1 = half4(0.0h);
+            float fa0, frb0, fa1 = 0.0f, frb1 = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 8; t++) { wv1[t] = 0u; }
+            {
+              const int gl = int(sg);
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 8; t++) { wv0[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+              sA0 = *(const device half4*)(scol + (size_t)gl * N);
+              sB0 = *(const device half4*)(scol + (size_t)gl * N + 16);
+              if (!NEG) {
+                bA0 = *(const device half4*)(bcol + (size_t)gl * N);
+                bB0 = *(const device half4*)(bcol + (size_t)gl * N + 16);
+              }
+              fa0 = ascale[mr * Kg + gl];
+              frb0 = rsb[mr * Kg + gl];
+            }
+            if (int(sg) + 4 < Kg) {
+              const int gl = int(sg) + 4;
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 8; t++) { wv1[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+              sA1 = *(const device half4*)(scol + (size_t)gl * N);
+              sB1 = *(const device half4*)(scol + (size_t)gl * N + 16);
+              if (!NEG) {
+                bA1 = *(const device half4*)(bcol + (size_t)gl * N);
+                bB1 = *(const device half4*)(bcol + (size_t)gl * N + 16);
+              }
+              fa1 = ascale[mr * Kg + gl];
+              frb1 = rsb[mr * Kg + gl];
+            }
+            for (int g = int(sg); g < Kg; g += 8) {
+              {
+                const int gc = g;
+
+            """
+        let middle = """
+              }
+              if (g + 4 >= Kg) { break; }
+              {
+                const int gc = g + 4;
+
+            """
+        let tail = """
+              }
+            }
+            threadgroup float* red = (threadgroup float*)bs[sg];
+            if (mrow < ROWS) {
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < 4; e++) {
+                red[mrow * 32 + nb + e] = acc[e];
+                red[mrow * 32 + nb + 16 + e] = acc[4 + e];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const threadgroup float4* r0 = (const threadgroup float4*)bs[0];
+            const threadgroup float4* r1 = (const threadgroup float4*)bs[1];
+            const threadgroup float4* r2 = (const threadgroup float4*)bs[2];
+            const threadgroup float4* r3 = (const threadgroup float4*)bs[3];
+            for (int e = int(tid); e < ROWS * 8; e += 128) {
+              float4 v = r0[e] + r1[e];
+              v = v + r2[e];
+              v = v + r3[e];
+              *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = good ? v : float4(as_type<float>(0x7fc00000u));
+            }
+
+            """
+        return head + naxPrefStep(0) + middle + naxPrefStep(1) + tail
+    }()
+
     /// `naxFastBody` for `layers` sibling projections of one activation in
     /// one dispatch: threadgroups x < N0 / 32 take layer 0, the next N1 / 32
     /// layer 1, and so on, each running the one-layer body unchanged. Inputs
     /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
     /// N0, N1, ...]; outputs `out0`....
-    static func naxFastSource(layers: Int) -> String {
+    static func naxFastSource(layers: Int, body: String = naxFastBody) -> String {
         var pick = """
             #pragma clang fp contract(off)
             #pragma clang fp reassociate(off)
@@ -3023,7 +3182,7 @@ enum VerifyInt8Matmul {
         for l in 1 ..< layers {
             pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); scalesT = s\(l); biasesT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + naxFastBody
+        return pick + body
     }
 
     private static let naxKernel = MLXFast.metalKernel(
@@ -3054,10 +3213,31 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
 
+    /// `naxPrefBody` for one, two and three layers (index `layers - 1`).
+    private static let naxPrefKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_nax_pref\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxFastSource(layers: layers, body: naxPrefBody),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
+    /// `DARKBLOOM_BONSAI_VERIFY_PREFETCH=0` keeps the one-group-ahead fast
+    /// kernel without checking the prefetch kernel.
+    private static let prefetchAllowed = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_PREFETCH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
     /// `naxFast`: the fast kernel matched (it then replaces the vector one);
     /// `naxShared`: its two- and three-layer forms matched too.
+    /// `naxPrefetch`: the prefetch kernel matched the plain kernel in every
+    /// form the fast kernel is used in (it then replaces the fast one).
+    nonisolated(unsafe) private static var naxPrefetch = false
     nonisolated(unsafe) private static var naxVector = false
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
@@ -3083,14 +3263,14 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool
+        m: Int, k: Int, negative: Bool, prefetch: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
         let template = [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
-        return naxFastKernels[layers.count - 1](
+        return ((prefetch ?? naxPrefetch) ? naxPrefKernels : naxFastKernels)[layers.count - 1](
             inputs, template: template,
             grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -3099,13 +3279,71 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
+    /// The prefetch kernel against the plain kernel on a wider fixed problem
+    /// than `checkKernels`: K = 35 groups (9, 9, 9 and 8 per simdgroup, so
+    /// both slots are refilled and the loop ends after either slot) and 256
+    /// columns, at 4 rows in every form the fast kernel is used in, and at 7
+    /// rows in the one-layer form. Run inside `checkKernels`' error handler.
+    private static func prefetchMatches() -> Bool {
+        let n = 256, kg = 35, k = kg * 128
+        let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 7) &* 2_654_435_761) }, [n, k / 16])
+        let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+        let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            let equal = MLX.all(a .== b)
+            eval(equal)
+            return !checkFailed && equal.item(Bool.self)
+        }
+        for m in [4, 7] {
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { $0 < m * k ? Int8(truncatingIfNeeded: ($0 * 41 + 3) % 255 - 127) : 0 },
+                [tileRows, k])
+            let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
+            let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+            func plain(_ offsets: MLXArray) -> MLXArray {
+                run(.plain, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                    scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, vector: false, negative: false)
+                    .view(dtype: .uint32)
+            }
+            func prefetched(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>]) -> MLXArray {
+                let outputs = runFast(
+                    codes: codes, ascale: ascale, rsb: rsb,
+                    layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
+                    m: m, k: k, negative: negative, prefetch: true)
+                return concatenated(outputs, axis: 1).view(dtype: .uint32)
+            }
+            let reference = plain(biasesT)
+            guard same(prefetched(biasesT, negative: false, [0 ..< n]), reference) else { return false }
+            guard m == 4 else { continue }
+            let negated = plain(negatedT)
+            if negativeForms {
+                guard same(prefetched(negatedT, negative: true, [0 ..< n]), negated) else { return false }
+            }
+            if naxShared {
+                let three = [0 ..< 64, 64 ..< 256, 0 ..< 96]
+                guard same(prefetched(biasesT, negative: false, [0 ..< 128, 128 ..< 256]), reference),
+                    same(prefetched(biasesT, negative: false, three),
+                        concatenated([reference, reference[0..., 0 ..< 96]], axis: 1))
+                else { return false }
+                if negativeForms {
+                    guard same(prefetched(negatedT, negative: true, three),
+                        concatenated([negated, negated[0..., 0 ..< 96]], axis: 1))
+                    else { return false }
+                }
+            }
+        }
+        return !checkFailed
+    }
+
     /// Runs the kernels on a fixed, input-independent 4 x 64 x 1024 problem
     /// (two threadgroups, two groups per simdgroup) and compares output
     /// bits, as `PromptInt8Matmul.checkKernels`: the plain `NEG = 1` form
     /// against `NEG = 0` on negated-scale offsets, then on a NAX device the
     /// fast tensor kernel (both forms, then its two- and three-layer forms on
-    /// column slices), else the vector tensor kernel (both forms), else the
-    /// record tensor kernel, against the plain kernel.
+    /// column slices, then the prefetch kernel by `prefetchMatches`), else the
+    /// vector tensor kernel (both forms), else the record tensor kernel,
+    /// against the plain kernel.
     @discardableResult
     private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
@@ -3141,6 +3379,7 @@ enum VerifyInt8Matmul {
         negativeForms = false
         naxFast = false
         naxShared = false
+        naxPrefetch = false
         withErrorHandler({ message in
             if !VerifyInt8Matmul.checkFailed { VerifyInt8Matmul.checkNote = String(message.prefix(160)) }
             VerifyInt8Matmul.checkFailed = true
@@ -3165,6 +3404,13 @@ enum VerifyInt8Matmul {
                     checkFailed = false
                     naxShared = false
                 }
+                if prefetchAllowed {
+                    naxPrefetch = prefetchMatches()
+                    if checkFailed {
+                        checkFailed = false
+                        naxPrefetch = false
+                    }
+                }
                 return
             }
             checkFailed = false
@@ -3179,7 +3425,7 @@ enum VerifyInt8Matmul {
         }
         if !checkFailed {
             checkNote = !matched ? "outputs differ"
-                : "bit-identical (\(nax ? (naxFast ? (naxShared ? "fast, shared" : "fast") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+                : "bit-identical (\(nax ? (naxFast ? (naxPrefetch ? "prefetch" : "fast") + (naxShared ? ", shared" : "") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
         }
         return matched
     }
