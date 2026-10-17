@@ -4336,7 +4336,7 @@ private enum DraftStepRowKernels {
             for (short r = 0; r < 16; r++) rot[i + 256 * r] = x_reg[r] * 0.015625f;
             """, header: header)
 
-    /// One simdgroup per 32-row block: the block's best screened row (first
+    /// One simdgroup per CH-row block: the block's best screened row (first
     /// maximum, as `argMax`), rescored on the full width (the arithmetic of
     /// `DraftScreenQMV.rescore`).
     static let rescorePick = MLXFast.metalKernel(
@@ -4349,10 +4349,11 @@ private enum DraftStepRowKernels {
             const int in_w = K / 4;
             const int in_g = K / 128;
             const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
-            const float p = partial[c * 32 + simd_lid];
+            const float p = simd_lid < uint(CH)
+                ? partial[c * CH + int(simd_lid)] : -INFINITY;
             const float m = simd_max(p);
-            const uint pick = simd_min(p == m ? simd_lid : 32u);
-            const int r = c * 32 + int(min(pick, 31u));
+            const uint pick = simd_min(simd_lid < uint(CH) && p == m ? simd_lid : 32u);
+            const int r = c * CH + int(min(pick, uint(CH - 1)));
             const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
             const device half* sc = scales + r * in_g + simd_lid / 8;
             const device half* bi = biases + r * in_g + simd_lid / 8;
@@ -4454,8 +4455,8 @@ extension HadamardQuantizedLinear {
     /// Draft-only screened token for the hidden `z` before its final RMSNorm:
     /// the normalized hidden (`[1, 1, 4096]`, FP32) and `ids[screenedArgMax]`
     /// (`[1]`, int32): the norm, the rotation, the screen, the rescore of
-    /// each 32-row block's best row and the final pick in four kernels. Same
-    /// rule as `screenedArgMax` with `chunk == 32`. Nil when the packing or
+    /// each block's best row and the final pick in four kernels. Supports
+    /// 16- and 32-row blocks, as `screenedArgMax`. Nil when the packing or
     /// the shapes do not take it. `row` is the winner's row in this head.
     public func draftScreenedToken(
         _ z: MLXArray, normWeight: MLXArray, eps: MLXArray, ids: MLXArray, width: Int, chunk: Int
@@ -4463,7 +4464,7 @@ extension HadamardQuantizedLinear {
         let K = transform.width
         let N = weight.dim(0)
         guard readsFloat16ConstantsInPlace, bias == nil, gdnLayout == nil, let biases,
-            K == 4096, transform.blockSize == 4096, chunk == 32,
+            K == 4096, transform.blockSize == 4096, (chunk == 16 || chunk == 32),
             width > 0, width < K, width % 512 == 0, N % chunk == 0, (N / chunk) % 2 == 0,
             z.dtype == .float32, z.size == K,
             normWeight.dtype == .float16, normWeight.size == K,
@@ -4482,7 +4483,7 @@ extension HadamardQuantizedLinear {
             outputShapes: [[N]], outputDTypes: [.float32])[0]
         let blocks = N / chunk
         let rescored = DraftStepRowKernels.rescorePick(
-            [rotated, weight, scales, biases, partial],
+            [rotated, weight, scales, biases, partial], template: [("CH", chunk)],
             grid: (32, blocks, 1), threadGroup: (32, 2, 1),
             outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
         let picked = DraftStepRowKernels.pickToken(
