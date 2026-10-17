@@ -568,6 +568,81 @@ public struct SignedBlockHadamard {
             outputDTypes: [.int8, .float32, .float32, .float32, .float32])
     }
 
+    /// `residualNormVerifyNormalized` at prompt width (`PromptInt8Matmul`
+    /// rows): the same kernel, one threadgroup per row, with the prompt
+    /// constant order (`VERIFY_ROWS` 0). Returns `[codes, ascale, rsb, x +
+    /// residual, rmsNorm(x + residual, weight)]`; the codes and constants are
+    /// those of `quantizedForPrompt` on the normalized rows.
+    func residualNormPromptNormalized(
+        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
+    ) -> [MLXArray]? {
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            residual.dtype == .float32, residual.shape == x.shape,
+            weight.dtype == .float32, weight.shape == [4096], x.size > 0,
+            x.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let rows = x.size / width
+        guard PromptInt8Matmul.applies(rows: rows) else { return nil }
+        return Self.residualNormNormedQuantized4096Kernel(
+            [x, residual, weight, MLXArray([eps]), signs],
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+            grid: (256, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, width], [rows * 32], [rows * 32], x.shape, x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+    }
+
+    /// Whether `residualNormPromptNormalized` gives, bit for bit, MLX's add,
+    /// `MLXFast.rmsNorm` and `quantizedForPrompt` of the normalized rows, on
+    /// synthetic rows at widths 512 and 128. Run once, at load.
+    nonisolated(unsafe) private static var boundaryCheckFailed = false
+    nonisolated(unsafe) private static var boundaryCheckNote = "ok"
+
+    func promptBoundaryMatchesSeparate() -> (Bool, String) {
+        Self.boundaryCheckFailed = false
+        Self.boundaryCheckNote = "ok"
+        var note: String? = nil
+        var matched = false
+        withErrorHandler({ message in
+            if !SignedBlockHadamard.boundaryCheckFailed {
+                SignedBlockHadamard.boundaryCheckNote = String(message.prefix(160))
+            }
+            SignedBlockHadamard.boundaryCheckFailed = true
+        }) {
+            for (trial, rows) in [512, 128].enumerated() {
+                let key = MLXRandom.key(UInt64(41 + trial))
+                let keys = MLXRandom.split(key: key, into: 3)
+                let x = MLXRandom.normal([1, rows, 4096], key: keys[0]) * Float(4 + 20 * trial)
+                let delta = MLXRandom.normal([1, rows, 4096], key: keys[1]) * 0.75
+                let weight = MLXRandom.uniform(Float(0.05) ..< Float(2.5), [4096], key: keys[2])
+                let eps: Float = 1e-6
+                guard let fused = residualNormPromptNormalized(x, residual: delta, weight: weight, eps: eps)
+                else { note = "route not taken at rows \(rows)"; return }
+                let sum = x + delta
+                let normed = MLXFast.rmsNorm(sum, weight: weight, eps: eps)
+                guard let separate = quantizedForPrompt(normed)
+                else { note = "separate route not taken at rows \(rows)"; return }
+                let pairs: [(MLXArray, MLXArray)] = [
+                    (fused[0].view(dtype: .uint8), separate.codes.view(dtype: .uint8)),
+                    (fused[1].view(dtype: .uint32), separate.ascale.view(dtype: .uint32)),
+                    (fused[2].view(dtype: .uint32), separate.rsb.view(dtype: .uint32)),
+                    (fused[3].view(dtype: .uint32), sum.view(dtype: .uint32)),
+                    (fused[4].view(dtype: .uint32), normed.view(dtype: .uint32)),
+                ]
+                for (index, (a, b)) in pairs.enumerated() {
+                    let equal = a.shape == b.shape ? MLX.all(a .== b) : MLXArray(false)
+                    eval(equal)
+                    if Self.boundaryCheckFailed { return }
+                    if !equal.item(Bool.self) {
+                        note = "output \(index) differs at rows \(rows)"
+                        return
+                    }
+                }
+            }
+            matched = !Self.boundaryCheckFailed
+        }
+        return (matched, note ?? Self.boundaryCheckNote)
+    }
+
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_residual_norm_4096_q8",
         inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
@@ -2974,6 +3049,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            if transform.width == 4096 { _ = Self.promptBoundaryEnabled(transform) }
         }
     }
 
@@ -3087,6 +3163,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public struct VerifyBoundary {
         let activation: PromptInt8Activation
         let transform: SignedBlockHadamard
+        /// Prompt-width codes (`PromptInt8Matmul` order) rather than verify.
+        var prompt = false
         /// `x + delta`, the residual stream entering the layer.
         public let residual: MLXArray
         /// `rmsNorm(x + delta, weight)`.
@@ -3121,6 +3199,66 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             transform: first.transform, residual: outputs[3], normalized: outputs[4])
     }
 
+    nonisolated(unsafe) private static var promptBoundaryChecked: Bool?
+
+    /// The prompt-width boundary kernel passed its load-time bit check
+    /// against the separate add, RMSNorm and quantization (once per process;
+    /// `DARKBLOOM_BONSAI_PROMPT_BOUNDARY=0` turns it off).
+    static func promptBoundaryEnabled(_ transform: SignedBlockHadamard) -> Bool {
+        if let promptBoundaryChecked { return promptBoundaryChecked }
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_BOUNDARY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let enabled: Bool
+        let note: String
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            (enabled, note) = (false, "disabled")
+        } else if PromptInt8Matmul.route == .off {
+            (enabled, note) = (false, "int8 prompt route off")
+        } else {
+            (enabled, note) = transform.promptBoundaryMatchesSeparate()
+        }
+        promptBoundaryChecked = enabled
+        FileHandle.standardError.write(
+            "prompt boundary: \(enabled ? "fused" : "separate") (check: \(note))\n"
+                .data(using: .utf8)!)
+        return enabled
+    }
+
+    /// Rows at which `promptBoundary` can apply.
+    public static func promptBoundaryApplies(rows: Int) -> Bool {
+        PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+            && promptBoundaryChecked == true
+    }
+
+    /// `verifyBoundary` at prompt width: `x + delta`, its RMSNorm and the
+    /// prompt codes of the rotated norm in one kernel, each the bits of the
+    /// separate add, `rmsNorm` and `quantizedForPrompt`. Nil when the rows,
+    /// the packing, the route or the load-time check do not qualify; the
+    /// caller then adds, normalizes and projects separately.
+    public static func promptBoundary(
+        _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
+        projections: [Linear]
+    ) -> VerifyBoundary? {
+        guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32,
+            promptBoundaryApplies(rows: x.size / 4096)
+        else { return nil }
+        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
+        guard packed.count == projections.count, let first = packed.first,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
+                    && $0.transform.isIdentical(to: first.transform)
+            }),
+            let outputs = first.transform.residualNormPromptNormalized(
+                x, residual: delta, weight: weight, eps: eps)
+        else { return nil }
+        let rows = x.size / 4096
+        return VerifyBoundary(
+            activation: PromptInt8Activation(
+                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
+            transform: first.transform, prompt: true, residual: outputs[3], normalized: outputs[4])
+    }
+
     /// `projections` applied to `boundary.normalized` from the boundary's
     /// codes. Nil when a projection's packing or rotation differs.
     public static func boundaryProjections(
@@ -3130,10 +3268,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard packed.count == projections.count,
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
-                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.blockSize == 4096
+                    && $0.weight.dim(0) % (boundary.prompt ? 64 : 32) == 0
                     && $0.transform.isIdentical(to: boundary.transform)
             })
         else { return nil }
+        if boundary.prompt {
+            return packed.map { layer in
+                let (scalesT, biasesT) = layer.promptConstants.get(
+                    scales: layer.scales, biases: layer.biases!)
+                return PromptInt8Matmul.matmul(
+                    boundary.activation, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: layer.promptConstants.negative)!
+                    .reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
+            }
+        }
         guard let outputs = VerifyInt8Matmul.matmul(
             boundary.activation, layers: packed.map(\.verifyOperands))
         else { return nil }

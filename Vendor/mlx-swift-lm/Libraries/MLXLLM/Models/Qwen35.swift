@@ -1629,13 +1629,14 @@ final class Qwen35GatedDeltaNet: Module {
     func cbv2Forward(
         _ inputs: MLXArray,
         modelLayerIndex: Int,
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        boundary: HadamardQuantizedLinear.VerifyBoundary? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
-        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
+        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, boundary: boundary)
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
@@ -2389,6 +2390,15 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
                 exactTargetVerify: exactTargetVerify)
         }
+        return cbv2PostAttention(
+            x, r, exactTargetVerify: exactTargetVerify, lastPositionOnly: lastPositionOnly)
+    }
+
+    /// The layer's second half from its input `x` and mixer output `r`:
+    /// `x + r`, the post-attention norm and the MLP, added.
+    fileprivate func cbv2PostAttention(
+        _ x: MLXArray, _ r: MLXArray, exactTargetVerify: Bool, lastPositionOnly: Bool
+    ) -> MLXArray {
         if (!lastPositionOnly || x.dim(1) == 1), let dense = mlp as? Qwen3NextMLP,
             let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
                 x, residual: r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
@@ -2495,6 +2505,74 @@ extension Qwen35DecoderLayer {
             return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
         }
         let h = boundary.residual + r
+        return (h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
+    }
+}
+
+extension Qwen35DecoderLayer {
+    /// Prompt-width layer (the prefill twin of `cbv2ForwardVerifyFused`).
+    /// With `delta`, the input arrives as the previous layer's residual `x`
+    /// plus its last output, not yet added; the add, the input RMSNorm and
+    /// the prompt codes of the rotated norm come from one kernel
+    /// (`HadamardQuantizedLinear.promptBoundary`) and feed every input
+    /// projection. Without `delta`, the input is `x` and runs the separate
+    /// norm. Returns the layer's residual and MLP output unadded, or, when
+    /// `last`, its added output (with `lastPositionOnly`, the final row only)
+    /// and no delta. Every value is the bits of the unfused `cbv2Forward`.
+    /// Nil (nothing built) when the layer or the shapes do not qualify.
+    func cbv2ForwardPromptFused(
+        _ x: MLXArray, delta: MLXArray?,
+        modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?,
+        last: Bool, lastPositionOnly: Bool
+    ) -> (residual: MLXArray, delta: MLXArray?)? {
+        guard let dense = mlp as? Qwen3NextMLP else { return nil }
+        let firstProjections: [Linear]
+        if isLinear {
+            guard let linearAttn, attentionCache == nil else { return nil }
+            firstProjections = [linearAttn.inProjQKV, linearAttn.inProjZ]
+        } else {
+            guard let selfAttn, attentionCache != nil else { return nil }
+            firstProjections = [selfAttn.qProj, selfAttn.kProj, selfAttn.vProj]
+        }
+        let boundary: HadamardQuantizedLinear.VerifyBoundary?
+        let residual: MLXArray
+        let normalized: MLXArray
+        if let delta {
+            guard
+                let fused = HadamardQuantizedLinear.promptBoundary(
+                    x, delta: delta, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
+                    projections: firstProjections)
+            else { return nil }
+            (boundary, residual, normalized) = (fused, fused.residual, fused.normalized)
+        } else {
+            (boundary, residual, normalized) = (nil, x, inputLayerNorm(x))
+        }
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!.cbv2Forward(
+                normalized, modelLayerIndex: modelLayerIndex,
+                recurrentState: recurrentState, boundary: boundary)
+        } else {
+            r = selfAttn!.cbv2Forward(
+                normalized, cache: attentionCache!, positionIds: positionIds,
+                exactTargetVerify: false, boundary: boundary)
+        }
+        if last {
+            return (
+                cbv2PostAttention(
+                    residual, r, exactTargetVerify: false, lastPositionOnly: lastPositionOnly),
+                nil)
+        }
+        if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
+            residual, residual: r, weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
+        {
+            return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+        }
+        let h = residual + r
         return (h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
     }
 }
@@ -2679,6 +2757,10 @@ public class Qwen35TextModelInner: Module {
             && hiddenStates.ndim == 3 && hiddenStates.dim(0) == 1
             && (2 ... 8).contains(hiddenStates.dim(1))
         var pendingDelta: MLXArray? = nil
+        // Prefill: the same carry at prompt width (`promptBoundary`).
+        let fusePromptBoundaries = !captureRecurrentWindow && !exactTargetVerify
+            && tapLayerIds == nil && hiddenStates.ndim == 3 && hiddenStates.dim(0) == 1
+            && HadamardQuantizedLinear.promptBoundaryApplies(rows: hiddenStates.dim(1))
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
@@ -2702,6 +2784,38 @@ public class Qwen35TextModelInner: Module {
                     asyncEval(hiddenStates, fused.delta)
                 }
                 continue
+            }
+            if fusePromptBoundaries {
+                let last = modelLayerIndex + 1 == layers.count
+                var fused = pendingDelta.flatMap { delta in
+                    layer.cbv2ForwardPromptFused(
+                        hiddenStates, delta: delta, modelLayerIndex: modelLayerIndex,
+                        attentionCache: attentionCache, recurrentState: recurrentState,
+                        positionIds: positionIds, last: last,
+                        lastPositionOnly: lastPositionOnly && last)
+                }
+                if fused == nil {
+                    if let delta = pendingDelta {
+                        hiddenStates = hiddenStates + delta
+                        pendingDelta = nil
+                    }
+                    fused = layer.cbv2ForwardPromptFused(
+                        hiddenStates, delta: nil, modelLayerIndex: modelLayerIndex,
+                        attentionCache: attentionCache, recurrentState: recurrentState,
+                        positionIds: positionIds, last: last,
+                        lastPositionOnly: lastPositionOnly && last)
+                }
+                if let fused {
+                    (hiddenStates, pendingDelta) = (fused.residual, fused.delta)
+                    if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
+                        if let delta = fused.delta {
+                            asyncEval(hiddenStates, delta)
+                        } else {
+                            asyncEval(hiddenStates)
+                        }
+                    }
+                    continue
+                }
             }
             if let delta = pendingDelta {
                 hiddenStates = hiddenStates + delta
