@@ -702,6 +702,26 @@ final class CBv2MTPRoundDriver {
         stateful.observeCommittedTarget(observation, requestState: detachedState)
     }
 
+    /// `DARKBLOOM_BONSAI_DFLASH_PROMPT_IN_BEGIN=0` restores lazy absorption
+    /// (the first proposal projects the prompt context inside the first
+    /// decode round, the parent behavior).
+    static let dflashPromptAbsorbEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFLASH_PROMPT_IN_BEGIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Seed-prefill boundary: a block drafter absorbs its pending prompt
+    /// context into its caches now, so the projection runs inside the begin
+    /// step's work. Returns the arrays the step must evaluate; a chain
+    /// drafter, a disabled switch, or an empty pending set return nothing.
+    func absorbCommittedContext(detachedState: any CBv2MTPRequestState) -> [MLXArray] {
+        guard Self.dflashPromptAbsorbEnabled,
+            let block = drafter as? any CBv2MTPBlockDrafter
+        else { return [] }
+        return block.absorbPendingContext(requestState: detachedState)
+    }
+
     func marginalDepth(
         for id: CBv2RequestID,
         offeredDepth: Int,
@@ -822,6 +842,44 @@ final class CBv2MTPRoundDriver {
                 "CBv2 block MTP: the target's context tap is not armed")
         }
         return context
+    }
+
+    // MARK: Block-drafter confidence depth
+
+    /// Confidence tiers for a block drafter's per-round depth, highest first.
+    /// A round whose lowest carried target top-two margin clears `minimumMargin`
+    /// drafts `depth` tokens. The top tier uses the same margin as the prompt
+    /// lookup deep chain (`Qwen35MTP.promptLookupMissDeep`), so both features
+    /// read the target's confidence on one scale. The drafter's declared depth
+    /// is the ceiling; a tier deeper than it is a no-op through `clampPlanDepth`.
+    static let blockConfidenceTiers: [(minimumMargin: Double, depth: Int)] = [
+        (minimumMargin: 4, depth: 15),
+        (minimumMargin: 2, depth: 11),
+        (minimumMargin: 1, depth: 7),
+    ]
+    static let blockConfidenceFloorDepth = 3
+
+    /// Per-round draft depth for a block drafter, from the carried target
+    /// top-two margin of each row's last committed token. Returns nil (leave
+    /// the planned depth alone) for every other decoder and verification mode,
+    /// and when any row has no carried margin yet. The margin is host-resident
+    /// from the previous round's finalize, so this adds no GPU sync.
+    func blockConfidenceRoundDepth(for rows: [CBv2ScheduledRequest]) -> Int? {
+        guard config.verificationMode != .serialTarget,
+            drafter is any CBv2MTPBlockDrafter,
+            let fixed = config.fixedDraftTokens, fixed > 0, !rows.isEmpty
+        else { return nil }
+        var lowest = Double.infinity
+        for rec in rows {
+            guard let margin = carries[rec.id]?.previousTopTwoMargin, margin.isFinite else {
+                return nil
+            }
+            lowest = min(lowest, margin)
+        }
+        for tier in Self.blockConfidenceTiers where lowest >= tier.minimumMargin {
+            return min(tier.depth, fixed)
+        }
+        return min(Self.blockConfidenceFloorDepth, fixed)
     }
 
     // MARK: Prompt lookup

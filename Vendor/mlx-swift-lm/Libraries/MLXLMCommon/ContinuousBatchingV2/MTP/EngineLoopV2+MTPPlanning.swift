@@ -229,6 +229,13 @@ extension EngineLoopV2 {
                 to: mtp.lookupMissRoundDepth(for: eligibleRows, missDepth: missDepth),
                 reason: "lookup_miss")
         }
+        // A block drafter's round drafts a block sized to the target's carried
+        // confidence (verify rows 2...16). Other decoders return nil here.
+        if mtp.planDepth > 0, let confidenceDepth = mtp.blockConfidenceRoundDepth(for: eligibleRows),
+            confidenceDepth < mtp.planDepth
+        {
+            mtp.clampPlanDepth(to: confidenceDepth, reason: "confidence_truncate")
+        }
         if mtp.planDepth > 0 {
             let eligibleIDs = Set(eligibleRows.map(\.id))
             let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
