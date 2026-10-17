@@ -13,6 +13,50 @@ public enum HadamardError: Error {
     case missingSignWidth(Int)
 }
 
+
+/// The record and shuffle-middle forms of one rotation kernel. The shuffle
+/// form replaces the first threadgroup-memory round-trip of the block-4096
+/// Walsh-Hadamard transform with a half-simdgroup register transpose
+/// (`hadamard_halfgroup_transpose`); every radix pass keeps its operands and
+/// order, so the two forms must agree bit for bit.
+struct HadamardKernelForms {
+    let record: MLXFast.MLXFastKernel
+    let shuffle: MLXFast.MLXFastKernel
+
+    init(_ make: (_ suffix: String, _ shuffleMiddle: Bool) -> MLXFast.MLXFastKernel) {
+        record = make("", false)
+        shuffle = make("_sfl", true)
+    }
+
+    var pick: MLXFast.MLXFastKernel { HadamardMiddleShuffle.enabled ? shuffle : record }
+}
+
+/// Resolves once, at the first rotation of the process (inside the load-time
+/// warm): the shuffle forms serve only after a bitwise trial against the
+/// record forms on adversarial synthetic blocks (cancellation pairs, signed
+/// zeros, mixed magnitudes) across both kernel families and both quantizer
+/// widths. Any mismatch, or `DARKBLOOM_BONSAI_WHT_SHUFFLE=0`, keeps the
+/// record forms and prints one line.
+enum HadamardMiddleShuffle {
+    static let killSwitch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_SHUFFLE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Swift guarantees one-time, thread-safe initialization of a static
+    /// let, so concurrent first rotations cannot race the trial. The trial
+    /// reads the kernel forms directly (never `.pick`), so there is no
+    /// initialization recursion.
+    static let enabled: Bool = {
+        let value = killSwitch ? false : SignedBlockHadamard.middleShuffleTrial()
+        FileHandle.standardError.write(
+            "WHTSFL middle shuffle: \(value ? "on (trial bit-identical)" : killSwitch ? "off (switch)" : "OFF (trial mismatch, record form kept)")\n"
+                .data(using: .utf8)!)
+        return value
+    }()
+}
+
 /// A normalized block Walsh-Hadamard transform with explicit input signs.
 ///
 /// Forward evaluation computes `(x * signs) H`; inverse evaluation computes
@@ -66,7 +110,39 @@ public struct SignedBlockHadamard {
             const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
             """
 
-    private static func fused4096Source(residualNorm: Bool) -> String {
+    /// The record middle: pass-1 registers to threadgroup memory, barrier,
+    /// the pass-2 transposed read. The shuffle middle: the same permutation
+    /// through `hadamard_halfgroup_transpose` (the exchange spans only the
+    /// 16 lanes of a half-simdgroup), no store and no barrier; the operands
+    /// and order of every radix pass are unchanged, so the outputs keep
+    /// their bits. Pass 2's write-back and pass 3 stay in threadgroup
+    /// memory either way (their exchange crosses simdgroups).
+    private static func middlePassSource(radix: String, shuffleMiddle: Bool) -> String {
+        shuffleMiddle ? """
+            \(radix)(x_reg);
+            const short k1 = i & 15;
+            const short r_base2 = (i - k1);
+            hadamard_halfgroup_transpose(x_reg, ushort(k1));
+            \(radix)(x_reg);
+            """ : """
+            \(radix)(x_reg);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              buf[i * 17 + r] = x_reg[r];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const short k1 = i & 15;
+            const short r_base2 = (i - k1);
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < 16; r++) {
+              x_reg[r] = buf[(r_base2 + r) * 17 + k1];
+            }
+            \(radix)(x_reg);
+            """
+    }
+
+    private static func fused4096Source(residualNorm: Bool, shuffleMiddle: Bool = false) -> String {
         let prefix = residualNorm ? residualNormSource : ""
         let valueRead = residualNorm ? """
             const float4 raw = in4[v] + *((const device float4*)(residual + in_offset) + v);
@@ -115,20 +191,7 @@ public struct SignedBlockHadamard {
                 x_reg[r] = val;
               }
             }
-            hadamard_radix16(x_reg);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              buf[i * 17 + r] = x_reg[r];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const short k1 = i & 15;
-            const short r_base2 = (i - k1);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[(r_base2 + r) * 17 + k1];
-            }
-            hadamard_radix16(x_reg);
+            \(middlePassSource(radix: "hadamard_radix16", shuffleMiddle: shuffleMiddle))
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
               buf[(r_base2 + r) * 17 + k1] = x_reg[r];
@@ -153,6 +216,29 @@ public struct SignedBlockHadamard {
             }
             """
     }
+
+    /// The 16x16 register transpose across the 16 lanes of a half-simdgroup:
+    /// lane h's register r and lane r's register h trade places, through
+    /// `simd_shuffle_xor` butterfly stages (pure data movement, no
+    /// arithmetic). After it, lane h holds in register r exactly the value
+    /// the record path read from `buf[(r_base2 + r) * 17 + k1]`, so the
+    /// middle radix-16 pass runs on identical operands in identical order.
+    static let halfgroupTransposeSource = """
+            METAL_FUNC void hadamard_halfgroup_transpose(thread float* x, ushort h) {
+              #pragma clang loop unroll(full)
+              for (ushort m = 1; m < 16; m <<= 1) {
+                const bool upper = (h & m) != 0;
+                #pragma clang loop unroll(full)
+                for (short r = 0; r < 16; r++) {
+                  if ((r & short(m)) != 0) continue;
+                  const short partner = r | short(m);
+                  const float send = upper ? x[r] : x[partner];
+                  const float got = simd_shuffle_xor(send, m);
+                  if (upper) { x[r] = got; } else { x[partner] = got; }
+                }
+              }
+            }
+            """
 
     private static let fused4096Header = """
             using namespace metal;
@@ -186,15 +272,23 @@ public struct SignedBlockHadamard {
             }
             """
 
-    private static let fused4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096", inputNames: ["x", "signs"], outputNames: ["y"],
-        source: fused4096Source(residualNorm: false), header: fused4096Header)
+    static let fused4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_4096" + suffix,
+            inputNames: ["x", "signs"], outputNames: ["y"],
+            source: fused4096Source(residualNorm: false, shuffleMiddle: sfl),
+            header: fused4096Header + halfgroupTransposeSource)
+    }
+    private static var fused4096Kernel: MLXFast.MLXFastKernel { fused4096KernelForms.pick }
 
-    private static let residualNorm4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_residual_norm_4096",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
-        outputNames: ["y", "residual_out"],
-        source: fused4096Source(residualNorm: true), header: fused4096Header)
+    static let residualNorm4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_residual_norm_4096" + suffix,
+            inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"], outputNames: ["y", "residual_out"],
+            source: fused4096Source(residualNorm: true, shuffleMiddle: sfl),
+            header: fused4096Header + halfgroupTransposeSource)
+    }
+    private static var residualNorm4096Kernel: MLXFast.MLXFastKernel { residualNorm4096KernelForms.pick }
 
     private func fused4096(_ x: MLXArray, inverse: Bool) -> MLXArray? {
         guard blockSize == 4096, x.size > 0, x.size <= Int(UInt32.max),
@@ -263,10 +357,12 @@ public struct SignedBlockHadamard {
     private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
         attentionGate: Bool = false, normalizedOutput: Bool = false,
-        rotatedOutput: Bool = false, normOnly: Bool = false
+        rotatedOutput: Bool = false, normOnly: Bool = false,
+        shuffleMiddle: Bool = false
     ) -> String {
         if normOnly {
-            return normQuantized4096Source(normalizedOutput: normalizedOutput)
+            return normQuantized4096Source(
+                normalizedOutput: normalizedOutput, shuffleMiddle: shuffleMiddle)
         }
         let valueRead = swiglu ? """
             const float4 g = in4[w];
@@ -345,20 +441,7 @@ public struct SignedBlockHadamard {
               x_reg[4 * w + 2] = val.z;
               x_reg[4 * w + 3] = val.w;
             }
-            hadamard_radix16_q8(x_reg);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              buf[i * 17 + r] = x_reg[r];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const short k1 = i & 15;
-            const short r_base2 = (i - k1);
-            #pragma clang loop unroll(full)
-            for (short r = 0; r < 16; r++) {
-              x_reg[r] = buf[(r_base2 + r) * 17 + k1];
-            }
-            hadamard_radix16_q8(x_reg);
+            \(middlePassSource(radix: "hadamard_radix16_q8", shuffleMiddle: shuffleMiddle))
             #pragma clang loop unroll(full)
             for (short r = 0; r < 16; r++) {
               buf[(r_base2 + r) * 17 + k1] = x_reg[r];
@@ -425,7 +508,9 @@ public struct SignedBlockHadamard {
     /// `residualNormSource` forms it) and the codes of the rotated normalized
     /// row, optionally also writing the normalized row. The value entering the
     /// rotation is `(weight * (x * inv)) * sign`, as in the residual form.
-    private static func normQuantized4096Source(normalizedOutput: Bool) -> String {
+    private static func normQuantized4096Source(
+        normalizedOutput: Bool, shuffleMiddle: Bool = false
+    ) -> String {
         let prefix = residualNormSource.replacingOccurrences(
             of: "(x + at))\n      + *((const device float4*)(residual + at));", with: "(x + at));")
         precondition(prefix != residualNormSource, "norm-only prefix not formed")
@@ -441,7 +526,8 @@ public struct SignedBlockHadamard {
             float4 val = (weight * (raw * norm_inv)) * s4[w];
             """
         let residualSource = quantized4096Source(
-            swiglu: false, residualNorm: true, normalizedOutput: normalizedOutput)
+            swiglu: false, residualNorm: true, normalizedOutput: normalizedOutput,
+            shuffleMiddle: shuffleMiddle)
         let residualRead = normalizedOutput ? """
             const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
             *((device float4*)(residual_out + in_offset) + w) = raw;
@@ -494,37 +580,50 @@ public struct SignedBlockHadamard {
             }
             """
 
-    private static let quantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096_q8",
-        inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false), header: quantized4096Header,
-        ensureRowContiguous: true)
+    static let quantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_4096_q8" + suffix,
+            inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: false, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var quantized4096Kernel: MLXFast.MLXFastKernel { quantized4096KernelForms.pick }
 
-    private static let quantized4096RotatedKernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_4096_q8_rot",
-        inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb", "rotated_out"],
-        source: quantized4096Source(swiglu: false, rotatedOutput: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let quantized4096RotatedKernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_4096_q8_rot" + suffix,
+            inputNames: ["x", "signs"], outputNames: ["codes", "ascale", "rsb", "rotated_out"],
+            source: quantized4096Source(swiglu: false, rotatedOutput: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var quantized4096RotatedKernel: MLXFast.MLXFastKernel { quantized4096RotatedKernelForms.pick }
 
-    private static let quantizedSwiGLU4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_swiglu_4096_q8",
-        inputNames: ["x", "up", "signs"], outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: true), header: quantized4096Header,
-        ensureRowContiguous: true)
+    static let quantizedSwiGLU4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_swiglu_4096_q8" + suffix,
+            inputNames: ["x", "up", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var quantizedSwiGLU4096Kernel: MLXFast.MLXFastKernel { quantizedSwiGLU4096KernelForms.pick }
 
-    private static let gatedNormQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_gated_norm_4096_q8",
-        inputNames: ["x", "gate", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false, gatedNorm: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let gatedNormQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_gated_norm_4096_q8" + suffix,
+            inputNames: ["x", "gate", "norm_weight", "epsilon", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: false, gatedNorm: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var gatedNormQuantized4096Kernel: MLXFast.MLXFastKernel { gatedNormQuantized4096KernelForms.pick }
 
-    private static let attentionGateQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_attention_gate_4096_q8",
-        inputNames: ["x", "gate", "signs"],
-        outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false, attentionGate: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let attentionGateQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_attention_gate_4096_q8" + suffix,
+            inputNames: ["x", "gate", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: false, attentionGate: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var attentionGateQuantized4096Kernel: MLXFast.MLXFastKernel { attentionGateQuantized4096KernelForms.pick }
 
     /// `forward(attention * sigmoid(gate))` quantized for `VerifyInt8Matmul`,
     /// for a gated full-attention output: `attention` is the `[1, 16, rows,
@@ -556,13 +655,15 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
-    private static let attentionGatePromptQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_attention_gate_prompt_4096_q8",
-        inputNames: ["x", "gate", "signs"],
-        outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false, attentionGate: true).replacingOccurrences(
-            of: "* uint(VERIFY_ROWS) + ag_row", with: "* uint(ATTENTION_ROWS) + ag_row"),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let attentionGatePromptQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_attention_gate_prompt_4096_q8" + suffix,
+            inputNames: ["x", "gate", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: false, attentionGate: true, shuffleMiddle: sfl).replacingOccurrences(
+                of: "* uint(VERIFY_ROWS) + ag_row", with: "* uint(ATTENTION_ROWS) + ag_row"),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var attentionGatePromptQuantized4096Kernel: MLXFast.MLXFastKernel { attentionGatePromptQuantized4096KernelForms.pick }
 
     /// `quantizedForVerifyAttentionGate` at prompt width: the same kernel
     /// arithmetic, with the head-major attention rows given by
@@ -642,12 +743,14 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
-    private static let residualNormNormedQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_residual_norm_normed_4096_q8",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb", "residual_out", "normed_out"],
-        source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let residualNormNormedQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_residual_norm_normed_4096_q8" + suffix,
+            inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"], outputNames: ["codes", "ascale", "rsb", "residual_out", "normed_out"],
+            source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var residualNormNormedQuantized4096Kernel: MLXFast.MLXFastKernel { residualNormNormedQuantized4096KernelForms.pick }
 
     /// `residualNorm` at verify width that also returns the normalized
     /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
@@ -673,26 +776,32 @@ public struct SignedBlockHadamard {
             outputDTypes: [.int8, .float32, .float32, .float32, .float32])
     }
 
-    private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_residual_norm_4096_q8",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb", "residual_out"],
-        source: quantized4096Source(swiglu: false, residualNorm: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let residualNormQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_residual_norm_4096_q8" + suffix,
+            inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"], outputNames: ["codes", "ascale", "rsb", "residual_out"],
+            source: quantized4096Source(swiglu: false, residualNorm: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var residualNormQuantized4096Kernel: MLXFast.MLXFastKernel { residualNormQuantized4096KernelForms.pick }
 
-    private static let normQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_norm_4096_q8",
-        inputNames: ["x", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb"],
-        source: quantized4096Source(swiglu: false, normOnly: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let normQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_norm_4096_q8" + suffix,
+            inputNames: ["x", "norm_weight", "epsilon", "signs"], outputNames: ["codes", "ascale", "rsb"],
+            source: quantized4096Source(swiglu: false, normOnly: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var normQuantized4096Kernel: MLXFast.MLXFastKernel { normQuantized4096KernelForms.pick }
 
-    private static let normNormedQuantized4096Kernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_norm_normed_4096_q8",
-        inputNames: ["x", "norm_weight", "epsilon", "signs"],
-        outputNames: ["codes", "ascale", "rsb", "normed_out"],
-        source: quantized4096Source(swiglu: false, normalizedOutput: true, normOnly: true),
-        header: quantized4096Header, ensureRowContiguous: true)
+    static let normNormedQuantized4096KernelForms = HadamardKernelForms { suffix, sfl in
+        MLXFast.metalKernel(
+            name: "signed_block_hadamard_norm_normed_4096_q8" + suffix,
+            inputNames: ["x", "norm_weight", "epsilon", "signs"], outputNames: ["codes", "ascale", "rsb", "normed_out"],
+            source: quantized4096Source(swiglu: false, normalizedOutput: true, normOnly: true, shuffleMiddle: sfl),
+            header: quantized4096Header + halfgroupTransposeSource, ensureRowContiguous: true)
+    }
+    private static var normNormedQuantized4096Kernel: MLXFast.MLXFastKernel { normNormedQuantized4096KernelForms.pick }
 
     /// `quantizedForPrompt(rmsNorm(x, weight))` at prompt width in one kernel:
     /// `[codes, ascale, rsb]`, plus the normalized rows (the bits of
@@ -751,6 +860,172 @@ public struct SignedBlockHadamard {
             inputs, template: [("T", DType.float32), ("BLOCKS_PER_ROW", 1), ("INVERSE", false)],
             grid: (256, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [x.shape, x.shape], outputDTypes: [.float32, .float32])
+    }
+
+
+    /// The bitwise record-vs-shuffle trial `HadamardMiddleShuffle` resolves
+    /// with. Every one of the twelve kernel pairs runs on deterministic
+    /// adversarial input (exact cancellation pairs, signed zeros, integer
+    /// mantissas scaled by 2^-16..2^15 — element magnitudes reach ~2^38 —
+    /// plus bounded model-scale values), at both quantizer widths where the
+    /// kernel serves both, and the fused family also at float16 on bounded
+    /// input; every output of every pair must match bit for bit.
+    static func middleShuffleTrial() -> Bool {
+        func wild(_ count: Int, seed: UInt32) -> [Float] {
+            var values = [Float](repeating: 0, count: count)
+            var state = seed
+            for index in 0 ..< count {
+                state = state &* 1_664_525 &+ 1_013_904_223
+                let mantissa = Float(Int32(bitPattern: state) >> 8)
+                let scale = exp2(Float(Int(state >> 27) & 31) - 16)
+                var value = mantissa * scale
+                if index % 97 == 0 { value = 0 }
+                if index % 101 == 0 { value = -0.0 }
+                if index % 89 == 1 { value = -values[index - 1] }
+                values[index] = value
+            }
+            return values
+        }
+        func scaled(_ count: Int, seed: UInt32) -> [Float] {
+            var values = [Float](repeating: 0, count: count)
+            var state = seed
+            for index in 0 ..< count {
+                state = state &* 1_664_525 &+ 1_013_904_223
+                values[index] = (Float(state >> 8) / Float(1 << 24) - 0.5) * 4
+                if index % 97 == 0 { values[index] = 0 }
+                if index % 101 == 0 { values[index] = -0.0 }
+            }
+            return values
+        }
+        func sameBits(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            guard a.shape == b.shape, a.dtype == b.dtype else { return false }
+            if a.dtype == .int8 { return a.asArray(Int8.self) == b.asArray(Int8.self) }
+            return a.asType(.float32).asArray(Float.self).map(\.bitPattern)
+                == b.asType(.float32).asArray(Float.self).map(\.bitPattern)
+        }
+        func agree(
+            _ forms: HadamardKernelForms, _ inputs: [MLXArray],
+            _ template: [(String, any KernelTemplateArg)],
+            grid: (Int, Int, Int), shapes: [[Int]], dtypes: [DType]
+        ) -> Bool {
+            let outs = [forms.record, forms.shuffle].map { kernel in
+                kernel(
+                    inputs, template: template, grid: grid, threadGroup: (256, 1, 1),
+                    outputShapes: shapes, outputDTypes: dtypes)
+            }
+            for part in 0 ..< shapes.count where !sameBits(outs[0][part], outs[1][part]) {
+                return false
+            }
+            return true
+        }
+
+        let signs = MLXArray(wild(4096, seed: 0x5f37_59df).map { $0 < 0 ? Float(-1) : Float(1) })
+        let epsilon = MLXArray([Float(1e-6)])
+        let weight4096 = MLXArray(wild(4096, seed: 0x0a5a_5a5a))
+        let weight128 = MLXArray(wild(128, seed: 0x00c0_ffee))
+        let tile = VerifyInt8Matmul.tileRows
+        let x2 = MLXArray(wild(2 * 4096, seed: 0x9e37_79b9)).reshaped([2, 4096])
+        let residual2 = MLXArray(wild(2 * 4096, seed: 0x1234_5677)).reshaped([2, 4096])
+        func q8Shapes(rows: Int, outRows: Int, extra: [[Int]] = []) -> [[Int]] {
+            [[outRows, 4096], [rows * 32], [rows * 32]] + extra
+        }
+        let i8f: [DType] = [.int8, .float32, .float32]
+
+        // Fused family: forward + inverse at float32 on wild input, forward
+        // at float16 on bounded input, and the residual-norm form.
+        for inverse in [false, true] {
+            guard agree(
+                fused4096KernelForms, [x2, signs],
+                [("T", DType.float32), ("BLOCKS_PER_ROW", 1), ("INVERSE", inverse)],
+                grid: (256, 2, 1), shapes: [[2, 4096]], dtypes: [.float32])
+            else { return false }
+        }
+        let xh = MLXArray(scaled(2 * 4096, seed: 0x7b2d_4e1f)).reshaped([2, 4096])
+            .asType(.float16)
+        guard agree(
+            fused4096KernelForms, [xh, signs],
+            [("T", DType.float16), ("BLOCKS_PER_ROW", 1), ("INVERSE", false)],
+            grid: (256, 2, 1), shapes: [[2, 4096]], dtypes: [.float16]),
+            agree(
+                residualNorm4096KernelForms, [x2, residual2, weight4096, epsilon, signs],
+                [("T", DType.float32), ("BLOCKS_PER_ROW", 1), ("INVERSE", false)],
+                grid: (256, 2, 1), shapes: [[2, 4096], [2, 4096]], dtypes: [.float32, .float32])
+        else { return false }
+
+        // Quantizer family, every form; both widths where the kernel serves
+        // both (each template set is its own compiled specialization).
+        let x64 = MLXArray(wild(64 * 4096, seed: 0x2545_f491)).reshaped([64, 4096])
+        let up64 = MLXArray(wild(64 * 4096, seed: 0x1f83_d9ab)).reshaped([64, 4096])
+        let x3 = MLXArray(wild(3 * 4096, seed: 0x7f4a_7c15)).reshaped([3, 4096])
+        let x5 = MLXArray(wild(5 * 4096, seed: 0x452a_f8e1)).reshaped([5, 4096])
+        let gate5 = MLXArray(wild(5 * 4096, seed: 0x0bad_f00d)).reshaped([5, 4096])
+        let gate64 = MLXArray(wild(64 * 4096, seed: 0x00dd_ba11)).reshaped([64, 4096])
+        let residual3 = MLXArray(wild(3 * 4096, seed: 0x600d_cafe)).reshaped([3, 4096])
+        let verify: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 3)]
+        let verify5: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 5)]
+        let prompt: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
+        guard
+            agree(
+                quantized4096KernelForms, [x64, signs], prompt,
+                grid: (256, 64, 1), shapes: q8Shapes(rows: 64, outRows: 64), dtypes: i8f),
+            agree(
+                quantized4096KernelForms, [x3, signs], verify,
+                grid: (256, tile, 1), shapes: q8Shapes(rows: 3, outRows: tile), dtypes: i8f),
+            agree(
+                quantized4096RotatedKernelForms, [x5, signs], verify5,
+                grid: (256, tile, 1),
+                shapes: q8Shapes(rows: 5, outRows: tile, extra: [[5, 4096]]),
+                dtypes: i8f + [.float32]),
+            agree(
+                quantizedSwiGLU4096KernelForms, [x64, up64, signs], prompt,
+                grid: (256, 64, 1), shapes: q8Shapes(rows: 64, outRows: 64), dtypes: i8f),
+            agree(
+                gatedNormQuantized4096KernelForms, [x5, gate5, weight128, epsilon, signs], verify5,
+                grid: (256, tile, 1), shapes: q8Shapes(rows: 5, outRows: tile), dtypes: i8f),
+            agree(
+                gatedNormQuantized4096KernelForms, [x64, gate64, weight128, epsilon, signs],
+                prompt, grid: (256, 64, 1), shapes: q8Shapes(rows: 64, outRows: 64), dtypes: i8f)
+        else { return false }
+
+        // The attention-gate pair reads the head-major attention layout and
+        // the gate halves of the query projection in place.
+        let attention4 = MLXArray(wild(16 * 4 * 256, seed: 0x1357_9bdf))
+            .reshaped([1, 16, 4, 256])
+        let qproj4 = MLXArray(wild(4 * 8192, seed: 0x0246_8ace)).reshaped([4, 8192])
+        let attention64 = MLXArray(wild(16 * 64 * 256, seed: 0x0f1e_2d3c))
+            .reshaped([1, 16, 64, 256])
+        let qproj64 = MLXArray(wild(64 * 8192, seed: 0x5a5a_1234)).reshaped([64, 8192])
+        guard
+            agree(
+                attentionGateQuantized4096KernelForms, [attention4, qproj4, signs],
+                [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 4)],
+                grid: (256, tile, 1), shapes: q8Shapes(rows: 4, outRows: tile), dtypes: i8f),
+            agree(
+                attentionGatePromptQuantized4096KernelForms, [attention64, qproj64, signs],
+                [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0), ("ATTENTION_ROWS", 64)],
+                grid: (256, 64, 1), shapes: q8Shapes(rows: 64, outRows: 64), dtypes: i8f),
+            agree(
+                residualNormQuantized4096KernelForms,
+                [x3, residual3, weight4096, epsilon, signs], verify,
+                grid: (256, tile, 1),
+                shapes: q8Shapes(rows: 3, outRows: tile, extra: [[3, 4096]]),
+                dtypes: i8f + [.float32]),
+            agree(
+                residualNormNormedQuantized4096KernelForms,
+                [x3, residual3, weight4096, epsilon, signs], verify,
+                grid: (256, tile, 1),
+                shapes: q8Shapes(rows: 3, outRows: tile, extra: [[3, 4096], [3, 4096]]),
+                dtypes: i8f + [.float32, .float32]),
+            agree(
+                normQuantized4096KernelForms, [x64, weight4096, epsilon, signs], prompt,
+                grid: (256, 64, 1), shapes: q8Shapes(rows: 64, outRows: 64), dtypes: i8f),
+            agree(
+                normNormedQuantized4096KernelForms, [x64, weight4096, epsilon, signs], prompt,
+                grid: (256, 64, 1),
+                shapes: q8Shapes(rows: 64, outRows: 64, extra: [[64, 4096]]),
+                dtypes: i8f + [.float32])
+        else { return false }
+        return true
     }
 
     /// `forward(x)` quantized for `PromptInt8Matmul`: int8 codes `[rows,
