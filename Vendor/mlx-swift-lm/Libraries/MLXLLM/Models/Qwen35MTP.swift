@@ -1047,11 +1047,13 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     /// The head's chain depth on rounds whose prompt lookup misses, when the
     /// declared depth is deeper: lookup rounds propose the declared depth.
-    /// Default 3. Local experiments override it with
+    /// Default 4: with the verify body and the exact screened head both flat
+    /// for 2 to 8 rows, a fourth head step commits more per round than it
+    /// costs. Local experiments override it with
     /// `QWEN35_PLD_MISS_DEPTH=<k>`; `0` or `off` keeps the declared depth.
     static let promptLookupMissDepth: Int? = {
         guard let raw = ProcessInfo.processInfo.environment["QWEN35_PLD_MISS_DEPTH"] else {
-            return 3
+            return 4
         }
         guard let value = Int(raw), value > 0 else { return nil }
         return value
