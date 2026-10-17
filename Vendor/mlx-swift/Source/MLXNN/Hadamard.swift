@@ -1957,6 +1957,59 @@ private enum DraftScreenQMV {
             }
             """)
 
+    /// Affine symmetry fast partial screening when NEG is active: eliminates biases buffer
+    /// entirely, saving 148 MB of memory traffic per verification step.
+    static let partialFast = MLXFast.metalKernel(
+        name: "hadamard_qmv_screen_f16_fast",
+        inputNames: ["x", "w", "scales"], outputNames: ["y"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint3 tid = threadgroup_position_in_grid;
+            const int K = x_shape[1];
+            const int in_w = K / 4;
+            const int in_g = K / 128;
+            const int out_row = tid.y * 8 + simd_gid * 4;
+            const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
+            const device half* sc = scales + out_row * in_g + simd_lid / 8;
+            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+            float x_thread[16];
+            float result[4] = {0, 0, 0, 0};
+            for (int k = 0; k < P; k += 512) {
+              float sum = 0;
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < 4; ++i) {
+                const float4 xv = xp4[i];
+                sum += xv.x + xv.y + xv.z + xv.w;
+                x_thread[4 * i] = xv.x;
+                x_thread[4 * i + 1] = xv.y * 0.25f;
+                x_thread[4 * i + 2] = xv.z * 0.0625f;
+                x_thread[4 * i + 3] = xv.w * 0.015625f;
+              }
+              #pragma clang loop unroll(full)
+              for (int r = 0; r < 4; r++) {
+                const uint packed_w = *(const device uint*)(ws + r * in_w);
+                const float s = float(sc[r * in_g]);
+                float accum = 0;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                  const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
+                  accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
+                      + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
+                }
+                result[r] += s * (accum - sum);
+              }
+              ws += 128;
+              sc += 4;
+              xp4 += 128;
+            }
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < 4; r++) {
+              const float total = simd_sum(result[r]);
+              if (simd_lid == 0) y[out_row + r] = total;
+            }
+            """)
+
     /// One simdgroup per `CH`-row block: the full-width score of the block's
     /// screened row, and that row's index.
     static let rescore = MLXFast.metalKernel(
@@ -3876,12 +3929,20 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             x.dtype == .float32, x.size == K, width > 0, width < K, width % 512 == 0,
             chunk > 0, N % chunk == 0, (N / chunk) % 2 == 0
         else { return nil }
-        let neg = promptConstants.negative ? 1 : 0
         let rotated = transform(x).reshaped([1, K])
-        let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases], template: [("P", width), ("NEG", neg)],
-            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[N]], outputDTypes: [.float32])[0]
+        let neg = promptConstants.negative ? 1 : 0
+        let partial: MLXArray
+        if promptConstants.negative {
+            partial = DraftScreenQMV.partialFast(
+                [rotated, weight, scales], template: [("P", width)],
+                grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[N]], outputDTypes: [.float32])[0]
+        } else {
+            partial = DraftScreenQMV.partial(
+                [rotated, weight, scales, biases], template: [("P", width), ("NEG", neg)],
+                grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[N]], outputDTypes: [.float32])[0]
+        }
         let blocks = N / chunk
         let rescored: [MLXArray]
         if chunk < 32 && 32 % chunk == 0 && promptConstants.negative {
@@ -4475,16 +4536,32 @@ extension HadamardQuantizedLinear {
             grid: (256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, K], [1, K]], outputDTypes: [.float32, .float32])
         let rotated = normed[1]
-        let partial = DraftScreenQMV.partial(
-            [rotated, weight, scales, biases],
-            template: [("P", width), ("NEG", promptConstants.negative ? 1 : 0)],
-            grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[N]], outputDTypes: [.float32])[0]
+        let partial: MLXArray
+        if promptConstants.negative {
+            partial = DraftScreenQMV.partialFast(
+                [rotated, weight, scales], template: [("P", width)],
+                grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[N]], outputDTypes: [.float32])[0]
+        } else {
+            partial = DraftScreenQMV.partial(
+                [rotated, weight, scales, biases],
+                template: [("P", width), ("NEG", promptConstants.negative ? 1 : 0)],
+                grid: (32, N / 8 * 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[N]], outputDTypes: [.float32])[0]
+        }
         let blocks = N / chunk
-        let rescored = DraftStepRowKernels.rescorePick(
-            [rotated, weight, scales, biases, partial],
-            grid: (32, blocks, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        let rescored: [MLXArray]
+        if promptConstants.negative {
+            rescored = DraftScreenQMV.rescoreFast32(
+                [rotated, weight, scales, partial],
+                grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        } else {
+            rescored = DraftStepRowKernels.rescorePick(
+                [rotated, weight, scales, biases, partial],
+                grid: (32, blocks, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[blocks], [blocks]], outputDTypes: [.float32, .int32])
+        }
         let picked = DraftStepRowKernels.pickToken(
             [rescored[0], rescored[1], ids], grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
             outputShapes: [[1], [1]], outputDTypes: [.int32, .int32])

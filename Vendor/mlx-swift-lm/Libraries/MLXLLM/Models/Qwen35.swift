@@ -671,12 +671,12 @@ private enum Qwen35RegisterGDN {
         """)
 
     /// v2 of `stagedValueKernel`: every 16 steps the threadgroup also copies
-    /// the k rows of the tile (16 x 128 floats) and the step's g and beta into
-    /// threadgroup memory, so the serial step reads them from threadgroup
-    /// memory instead of 16 threads (k) or 128 threads (g, beta) each loading
+    /// the k and q rows of the tile (each 16 x 128 floats) and the step's g and
+    /// beta into threadgroup memory, so the serial step reads them from threadgroup
+    /// memory instead of 16 threads (k, q) or 128 threads (g, beta) each loading
     /// the same device address. Loads only: the values and every arithmetic
     /// op are `valueKernel`'s, so y and the state are bit-identical.
-    /// 10,368 bytes of threadgroup memory (v 2 KiB, k 8 KiB, g/beta 128 B).
+    /// 18,560 bytes of threadgroup memory (v 2 KiB, k 8 KiB, q 8 KiB, g/beta 128 B).
     private static let stagedV2ValueKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_value_conv_staged_v2",
         inputNames: ["q", "k", "v", "g", "beta", "state_in", "conv_weight"],
@@ -696,7 +696,6 @@ private enum Qwen35RegisterGDN {
         const uint sg = simdgroup_index_in_threadgroup;
         const uint dk0 = (lane % LPD) * R;
         const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
-        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
         auto g_ = g + b_idx * T * Hv + hv_idx;
         auto beta_ = beta + b_idx * T * Hv + hv_idx;
         device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
@@ -718,6 +717,7 @@ private enum Qwen35RegisterGDN {
         constexpr int TS = 16;
         threadgroup float vts[TS][32];
         threadgroup float4 kts[TS][Dk / 4];
+        threadgroup float4 qts[TS][Dk / 4];
         threadgroup float gts[TS];
         threadgroup float bts[TS];
         const uint ltid = sg * 32u + lane;
@@ -725,6 +725,7 @@ private enum Qwen35RegisterGDN {
         const uint ch_tg = 2u * Hk * Dk + hv_idx * Dv + threadgroup_position_in_grid.y * DVPT;
         const uint v_stride = v_shape[2];
         const device float4* k_tile4 = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
+        const device float4* q_tile4 = (const device float4*)(q + (b_idx * T * Hk + hk_idx) * Dk);
         for (int t = 0; t < T; ++t) {
           const int s = t % TS;
           if (s == 0) {
@@ -742,6 +743,7 @@ private enum Qwen35RegisterGDN {
               const float sig = 1.0f / (1.0f + metal::exp(metal::abs(cv)));
               vts[ss][c] = cv * (cv < 0.0f ? sig : 1.0f - sig);
               kts[ss][c] = k_tile4[(uint(t) + ss) * (Hk * Dk / 4) + c];
+              qts[ss][c] = q_tile4[(uint(t) + ss) * (Hk * Dk / 4) + c];
             }
             if (ltid < uint(tn)) {
               gts[ltid] = g_[ltid * Hv];
@@ -756,7 +758,7 @@ private enum Qwen35RegisterGDN {
             const uint kj = (lane % LPD) * 4u + uint(j);
             const float4 k4 = kts[s][kj];
             kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
-            const float4 q4 = ((const device float4*)q_)[j];
+            const float4 q4 = qts[s][kj];
             qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
           }
           float kv[DVPL];
@@ -814,7 +816,7 @@ private enum Qwen35RegisterGDN {
               y_[d] = out[d];
             }
           }
-          q_ += Hk * Dk; y_ += Hv * Dv;
+          y_ += Hv * Dv;
           if (s == TS - 1) { g_ += TS * Hv; beta_ += TS * Hv; }
         }
         #pragma clang loop unroll(full)
@@ -2041,6 +2043,12 @@ final class Qwen35GatedDeltaNet: Module {
             if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
                 return (qkv, z, ba.0, ba.1)
             }
+            if let sharedBA = (S >= 128
+                ? HadamardQuantizedLinear.sharedPromptProjections(inputs, [inProjB, inProjA])
+                : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjB, inProjA]))
+            {
+                return (qkv, z, sharedBA[0], sharedBA[1])
+            }
             return (qkv, z, inProjB(inputs), inProjA(inputs))
         }
         let outFused = fusedInProj(inputs)
@@ -2485,6 +2493,20 @@ final class Qwen35GatedDeltaNet: Module {
             cache.prefixReplayTape = pendingPrefixTape
         }
 
+        if out.ndim == 4, out.dim(-1) == 128 {
+            if S >= 64,
+                let packed = outProj as? HadamardQuantizedLinear,
+                let gated = packed.callAfterGatedNormPrompt(
+                    out, gate: z, normWeight: norm.weight, eps: norm.eps)
+            {
+                return gated
+            } else if let packed = outProj as? HadamardQuantizedLinear,
+                let gated = packed.callAfterGatedNorm(
+                    out, gate: z, normWeight: norm.weight, eps: norm.eps)
+            {
+                return gated
+            }
+        }
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
@@ -2540,12 +2562,19 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        if out.ndim == 4, out.dim(-1) == 128, S >= 64,
-            let packed = outProj as? HadamardQuantizedLinear,
-            let gated = packed.callAfterGatedNormPrompt(
-                out, gate: z, normWeight: norm.weight, eps: norm.eps)
-        {
-            return gated
+        if out.ndim == 4, out.dim(-1) == 128 {
+            if S >= 64,
+                let packed = outProj as? HadamardQuantizedLinear,
+                let gated = packed.callAfterGatedNormPrompt(
+                    out, gate: z, normWeight: norm.weight, eps: norm.eps)
+            {
+                return gated
+            } else if let packed = outProj as? HadamardQuantizedLinear,
+                let gated = packed.callAfterGatedNorm(
+                    out, gate: z, normWeight: norm.weight, eps: norm.eps)
+            {
+                return gated
+            }
         }
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
@@ -2873,7 +2902,7 @@ enum Qwen35VerifyQKNormRoPE {
         queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float
     ) -> (MLXArray, MLXArray)? {
         guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
-            (2 ... 8).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1)),
+            (2 ... 4096).contains(queryProjection.dim(1)),
             queryProjection.dim(2) == queryHeads * 512, keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
@@ -2960,18 +2989,32 @@ final class Qwen35Attention: Module {
             : HadamardQuantizedLinear.sharedShortProjections(x, [qProj, kProj, vProj])
         let qProjOutput = shared?[0] ?? qProj(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qSplit[0]
+        let unnormedQueries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
         var keys = shared?[1] ?? kProj(x)
         var values = shared?[2] ?? vProj(x)
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        var queries: MLXArray
+        let offsetArray = (graphOffsetArray(for: cache)
+            ?? MLXArray(Int32(cache?.offset ?? 0)))
+            .asType(.int32).reshaped([1])
+        if B == 1, let plainRope,
+            let fused = Qwen35VerifyQKNormRoPE.apply(
+                queryProjection: qProjOutput, keyProjection: keys,
+                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: offsetArray,
+                queryHeads: attentionHeads, keyHeads: kvHeads,
+                ropeDims: plainRope.dims, ropeBase: plainRope.base)
+        {
+            (queries, keys) = fused
+        } else {
+            queries = qNorm(unnormedQueries).transposed(0, 2, 1, 3)
+            keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -3370,7 +3413,10 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let normalized = postAttentionLayerNorm(h)
+        let feedForward = (mlp as? Qwen3NextMLP)?.qwen35TargetVerify(normalized, exact: false)
+            ?? (mlp as! UnaryLayer)(normalized)
+        return h + feedForward
     }
 
     func cbv2Forward(
