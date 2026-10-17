@@ -417,6 +417,10 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// least `minimumMargin` for every row: such rounds draft `depth` tokens,
     /// the others `lookupMissDraftDepth`. Default nil (one drafted depth).
     var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { get }
+    /// A shallower chain for a drafted round whose carried target top-two
+    /// margin is below `maximumMargin`: near-tie rounds truncate to `depth` tokens
+    /// to avoid wasting draft iterations and rectangular verify width. Default nil.
+    var lookupMissShallowDraft: (depth: Int, maximumMargin: Double)? { get }
     /// Complete a round whose drafts came from prompt lookup. Nothing was
     /// staged, so queue the carry transition the round's first draft step
     /// would have consumed (`seedToken` [1, 1] with the target's pre-norm
@@ -428,9 +432,15 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         seedHidden: MLXArray,
         committedDraftTokens: MLXArray,
         committedTargetHidden: MLXArray)
+    /// The host value of the seed token the next `draftStep` (a round's
+    /// first) receives, which the engine already holds on the host. A
+    /// drafter may key host-side choices on it instead of reading the device
+    /// token back. Default: ignored.
+    func noteRoundSeed(_ token: Int32, requestState: any CBv2MTPRequestState)
 }
 
 extension CBv2MTPRequestStatefulDrafter {
+    public func noteRoundSeed(_ token: Int32, requestState: any CBv2MTPRequestState) {}
     public var draftShortlistSize: Int? { nil }
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
@@ -438,6 +448,7 @@ extension CBv2MTPRequestStatefulDrafter {
     public var lookupDraftNgram: Int? { nil }
     public var lookupMissDraftDepth: Int? { nil }
     public var lookupMissDeepDraft: (depth: Int, minimumMargin: Double)? { nil }
+    public var lookupMissShallowDraft: (depth: Int, maximumMargin: Double)? { nil }
     public func commitLookupRound(
         requestState: any CBv2MTPRequestState,
         seedToken: MLXArray,

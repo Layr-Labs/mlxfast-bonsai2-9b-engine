@@ -268,6 +268,8 @@ final class CBv2MTPRoundDriver {
     /// Deeper drafted depth and the carried-margin threshold that selects it,
     /// or nil to keep one drafted depth.
     let lookupMissDeep: (depth: Int, minimumMargin: Double)?
+    /// Shallower drafted depth for low-confidence rounds (carried margin < maximumMargin).
+    let lookupMissShallow: (depth: Int, maximumMargin: Double)?
     private var missDepthSchedule: [Int]
     /// The current plan took the schedule's first entry, and a round that
     /// plan launched consumed its carry. An entry is dropped only after a
@@ -393,6 +395,14 @@ final class CBv2MTPRoundDriver {
                 .flatMap {
                     $0.depth > (missDepth ?? 0) && $0.depth < (config.fixedDraftTokens ?? 0)
                         && $0.minimumMargin.isFinite ? $0 : nil
+                }
+        self.lookupMissShallow =
+            missDepth == nil
+            ? nil
+            : (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupMissShallowDraft
+                .flatMap {
+                    $0.depth > 0 && $0.depth < (missDepth ?? 0)
+                        && $0.maximumMargin.isFinite ? $0 : nil
                 }
         self.missDepthSchedule = config.missDepthSchedule
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
@@ -835,6 +845,13 @@ final class CBv2MTPRoundDriver {
         if let depth = missDepthSchedule.first {
             missDepthScheduleArmed = true
             return min(max(depth, 1), deepest)
+        }
+        if let shallow = lookupMissShallow, !rows.isEmpty {
+            let anyUncertain = rows.contains { rec in
+                guard let margin = carries[rec.id]?.previousTopTwoMargin else { return false }
+                return margin < shallow.maximumMargin
+            }
+            if anyUncertain { return shallow.depth }
         }
         guard let deep = lookupMissDeep, !rows.isEmpty else { return missDepth }
         let allConfident = rows.allSatisfy { rec in
