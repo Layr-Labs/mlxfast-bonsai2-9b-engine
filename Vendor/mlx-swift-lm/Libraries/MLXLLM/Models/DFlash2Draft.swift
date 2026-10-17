@@ -319,6 +319,13 @@ public protocol DFlash2Target: AnyObject {
     /// The target's output projection, applied through the target's module. The
     /// drafter applies any config-level logit transform itself.
     func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray
+    /// Build, at load, the per-process state the target's `rows`-row verify head
+    /// would otherwise build inside the first measured window. Never changes a token.
+    func prepareDFlash2Verify(rows: Int)
+}
+
+extension DFlash2Target {
+    public func prepareDFlash2Verify(rows: Int) {}
 }
 
 /// Where a tower keeps its tap state, deliberately OFF the module tree.
@@ -499,18 +506,25 @@ private final class DFlash2Attention: Module {
             }
         }
 
-        var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var blockKeys = kProj(x)
-        var blockValues = vProj(x)
+        var queries: MLXArray, contextKeys: MLXArray, contextValues: MLXArray
+        var blockKeys: MLXArray, blockValues: MLXArray
+        if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
+            (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
+        } else {
+            (queries, blockKeys, blockValues) = (qProj(x), kProj(x), vProj(x))
+        }
+        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+            (contextKeys, contextValues) = (kv[0], kv[1])
+        } else {
+            (contextKeys, contextValues) = (kProj(context), vProj(context))
+        }
 
-        queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
-        contextKeys = kNorm(contextKeys.reshaped(B, contextLength, kvHeads, -1))
+        queries = DF2Fast.rms(queries.reshaped(B, L, heads, -1), qNorm).transposed(0, 2, 1, 3)
+        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
             .transposed(0, 2, 1, 3)
         contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
             .transposed(0, 2, 1, 3)
-        blockKeys = kNorm(blockKeys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        blockKeys = DF2Fast.rms(blockKeys.reshaped(B, L, kvHeads, -1), kNorm).transposed(0, 2, 1, 3)
         blockValues = blockValues.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         // The block sits immediately after the context, so both the queries and
@@ -528,7 +542,10 @@ private final class DFlash2Attention: Module {
         let values = concatenated([cachedValues, blockValues], axis: 2)
 
         var mask: MLXArray?
-        if let slidingWindow {
+        if let slidingWindow, DF2Fast.on, !isCausal, cachedLength + L <= slidingWindow {
+            // Every block row sees every cached and block key: the window mask is all true.
+            mask = nil
+        } else if let slidingWindow {
             mask = DFlash2SlidingMask.make(
                 contextLength: cachedLength,
                 blockLength: L,
@@ -540,7 +557,7 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
     }
 }
 
@@ -621,6 +638,14 @@ final class DFlash2GroupedDynamicCausalConv: Module {
     }
 
     /// The second tap, over the sub-layer's output.
+    var fastBase: MLXArray {
+        if let b = DF2Fast.baseCache[ObjectIdentifier(self)] { return b }
+        let b = contiguous(baseKernel.asType(.float32).reshaped([-1]))
+        eval(b)
+        DF2Fast.baseCache[ObjectIdentifier(self)] = b
+        return b
+    }
+
     func finish(_ hidden: MLXArray, dynamic: MLXArray) -> MLXArray {
         Self.convolve(
             hidden: hidden, dynamic: dynamic, base: baseKernel[1], groupSize: groupSize)
@@ -642,7 +667,10 @@ private final class DFlash2MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        if let gu = DF2Fast.linears(x, [gate, up]), let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
+            return y[0]
+        }
+        return down(silu(gate(x)) * up(x))
     }
 }
 
@@ -676,6 +704,20 @@ private final class DFlash2DecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache
     ) -> MLXArray {
+        if DF2Fast.on, x.dim(0) == 1, x.size / x.dim(-1) <= 16 {
+            let n1 = DF2Fast.rms(x, inputLayerNorm)
+            let p1 = DF2Fast.linear(n1, attentionConv.kernelProjection)
+            let base1 = attentionConv.fastBase
+            let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
+            let attended = DF2Fast.dynConv(
+                selfAttn(a, context: context, rope: rope, cache: cache), dyn: p1, base: base1, part: 1,
+                residual: x)
+            let n2 = DF2Fast.rms(attended, postAttentionLayerNorm)
+            let p2 = DF2Fast.linear(n2, mlpConv.kernelProjection)
+            let base2 = mlpConv.fastBase
+            let m = DF2Fast.dynConv(n2, dyn: p2, base: base2, part: 0, residual: nil)
+            return DF2Fast.dynConv(mlp(m), dyn: p2, base: base2, part: 1, residual: attended)
+        }
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
         let attended = x
             + attentionConv.finish(
@@ -800,6 +842,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
         }
         self.target = target
+        if DF2Fast.on { try prepareFirstRound(target) }
+    }
+
+    /// Prepare at load what the first round of the first request would otherwise
+    /// build inside a measured decode window: the fast path's cached operands
+    /// (FP32 scale and bias transposes, FP32 norm weights, conv bases), the
+    /// drafter's kernels at both context shapes (more than 16 rows: the prompt;
+    /// 16 or fewer: a round), and the target's exact verify head at the block
+    /// width. The proposals run on a throwaway cache and are discarded; nothing
+    /// here reaches a request's state.
+    private func prepareFirstRound(_ target: any DFlash2Target) throws {
+        let cache = try makeCache()
+        for rows in [32, 16] {
+            let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
+            eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
+        }
+        target.prepareDFlash2Verify(rows: config.dflash.blockSize)
     }
 
     // MARK: The cache
@@ -876,15 +935,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
 
         for (index, layer) in layers.enumerated() {
             h = layer(h, context: context, rope: rope, cache: cache[index])
+            // Hand each finished layer to the GPU while the next one is built.
+            if DF2Fast.on { asyncEval(h) }
         }
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
         }
-        return norm(h)
+        return DF2Fast.rms(h, norm)
     }
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
@@ -925,6 +986,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1)
+        if DF2Fast.on, anchor.count == 1 {
+            let sel = candidateSelector
+            return DF2Fast.select(
+                logits: try logits(hidden), projected: DF2Fast.linear(hidden, sel.hiddenProjection),
+                anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
+                succ: sel.successorCodebook)
+        }
         return candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
@@ -991,5 +1059,318 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(drafter)
         return drafter
+    }
+}
+
+// MARK: - Fast drafter path (on by default; `DF2_FAST=0` restores the reference graph). Drafter-only
+// numerics: it changes which tokens are proposed, never which tokens the target emits.
+
+/// int8 activations (per row, per 32-group) x the pinned 8-bit g32 codes on the NAX
+/// tensor units (16 x 32 x 32 per group; codes ^ 0x80 staged as int8, offsets + 128 * s);
+/// fused grouped dynamic convolution; fused top-16 and greedy selector.
+enum DF2Fast {
+    static let on = ProcessInfo.processInfo.environment["DF2_FAST"] != "0"
+    static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
+    static let header = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        """
+
+    /// x [R, K] (or silu(x) * x2 when SWIGLU) -> xq int8 [16, K], ascale [16, G], xs [16, G].
+    static let quant = MLXFast.metalKernel(
+        name: "df2_act_q8", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
+        source: """
+            const int K = ksz[0]; const int R = ksz[1]; const int G = K / 32;
+            const int m = int(threadgroup_position_in_grid.y);
+            for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
+              float v[32]; float amax = 0.0f, sum = 0.0f;
+              if (m < R) {
+                for (int u = 0; u < 32; u++) {
+                  float a = float(x[(size_t)m * K + g * 32 + u]);
+                  if (SWIGLU) { const float b = float(x2[(size_t)m * K + g * 32 + u]); a = a / (1.0f + metal::exp(-a)) * b; }
+                  v[u] = a; amax = max(amax, fabs(a)); sum += a;
+                }
+              } else {
+                for (int u = 0; u < 32; u++) { v[u] = 0.0f; }
+              }
+              const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
+              const float ia = 1.0f / a;
+              device char4* dst = (device char4*)(xq + (size_t)m * K + g * 32);
+              for (int u = 0; u < 8; u++) {
+                dst[u] = char4(int4(rint(float4(v[4*u], v[4*u+1], v[4*u+2], v[4*u+3]) * ia)));
+              }
+              ascale[m * G + g] = m < R ? a : 0.0f;
+              xs[m * G + g] = sum;
+            }
+            """)
+
+    static func matmulSource(layers: Int) -> String {
+        var pick = """
+            const int K = ksz[0];
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; const device float* sT = s0; const device float* bT = b0;
+            device float* out = out0; int N = ksz[2];
+
+            """
+        for l in 1 ..< layers {
+            pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+        }
+        return pick + """
+            const int G = K / 32;
+            const int n0 = bx * 32;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_position_in_threadgroup.x;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            threadgroup uint32_t bs[SPLIT][32 * 8];
+            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
+            auto tA0 = A.template slice<32, 16>(0, 0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            bool ok = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && ok; i++) {
+              auto ids = cT.get_multidimensional_index(i);
+              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+            }
+            float acc[16], accb[16];
+            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
+            const int m0 = mrow, m1 = mrow + 8;
+            const int sj = int(lane & 7u), sc = int(lane >> 3);
+            const device uint32_t* wsrc = w + (size_t)(n0 + sc) * (K / 4) + sj;
+            threadgroup uint32_t* sdst = bs[sg] + sc * 8 + sj;
+            uint32_t wv[8];
+            for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + int(sg) * 8]; }
+            for (int g = int(sg); g < G; g += SPLIT) {
+              for (int t = 0; t < 8; t++) { sdst[32 * t] = wv[t] ^ 0x80808080u; }
+              if (g + SPLIT < G) { for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + (g + SPLIT) * 8]; } }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              auto tA = A.template slice<32, 16>(g * 32, 0);
+              op.run(tA, Bt, cT);
+              const device float* sr = sT + (size_t)g * N + n0 + nb;
+              const device float* br = bT + (size_t)g * N + n0 + nb;
+              const float4 s0v = *(const device float4*)sr, s1v = *(const device float4*)(sr + 16);
+              const float4 b0v = fma(float4(128.0f), s0v, *(const device float4*)br);
+              const float4 b1v = fma(float4(128.0f), s1v, *(const device float4*)(br + 16));
+              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+              const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
+              for (int i = 0; i < 16; i++) {
+                const int j = (i & 3);
+                const float s = (i >> 3) ? s1v[j] : s0v[j];
+                const float b = (i >> 3) ? b1v[j] : b0v[j];
+                const bool hi = (i >> 2) & 1;
+                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                accb[i] = fma(b, hi ? x1 : x0, accb[i]);
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup float red[SPLIT][16 * 32];
+            for (int i = 0; i < 16; i++) {
+              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+              red[sg][m * 32 + n] = acc[i] + accb[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
+              out[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+    }
+
+    static let matmuls: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "df2_i8_matmul\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: matmulSource(layers: layers), header: header, ensureRowContiguous: true)
+    }
+
+    final class Operands {
+        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
+            self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
+        }
+    }
+    nonisolated(unsafe) static var operandCache: [ObjectIdentifier: Operands] = [:]
+    nonisolated(unsafe) static var baseCache: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) static var normCache: [ObjectIdentifier: MLXArray] = [:]
+
+    /// `norm(x)` with the norm's weight widened to FP32 once (no per-call cast).
+    static func rms(_ x: MLXArray, _ norm: RMSNorm) -> MLXArray {
+        guard on else { return norm(x) }
+        let key = ObjectIdentifier(norm)
+        let weight: MLXArray
+        if let w = normCache[key] {
+            weight = w
+        } else {
+            weight = norm.weight.asType(.float32)
+            eval(weight)
+            normCache[key] = weight
+        }
+        return MLXFast.rmsNorm(x.asType(.float32), weight: weight, eps: norm.eps)
+    }
+
+    static func operands(_ layer: Linear) -> Operands? {
+        if let o = operandCache[ObjectIdentifier(layer)] { return o }
+        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
+            let biases = q.biases, q.bias == nil, q.weight.dim(0) % 32 == 0
+        else { return nil }
+        let sT = contiguous(q.scales.asType(.float32).transposed())
+        let bT = contiguous(biases.asType(.float32).transposed())
+        eval(sT, bT)
+        let o = Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
+        operandCache[ObjectIdentifier(layer)] = o
+        return o
+    }
+
+    /// Activation codes of x [.., K] (rows <= 16); `up` makes them silu(x) * up.
+    static func codes(_ x: MLXArray, up: MLXArray? = nil) -> (MLXArray, MLXArray, MLXArray, Int)? {
+        let K = x.dim(-1)
+        let rows = x.size / K
+        guard (1 ... 16).contains(rows), K % 32 == 0 else { return nil }
+        let x2 = up ?? x
+        let o = quant(
+            [x.reshaped([rows, K]), x2.reshaped([rows, K]), MLXArray([Int32(K), Int32(rows)])],
+            template: [("SWIGLU", up == nil ? 0 : 1)],
+            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[16 * K], [16 * (K / 32)], [16 * (K / 32)]],
+            outputDTypes: [.int8, .float32, .float32])
+        return (o[0], o[1], o[2], rows)
+    }
+
+    /// `layers(x)` (or of silu(x) * up) for sibling 8-bit g32 linears sharing x; nil when not eligible.
+    static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
+        guard on, (1 ... 3).contains(layers.count) else { return nil }
+        let ops = layers.compactMap { operands($0) }
+        guard ops.count == layers.count, ops.allSatisfy({ $0.k == x.dim(-1) }),
+            let (xq, ascale, xs, rows) = codes(x, up: up)
+        else { return nil }
+        let ns = ops.map(\.n)
+        let outs = matmuls[layers.count - 1](
+            [xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT)
+                + [ascale, xs, MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
+            template: [("SPLIT", split)],
+            grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+        let lead = Array(x.shape.dropLast())
+        return zip(outs, ns).map { $0.reshaped(lead + [$1]) }
+    }
+
+    static func linear(_ x: MLXArray, _ layer: Linear) -> MLXArray {
+        linears(x, [layer])?[0] ?? layer(x)
+    }
+
+    /// One part of `DFlash2GroupedDynamicCausalConv` (B = 1) in one kernel, plus an optional residual.
+    static let conv = MLXFast.metalKernel(
+        name: "df2_dyn_conv", inputNames: ["h", "dyn", "base", "res", "dsz"], outputNames: ["out"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const int D = dsz[0]; const int L = dsz[1];
+            if (int(i) >= L * D) return;
+            const int l = int(i) / D, c = int(i) % D, g = c / 16;
+            const int dw = 4 * (D / 16);
+            float acc = RES ? float(res[i]) : 0.0f;
+            acc += (float(base[(PART * 2 + 0) * D + c]) + float(dyn[l * dw + PART * (dw / 2) + g])) * float(h[i]);
+            if (l >= 1) {
+              acc += (float(base[(PART * 2 + 1) * D + c]) + float(dyn[l * dw + PART * (dw / 2) + D / 16 + g])) * float(h[i - D]);
+            }
+            out[i] = acc;
+            """)
+
+    static func dynConv(_ h: MLXArray, dyn: MLXArray, base: MLXArray, part: Int, residual: MLXArray?) -> MLXArray {
+        let D = h.dim(-1), L = h.size / D
+        return conv(
+            [h, dyn, base, residual ?? h, MLXArray([Int32(D), Int32(L)])],
+            template: [("PART", part), ("RES", residual == nil ? 0 : 1)],
+            grid: ((L * D + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [h.shape], outputDTypes: [.float32])[0]
+    }
+
+    static let topk = MLXFast.metalKernel(
+        name: "df2_topk16", inputNames: ["logits", "vsz"], outputNames: ["ids", "vals"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+            const int Vn = vsz[0];
+            const device float* lr = logits + (size_t)row * Vn;
+            const float NEG = -INFINITY;
+            float tv[4] = {NEG, NEG, NEG, NEG}; int ti[4] = {-1, -1, -1, -1};
+            for (int n = int(tid); n < Vn; n += 512) {
+              const float v = lr[n];
+              if (v > tv[3]) {
+                int k = 3;
+                while (k > 0 && v > tv[k - 1]) { tv[k] = tv[k - 1]; ti[k] = ti[k - 1]; k--; }
+                tv[k] = v; ti[k] = n;
+              }
+            }
+            threadgroup float cv[2048]; threadgroup int ci[2048];
+            threadgroup float wv[32]; threadgroup int ws[32];
+            if (tid < 32) { wv[tid] = NEG; ws[tid] = 0x7fffffff; }
+            for (int k = 0; k < 4; k++) { cv[tid * 4 + k] = tv[k]; ci[tid * 4 + k] = ti[k]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int r = 0; r < 16; r++) {
+              float bv = NEG; int bs = 0x7fffffff;
+              for (int k = 0; k < 4; k++) { const float v = cv[tid * 4 + k]; if (v > bv) { bv = v; bs = int(tid * 4 + k); } }
+              const float m = simd_max(bv);
+              int sl = bv == m ? bs : 0x7fffffff; sl = simd_min(sl);
+              if (lane == 0) { wv[sg] = m; ws[sg] = sl; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (sg == 0) {
+                const float v2 = wv[lane]; const float m2 = simd_max(v2);
+                int s2 = v2 == m2 ? ws[lane] : 0x7fffffff; s2 = simd_min(s2);
+                if (lane == 0) { ids[row * 16 + r] = ci[s2]; vals[row * 16 + r] = cv[s2]; cv[s2] = NEG; }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+
+    static let selector = MLXFast.metalKernel(
+        name: "df2_selector", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor"], outputNames: ["path"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+            const int P = int(cand_shape[0]);
+            threadgroup float ev[16]; threadgroup int cur;
+            if (tid == 0) { cur = anchor[0]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int p = 0; p < P; p++) {
+              const int pr = cur;
+              const int c = cand[p * 16 + sg];
+              float acc = 0.0f;
+              for (int r = int(lane); r < 256; r += 32) {
+                acc += float(pred[(size_t)pr * 256 + r]) * float(proj[p * 256 + r]) * float(succ[(size_t)c * 256 + r]);
+              }
+              acc = simd_sum(acc);
+              if (lane == 0) { ev[sg] = float(unary[p * 16 + sg]) + acc; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (tid == 0) {
+                int best = 0; float bv = ev[0];
+                for (int j = 1; j < 16; j++) { if (ev[j] > bv) { bv = ev[j]; best = j; } }
+                cur = cand[p * 16 + best]; path[p] = cur;
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+
+    /// Fused top-16 + greedy selector for `selectGreedy` (B = 1).
+    static func select(
+        logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray
+    ) -> MLXArray {
+        let V = logits.dim(-1), P = logits.size / V
+        let top = topk(
+            [logits.reshaped([P, V]).asType(.float32), MLXArray([Int32(V)])],
+            grid: (P * 512, 1, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[P, 16], [P, 16]], outputDTypes: [.int32, .float32])
+        let path = selector(
+            [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32)],
+            grid: (512, 1, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[P]], outputDTypes: [.int32])[0]
+        return path.reshaped([1, P])
     }
 }
