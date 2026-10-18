@@ -405,6 +405,9 @@ public final class DFlash2DraftHeadSlot {
             guard p.shape == f.shape, p.dtype == f.dtype else {
                 return "\(dtype) shape or dtype differs"
             }
+            guard isFinite(p).all().item(Bool.self), isFinite(f).all().item(Bool.self) else {
+                return "\(dtype) nonfinite output in prefix or full head"
+            }
             let pf = contiguous(p.asType(.float32)).view(dtype: .uint32)
             let ff = contiguous(f.asType(.float32)).view(dtype: .uint32)
             let perRow = (pf .!= ff).asType(.int32).reshaped([-1, rows]).sum(axis: -1)
@@ -581,16 +584,13 @@ private final class DFlash2Attention: Module {
     ///   - context: the projected target hidden state, `[B, contextLength, hidden]`.
     func callAsFunction(
         _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
-        conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil,
         ropeSpec: DF2Fast.RopeSpec? = nil,
-        contextCodes: DF2Fast.W4Codes? = nil,
         precomputedContextKV: (MLXArray, MLXArray)? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
         var context = context
         var contextLength = context.dim(1)
-        var activeContextCodes = contextCodes
         var activePrecomputedKV = precomputedContextKV
 
         if let slidingWindow {
@@ -599,7 +599,6 @@ private final class DFlash2Attention: Module {
             if skip > 0 {
                 context = context[0..., skip..., 0...]
                 contextLength = context.dim(1)
-                activeContextCodes = nil
                 activePrecomputedKV = nil
                 // The dropped rows still happened, so the cache's notion of
                 // where the block sits has to move with them.
@@ -612,12 +611,7 @@ private final class DFlash2Attention: Module {
         var queries: MLXArray
         var contextKeys: MLXArray? = nil, contextValues: MLXArray? = nil
         var blockKeys: MLXArray, blockValues: MLXArray
-        if let conv0,
-            let qkv = DF2Fast.linearsConv0(
-                conv0.n, dyn: conv0.dyn, base: conv0.base, [qProj, kProj, vProj])
-        {
-            (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
-        } else if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
+        if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
         } else {
             (queries, blockKeys, blockValues) = (qProj(x), kProj(x), vProj(x))
@@ -627,15 +621,10 @@ private final class DFlash2Attention: Module {
         if contextLength > 0 {
             if let activePrecomputedKV {
                 (contextKeys, contextValues) = (activePrecomputedKV.0, activePrecomputedKV.1)
-            } else if let activeContextCodes,
-                let kv = DF2Fast.w4LinearsFromCodes(
-                    activeContextCodes, leadShape: [B, contextLength], [kProj, vProj])
-            {
-                (contextKeys, contextValues) = (kv[0], kv[1])
-            } else if let kv = DF2Fast.linears(context, [kProj, vProj]) {
-                (contextKeys, contextValues) = (kv[0], kv[1])
             } else if let kv = DF2Fast.fusedKVLinear(context, kProj: kProj, vProj: vProj) {
                 (contextKeys, contextValues) = (kv.0, kv.1)
+            } else if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+                (contextKeys, contextValues) = (kv[0], kv[1])
             } else {
                 (contextKeys, contextValues) = (kProj(context), vProj(context))
             }
@@ -747,16 +736,6 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        // MLX's full-attention path (L > 8) writes the output token-major, so the
-        // [1, L, 4096] view is already row-contiguous: read it in place rather than
-        // have the head-major quantizer's input check copy it. Same values, same
-        // column order, same bits. The vector path (L <= 8) writes head-major.
-        if B == 1, heads == 32, L > 8, DF2Fast.tokenMajorOProj {
-            return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
-        }
-        if B == 1, heads == 32, let y = DF2Fast.linearHeadMajor(output, oProj, L: L) {
-            return y
-        }
         return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
     }
 
@@ -1101,23 +1080,11 @@ private final class DFlash2MLP: Module, UnaryLayer {
         super.init()
     }
 
-    func callAsFunction(
-        _ x: MLXArray, conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil
-    ) -> MLXArray {
-        if let conv0,
-            let gu = DF2Fast.linearsConv0(conv0.n, dyn: conv0.dyn, base: conv0.base, [gate, up]),
-            let y = DF2Fast.linears(gu[0], [down], up: gu[1])
-        {
-            return y[0]
-        }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let gu = DF2Fast.linears(x, [gate, up]), let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
             return y[0]
         }
         return down(silu(gate(x)) * up(x))
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        callAsFunction(x, conv0: nil)
     }
 }
 
@@ -1149,67 +1116,43 @@ private final class DFlash2DecoderLayer: Module {
     }
 
     func forwardFast(
-        _ x: MLXArray, normedInput: MLXArray?, normedCodes: DF2Fast.W4Codes?,
-        nextNorm: RMSNorm?, nextQStart: Int = 0,
+        _ x: MLXArray, normedInput: MLXArray?,
+        nextNorm: RMSNorm?,
         context: MLXArray, rope: RoPELayer, cache: KVCache,
-        ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.W4Codes?,
+        ropeSpec: DF2Fast.RopeSpec?,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
         submitAttention: Bool = false
-    ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
+    ) -> (h: MLXArray, nextNormed: MLXArray?) {
         let n1 = normedInput ?? DF2Fast.rms(x, inputLayerNorm)
-        let leadShape = Array(n1.shape.dropLast())
-        let p1 =
-            (normedCodes.flatMap {
-                DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [attentionConv.kernelProjection])
-            }?[0]) ?? DF2Fast.linear(n1, attentionConv.kernelProjection)
+        let p1 = DF2Fast.linear(n1, attentionConv.kernelProjection)
         let base1 = attentionConv.fastBase
-        let attnOut: MLXArray
-        if DF2Fast.w4Group != nil {
-            attnOut = selfAttn(
-                n1, context: context, rope: rope, cache: cache,
-                conv0: (n: n1, dyn: p1, base: base1),
-                ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
-        } else {
-            let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
-            attnOut = selfAttn(
-                a, context: context, rope: rope, cache: cache,
-                ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
-        }
-        // Hand the attention half to the GPU while the rest is built.
+        let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
+        let attnOut = selfAttn(
+            a, context: context, rope: rope, cache: cache,
+            ropeSpec: ropeSpec,
+            precomputedContextKV: precomputedContextKV)
         if submitAttention { asyncEval(attnOut) }
         let attended: MLXArray
         let n2: MLXArray
-        let n2Codes: DF2Fast.W4Codes?
         if let fused = DF2Fast.dynConvRms(
-            attnOut, dyn: p1, base: base1, residual: x, norm: postAttentionLayerNorm, qStart: 0)
+            attnOut, dyn: p1, base: base1, residual: x, norm: postAttentionLayerNorm)
         {
-            (attended, n2, n2Codes) = fused
+            (attended, n2) = fused
         } else {
             attended = DF2Fast.dynConv(attnOut, dyn: p1, base: base1, part: 1, residual: x)
             n2 = DF2Fast.rms(attended, postAttentionLayerNorm)
-            n2Codes = nil
         }
-        let p2 =
-            (n2Codes.flatMap {
-                DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [mlpConv.kernelProjection])
-            }?[0]) ?? DF2Fast.linear(n2, mlpConv.kernelProjection)
+        let p2 = DF2Fast.linear(n2, mlpConv.kernelProjection)
         let base2 = mlpConv.fastBase
-        let mlpOut: MLXArray
-        if DF2Fast.w4Group != nil {
-            mlpOut = mlp(n2, conv0: (n: n2, dyn: p2, base: base2))
-        } else {
-            let m = DF2Fast.dynConv(n2, dyn: p2, base: base2, part: 0, residual: nil)
-            mlpOut = mlp(m)
-        }
+        let m = DF2Fast.dynConv(n2, dyn: p2, base: base2, part: 0, residual: nil)
+        let mlpOut = mlp(m)
         if let nextNorm,
             let fused = DF2Fast.dynConvRms(
-                mlpOut, dyn: p2, base: base2, residual: attended, norm: nextNorm, qStart: nextQStart)
+                mlpOut, dyn: p2, base: base2, residual: attended, norm: nextNorm)
         {
-            return (fused.0, fused.1, fused.2)
+            return (fused.0, fused.1)
         }
-        return (DF2Fast.dynConv(mlpOut, dyn: p2, base: base2, part: 1, residual: attended), nil, nil)
+        return (DF2Fast.dynConv(mlpOut, dyn: p2, base: base2, part: 1, residual: attended), nil)
     }
 
     func callAsFunction(
@@ -1217,9 +1160,9 @@ private final class DFlash2DecoderLayer: Module {
     ) -> MLXArray {
         if DF2Fast.on, x.dim(0) == 1, x.size / x.dim(-1) <= 16 {
             return forwardFast(
-                x, normedInput: nil, normedCodes: nil, nextNorm: nil, nextQStart: 0,
+                x, normedInput: nil, nextNorm: nil,
                 context: context, rope: rope, cache: cache,
-                ropeSpec: nil, contextCodes: nil
+                ropeSpec: nil
             ).h
         }
         let (attentionInput, attentionTaps) = attentionConv.prepare(inputLayerNorm(x))
@@ -1384,7 +1327,6 @@ final class DFlash2CandidateSelector: Module {
         super.init()
     }
 
-    // Strict loading finishes before these registered payloads change.
     func preparePackedCodebooks() {
         guard DF2Fast.on, topK == 16,
             predecessorCodebook.ndim == 2, predecessorCodebook.dim(1) == 256,
@@ -1392,14 +1334,14 @@ final class DFlash2CandidateSelector: Module {
         else { return }
         if let copy = try? DFlash2PackedCodebook(predecessorCodebook) {
             codebookCopies.predecessor = copy
-            predecessorCodebook._updateInternal(copy.packed)
         }
         if let copy = try? DFlash2PackedCodebook(successorCodebook) {
             codebookCopies.successor = copy
-            successorCodebook._updateInternal(copy.packed)
         }
     }
 
+    var predecessorPacked: MLXArray? { codebookCopies.predecessor?.packed }
+    var successorPacked: MLXArray? { codebookCopies.successor?.packed }
     var predecessorLookup: MLXArray? { codebookCopies.predecessor?.lookup }
     var successorLookup: MLXArray? { codebookCopies.successor?.lookup }
 
@@ -1484,8 +1426,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     // MARK: Binding
 
     public func bind(target: any DFlash2Target) throws {
-        // The per-row kernels' wide-form bit check (load time, before any proposal).
-        if DF2Fast.on, let group = DF2Fast.w4Group { DF2WideLanes.prepare(group: group) }
         guard target.dFlash2VocabularySize == config.vocabularySize else {
             throw DFlash2Error.vocabularyMismatch(
                 drafter: config.vocabularySize, target: target.dFlash2VocabularySize)
@@ -1500,9 +1440,91 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let rows = DF2Vocab.rows
         if rows >= config.dflash.selectorTopK && rows < config.vocabularySize {
             let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
-            eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
+            let logits = target.draftLogitsForDFlash2Hidden(probe, rows: rows)
+            eval(logits)
+            guard isFinite(logits).all().item(Bool.self) else {
+                throw NonFiniteProjectionError()
+            }
         }
         if DF2Fast.on { try prepareFirstRound(target) }
+    }
+
+    public struct NonFiniteProjectionError: LocalizedError {
+        public let errorDescription: String? =
+            "DFlash2 canonical 8-bit fast projection probe produced nonfinite values."
+    }
+
+    private func probeFastProjections() throws {
+        guard DF2Fast.on, DF2Fast.tensorAvailable, !layers.isEmpty else { return }
+        let k = config.hiddenSize
+        let values = (0 ..< 16 * k).map { i -> Float in
+            let t = Double(i)
+            return Float(Foundation.sin(t * 0.7548776) * (1 + 0.5 * Foundation.cos(t * 0.0137)) + 0.1)
+        }
+        let probe = MLXArray(values, [16, k])
+        let l0 = layers[0]
+
+        // 3-grouping (Q, K, V)
+        if let outs = DF2Fast.linears(probe, [l0.selfAttn.qProj, l0.selfAttn.kProj, l0.selfAttn.vProj]) {
+            eval(outs)
+            for out in outs {
+                guard isFinite(out).all().item(Bool.self) else {
+                    throw NonFiniteProjectionError()
+                }
+            }
+        }
+        // 2-grouping (K, V)
+        if let outs = DF2Fast.linears(probe, [l0.selfAttn.kProj, l0.selfAttn.vProj]) {
+            eval(outs)
+            for out in outs {
+                guard isFinite(out).all().item(Bool.self) else {
+                    throw NonFiniteProjectionError()
+                }
+            }
+        }
+        // 2-grouping with SWIGLU (Gate, Up)
+        if let outs = DF2Fast.linears(probe, [l0.mlp.gate, l0.mlp.up]) {
+            eval(outs)
+            for out in outs {
+                guard isFinite(out).all().item(Bool.self) else {
+                    throw NonFiniteProjectionError()
+                }
+            }
+            // 1-grouping (Down) with up: outs[1]
+            if let downOut = DF2Fast.linears(outs[0], [l0.mlp.down], up: outs[1]) {
+                eval(downOut)
+                guard isFinite(downOut[0]).all().item(Bool.self) else {
+                    throw NonFiniteProjectionError()
+                }
+            }
+        }
+        // 1-grouping (O-proj)
+        if let outs = DF2Fast.linears(probe, [l0.selfAttn.oProj]) {
+            eval(outs)
+            guard isFinite(outs[0]).all().item(Bool.self) else {
+                throw NonFiniteProjectionError()
+            }
+        }
+        // 1-grouping (Selector projection)
+        if let outs = DF2Fast.linears(probe, [candidateSelector.hiddenProjection]) {
+            eval(outs)
+            guard isFinite(outs[0]).all().item(Bool.self) else {
+                throw NonFiniteProjectionError()
+            }
+        }
+        // FC projection
+        let targetK = config.targetHiddenSize
+        let fcValues = (0 ..< 16 * targetK).map { i -> Float in
+            let t = Double(i)
+            return Float(Foundation.cos(t * 0.7548776) * (1 + 0.5 * Foundation.sin(t * 0.0137)) + 0.1)
+        }
+        let fcProbe = MLXArray(fcValues, [16, targetK]).asType(dtype)
+        if let fcOut = DF2Fast.linears(fcProbe, [fc]) {
+            eval(fcOut)
+            guard isFinite(fcOut[0]).all().item(Bool.self) else {
+                throw NonFiniteProjectionError()
+            }
+        }
     }
 
     /// Prepare at load what the first round of the first request would otherwise
@@ -1513,6 +1535,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// width. The proposals run on a throwaway cache and are discarded; nothing
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
+        try probeFastProjections()
         let cache = try makeCache()
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
@@ -1582,18 +1605,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         logitsStart: Int
     ) throws -> MLXArray {
-        try hiddenStatesWithCodes(
-            inputs, targetHidden: targetHidden, cache: cache, logitsStart: logitsStart
-        ).hidden
+        try hiddenStates(
+            inputs, targetHidden: targetHidden, cache: cache, logitsStart: logitsStart, projected: nil)
     }
 
-    private func hiddenStatesWithCodes(
+    private func hiddenStates(
         _ inputs: MLXArray,
         targetHidden: MLXArray,
         cache: [KVCache],
         logitsStart: Int,
         projected: DFlash2ContextProjection.Use? = nil
-    ) throws -> (hidden: MLXArray, codes: DF2Fast.W4Codes?) {
+    ) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
             throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
@@ -1629,96 +1651,32 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        var context: MLXArray
-        let cCodes: DF2Fast.W4Codes?
-        var deferredContextNorm: (input: MLXArray, group: Int)? = nil
+        let context: MLXArray
         if let projected {
             context = projected.context
-            cCodes = nil
         } else if targetHidden.dim(1) == 0 {
             context = MLXArray.zeros([targetHidden.dim(0), 0, config.hiddenSize], dtype: dtype)
-            cCodes = nil
         } else {
-            let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
-            if let group = DF2Fast.w4Group, fcOut.dim(0) == 1,
-                (1 ... 16).contains(fcOut.dim(1)),
-                let rq = DF2Fast.rmsQuant(
-                    fcOut, hiddenNorm, group: group,
-                    writeNorm: !(DF2Fast.on && h.ndim == 3 && h.dim(0) == 1
-                        && h.size / h.dim(-1) <= 16 && layers.count == 6
-                        && (config.slidingWindow.map { fcOut.dim(1) < $0 } ?? true)))
-            {
-                if rq.0.size == 1 {
-                    // Shape carrier only until every context K/V projection succeeds.
-                    // A failed projection below materializes the original normalized output.
-                    context = fcOut
-                    cCodes = rq.1
-                    deferredContextNorm = (fcOut, group)
-                } else {
-                    (context, cCodes) = rq
-                }
-            } else {
-                context = DF2Fast.rms(fcOut, hiddenNorm)
-                cCodes = nil
-            }
+            context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
         }
 
         if DF2Fast.on, h.ndim == 3, h.dim(0) == 1, h.size / h.dim(-1) <= 16, !layers.isEmpty {
             let rSpec = DF2Fast.ropeSpec(self)
-            var normed: MLXArray?
-            var normedCodes: DF2Fast.W4Codes?
-            if let group = DF2Fast.w4Group,
-                let rq = DF2Fast.rmsQuant(h, layers[0].inputLayerNorm, group: group)
-            {
-                (normed, normedCodes) = rq
-            } else {
-                normed = DF2Fast.rms(h, layers[0].inputLayerNorm)
-                normedCodes = nil
-            }
-            var precomputedKV: [(MLXArray, MLXArray)]? = projected?.contextKV
-            if let cCodes, layers.count == 6 {
-                let lead = [1, context.dim(1)]
-                if let kv012 = DF2Fast.w4LinearsFromCodes(
-                    cCodes, leadShape: lead,
-                    [
-                        layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
-                        layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
-                        layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
-                    ]),
-                    let kv345 = DF2Fast.w4LinearsFromCodes(
-                        cCodes, leadShape: lead,
-                        [
-                            layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
-                            layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
-                            layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
-                        ])
-                {
-                    precomputedKV = [
-                        (kv012[0], kv012[1]), (kv012[2], kv012[3]), (kv012[4], kv012[5]),
-                        (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
-                    ]
-                }
-            }
-            if precomputedKV == nil, let deferredContextNorm {
-                // Preserve the original full-output path for any ineligible K/V group.
-                context = DF2Fast.rmsQuant(
-                    deferredContextNorm.input, hiddenNorm, group: deferredContextNorm.group)!.0
-            }
+            var normed: MLXArray? = DF2Fast.rms(h, layers[0].inputLayerNorm)
+            let precomputedKV: [(MLXArray, MLXArray)]? = projected?.contextKV
             let blockLen = h.dim(1)
             for (index, layer) in layers.enumerated() {
                 let isLast = index + 1 == layers.count
                 let nextNorm = isLast ? norm : layers[index + 1].inputLayerNorm
-                let nextQStart = isLast ? logitsStart : 0
                 let step = layer.forwardFast(
-                    h, normedInput: normed, normedCodes: normedCodes,
-                    nextNorm: nextNorm, nextQStart: nextQStart,
+                    h, normedInput: normed,
+                    nextNorm: nextNorm,
                     context: context, rope: rope, cache: cache[index],
-                    ropeSpec: rSpec, contextCodes: cCodes,
+                    ropeSpec: rSpec,
                     precomputedContextKV: precomputedKV?[index],
                     submitAttention: index == 0 && projected != nil)
                 h = step.h
                 normed = step.nextNormed
-                normedCodes = step.nextCodes
                 if let normed {
                     if isLast {
                         asyncEval(normed)
@@ -1733,12 +1691,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 if logitsStart > 0 && finalNormed.dim(1) != blockLen - logitsStart {
                     finalNormed = finalNormed[0..., logitsStart..., 0...]
                 }
-                return (finalNormed, normedCodes)
+                return finalNormed
             }
             if logitsStart > 0 {
                 h = h[0..., logitsStart..., 0...]
             }
-            return (DF2Fast.rms(h, norm), nil)
+            return DF2Fast.rms(h, norm)
         }
 
         for (index, layer) in layers.enumerated() {
@@ -1749,7 +1707,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if logitsStart > 0 {
             h = h[0..., logitsStart..., 0...]
         }
-        return (DF2Fast.rms(h, norm), nil)
+        return DF2Fast.rms(h, norm)
     }
 
     /// Absorb committed context rows into the drafter's caches without
@@ -1791,52 +1749,42 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     // MARK: Context projection ahead of acceptance
 
     /// The acceptance-independent head of the next block's forward, over every
-    /// column a verify can confirm: the context `fc` projection, its norm and
-    /// codes, every layer's context keys and values (before their norm and
-    /// rotation), and the embedding of every candidate anchor. The same
-    /// operations run on the same rows as in `hiddenStatesWithCodes`, so a
-    /// round that confirms `c` columns reads the first `c` rows of each and the
-    /// anchor row `c - 1` instead of recomputing them. nil when the fast path
-    /// does not apply.
+    /// column a verify can confirm: the context `fc` projection, its norm,
+    /// every layer's context keys and values (before their norm and rotation),
+    /// and the embedding of every candidate anchor. The same operations run
+    /// on the same rows as in `hiddenStates`, so a round that confirms `c`
+    /// columns reads the first `c` rows of each and the anchor row `c - 1`
+    /// instead of recomputing them. nil when the fast path does not apply.
     public func projectContext(targetHidden: MLXArray, anchors: MLXArray) -> DFlash2ContextProjection? {
         guard let target, DF2Fast.on, fc is QuantizedLinear, layers.count == 6,
-            let group = DF2Fast.w4Group, targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            targetHidden.ndim == 3, targetHidden.dim(0) == 1,
             (1 ... 16).contains(targetHidden.dim(1)),
             targetHidden.dim(-1) == config.targetHiddenSize,
             anchors.size == targetHidden.dim(1)
         else { return nil }
         let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
-        guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
+        let context = DF2Fast.rms(fcOut, hiddenNorm)
+        guard let kv = contextKeysValues(context) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         return DFlash2ContextProjection(anchorEmbeddings: embeddings, context: context, contextKV: kv)
     }
 
-    /// Every layer's context keys and values from the context codes, in the
-    /// two six-output launches `hiddenStatesWithCodes` uses.
-    private func contextKeysValues(_ codes: DF2Fast.W4Codes, rows: Int) -> [(MLXArray, MLXArray)]? {
-        let lead = [1, rows]
-        guard
-            let kv012 = DF2Fast.w4LinearsFromCodes(
-                codes, leadShape: lead,
-                [
-                    layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
-                    layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
-                    layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
-                ]),
-            let kv345 = DF2Fast.w4LinearsFromCodes(
-                codes, leadShape: lead,
-                [
-                    layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
-                    layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
-                    layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
-                ])
-        else { return nil }
-        return [
-            (kv012[0], kv012[1]), (kv012[2], kv012[3]), (kv012[4], kv012[5]),
-            (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
-        ]
+    /// Every layer's context keys and values from the context.
+    private func contextKeysValues(_ context: MLXArray) -> [(MLXArray, MLXArray)]? {
+        var result = [(MLXArray, MLXArray)]()
+        result.reserveCapacity(layers.count)
+        for layer in layers {
+            let kProj = layer.selfAttn.kProj
+            let vProj = layer.selfAttn.vProj
+            if let kv = DF2Fast.fusedKVLinear(context, kProj: kProj, vProj: vProj) {
+                result.append(kv)
+            } else if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+                result.append((kv[0], kv[1]))
+            } else {
+                result.append((kProj(context), vProj(context)))
+            }
+        }
+        return result
     }
 
     /// The projection rows a block over `contextRows` new rows reads, or nil
@@ -1845,7 +1793,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         _ projection: DFlash2ContextProjection, anchors: Int, blockSize: Int, contextRows: Int
     ) -> DFlash2ContextProjection.Use? {
         guard DF2Fast.on, anchors == 1, blockSize == config.dflash.blockSize, blockSize <= 16,
-            fc is QuantizedLinear, layers.count == 6, DF2Fast.w4Group != nil,
+            fc is QuantizedLinear, layers.count == 6,
             contextRows >= 1, contextRows <= projection.rows
         else { return nil }
         return projection.use(rows: contextRows)
@@ -1879,19 +1827,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             projectionUse($0, anchors: anchor.count, blockSize: blockSize, contextRows: targetHidden.dim(1))
         }
 
-        let (hidden, finalCodes) = try hiddenStatesWithCodes(
+        let hidden = try hiddenStates(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1, projected: contextUse)
         if DF2Fast.on, anchor.count == 1 {
             let sel = candidateSelector
-            let projected =
-                (finalCodes.flatMap {
-                    DF2Fast.w4LinearsFromCodes(
-                        $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
-                }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
+            let projected = DF2Fast.linear(hidden, sel.hiddenProjection)
             return DF2Fast.select(
                 logits: try logits(hidden), projected: projected,
-                anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
-                succ: sel.successorCodebook,
+                anchor: MLXArray(anchor.map { Int32($0) }),
+                pred: sel.predecessorPacked ?? sel.predecessorCodebook,
+                succ: sel.successorPacked ?? sel.successorCodebook,
                 predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
         }
         return candidateSelector.selectGreedy(
@@ -1973,9 +1918,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// fused grouped dynamic convolution; fused top-16 and greedy selector.
 enum DF2Fast {
     static let on = ProcessInfo.processInfo.environment["DF2_FAST"] != "0"
-    /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
-    static let tokenMajorOProj =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
     static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
     static let header = """
         #include <metal_tensor>
@@ -2031,10 +1973,14 @@ enum DF2Fast {
             constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
             mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
             tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-            threadgroup uint32_t bs[SPLIT][32 * 8];
-            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> B(
+                (device int8_t*)w, dextents<int, 2>(K, N), array<int, 2>{1, K});
             auto tA0 = A.template slice<32, 16>(0, 0);
-            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            auto tB0 = B.template slice<32, 32>(0, n0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, int32_t>();
+            using RecordB = tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>;
+            using RecordC = decltype(op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, RecordB, int32_t>());
+            static_assert(__is_same(decltype(cT), RecordC), "device B changed cooperative destination type");
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
             bool ok = cT.get_capacity() == 16;
@@ -2045,17 +1991,10 @@ enum DF2Fast {
             float acc[16], accb[16];
             for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
-            const int sj = int(lane & 7u), sc = int(lane >> 3);
-            const device uint32_t* wsrc = w + (size_t)(n0 + sc) * (K / 4) + sj;
-            threadgroup uint32_t* sdst = bs[sg] + sc * 8 + sj;
-            uint32_t wv[8];
-            for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + int(sg) * 8]; }
             for (int g = int(sg); g < G; g += SPLIT) {
-              for (int t = 0; t < 8; t++) { sdst[32 * t] = wv[t] ^ 0x80808080u; }
-              if (g + SPLIT < G) { for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + (g + SPLIT) * 8]; } }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
               auto tA = A.template slice<32, 16>(g * 32, 0);
-              op.run(tA, Bt, cT);
+              auto tB = B.template slice<32, 32>(g * 32, n0);
+              op.run(tA, tB, cT);
               const device float* sr = sT + (size_t)g * N + n0 + nb;
               const device float* br = bT + (size_t)g * N + n0 + nb;
               const float4 s0v = *(const device float4*)sr, s1v = *(const device float4*)(sr + 16);
@@ -2071,7 +2010,6 @@ enum DF2Fast {
                 acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
                 accb[i] = fma(b, hi ? x1 : x0, accb[i]);
               }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
             }
             threadgroup float red[SPLIT][16 * 32];
             for (int i = 0; i < 16; i++) {
@@ -2116,14 +2054,6 @@ enum DF2Fast {
             self.freqs = freqs
             self.mscale = mscale
         }
-    }
-    struct W4Codes {
-        let xq: MLXArray
-        let ascale: MLXArray
-        let xs: MLXArray
-        let rows: Int
-        let K: Int
-        let group: Int
     }
 
     nonisolated(unsafe) static var operandCache: [ObjectIdentifier: Operands] = [:]
@@ -2233,15 +2163,26 @@ enum DF2Fast {
         return (kv[0..., 0..., ..<op.nK], kv[0..., 0..., op.nK...])
     }
 
+    static let tensorAvailable = GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+
+    static func eligible(_ layer: Linear) -> QuantizedLinear? {
+        guard tensorAvailable, let q = layer as? QuantizedLinear,
+            q.bits == 8, q.groupSize == 32, q.mode == .affine,
+            q.biases != nil, q.bias == nil, q.weight.dim(0) % 32 == 0
+        else { return nil }
+        return q
+    }
+
     static func operands(_ layer: Linear) -> Operands? {
         if let o = operandCache[ObjectIdentifier(layer)] { return o }
-        guard let q = layer as? QuantizedLinear, q.bits == 8, q.groupSize == 32, q.mode == .affine,
-            let biases = q.biases, q.bias == nil, q.weight.dim(0) % 32 == 0
-        else { return nil }
+        guard let q = eligible(layer), let biases = q.biases else { return nil }
+        // The native tile already XORs these bytes before signed-int8 matmul.
+        // Cache that exact input-independent preprocessing, not new quantization.
+        let w = contiguous(q.weight ^ UInt32(0x80808080))
         let sT = contiguous(q.scales.asType(.float32).transposed())
         let bT = contiguous(biases.asType(.float32).transposed())
-        eval(sT, bT)
-        let o = Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
+        eval(w, sT, bT)
+        let o = Operands(w: w, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
         operandCache[ObjectIdentifier(layer)] = o
         return o
     }
@@ -2264,9 +2205,6 @@ enum DF2Fast {
     /// `layers(x)` (or of silu(x) * up) for sibling drafter linears sharing x; nil when not eligible.
     static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
         guard on, (1 ... 3).contains(layers.count) else { return nil }
-        if let group = w4Group, let y = w4Linears(x, layers, up: up, group: group) {
-            return y
-        }
         guard (1 ... 16).contains(x.size / x.dim(-1)) else { return nil }
         let ops = layers.compactMap { operands($0) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == x.dim(-1) }),
@@ -2281,908 +2219,6 @@ enum DF2Fast {
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
         let lead = Array(x.shape.dropLast())
         return zip(outs, ns).map { $0.reshaped(lead + [$1]) }
-    }
-
-    // MARK: 4-bit drafter linears, re-quantized at load (drafter numerics only)
-
-    /// Input columns per 4-bit group (64 or 128); nil (`DF2_W4=0`) keeps the pinned 8-bit g32 codes.
-    static let w4Group: Int? = {
-        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "64"
-        return v == "128" ? 128 : (v == "0" ? nil : 64)
-    }()
-
-    final class W4Operands {
-        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
-        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
-            self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
-        }
-    }
-    nonisolated(unsafe) static var w4Cache: [ObjectIdentifier: W4Operands] = [:]
-
-    /// An in-memory 4-bit affine copy of one pinned linear (the file on disk is untouched), built once
-    /// at load: per group of `group` input columns, the range [lo, hi] shrunk toward zero by the factor
-    /// in {1, 0.95, ..., 0.75} with the least squared error against the pinned weights, then FP16
-    /// scale (hi - lo) / 15 and offset lo. Codes are row-major [N, K / 2]; a word holds k = 8j ... 8j + 3
-    /// in its low nibbles and k = 8j + 4 ... 8j + 7 in its high nibbles. Scales and offsets are [G, N].
-    static func w4Operands(_ layer: Linear, group: Int) -> W4Operands? {
-        if let o = w4Cache[ObjectIdentifier(layer)] { return o }
-        guard let q = layer as? QuantizedLinear, q.mode == .affine, let biases = q.biases, q.bias == nil
-        else { return nil }
-        let N = q.weight.dim(0)
-        let K = q.weight.dim(1) * 32 / q.bits
-        guard N % 32 == 0, K % group == 0 else { return nil }
-        let G = K / group
-        let w = dequantized(
-            q.weight, scales: q.scales, biases: biases, groupSize: q.groupSize, bits: q.bits,
-            dtype: .float32
-        ).reshaped([N, G, group])
-        let lo0 = w.min(axis: -1), hi0 = w.max(axis: -1)
-        var best: MLXArray? = nil
-        var lo = lo0, hi = hi0
-        for c: Float in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75] {
-            let l = lo0 * c, h = hi0 * c
-            let sc = which(h .> l, (h - l) / 15, Float(1)).asType(.float16).asType(.float32)
-            let bc = l.asType(.float16).asType(.float32)
-            let u = clip(
-                round((w - bc.expandedDimensions(axis: -1)) / sc.expandedDimensions(axis: -1)),
-                min: 0, max: 15)
-            let e = square(u * sc.expandedDimensions(axis: -1) + bc.expandedDimensions(axis: -1) - w)
-                .sum(axis: -1)
-            if let b0 = best {
-                let better = e .< b0
-                best = which(better, e, b0)
-                lo = which(better, l, lo)
-                hi = which(better, h, hi)
-            } else {
-                best = e
-            }
-            eval(best!, lo, hi)
-        }
-        let s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
-        let b = lo.asType(.float16).asType(.float32)
-        let u = clip(
-            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15
-        ).asType(.uint32).reshaped([N, K / 8, 2, 4])
-        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
-        let packed = (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
-        let sT = contiguous(s.asType(.float16).transposed())
-        let bT = contiguous(b.asType(.float16).transposed())
-        eval(packed, sT, bT)
-        let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
-        w4Cache[ObjectIdentifier(layer)] = o
-        return o
-    }
-
-    /// x [R, K] (or silu(x) * x2, or head-major [1, 32, R, 128]) -> int8 codes per row and per KG-column group.
-    /// 16 contiguous columns per thread (`c0 = tid * 16`), single-pass register buffering, and SIMD-shuffle group reduction.
-    static let quantG = MLXFast.metalKernel(
-        name: "df2_act_q8g", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
-        source: """
-            const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
-            const int tid = int(thread_position_in_grid.x);
-            const uint lane = thread_index_in_simdgroup;
-            const int c0 = tid * 16;
-            if (c0 >= K) return;
-            const int m = int(threadgroup_position_in_grid.y);
-            const int g = tid / (KG / 16);
-            const size_t dstBase = (size_t)m * K + c0;
-            if (m >= R) {
-              device char4* dst = (device char4*)(xq + dstBase);
-              for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-              if ((tid & ((KG / 16) - 1)) == 0) {
-                ascale[m * G + g] = 0.0f;
-                xs[m * G + g] = 0.0f;
-              }
-              return;
-            }
-            const size_t srcBase = HEAD_MAJOR
-                ? (((size_t)(c0 >> 7) * R + m) * 128 + (c0 & 127))
-                : dstBase;
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              float a = float(x[srcBase + u]);
-              if (SWIGLU) { const float b = float(x2[srcBase + u]); a = a / (1.0f + metal::exp(-a)) * b; }
-              nv[u] = a;
-              local_amax = max(local_amax, fabs(a));
-            }
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-            if (KG == 128) {
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-            }
-            float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
-            for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
-            }
-            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-            const float ia = 1.0f / a;
-            device char4* dst = (device char4*)(xq + dstBase);
-            for (int u = 0; u < 4; u++) {
-              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-              dst[u] = char4(int4(rint(fv * ia)));
-            }
-            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-              ascale[m * G + g] = a;
-              xs[m * G + g] = seq_sum;
-            }
-            """)
-
-    /// Fused `dynConv(part: 0, residual: nil)` + `quantG` in one kernel: 16 contiguous columns (= 1 conv group) per thread.
-    static let quantGConv0 = MLXFast.metalKernel(
-        name: "df2_act_q8g_conv0", inputNames: ["h", "dyn", "base", "ksz"],
-        outputNames: ["xq", "ascale", "xs"],
-        source: """
-            const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
-            const int tid = int(thread_position_in_grid.x);
-            const uint lane = thread_index_in_simdgroup;
-            const int c0 = tid * 16;
-            if (c0 >= K) return;
-            const int m = int(threadgroup_position_in_grid.y);
-            const int g = tid / (KG / 16);
-            const size_t rowBase = (size_t)m * K + c0;
-            if (m >= R) {
-              device char4* dst = (device char4*)(xq + rowBase);
-              for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-              if ((tid & ((KG / 16) - 1)) == 0) {
-                ascale[m * G + g] = 0.0f;
-                xs[m * G + g] = 0.0f;
-              }
-              return;
-            }
-            const int dw = 4 * (K / 16);
-            const float d0 = float(dyn[m * dw + tid]);
-            const float d1 = m >= 1 ? float(dyn[m * dw + (K >> 4) + tid]) : 0.0f;
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              const int c = c0 + u;
-              float a = (float(base[c]) + d0) * float(h[rowBase + u]);
-              if (m >= 1) {
-                a += (float(base[K + c]) + d1) * float(h[rowBase - K + u]);
-              }
-              nv[u] = a;
-              local_amax = max(local_amax, fabs(a));
-            }
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-            if (KG == 128) {
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-            }
-            float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
-            for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
-            }
-            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-            const float ia = 1.0f / a;
-            device char4* dst = (device char4*)(xq + rowBase);
-            for (int u = 0; u < 4; u++) {
-              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-              dst[u] = char4(int4(rint(fv * ia)));
-            }
-            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-              ascale[m * G + g] = a;
-              xs[m * G + g] = seq_sum;
-            }
-            """)
-
-    /// int8 activations x the 4-bit codes on the NAX tensor units, one 16 x 32 x `group` op per group,
-    /// SPLIT simdgroups over K, 32 output columns per threadgroup, the codes of the next group
-    /// prefetched in registers; the epilogue adds s * a * C + (lo + 8 s) * sum(x) per group.
-    /// `form` 0 (the record kernel): each simdgroup stages its 32 x `group` tile as int8 (nibble - 8)
-    /// in threadgroup memory and reads the group's scales, offsets and activation sums after the op.
-    /// Form 1: the same, with those epilogue operands loaded one group ahead, beside the code
-    /// prefetch, so no device load sits between the op and the epilogue. The tile, the op and the
-    /// epilogue arithmetic are the same in both forms, so the output bits are the same; `w4Form`
-    /// checks that on the device before form 1 is used.
-    /// `narrow` (form 1 only): 16 output columns per threadgroup instead of 32, so a call launches
-    /// twice the threadgroups. The op, its layout guard, the group loop and the FP32 steps per output
-    /// are form 1's; columns 16-31 of the staged tile and their destination elements (8-15) are dead.
-    static func w4Source(layers: Int, group: Int, form: Int = 0, narrow: Bool = false) -> String {
-        precondition(!narrow || form == 1 || form == 2)
-        let ru = group / 32  // packed uint4 per row and group
-        let tw = group / 16  // unpacked uint4 per row and group
-        let cols = narrow ? 16 : 32  // output columns per threadgroup
-        let pr = narrow ? ru / 2 : ru  // packed uint4 rows each lane stages per group
-        let ne = narrow ? 8 : 16  // live destination elements per lane
-        var pick = """
-            const int K = ksz[0];
-            int bx = int(threadgroup_position_in_grid.x);
-            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
-            device float* out = out0; int N = ksz[2];
-
-            """
-        for l in 1 ..< layers {
-            pick += "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
-        }
-        let operandB =
-            """
-            threadgroup uint4 tiles[SPLIT * 32 * \(tw)];
-            threadgroup uint4* bs = tiles + sg * (32 * \(tw));
-            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs, dextents<int, 2>(\(group), 32));
-            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
-
-            """
-        let codeSetup =
-            """
-            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
-            const size_t rowU4 = (size_t)K / 32;
-            const device uint4* wsrc = (const device uint4*)w + (size_t)(n0 + lr) * rowU4 + lc;
-            uint4 wv[\(pr)];
-            for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + int(sg) * \(ru)]; }
-
-            """
-        let stage =
-            """
-              for (int p = 0; p < \(pr); p++) {
-                const int r = lr + p * \(32 / ru);
-                const uint4 x = wv[p];
-                bs[r * \(tw) + 2 * lc] = uint4(LO(x.x), HI(x.x), LO(x.y), HI(x.y));
-                bs[r * \(tw) + 2 * lc + 1] = uint4(LO(x.z), HI(x.z), LO(x.w), HI(x.w));
-              }
-
-            """
-        let prefetchCodes =
-            "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; }"
-        let pickS = narrow ? "s0v[j]" : "(i >> 3) ? s1v[j] : s0v[j]"
-        let pickB = narrow ? "b0v[j]" : "(i >> 3) ? b1v[j] : b0v[j]"
-        let epilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float s = \(pickS);
-                  const float b = \(pickB);
-                  const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-                  accb[i] = fma(b, hi ? x1 : x0, accb[i]);
-                }
-
-            """
-        let biasEpilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float b = \(pickB);
-                  const bool hi = (i >> 2) & 1;
-                  accb[i] = fma(b, hi ? x1 : x0, accb[i]);
-                }
-
-            """
-        let dotEpilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float s = \(pickS);
-                  const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-                }
-
-            """
-        let loop: String
-        if form == 0 {
-            loop = """
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  if (g + SPLIT < G) { \(prefetchCodes) }
-                  simdgroup_barrier(mem_flags::mem_threadgroup);
-                  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const device half* sr = sT + (size_t)g * N + n0 + nb;
-                  const device half* br = bT + (size_t)g * N + n0 + nb;
-                  const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(*(const device half4*)br));
-                  const float4 b1v = fma(float4(8.0f), s1v, float4(*(const device half4*)(br + 16)));
-                  const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
-                  const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
-                \(epilogue)  simdgroup_barrier(mem_flags::mem_threadgroup);
-                }
-
-                """
-        } else if form == 2 && narrow {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0;
-                  const float a0 = pa0, a1 = pa1;
-                  {
-                    const half4 co0 = po0;
-                    const float x0 = px0, x1 = px1;
-                    const float4 s0v = float4(cs0);
-                    const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                \(biasEpilogue)  }
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r);
-                    po0 = *(const device half4*)(oc + r);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0);
-                \(dotEpilogue)\(barrier)}
-
-                """
-        } else if form == 2 {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, cs1 = ps1;
-                  const float a0 = pa0, a1 = pa1;
-                  {
-                    const half4 co0 = po0, co1 = po1;
-                    const float x0 = px0, x1 = px1;
-                    const float4 s0v = float4(cs0), s1v = float4(cs1);
-                    const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                    const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
-                \(biasEpilogue)  }
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
-                    po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0), s1v = float4(cs1);
-                \(dotEpilogue)\(barrier)}
-
-                """
-        } else if narrow {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, co0 = po0;
-                  const float a0 = pa0, a1 = pa1, x0 = px0, x1 = px1;
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r);
-                    po0 = *(const device half4*)(oc + r);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0);
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                \(epilogue)\(barrier)}
-
-                """
-        } else {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, cs1 = ps1, co0 = po0, co1 = po1;
-                  const float a0 = pa0, a1 = pa1, x0 = px0, x1 = px1;
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
-                    po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0), s1v = float4(cs1);
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                  const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
-                \(epilogue)\(barrier)}
-
-                """
-        }
-        let reduce =
-            """
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            threadgroup float* red = (threadgroup float*)tiles;
-
-            """
-        return pick + """
-            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            const int G = K / \(group);
-            const int n0 = bx * \(cols);
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const uint tid = thread_position_in_threadgroup.x;
-            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, \(group), false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-            auto tA0 = A.template slice<\(group), 16>(0, 0);
-
-            """ + operandB + """
-            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
-            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
-              auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
-            }
-            float acc[\(ne)], accb[\(ne)];
-            for (int i = 0; i < \(ne); i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
-            const int m0 = mrow, m1 = mrow + 8;
-
-            """ + codeSetup + loop + reduce + """
-            for (int i = 0; i < \(ne); i++) {
-              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
-              red[sg * \(16 * cols) + m * \(cols) + n] = acc[i] + accb[i];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int e = int(tid); e < ksz[1] * \(cols); e += SPLIT * 32) {
-              float v = 0.0f;
-              for (int q = 0; q < SPLIT; q++) { v += red[q * \(16 * cols) + e]; }
-              out[(size_t)(e >> \(narrow ? 4 : 5)) * N + n0 + (e & \(cols - 1))] = ok ? v : as_type<float>(0x7fc00000u);
-            }
-            #undef LO
-            #undef HI
-            """
-    }
-
-    /// One kernel set per form (index = form), for 1 ... 6 sibling layers; form 0 keeps the record names.
-    static let w4KernelSets: [[MLXFast.MLXFastKernel]] = (0 ... 2).map { form in
-        (1 ... 6).map { layers in
-            let group = w4Group ?? 64
-            return MLXFast.metalKernel(
-                name: form == 0 ? "df2_w4g\(group)_\(layers)" : "df2_w4g\(group)f\(form)_\(layers)",
-                inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                    + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                outputNames: (0 ..< layers).map { "out\($0)" },
-                source: w4Source(layers: layers, group: group, form: form), header: header,
-                ensureRowContiguous: true)
-        }
-    }
-
-    static func w4Run(
-        form: Int, narrow: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int]
-    ) -> [MLXArray] {
-        let sizes = MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
-        let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
-        let kernels =
-            narrow
-            ? (form == 2
-                ? (formsFit ? w4Form2NarrowFormsKernels : w4Form2NarrowKernels)
-                : (formsFit ? w4NarrowFormsKernels : w4NarrowKernels))
-            : (formsFit ? w4FormsKernelSets : w4KernelSets)[form]
-        return kernels[ws.count - 1](
-            [xq] + ws + sTs + bTs + [ascale, xs, sizes],
-            template: formsFit ? [("SPLIT", split), ("KC", K)] : [("SPLIT", split)],
-            grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
-            threadGroup: (split * 32, 1, 1),
-            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-    }
-
-    nonisolated(unsafe) private static var w4CheckFailed = false
-    nonisolated(unsafe) private static var w4CheckNote = ""
-
-    /// The w4 kernel form, decided once, at the first 4-bit matmul. `DF2_W4_FORM=0` keeps the
-    /// record kernel. Otherwise form 1 is used only when it compiles and its output bits equal the
-    /// record kernel's on a fixed, input-independent problem at each drafter K (4096, 12288, 32768),
-    /// 15 and 16 rows, and 1, 2, 3 and 6 sibling layers of 64 columns each; a compile error or any
-    /// differing bit keeps the record kernel. Each problem runs the kernel variant the engine runs for
-    /// its shape (the specialized set at K 4096 and 12288, the general set at 32768).
-    static let w4Form: Int = {
-        let value = ProcessInfo.processInfo.environment["DF2_W4_FORM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let group = w4Group ?? 64
-        let chosen: Int
-        let note: String
-        if ["0", "false", "no", "off"].contains(value ?? "") {
-            chosen = 0
-            note = "off (DF2_W4_FORM=0)"
-        } else {
-            var finite = true
-            let failure = w4Check(form: 1, group: group, finite: &finite)
-            chosen = failure == nil ? 1 : 0
-            note = failure.map { "record kernel kept (\($0))" }
-                ?? "bit-identical to the record kernel at K 4096, 12288, 32768; rows 15, 16; layers 1, 2, 3, 6"
-                    + (finite ? "" : " (record output not finite on this device)")
-        }
-        FileHandle.standardError.write(
-            Data("DF2 w4 matmul form \(chosen): \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Form 2 keeps the admitted form 1 as its first fallback.
-    static let w4SelectedForm: Int = {
-        let accepted = w4Form
-        guard accepted == 1 else { return accepted }
-        let value = ProcessInfo.processInfo.environment["DF2_W4_FORM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if value == "1" { return accepted }
-        var finite = true
-        let failure = w4Check(form: 2, group: w4Group ?? 64, finite: &finite)
-        let chosen = failure == nil ? 2 : accepted
-        let note = failure.map { "accepted form 1 kept (\($0))" }
-            ?? "finite and bit-identical to accepted form 1 on fixed checks"
-        FileHandle.standardError.write(Data("DF2 w4 current-bias form \(chosen): \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Nil when `form` matches the record kernel bit for bit on every check problem, else why not.
-    static func w4Check(form: Int, group: Int, finite: inout Bool) -> String? {
-        let n = 64
-        var failure: String? = nil
-        w4CheckFailed = false
-        w4CheckNote = ""
-        withErrorHandler({ message in
-            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
-            DF2Fast.w4CheckFailed = true
-        }) {
-            for k in [4096, 12288, 32768] where k % group == 0 && k / group >= split {
-                let g = k / group
-                let w = MLXArray(
-                    (0 ..< n * k / 8).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) },
-                    [n, k / 8])
-                let sT = MLXArray((0 ..< g * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [g, n])
-                let bT = MLXArray((0 ..< g * n).map { Float16(-Float($0 % 7) / 512) }, [g, n])
-                let xq = MLXArray(
-                    (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let ascale = MLXArray((0 ..< 16 * g).map { Float(1 + $0 % 11) / 256 }, [16 * g])
-                let xs = MLXArray((0 ..< 16 * g).map { Float($0 % 17 - 8) / 64 }, [16 * g])
-                for rows in [16, 15] {
-                    for layers in [1, 2, 3, 6] {
-                        func bits(_ f: Int) -> MLXArray {
-                            let outs = w4Run(
-                                form: f, xq: xq, ascale: ascale, xs: xs, rows: rows, K: k,
-                                ws: Array(repeating: w, count: layers),
-                                sTs: Array(repeating: sT, count: layers),
-                                bTs: Array(repeating: bT, count: layers),
-                                ns: Array(repeating: n, count: layers))
-                            return concatenated(outs, axis: 1).view(dtype: .uint32)
-                        }
-                        let record = bits(form == 2 ? 1 : 0)
-                        let candidate = bits(form)
-                        if form == 2 {
-                            let recordFinite = isFinite(record.view(dtype: .float32)).all()
-                            let candidateFinite = isFinite(candidate.view(dtype: .float32)).all()
-                            eval(recordFinite, candidateFinite)
-                            if w4CheckFailed {
-                                failure = "compile or run error: \(w4CheckNote)"
-                                return
-                            }
-                            if !recordFinite.item(Bool.self) || !candidateFinite.item(Bool.self) {
-                                finite = false
-                                failure = "non-finite control or candidate at K \(k), rows \(rows), layers \(layers)"
-                                return
-                            }
-                        }
-                        let differ = (record .!= candidate).asType(.int32).sum()
-                        let nonFinite = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
-                        eval(differ, nonFinite)
-                        if w4CheckFailed {
-                            failure = "compile or run error: \(w4CheckNote)"
-                            return
-                        }
-                        let d = differ.item(Int32.self)
-                        if d != 0 {
-                            failure = "\(d) words differ at K \(k), rows \(rows), layers \(layers)"
-                            return
-                        }
-                        if nonFinite.item(Int32.self) != 0 { finite = false }
-                    }
-                }
-            }
-        }
-        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
-        return failure
-    }
-
-    /// The eligible W4 matrices fit in 32-bit element offsets. Specialize their
-    /// input stride while leaving tensor products and all FP32 reductions unchanged.
-    /// One set per w4 kernel form (index = form); form 0 keeps the names above.
-    static let w4FormsKernelSets: [[MLXFast.MLXFastKernel]] = (0 ... 2).map { form in
-        (1 ... 6).map { layers in
-            let group = w4Group ?? 64
-            let source = w4Specialize(w4Source(layers: layers, group: group, form: form))
-            return MLXFast.metalKernel(
-                name: form == 0 ? "df2_w4g\(group)_forms_\(layers)" : "df2_w4g\(group)f\(form)_forms_\(layers)",
-                inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                    + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                outputNames: (0 ..< layers).map { "out\($0)" },
-                source: source, header: header, ensureRowContiguous: true)
-        }
-    }
-
-    /// The compile-time K and 32-bit offset text replacements of the specialized kernels.
-    static func w4Specialize(_ source: String) -> String {
-        source
-            .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            .replacingOccurrences(of: "const size_t rowU4", with: "const uint rowU4")
-            .replacingOccurrences(of: "(size_t)", with: "(uint)")
-    }
-
-    /// Form 1 at 16 output columns per threadgroup (`w4Source(narrow: true)`), for 1 ... 6 sibling
-    /// layers: the general set, and the specialized set `w4FormsFit` picks, as for the wide kernels.
-    static let w4NarrowKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: false)
-    }
-    static let w4NarrowFormsKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: true)
-    }
-    static let w4Form2NarrowKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: false, form: 2)
-    }
-    static let w4Form2NarrowFormsKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: true, form: 2)
-    }
-    static func w4NarrowKernel(layers: Int, specialized: Bool, form: Int = 1) -> MLXFast.MLXFastKernel {
-        let group = w4Group ?? 64
-        let source = w4Source(layers: layers, group: group, form: form, narrow: true)
-        return MLXFast.metalKernel(
-            name: "df2_w4g\(group)f\(form)n\(specialized ? "_forms" : "")_\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: specialized ? w4Specialize(source) : source, header: header,
-            ensureRowContiguous: true)
-    }
-
-    /// The widest call (output columns summed over its sibling layers) that takes the narrow
-    /// kernels: 4096 columns launch 256 threadgroups instead of 128.
-    static let w4NarrowColumns = 4096
-
-    /// The drafter's own narrow-eligible shapes: (K, output columns per sibling layer).
-    static let w4NarrowShapes: [(k: Int, ns: [Int])] = [
-        (4096, [4096]), (12288, [4096]), (32768, [4096]), (4096, [1024]), (4096, [256]),
-        (4096, [1024, 1024]), (4096, [64, 64, 64]), (12288, [64, 64, 64, 64, 64, 64]),
-    ]
-
-    /// Whether narrow calls take the narrow kernels, decided once, at the first narrow-eligible
-    /// 4-bit matmul. `DF2_W4_NARROW=0` keeps the wide kernels. Otherwise the narrow kernels are used
-    /// only when form 1 is in use and their output bits equal the record kernel's (form 0, 32
-    /// columns) on a fixed, input-independent problem at each of `w4NarrowShapes`, 15 and 16 rows;
-    /// a compile error or any differing bit keeps the wide kernels.
-    static let w4Narrow: Bool = {
-        let value = ProcessInfo.processInfo.environment["DF2_W4_NARROW"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let chosen: Bool
-        let note: String
-        if ["0", "false", "no", "off"].contains(value ?? "") {
-            chosen = false
-            note = "off (DF2_W4_NARROW=0)"
-        } else if w4Form != 1 {
-            chosen = false
-            note = "off (w4 matmul form \(w4Form))"
-        } else {
-            var finite = true
-            let failure = w4NarrowCheck(group: w4Group ?? 64, finite: &finite)
-            chosen = failure == nil
-            note = failure.map { "wide kernels kept (\($0))" }
-                ?? "16 columns per threadgroup for calls up to \(w4NarrowColumns) columns; bit-identical to the record kernel at "
-                    + w4NarrowShapes.map { "K \($0.k) N \($0.ns.map(String.init).joined(separator: "+"))" }
-                    .joined(separator: ", ") + "; rows 15, 16"
-                    + (finite ? "" : " (record output not finite on this device)")
-        }
-        FileHandle.standardError.write(Data("DF2 w4 matmul narrow: \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Narrow form 2 must pass after accepted narrow form 1 has passed.
-    static let w4Form2Narrow: Bool = {
-        guard w4SelectedForm == 2, w4Narrow else { return false }
-        var finite = true
-        let failure = w4NarrowCheck(group: w4Group ?? 64, form: 2, finite: &finite)
-        let chosen = failure == nil
-        let note = failure.map { "accepted narrow form 1 kept (\($0))" }
-            ?? "finite and bit-identical to accepted narrow form 1 on fixed checks"
-        FileHandle.standardError.write(Data("DF2 w4 current-bias narrow: \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Nil when the narrow kernels match the record kernel bit for bit at every narrow shape.
-    static func w4NarrowCheck(group: Int, form: Int = 1, finite: inout Bool) -> String? {
-        var failure: String? = nil
-        w4CheckFailed = false
-        w4CheckNote = ""
-        withErrorHandler({ message in
-            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
-            DF2Fast.w4CheckFailed = true
-        }) {
-            for (k, ns) in w4NarrowShapes where k % group == 0 && k / group >= split {
-                let g = k / group
-                let xq = MLXArray(
-                    (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let ascale = MLXArray((0 ..< 16 * g).map { Float(1 + $0 % 11) / 256 }, [16 * g])
-                let xs = MLXArray((0 ..< 16 * g).map { Float($0 % 17 - 8) / 64 }, [16 * g])
-                var ws: [MLXArray] = [], sTs: [MLXArray] = [], bTs: [MLXArray] = []
-                for (l, n) in ns.enumerated() {
-                    let i = arange(n * k / 8, dtype: .uint32) + MLXArray(UInt32(l * 7919 + 1))
-                    let h = i * MLXArray(UInt32(2_654_435_761))
-                    ws.append((h ^ (h >> MLXArray(UInt32(15)))).reshaped([n, k / 8]))
-                    let j = arange(g * n, dtype: .int32) + MLXArray(Int32(l))
-                    sTs.append(
-                        ((j % MLXArray(Int32(13))).asType(.float32) + 1) / 1024)
-                    bTs.append(-(j % MLXArray(Int32(7))).asType(.float32) / 512)
-                    sTs[l] = sTs[l].asType(.float16).reshaped([g, n])
-                    bTs[l] = bTs[l].asType(.float16).reshaped([g, n])
-                }
-                eval(ws + sTs + bTs)
-                for rows in [16, 15] {
-                    let record = concatenated(
-                        w4Run(
-                            form: form == 2 ? 1 : 0, narrow: form == 2,
-                            xq: xq, ascale: ascale, xs: xs, rows: rows, K: k, ws: ws, sTs: sTs,
-                            bTs: bTs, ns: ns), axis: 1
-                    ).view(dtype: .uint32)
-                    let candidate = concatenated(
-                        w4Run(
-                            form: form, narrow: true, xq: xq, ascale: ascale, xs: xs, rows: rows, K: k,
-                            ws: ws, sTs: sTs, bTs: bTs, ns: ns), axis: 1
-                    ).view(dtype: .uint32)
-                    if form == 2 {
-                        let recordFinite = isFinite(record.view(dtype: .float32)).all()
-                        let candidateFinite = isFinite(candidate.view(dtype: .float32)).all()
-                        eval(recordFinite, candidateFinite)
-                        if w4CheckFailed {
-                            failure = "compile or run error: \(w4CheckNote)"
-                            return
-                        }
-                        if !recordFinite.item(Bool.self) || !candidateFinite.item(Bool.self) {
-                            finite = false
-                            failure = "non-finite control or candidate at K \(k), rows \(rows), N \(ns)"
-                            return
-                        }
-                    }
-                    let differ = (record .!= candidate).asType(.int32).sum()
-                    let nonFinite = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
-                    eval(differ, nonFinite)
-                    if w4CheckFailed {
-                        failure = "compile or run error: \(w4CheckNote)"
-                        return
-                    }
-                    let d = differ.item(Int32.self)
-                    if d != 0 {
-                        failure = "\(d) words differ at K \(k), N \(ns), rows \(rows)"
-                        return
-                    }
-                    if nonFinite.item(Int32.self) != 0 { finite = false }
-                }
-            }
-        }
-        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
-        return failure
-    }
-
-    /// The matrices the specialized kernels above take: K 4096 or 12288, 1 ... 16 rows, and every
-    /// N * K below 2^32.
-    static func w4FormsFit(K: Int, rows: Int, ns: [Int]) -> Bool {
-        (K == 4096 || K == 12288) && (1 ... 16).contains(rows)
-            && ns.allSatisfy { $0 > 0 && UInt64($0) * UInt64(K) < UInt64(UInt32.max) }
-    }
-
-    static func w4Quant(
-        _ x: MLXArray, up: MLXArray?, group: Int, headMajor: Bool, rowsOverride: Int? = nil,
-        kOverride: Int? = nil
-    ) -> W4Codes? {
-        let K = kOverride ?? x.dim(-1)
-        let rows = rowsOverride ?? (x.size / K)
-        guard (1 ... 16).contains(rows), (group == 64 || group == 128), K % group == 0,
-            K % 16 == 0, split > 0, K / group >= split
-        else {
-            return nil
-        }
-        let x2 = up ?? x
-        let wide = DF2WideLanes.serves(
-            .init(kind: .quantG, dtype: x.dtype, dtype2: x2.dtype, k: K, group: group,
-                flag: (up == nil ? 0 : 1) + (headMajor ? 2 : 0)))
-        let q = quantGRun(x, x2, K: K, rows: rows, group: group, headMajor: headMajor, swiglu: up != nil, wide: wide)
-        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
-    }
-
-    /// `df2_act_q8g` at 16 columns per thread, or its `DF2WideLaneSource` twin (`wide`).
-    static func quantGRun(
-        _ x: MLXArray, _ x2: MLXArray, K: Int, rows: Int, group: Int, headMajor: Bool, swiglu: Bool, wide: Bool
-    ) -> [MLXArray] {
-        let G = K / group
-        let totalThreads = K / (wide ? DF2WideLanes.e : 16)
-        let tg = Swift.min(256, totalThreads)
-        return (wide ? DF2WideLanes.quantG : quantG)(
-            [x, x2, MLXArray([Int32(K), Int32(rows)])],
-            template: [("SWIGLU", swiglu ? 1 : 0), ("KG", group), ("HEAD_MAJOR", headMajor ? 1 : 0)],
-            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[16 * K], [16 * G], [16 * G]],
-            outputDTypes: [.int8, .float32, .float32])
-    }
-
-    /// `df2_act_q8g_conv0` at 16 columns per thread, or its `DF2WideLaneSource` twin (`wide`).
-    static func conv0Run(
-        _ h: MLXArray, dyn: MLXArray, base: MLXArray, K: Int, rows: Int, group: Int, wide: Bool
-    ) -> [MLXArray] {
-        let G = K / group
-        let totalThreads = K / (wide ? DF2WideLanes.e : 16)
-        let tg = Swift.min(256, totalThreads)
-        return (wide ? DF2WideLanes.quantGConv0 : quantGConv0)(
-            [h, dyn, base, MLXArray([Int32(K), Int32(rows)])],
-            template: [("KG", group)],
-            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[16 * K], [16 * G], [16 * G]],
-            outputDTypes: [.int8, .float32, .float32])
-    }
-
-    static func w4LinearsFromCodes(
-        _ codes: W4Codes, leadShape: [Int], _ layers: [Linear]
-    ) -> [MLXArray]? {
-        guard on, (1 ... 6).contains(layers.count) else { return nil }
-        let ops = layers.compactMap { w4Operands($0, group: codes.group) }
-        guard ops.count == layers.count, ops.allSatisfy({ $0.k == codes.K }) else { return nil }
-        let ns = ops.map(\.n)
-        let preferredForm = w4SelectedForm
-        let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
-        let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
-        let outs = w4Run(
-            form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
-            rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-            ns: ns)
-        return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
-    }
-
-    /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
-    static func w4Linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray?, group: Int) -> [MLXArray]? {
-        guard let codes = w4Quant(x, up: up, group: group, headMajor: false) else { return nil }
-        return w4LinearsFromCodes(codes, leadShape: Array(x.shape.dropLast()), layers)
-    }
-
-    /// `layers(dynConv(h, dyn, base, part: 0, residual: nil))` with `dynConv(part: 0)` fused into `quantGConv0`.
-    static func linearsConv0(
-        _ h: MLXArray, dyn: MLXArray, base: MLXArray, _ layers: [Linear]
-    ) -> [MLXArray]? {
-        guard on, (1 ... 6).contains(layers.count), let group = w4Group, (group == 64 || group == 128)
-        else { return nil }
-        let K = h.dim(-1)
-        let rows = h.size / K
-        guard (1 ... 16).contains(rows), K % group == 0, K % 16 == 0, split > 0, K / group >= split
-        else { return nil }
-        let ops = layers.compactMap { w4Operands($0, group: group) }
-        guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
-        let wide = DF2WideLanes.serves(
-            .init(kind: .quantGConv0, dtype: h.dtype, dtype2: dyn.dtype, k: K, group: group, flag: base.dtype == .float32 ? 0 : 1))
-        let q = conv0Run(h.reshaped([rows, K]), dyn: dyn, base: base, K: K, rows: rows, group: group, wide: wide)
-        let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
-        return w4LinearsFromCodes(codes, leadShape: Array(h.shape.dropLast()), layers)
-    }
-
-    /// `layer(output.transposed(0, 2, 1, 3).reshaped(1, L, 4096))` reading head-major `[1, 32, L, 128]` directly.
-    static func linearHeadMajor(_ xHeadMajor: MLXArray, _ layer: Linear, L: Int) -> MLXArray? {
-        guard on, let group = w4Group,
-            let codes = w4Quant(
-                xHeadMajor, up: nil, group: group, headMajor: true, rowsOverride: L,
-                kOverride: 4096),
-            let outs = w4LinearsFromCodes(codes, leadShape: [1, L], [layer])
-        else { return nil }
-        return outs[0]
     }
 
     static func linear(_ x: MLXArray, _ layer: Linear) -> MLXArray {
@@ -3458,150 +2494,6 @@ enum DF2Fast {
         return (outs[0], outs[1], outs[2])
     }
 
-    /// Fused `rmsNorm(x, weight, eps)` + `W4Codes` int8 group quantization for `D = 4096, L <= 16`.
-    static let rmsQuantKernel = MLXFast.metalKernel(
-        name: "df2_rms_q8g",
-        inputNames: ["x", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_norm", "xq", "ascale", "xs"],
-        source: """
-            const uint tid = thread_position_in_threadgroup.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
-            const int c0 = int(tid) * 16;
-            const int G = D / KG;
-            const int g = int(tid) / (KG / 16);
-            if (l >= L) {
-              if (l < 16) {
-                const size_t qRowBase = (size_t)l * D + c0;
-                device char4* dst = (device char4*)(xq + qRowBase);
-                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-                if ((int(tid) & ((KG / 16) - 1)) == 0) {
-                  ascale[l * G + g] = 0.0f;
-                  xs[l * G + g] = 0.0f;
-                }
-              }
-              return;
-            }
-            const size_t rowBase = (size_t)l * D + c0;
-            float v[16];
-            float s4[4];
-            for (int k = 0; k < 4; k++) {
-              float ak = 0.0f;
-              for (int i = 0; i < 4; i++) {
-                const int u = 4 * k + i;
-                const float a = float(x[rowBase + u]);
-                v[u] = a;
-                ak += a * a;
-              }
-              s4[k] = ak;
-            }
-            float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
-            sq += simd_shuffle_xor(sq, 1);
-            sq += simd_shuffle_xor(sq, 2);
-            sq += simd_shuffle_xor(sq, 4);
-            threadgroup float shared_sq[32];
-            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-              const float tot = simd_sum(shared_sq[lane]);
-              if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float scale = shared_sq[0];
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              const float y = float(weight[c0 + u]) * (v[u] * scale);
-              if (WRITE_NORM) { out_norm[rowBase + u] = y; }
-              nv[u] = y;
-              local_amax = max(local_amax, fabs(y));
-            }
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-            if (KG == 128) {
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-            }
-            float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
-            for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
-            }
-            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-            const float ia = 1.0f / a;
-            device char4* dst = (device char4*)(xq + rowBase);
-            for (int u = 0; u < 4; u++) {
-              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-              dst[u] = char4(int4(rint(fv * ia)));
-            }
-            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-              ascale[l * G + g] = a;
-              xs[l * G + g] = seq_sum;
-            }
-            """)
-
-    static func rmsQuant(
-        _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true
-    ) -> (MLXArray, W4Codes)? {
-        let D = x.dim(-1), L = x.size / D
-        guard on, D == 4096, (1 ... 16).contains(L),
-            (group == 64 || group == 128), split > 0, D / group >= split
-        else {
-            return nil
-        }
-        let w = normWeight(norm)
-        let wide = DF2WideLanes.serves(
-            .init(kind: .rmsQuant, dtype: x.dtype, dtype2: w.dtype, k: D, group: group, flag: 0))
-        let outs = rmsQuantRun(
-            x, w, D: D, L: L, eps: norm.eps, group: group, wide: wide, writeNorm: writeNorm)
-        let codes = W4Codes(xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
-        return (outs[0], codes)
-    }
-
-    /// `df2_rms_q8g` at 256 lanes per row, or its `DF2WideLaneSource` twin (`wide`).
-    static func rmsQuantRun(
-        _ x: MLXArray, _ w: MLXArray, D: Int, L: Int, eps: Float, group: Int, wide: Bool,
-        writeNorm: Bool = true
-    ) -> [MLXArray] {
-        let G = D / group
-        let lanes = D / (wide ? DF2WideLanes.e : 16)
-        return (wide ? DF2WideLanes.rmsQuant : rmsQuantKernel)(
-            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([eps])],
-            template: [("D", D), ("KG", group), ("WRITE_NORM", writeNorm ? 1 : 0)],
-            grid: (lanes, Swift.max(L, 16), 1), threadGroup: (lanes, 1, 1),
-            outputShapes: [writeNorm ? x.shape : [1], [16 * D], [16 * G], [16 * G]],
-            outputDTypes: [.float32, .int8, .float32, .float32])
-    }
-
-    /// `df2_dyn_conv_rms_q8g` at 256 lanes per row, or its `DF2WideLaneSource` twin (`wide`).
-    static func convRmsQuantRun(
-        _ h: MLXArray, dyn: MLXArray, base: MLXArray, residual: MLXArray, weight: MLXArray,
-        D: Int, L: Int, qStart: Int, eps: Float, group: Int, wide: Bool
-    ) -> [MLXArray] {
-        let G = D / group
-        let qRows = L - qStart
-        let writeRes = qStart == 0
-        let resShape = writeRes ? h.shape : [1]
-        let normShape = qStart > 0 ? (Array(h.shape.dropLast(2)) + [qRows, D]) : h.shape
-        let lanes = D / (wide ? DF2WideLanes.e : 16)
-        return (wide ? DF2WideLanes.convRmsQuant : convRmsQuantKernel)(
-            [
-                h, dyn, base, residual, weight,
-                MLXArray([Int32(D), Int32(L), Int32(qStart)]),
-                MLXArray([eps]),
-            ],
-            template: [("D", D), ("KG", group), ("WRITE_RES", writeRes ? 1 : 0)],
-            grid: (lanes, Swift.max(L, qStart + 16), 1), threadGroup: (lanes, 1, 1),
-            outputShapes: [resShape, normShape, [16 * D], [16 * G], [16 * G]],
-            outputDTypes: [.float32, .float32, .int8, .float32, .float32])
-    }
-
     /// One part of `DFlash2GroupedDynamicCausalConv` (B = 1) in one kernel, plus an optional residual.
     static let conv = MLXFast.metalKernel(
         name: "df2_dyn_conv", inputNames: ["h", "dyn", "base", "res", "dsz"], outputNames: ["out"],
@@ -3674,139 +2566,18 @@ enum DF2Fast {
             }
             """)
 
-    /// Fused `dynConv(part: 1, residual: res)` + `rmsNorm(out_res, weight, eps)` + `W4Codes` int8 quantization
-    /// on rows `qStart ..< L` for `D = 4096`.
-    static let convRmsQuantKernel = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g",
-        inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
-        source: """
-            const uint tid = thread_position_in_threadgroup.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
-            const int qStart = dsz[2];
-            const int qm = l - qStart;
-            const int c0 = int(tid) * 16;
-            const int G = D / KG;
-            const int qg = int(tid) / (KG / 16);
-            if (!WRITE_RES && l < qStart) return;
-            if (l >= L) {
-              if (qm >= 0 && qm < 16) {
-                const size_t qRowBase = (size_t)qm * D + c0;
-                device char4* dst = (device char4*)(xq + qRowBase);
-                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-                if ((int(tid) & ((KG / 16) - 1)) == 0) {
-                  ascale[qm * G + qg] = 0.0f;
-                  xs[qm * G + qg] = 0.0f;
-                }
-              }
-              return;
-            }
-            const int dw = 4 * (D / 16);
-            const int g = int(tid);
-            const size_t rowBase = (size_t)l * D + c0;
-            const float d0 = float(dyn[l * dw + (dw / 2) + g]);
-            const float d1 = l >= 1 ? float(dyn[l * dw + (dw / 2) + (D / 16) + g]) : 0.0f;
-            float v[16];
-            float s4[4];
-            for (int k = 0; k < 4; k++) {
-              float ak = 0.0f;
-              for (int i = 0; i < 4; i++) {
-                const int u = 4 * k + i;
-                const int c = c0 + u;
-                float acc = float(res[rowBase + u]) + (float(base[2 * D + c]) + d0) * float(h[rowBase + u]);
-                if (l >= 1) {
-                  acc += (float(base[3 * D + c]) + d1) * float(h[rowBase - D + u]);
-                }
-                v[u] = acc;
-                if (WRITE_RES) { out_res[rowBase + u] = acc; }
-                ak += acc * acc;
-              }
-              s4[k] = ak;
-            }
-            float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
-            sq += simd_shuffle_xor(sq, 1);
-            sq += simd_shuffle_xor(sq, 2);
-            sq += simd_shuffle_xor(sq, 4);
-            threadgroup float shared_sq[32];
-            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-              const float tot = simd_sum(shared_sq[lane]);
-              if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float scale = shared_sq[0];
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              const float y = float(weight[c0 + u]) * (v[u] * scale);
-              nv[u] = y;
-              local_amax = max(local_amax, fabs(y));
-            }
-            if (qm >= 0 && qm < 16) {
-              const size_t qRowBase = (size_t)qm * D + c0;
-              for (int u = 0; u < 16; u++) {
-                out_norm[qRowBase + u] = nv[u];
-              }
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-              if (KG == 128) {
-                local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-              }
-              float seq_sum = 0.0f;
-              const uint grpBase = lane & ~uint((KG / 16) - 1);
-              for (int step = 0; step < (KG / 16); step++) {
-                seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-                if ((int(lane) & ((KG / 16) - 1)) == step) {
-                  for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-                }
-              }
-              const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-              const float ia = 1.0f / a;
-              device char4* dst = (device char4*)(xq + qRowBase);
-              for (int u = 0; u < 4; u++) {
-                const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-                dst[u] = char4(int4(rint(fv * ia)));
-              }
-              if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-                ascale[qm * G + qg] = a;
-                xs[qm * G + qg] = seq_sum;
-              }
-            }
-            """)
-
     static func dynConvRms(
-        _ h: MLXArray, dyn: MLXArray, base: MLXArray, residual: MLXArray, norm: RMSNorm,
-        qStart: Int = 0
-    ) -> (MLXArray, MLXArray, W4Codes?)? {
+        _ h: MLXArray, dyn: MLXArray, base: MLXArray, residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
         let D = h.dim(-1), L = h.size / D
         guard on, D == 4096 else { return nil }
         let w = normWeight(norm)
-        let qRows = L - qStart
-        if (1 ... 16).contains(qRows), let group = w4Group, (group == 64 || group == 128),
-            split > 0, D / group >= split
-        {
-            let wide = DF2WideLanes.serves(
-                .init(kind: .convRmsQuant, dtype: h.dtype, dtype2: residual.dtype, k: D, group: group,
-                    flag: (qStart == 0 ? 1 : 0) + (dyn.dtype == .float32 ? 0 : 2) + (base.dtype == .float32 ? 0 : 4)))
-            let outs = convRmsQuantRun(
-                h, dyn: dyn, base: base, residual: residual, weight: w,
-                D: D, L: L, qStart: qStart, eps: norm.eps, group: group, wide: wide)
-            let codes = W4Codes(
-                xq: outs[2], ascale: outs[3], xs: outs[4], rows: qRows, K: D, group: group)
-            return (outs[0], outs[1], codes)
-        }
         let outs = convRms(
             [h, dyn, base, residual, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
             template: [("D", D)],
             grid: (256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape, h.shape], outputDTypes: [.float32, .float32])
-        return (outs[0], outs[1], nil)
+        return (outs[0], outs[1])
     }
 
     static func dynConv(_ h: MLXArray, dyn: MLXArray, base: MLXArray, part: Int, residual: MLXArray?) -> MLXArray {
@@ -4029,434 +2800,3 @@ public final class DFlash2ContextProjection {
             contextKV: kv)
     }
 }
-
-/// Serves `DF2WideLaneSource` for the drafter's per-row kernels. Each input combination (kernel,
-/// dtypes, width, group, form) runs wide only after a load-time check found every output bit equal to
-/// the record kernel's; anything unchecked, failed or erroring keeps the record kernel.
-/// `DF2_WIDE=0` keeps every record kernel. The default serves the conv and row-norm kernels
-/// (`df2_act_q8g_conv0`, `df2_rms_q8g`, `df2_dyn_conv_rms_q8g`) at 512 lanes per 4096-column row;
-/// a value containing `all` adds `df2_act_q8g`, one containing `1024` uses 1024 lanes.
-enum DF2WideLanes {
-    typealias Kind = DF2WideLaneSource.Kind
-
-    struct Combo: Hashable {
-        let kind: Kind
-        let dtype: DType
-        let dtype2: DType
-        let k: Int
-        let group: Int
-        let flag: Int
-    }
-
-    static let setting: String =
-        (ProcessInfo.processInfo.environment["DF2_WIDE"] ?? "")
-        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    static let enabled = !["0", "false", "no", "off"].contains(setting)
-    static let e = setting.contains("1024") ? 4 : 8
-    /// `df2_act_q8g` runs wide by default too (still only after its load check);
-    /// `DARKBLOOM_BONSAI_DF2_QUANTG_WIDE=0` restores the `all`-only opt-in.
-    static let quantGDefault =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_QUANTG_WIDE"] != "0"
-    static func offered(_ kind: Kind) -> Bool {
-        enabled && (kind != .quantG || quantGDefault || setting.contains("all"))
-    }
-
-    static let quantG = MLXFast.metalKernel(
-        name: "df2_act_q8g_e\(e)", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
-        source: DF2WideLaneSource.source(.quantG, e: e))
-    static let quantGConv0 = MLXFast.metalKernel(
-        name: "df2_act_q8g_conv0_e\(e)", inputNames: ["h", "dyn", "base", "ksz"],
-        outputNames: ["xq", "ascale", "xs"], source: DF2WideLaneSource.source(.quantGConv0, e: e))
-    static let rmsQuant = MLXFast.metalKernel(
-        name: "df2_rms_q8g_e\(e)", inputNames: ["x", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_norm", "xq", "ascale", "xs"], source: DF2WideLaneSource.source(.rmsQuant, e: e))
-    static let convRmsQuant = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g_e\(e)",
-        inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
-        source: DF2WideLaneSource.source(.convRmsQuant, e: e))
-
-    /// Written once by `prepare` at bind, before any proposal; read-only afterwards.
-    nonisolated(unsafe) static var passed: Set<Combo> = []
-    nonisolated(unsafe) static var prepared = false
-
-    static func serves(_ combo: Combo) -> Bool {
-        enabled && passed.contains(combo)
-    }
-
-    private static func log(_ s: String) {
-        FileHandle.standardError.write(Data("DF2 wide lanes: \(s)\n".utf8))
-    }
-
-    /// Deterministic synthetic rows: row 0 all zero, row 1 at 30x, the rest O(1).
-    private static func rows(_ r: Int, _ width: Int, seed: Float, dtype: DType = .float32) -> MLXArray {
-        let i = MLXArray(0 ..< (r * width)).asType(.float32)
-        let v = MLX.sin(i * (0.7548776 + seed)) * (1 + 0.5 * MLX.cos(i * 0.0137 + seed)) * 2
-        let scale = MLXArray((0 ..< r).map { Float($0 == 0 ? 0 : ($0 == 1 ? 30 : 1)) }).reshaped([r, 1])
-        return (v.reshaped([r, width]) * scale).asType(dtype)
-    }
-
-    private static func same(_ a: [MLXArray], _ b: [MLXArray], skip: Set<Int> = []) -> MLXArray {
-        var eq: [MLXArray] = []
-        for (j, (x, y)) in zip(a, b).enumerated() where !skip.contains(j) {
-            eq.append(MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32)))
-        }
-        return MLX.all(MLX.stacked(eq))
-    }
-
-    /// One combination at 3, 11 and 16 rows: record kernel vs wide kernel, every output bit.
-    private static func check(_ c: Combo) -> Bool {
-        var eqs: [MLXArray] = []
-        for r in [3, 11, 16] {
-            switch c.kind {
-            case .quantG:
-                let swiglu = c.flag & 1 != 0, headMajor = c.flag & 2 != 0
-                let x = rows(r, c.k, seed: 0.01, dtype: c.dtype)
-                let x2 = swiglu ? rows(r, c.k, seed: 0.02, dtype: c.dtype2) : x
-                let xin = headMajor ? x.reshaped([r, 32, 128]).transposed(1, 0, 2).reshaped([1, 32, r, 128]) : x
-                let x2in = headMajor ? xin : x2
-                let a = DF2Fast.quantGRun(xin, x2in, K: c.k, rows: r, group: c.group, headMajor: headMajor, swiglu: swiglu, wide: false)
-                let b = DF2Fast.quantGRun(xin, x2in, K: c.k, rows: r, group: c.group, headMajor: headMajor, swiglu: swiglu, wide: true)
-                eqs.append(same(a, b))
-            case .quantGConv0:
-                let h = rows(r, c.k, seed: 0.03, dtype: c.dtype)
-                let dyn = (rows(r, c.k / 4, seed: 0.04) * 0.2).asType(c.dtype2)
-                let base = (rows(4, c.k, seed: 0.05)[2...] * 0.2).reshaped([-1]).asType(c.flag == 0 ? .float32 : .bfloat16)
-                let a = DF2Fast.conv0Run(h, dyn: dyn, base: base, K: c.k, rows: r, group: c.group, wide: false)
-                let b = DF2Fast.conv0Run(h, dyn: dyn, base: base, K: c.k, rows: r, group: c.group, wide: true)
-                eqs.append(same(a, b))
-            case .rmsQuant:
-                let x = rows(r, c.k, seed: 0.06, dtype: c.dtype).reshaped([1, r, c.k])
-                let w = (MLX.abs(rows(2, c.k, seed: 0.07)[1]) * 0.25 + 0.5).asType(c.dtype2)
-                let a = DF2Fast.rmsQuantRun(x, w, D: c.k, L: r, eps: 1e-6, group: c.group, wide: false)
-                let b = DF2Fast.rmsQuantRun(x, w, D: c.k, L: r, eps: 1e-6, group: c.group, wide: true)
-                eqs.append(same(a, b))
-            case .convRmsQuant:
-                let qStart = c.flag & 1 != 0 ? 0 : 1
-                let h = rows(r, c.k, seed: 0.08, dtype: c.dtype).reshaped([1, r, c.k])
-                let res = rows(r, c.k, seed: 0.09, dtype: c.dtype2).reshaped([1, r, c.k])
-                let dyn = (rows(r, c.k / 4, seed: 0.10) * 0.2).asType(c.flag & 2 != 0 ? .bfloat16 : .float32)
-                    .reshaped([1, r, c.k / 4])
-                let base = (rows(4, c.k, seed: 0.11)[2...] * 0.2).reshaped([-1])
-                    .asType(c.flag & 4 != 0 ? .bfloat16 : .float32)
-                let base4 = concatenated([base, base])
-                let w = MLX.abs(rows(2, c.k, seed: 0.12)[1]) * 0.25 + 0.5
-                let a = DF2Fast.convRmsQuantRun(
-                    h, dyn: dyn, base: base4, residual: res, weight: w,
-                    D: c.k, L: r, qStart: qStart, eps: 1e-6, group: c.group, wide: false)
-                let b = DF2Fast.convRmsQuantRun(
-                    h, dyn: dyn, base: base4, residual: res, weight: w,
-                    D: c.k, L: r, qStart: qStart, eps: 1e-6, group: c.group, wide: true)
-                eqs.append(same(a, b, skip: qStart == 0 ? [] : [0]))
-            }
-        }
-        return MLX.all(MLX.stacked(eqs)).item(Bool.self)
-    }
-
-    /// The combinations the drafter's fast path dispatches (FP32 hidden; BF16 token embeddings and
-    /// target hidden at the first norm, the first residual and the context projection input).
-    static func combos(group: Int) -> [Combo] {
-        var c: [Combo] = []
-        for (k, d, flag) in [
-            (4096, DType.float32, 0), (4096, .bfloat16, 0), (12288, .float32, 1), (4096, .float32, 2),
-            (32768, .bfloat16, 0), (32768, .float32, 0),
-        ] {
-            c.append(Combo(kind: .quantG, dtype: d, dtype2: d, k: k, group: group, flag: flag))
-        }
-        c.append(Combo(kind: .quantGConv0, dtype: .float32, dtype2: .float32, k: 4096, group: group, flag: 0))
-        for d in [DType.float32, .bfloat16] {
-            c.append(Combo(kind: .rmsQuant, dtype: d, dtype2: .float32, k: 4096, group: group, flag: 0))
-            for writeRes in [1, 0] {
-                c.append(Combo(kind: .convRmsQuant, dtype: .float32, dtype2: d, k: 4096, group: group, flag: writeRes))
-            }
-        }
-        return c
-    }
-
-    /// Runs the check once, at drafter bind (load time, before any proposal or timed window).
-    static func prepare(group: Int) {
-        guard !prepared else { return }
-        prepared = true
-        guard enabled else {
-            log("off (DF2_WIDE)")
-            return
-        }
-        for kind in Kind.allCases where offered(kind) {
-            var ok = 0, failed: [String] = []
-            for combo in combos(group: group) where combo.kind == kind {
-                // An MLX error in the check (a pipeline that cannot run this many threads per
-                // threadgroup on this GPU, a compile error) keeps the record kernel.
-                let name = "\(combo.dtype)/\(combo.dtype2)/k\(combo.k)/form\(combo.flag)"
-                do {
-                    if try withError({ check(combo) }) {
-                        passed.insert(combo)
-                        ok += 1
-                    } else {
-                        failed.append(name + " mismatch")
-                    }
-                } catch {
-                    failed.append(name + " error \(error)")
-                }
-            }
-            log("\(kind.rawValue) e\(e) load check: \(ok) combinations bitwise equal at rows 3, 11, 16"
-                + (failed.isEmpty ? "" : "; record kernel kept for " + failed.joined(separator: ", ")))
-        }
-    }
-}
-
-// WIDELANES-GEN BEGIN
-/// The drafter's four per-row activation kernels (`df2_act_q8g`, `df2_act_q8g_conv0`, `df2_rms_q8g`,
-/// `df2_dyn_conv_rms_q8g`) with `e` contiguous columns per thread instead of 16: e = 8 puts 512 lanes on a
-/// 4096-column row. Every element formula is the 16-column kernel's. The row RMS keeps its reduction tree:
-/// each thread still sums squares in quads, the record's 16-column partial ((q0 + q1) + (q2 + q3)) is rebuilt
-/// with xor shuffles (FP32 addition commutes bit for bit), then the record's xor 1, 2, 4 butterfly over 128
-/// columns runs at strides 16/e, 32/e, 64/e and the same 32 block partials meet in one simd_sum. The group
-/// sum stays strictly sequential in column order, chained over KG/e lanes, and the group max is order-free.
-/// So every output bit equals the 16-column kernel's.
-enum DF2WideLaneSource {
-    enum Kind: String, CaseIterable {
-        case quantG, quantGConv0, rmsQuant, convRmsQuant
-        var hasRowNorm: Bool { self == .rmsQuant || self == .convRmsQuant }
-    }
-
-    /// Group max, sequential group sum and int8 codes of `nv[e]`; scale and sum land at `row * G + group`.
-    static func tail(e: Int, row: String, group: String, base: String) -> String {
-        """
-        for (int s = 1; s < (KG / \(e)); s <<= 1) {
-          local_amax = max(local_amax, simd_shuffle_xor(local_amax, ushort(s)));
-        }
-        float seq_sum = 0.0f;
-        const uint grpBase = lane & ~uint((KG / \(e)) - 1);
-        for (int step = 0; step < (KG / \(e)); step++) {
-          seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-          if ((int(lane) & ((KG / \(e)) - 1)) == step) {
-            for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
-          }
-        }
-        const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-        const float ia = 1.0f / a;
-        device char4* dst = (device char4*)(xq + \(base));
-        for (int u = 0; u < \(e / 4); u++) {
-          const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-          dst[u] = char4(int4(rint(fv * ia)));
-        }
-        if ((int(lane) & ((KG / \(e)) - 1)) == (KG / \(e)) - 1) {
-          ascale[\(row) * G + \(group)] = a;
-          xs[\(row) * G + \(group)] = seq_sum;
-        }
-
-        """
-    }
-
-    /// Zero codes, scale and sum for a padding row `row` (rows past the live count, up to 16).
-    static func zeroRow(e: Int, row: String, group: String, base: String, lanes: String) -> String {
-        """
-        device char4* zdst = (device char4*)(xq + \(base));
-        for (int u = 0; u < \(e / 4); u++) { zdst[u] = char4(0); }
-        if ((\(lanes) & ((KG / \(e)) - 1)) == 0) {
-          ascale[\(row) * G + \(group)] = 0.0f;
-          xs[\(row) * G + \(group)] = 0.0f;
-        }
-
-        """
-    }
-
-    /// From the quad sums `s4[e / 4]` to `scale` = rsqrt(mean square + eps) with the record's tree.
-    static func rowScale(e: Int) -> String {
-        let lps = 16 / e  // lanes per record thread
-        let first: String
-        switch e {
-        case 16: first = "float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);\n"
-        case 8: first = "float sq = s4[0] + s4[1];\nsq += simd_shuffle_xor(sq, 1);\n"
-        default: first = "float sq = s4[0];\nsq += simd_shuffle_xor(sq, 1);\nsq += simd_shuffle_xor(sq, 2);\n"
-        }
-        return first + """
-            sq += simd_shuffle_xor(sq, \(lps));
-            sq += simd_shuffle_xor(sq, \(2 * lps));
-            sq += simd_shuffle_xor(sq, \(4 * lps));
-            threadgroup float shared_sq[32];
-            if ((tid & \(8 * lps - 1)u) == 0) { shared_sq[tid / \(8 * lps)u] = sq; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-              const float tot = simd_sum(shared_sq[lane]);
-              if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float scale = shared_sq[0];
-
-            """
-    }
-
-    static func source(_ kind: Kind, e: Int) -> String {
-        switch kind {
-        case .quantG:
-            return """
-                const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
-                const int tid = int(thread_position_in_grid.x);
-                const uint lane = thread_index_in_simdgroup;
-                const int c0 = tid * \(e);
-                if (c0 >= K) return;
-                const int m = int(threadgroup_position_in_grid.y);
-                const int g = tid / (KG / \(e));
-                const size_t dstBase = (size_t)m * K + c0;
-                if (m >= R) {
-
-                """ + zeroRow(e: e, row: "m", group: "g", base: "dstBase", lanes: "tid") + """
-                  return;
-                }
-                const size_t srcBase = HEAD_MAJOR
-                    ? (((size_t)(c0 >> 7) * R + m) * 128 + (c0 & 127))
-                    : dstBase;
-                float nv[\(e)];
-                float local_amax = 0.0f;
-                for (int u = 0; u < \(e); u++) {
-                  float a = float(x[srcBase + u]);
-                  if (SWIGLU) { const float b = float(x2[srcBase + u]); a = a / (1.0f + metal::exp(-a)) * b; }
-                  nv[u] = a;
-                  local_amax = max(local_amax, fabs(a));
-                }
-
-                """ + tail(e: e, row: "m", group: "g", base: "dstBase")
-        case .quantGConv0:
-            return """
-                const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
-                const int tid = int(thread_position_in_grid.x);
-                const uint lane = thread_index_in_simdgroup;
-                const int c0 = tid * \(e);
-                if (c0 >= K) return;
-                const int m = int(threadgroup_position_in_grid.y);
-                const int g = tid / (KG / \(e));
-                const size_t rowBase = (size_t)m * K + c0;
-                if (m >= R) {
-
-                """ + zeroRow(e: e, row: "m", group: "g", base: "rowBase", lanes: "tid") + """
-                  return;
-                }
-                const int dw = 4 * (K / 16);
-                const int cg = c0 >> 4;
-                const float d0 = float(dyn[m * dw + cg]);
-                const float d1 = m >= 1 ? float(dyn[m * dw + (K >> 4) + cg]) : 0.0f;
-                float nv[\(e)];
-                float local_amax = 0.0f;
-                for (int u = 0; u < \(e); u++) {
-                  const int c = c0 + u;
-                  float a = (float(base[c]) + d0) * float(h[rowBase + u]);
-                  if (m >= 1) {
-                    a += (float(base[K + c]) + d1) * float(h[rowBase - K + u]);
-                  }
-                  nv[u] = a;
-                  local_amax = max(local_amax, fabs(a));
-                }
-
-                """ + tail(e: e, row: "m", group: "g", base: "rowBase")
-        case .rmsQuant:
-            return """
-                const uint tid = thread_position_in_threadgroup.x;
-                const uint lane = thread_index_in_simdgroup;
-                const uint sg = simdgroup_index_in_threadgroup;
-                const int l = int(threadgroup_position_in_grid.y);
-                const int L = dsz[1];
-                const int c0 = int(tid) * \(e);
-                const int G = D / KG;
-                const int g = int(tid) / (KG / \(e));
-                if (l >= L) {
-                  if (l < 16) {
-                    const size_t qRowBase = (size_t)l * D + c0;
-
-                """ + zeroRow(e: e, row: "l", group: "g", base: "qRowBase", lanes: "int(tid)") + """
-                  }
-                  return;
-                }
-                const size_t rowBase = (size_t)l * D + c0;
-                float v[\(e)];
-                float s4[\(e / 4)];
-                for (int k = 0; k < \(e / 4); k++) {
-                  float ak = 0.0f;
-                  for (int i = 0; i < 4; i++) {
-                    const int u = 4 * k + i;
-                    const float a = float(x[rowBase + u]);
-                    v[u] = a;
-                    ak += a * a;
-                  }
-                  s4[k] = ak;
-                }
-
-                """ + rowScale(e: e) + """
-                float nv[\(e)];
-                float local_amax = 0.0f;
-                for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
-                  if (WRITE_NORM) { out_norm[rowBase + u] = y; }
-                  nv[u] = y;
-                  local_amax = max(local_amax, fabs(y));
-                }
-
-                """ + tail(e: e, row: "l", group: "g", base: "rowBase")
-        case .convRmsQuant:
-            return """
-                const uint tid = thread_position_in_threadgroup.x;
-                const uint lane = thread_index_in_simdgroup;
-                const uint sg = simdgroup_index_in_threadgroup;
-                const int l = int(threadgroup_position_in_grid.y);
-                const int L = dsz[1];
-                const int qStart = dsz[2];
-                const int qm = l - qStart;
-                const int c0 = int(tid) * \(e);
-                const int G = D / KG;
-                const int qg = int(tid) / (KG / \(e));
-                if (!WRITE_RES && l < qStart) return;
-                if (l >= L) {
-                  if (qm >= 0 && qm < 16) {
-                    const size_t qRowBase = (size_t)qm * D + c0;
-
-                """ + zeroRow(e: e, row: "qm", group: "qg", base: "qRowBase", lanes: "int(tid)") + """
-                  }
-                  return;
-                }
-                const int dw = 4 * (D / 16);
-                const int g = c0 >> 4;
-                const size_t rowBase = (size_t)l * D + c0;
-                const float d0 = float(dyn[l * dw + (dw / 2) + g]);
-                const float d1 = l >= 1 ? float(dyn[l * dw + (dw / 2) + (D / 16) + g]) : 0.0f;
-                float v[\(e)];
-                float s4[\(e / 4)];
-                for (int k = 0; k < \(e / 4); k++) {
-                  float ak = 0.0f;
-                  for (int i = 0; i < 4; i++) {
-                    const int u = 4 * k + i;
-                    const int c = c0 + u;
-                    float acc = float(res[rowBase + u]) + (float(base[2 * D + c]) + d0) * float(h[rowBase + u]);
-                    if (l >= 1) {
-                      acc += (float(base[3 * D + c]) + d1) * float(h[rowBase - D + u]);
-                    }
-                    v[u] = acc;
-                    if (WRITE_RES) { out_res[rowBase + u] = acc; }
-                    ak += acc * acc;
-                  }
-                  s4[k] = ak;
-                }
-
-                """ + rowScale(e: e) + """
-                float nv[\(e)];
-                float local_amax = 0.0f;
-                for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
-                  nv[u] = y;
-                  local_amax = max(local_amax, fabs(y));
-                }
-                if (qm >= 0 && qm < 16) {
-                  const size_t qRowBase = (size_t)qm * D + c0;
-                  for (int u = 0; u < \(e); u++) {
-                    out_norm[qRowBase + u] = nv[u];
-                  }
-
-                """ + tail(e: e, row: "qm", group: "qg", base: "qRowBase") + """
-                }
-
-                """
-        }
-    }
-}
-// WIDELANES-GEN END
