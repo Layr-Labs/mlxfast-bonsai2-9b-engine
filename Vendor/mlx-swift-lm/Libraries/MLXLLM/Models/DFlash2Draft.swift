@@ -3387,8 +3387,9 @@ enum DF2Fast {
             device float* dst;
             float pos;
             if (!isK) {
-              h = vecIdx / L;
-              s = vecIdx % L;
+              // Four heads of one row share a rotary phase in this group.
+              h = (vecIdx / (4 * L)) * 4 + int(simdgroup_index_in_threadgroup);
+              s = (vecIdx / 4) % L;
               t = s;
               H = 32;
               S_out = L;
@@ -3398,8 +3399,8 @@ enum DF2Fast {
               pos = float(offset + C + s);
             } else {
               const int kIdx = vecIdx - 32 * L;
-              h = kIdx / CL;
-              t = kIdx % CL;
+              h = (kIdx / (4 * CL)) * 4 + int(simdgroup_index_in_threadgroup);
+              t = (kIdx / 4) % CL;
               s = (t < C) ? t : (t - C);
               H = 8;
               S_out = CL;
@@ -3408,6 +3409,18 @@ enum DF2Fast {
               dst = k_out;
               pos = float(offset + t);
             }
+            threadgroup float4 phase[32];
+            if (simdgroup_index_in_threadgroup == 0u) {
+              const float th0 = pos * (1.0f / freqs[d0]);
+              const float th1 = pos * (1.0f / freqs[d1]);
+              phase[lane] = float4(
+                metal::fast::cos(th0), metal::fast::sin(th0),
+                metal::fast::cos(th1), metal::fast::sin(th1));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float4 rotaryPhase = phase[lane];
+            const float c0 = rotaryPhase.x, s0 = rotaryPhase.y;
+            const float c1 = rotaryPhase.z, s1 = rotaryPhase.w;
             const size_t srcBase = ((size_t)s * H + h) * 128;
             const size_t dstBase = ((size_t)h * S_out + t) * 128;
             float acc = 0.0f;
@@ -3424,10 +3437,6 @@ enum DF2Fast {
             const float ny0 = (w[d0 + 64] * (y0 * inv_mean)) * mscale;
             const float nx1 = (w[d1] * (x1 * inv_mean)) * mscale;
             const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
-            const float th0 = pos * (1.0f / freqs[d0]);
-            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
-            const float th1 = pos * (1.0f / freqs[d1]);
-            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
             dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
