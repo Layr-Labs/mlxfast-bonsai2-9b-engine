@@ -612,7 +612,18 @@ private final class DFlash2Attention: Module {
         var queries: MLXArray
         var contextKeys: MLXArray? = nil, contextValues: MLXArray? = nil
         var blockKeys: MLXArray, blockValues: MLXArray
-        if let conv0,
+        var contextProjected = false
+        if let conv0, DF2Fast.kvDual, contextLength > 0, activePrecomputedKV == nil,
+            let activeContextCodes, activeContextCodes.rows == contextLength,
+            let blockCodes = DF2Fast.conv0Codes(conv0.n, dyn: conv0.dyn, base: conv0.base),
+            let all = DF2Fast.w4DualFromCodes(
+                blockCodes, blockLead: Array(conv0.n.shape.dropLast()),
+                activeContextCodes, contextLead: [B, contextLength], q: qProj, k: kProj, v: vProj)
+        {
+            (queries, blockKeys, blockValues) = (all[0], all[1], all[2])
+            (contextKeys, contextValues) = (all[3], all[4])
+            contextProjected = true
+        } else if let conv0,
             let qkv = DF2Fast.linearsConv0(
                 conv0.n, dyn: conv0.dyn, base: conv0.base, [qProj, kProj, vProj])
         {
@@ -624,7 +635,7 @@ private final class DFlash2Attention: Module {
         }
         // A block with no new context rows (its context was absorbed ahead of
         // it) attends to the cache as it stands; nothing is projected for it.
-        if contextLength > 0 {
+        if contextLength > 0, !contextProjected {
             if let activePrecomputedKV {
                 (contextKeys, contextValues) = (activePrecomputedKV.0, activePrecomputedKV.1)
             } else if let activeContextCodes,
@@ -1350,7 +1361,94 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
             eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
         }
+        checkKVDual()
         if DF2Fast.on { try prepareFirstRound(target) }
+    }
+
+    /// Turns the dual q|k|v + context k|v launch on only if it reproduces the record's launches bit for bit
+    /// at load: synthetic int8 codes (fixed keys, no request data) for 16 block rows and 1, 9 and 16 context
+    /// rows, every layer's own q, k and v, against the record's block q|k|v launch and its two cross-layer
+    /// context k|v launches, uint32 compare of all five outputs. Anything else keeps the record path.
+    private func checkKVDual() {
+        DF2Fast.kvDual = false
+        func report(_ state: String) {
+            FileHandle.standardError.write(Data("DF2 kv dual: \(state)\n".utf8))
+        }
+        guard DF2Fast.on, DF2Fast.kvDualEnv, let group = DF2Fast.w4Group, layers.count == 6,
+            config.hiddenSize == 4096
+        else {
+            report("off (DF2_KVDUAL=0, DF2_FAST=0, DF2_W4=0 or a different drafter shape)")
+            return
+        }
+        // An MLX error inside the check (a pipeline this GPU cannot build or run) keeps the record path
+        // instead of stopping the process.
+        let verdict: (failure: String?, summary: String)
+        do {
+            verdict = try withError { kvDualCompare(group: group) }
+        } catch {
+            report("off (MLX error in the check: \(error); record path kept)")
+            return
+        }
+        if let failure = verdict.failure {
+            report("off (\(failure); record path kept)")
+            return
+        }
+        DF2Fast.kvDual = true
+        report("on (bitwise equal to the record's q|k|v and context k|v launches: \(verdict.summary))")
+    }
+
+    /// The comparison behind `checkKVDual`: nil failure when every output word matches.
+    private func kvDualCompare(group: Int) -> (failure: String?, summary: String) {
+        let K = config.hiddenSize, G = K / group
+        func codes(_ rows: Int, _ seed: UInt64) -> DF2Fast.W4Codes {
+            let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+            return DF2Fast.W4Codes(
+                xq: MLXRandom.randInt(Int32(-127) ..< Int32(128), [16 * K], key: keys[0]).asType(.int8),
+                ascale: MLXRandom.uniform(Float(0.001) ..< Float(0.05), [16 * G], key: keys[1]),
+                xs: MLXRandom.uniform(Float(-10) ..< Float(10), [16 * G], key: keys[2]),
+                rows: rows, K: K, group: group)
+        }
+        let attn = layers.map(\.selfAttn)
+        let block = codes(16, 0xDF2D_0001)
+        var differ = 0, nan = 0, words = 0
+        for C in [1, 9, 16] {
+            let context = codes(C, 0xDF2D_0100 + UInt64(C))
+            guard
+                let kv012 = DF2Fast.w4LinearsFromCodes(
+                    context, leadShape: [1, C], attn[0 ..< 3].flatMap { [$0.kProj, $0.vProj] }),
+                let kv345 = DF2Fast.w4LinearsFromCodes(
+                    context, leadShape: [1, C], attn[3 ..< 6].flatMap { [$0.kProj, $0.vProj] })
+            else { return ("record context launch not eligible", "") }
+            let recordContext = kv012 + kv345
+            for (i, a) in attn.enumerated() {
+                guard
+                    let record = DF2Fast.w4LinearsFromCodes(
+                        block, leadShape: [1, 16], [a.qProj, a.kProj, a.vProj]),
+                    let dual = DF2Fast.w4DualFromCodes(
+                        block, blockLead: [1, 16], context, contextLead: [1, C],
+                        q: a.qProj, k: a.kProj, v: a.vProj)
+                else { return ("dual launch not eligible", "") }
+                let pairs = [
+                    (record[0], dual[0]), (record[1], dual[1]), (record[2], dual[2]),
+                    (recordContext[2 * i], dual[3]), (recordContext[2 * i + 1], dual[4]),
+                ]
+                for (r, d) in pairs {
+                    guard r.shape == d.shape, r.dtype == d.dtype else {
+                        return ("shape or dtype differs at layer \(i), context rows \(C)", "")
+                    }
+                    let ru = contiguous(r).view(dtype: .uint32)
+                    let du = contiguous(d).view(dtype: .uint32)
+                    differ += Int((ru .!= du).asType(.int32).sum().item(Int32.self))
+                    nan += Int((ru .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum().item(Int32.self))
+                    words += r.size
+                }
+            }
+        }
+        if differ != 0 {
+            return ("\(differ) of \(words) words differ from the record's launches", "")
+        }
+        return (nil, "\(words) words, 6 layers x context rows 1, 9, 16; "
+            + "\(nan) layout-guard NaN words in the record's own output")
     }
 
     /// Prepare at load what the first round of the first request would otherwise
@@ -1505,7 +1603,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 normedCodes = nil
             }
             var precomputedKV: [(MLXArray, MLXArray)]? = nil
-            if let cCodes, layers.count == 6 {
+            // With the dual launch each layer projects its context k|v from the k and v tiles its block
+            // q|k|v launch already stages, so the separate cross-layer context launches are skipped.
+            if let cCodes, layers.count == 6, !DF2Fast.kvDual {
                 let lead = [1, context.dim(1)]
                 if let kv012 = DF2Fast.w4LinearsFromCodes(
                     cCodes, leadShape: lead,
@@ -2342,6 +2442,204 @@ enum DF2Fast {
             source: source, header: header, ensureRowContiguous: true)
     }
 
+    // MARK: One weight read for a layer's block q|k|v and its context k|v
+
+    /// The block `q|k|v` launch of `w4Source(layers: 3)` that also projects the layer's context rows through
+    /// `k` and `v` from the same staged weight tile: a `k` or `v` threadgroup runs a second 16 x 32 x `group`
+    /// op on the context codes `xq2` and keeps a second accumulator pair in the same per-group FP32 order
+    /// (fma(s * a, C, acc), fma(lo + 8 s, sum(x), accb)), then a second reduction over the SPLIT partials in
+    /// the same q order. Every block output is computed by the same expressions as the record's `q|k|v`
+    /// launch, every context output by the same expressions as its context `k|v` launch, so the outputs are
+    /// the same bits, and the `k` and `v` weights cross memory once per round instead of twice.
+    /// ksz = [K, block rows, Nq, Nk, Nv, context rows].
+    static func w4DualSource(group: Int) -> String {
+        let ru = group / 32  // packed uint4 per row and group
+        let tw = group / 16  // unpacked uint4 per row and group
+        return """
+            const int K = ksz[0];
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
+            device float* out = out0; device float* outc = out0; bool dual = false; int N = ksz[2];
+            if (bx >= N / 32) { bx -= N / 32; w = w1; sT = s1; bT = b1; out = out1; outc = out3; dual = true; N = ksz[3]; }
+            if (bx >= N / 32) { bx -= N / 32; w = w2; sT = s2; bT = b2; out = out2; outc = out4; dual = true; N = ksz[4]; }
+            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            const int G = K / \(group);
+            const int n0 = bx * 32;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_position_in_threadgroup.x;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, \(group), false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A2((device int8_t*)xq2, dextents<int, 2>(K, 16));
+            threadgroup uint4 tiles[SPLIT * 32 * \(tw)];
+            threadgroup uint4* bs = tiles + sg * (32 * \(tw));
+            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs, dextents<int, 2>(\(group), 32));
+            auto tA0 = A.template slice<\(group), 16>(0, 0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            auto cT2 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            bool ok = cT.get_capacity() == 16 && cT2.get_capacity() == 16;
+            for (int i = 0; i < 16 && ok; i++) {
+              auto ids = cT.get_multidimensional_index(i);
+              auto ids2 = cT2.get_multidimensional_index(i);
+              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1)
+                && ids2[0] == ids[0] && ids2[1] == ids[1];
+            }
+            float acc[16], accb[16], acc2[16], accb2[16];
+            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; acc2[i] = 0.0f; accb2[i] = 0.0f; }
+            const int m0 = mrow, m1 = mrow + 8;
+            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
+            const size_t rowU4 = (size_t)K / 32;
+            const device uint4* wsrc = (const device uint4*)w + (size_t)(n0 + lr) * rowU4 + lc;
+            uint4 wv[\(ru)];
+            for (int p = 0; p < \(ru); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + int(sg) * \(ru)]; }
+            for (int g = int(sg); g < G; g += SPLIT) {
+              for (int p = 0; p < \(ru); p++) {
+                const int r = lr + p * \(32 / ru);
+                const uint4 x = wv[p];
+                bs[r * \(tw) + 2 * lc] = uint4(LO(x.x), HI(x.x), LO(x.y), HI(x.y));
+                bs[r * \(tw) + 2 * lc + 1] = uint4(LO(x.z), HI(x.z), LO(x.w), HI(x.w));
+              }
+              if (g + SPLIT < G) { for (int p = 0; p < \(ru); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; } }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+              auto tA = A.template slice<\(group), 16>(g * \(group), 0);
+              op.run(tA, Bt, cT);
+              if (dual) {
+                auto tA2 = A2.template slice<\(group), 16>(g * \(group), 0);
+                op.run(tA2, Bt, cT2);
+              }
+              const device half* sr = sT + (size_t)g * N + n0 + nb;
+              const device half* br = bT + (size_t)g * N + n0 + nb;
+              const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));
+              const float4 b0v = fma(float4(8.0f), s0v, float4(*(const device half4*)br));
+              const float4 b1v = fma(float4(8.0f), s1v, float4(*(const device half4*)(br + 16)));
+              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+              const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
+              for (int i = 0; i < 16; i++) {
+                const int j = (i & 3);
+                const float s = (i >> 3) ? s1v[j] : s0v[j];
+                const float b = (i >> 3) ? b1v[j] : b0v[j];
+                const bool hi = (i >> 2) & 1;
+                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                accb[i] = fma(b, hi ? x1 : x0, accb[i]);
+              }
+              if (dual) {
+                const float ca0 = ascale2[m0 * G + g], ca1 = ascale2[m1 * G + g];
+                const float cx0 = xs2[m0 * G + g], cx1 = xs2[m1 * G + g];
+                for (int i = 0; i < 16; i++) {
+                  const int j = (i & 3);
+                  const float s = (i >> 3) ? s1v[j] : s0v[j];
+                  const float b = (i >> 3) ? b1v[j] : b0v[j];
+                  const bool hi = (i >> 2) & 1;
+                  acc2[i] = fma(s * (hi ? ca1 : ca0), float(cT2[i]), acc2[i]);
+                  accb2[i] = fma(b, hi ? cx1 : cx0, accb2[i]);
+                }
+              }
+              simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float* red = (threadgroup float*)tiles;
+            for (int i = 0; i < 16; i++) {
+              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+              red[sg * 512 + m * 32 + n] = acc[i] + accb[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            if (dual) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int i = 0; i < 16; i++) {
+                const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+                red[sg * 512 + m * 32 + n] = acc2[i] + accb2[i];
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int e = int(tid); e < ksz[5] * 32; e += SPLIT * 32) {
+                float v = 0.0f;
+                for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+                outc[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+              }
+            }
+            #undef LO
+            #undef HI
+            """
+    }
+
+    /// The dual launch with the record's constant-K form (`w4FormsKernels`): K = KC, 32-bit offsets.
+    static func w4DualFormsSource(group: Int) -> String {
+        w4DualSource(group: group)
+            .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            .replacingOccurrences(of: "const size_t rowU4", with: "const uint rowU4")
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    static let w4DualKernel: MLXFast.MLXFastKernel = {
+        let group = w4Group ?? 64
+        return MLXFast.metalKernel(
+            name: "df2_w4g\(group)_kvdual",
+            inputNames: ["xq", "w0", "w1", "w2", "s0", "s1", "s2", "b0", "b1", "b2", "ascale", "xs",
+                         "xq2", "ascale2", "xs2", "ksz"],
+            outputNames: ["out0", "out1", "out2", "out3", "out4"],
+            source: w4DualFormsSource(group: group), header: header, ensureRowContiguous: true)
+    }()
+
+    /// `DF2_KVDUAL=0` keeps the record's separate context k|v launches.
+    static let kvDualEnv = ProcessInfo.processInfo.environment["DF2_KVDUAL"] != "0"
+    /// Set once at bind by `DFlash2DraftModel.checkKVDual()`; the dual launch runs only after its bitwise check.
+    nonisolated(unsafe) static var kvDual = false
+
+    /// `[q, k, v](block codes)` and `[k, v](context codes)` in one launch; nil when not eligible.
+    static func w4DualFromCodes(
+        _ block: W4Codes, blockLead: [Int], _ context: W4Codes, contextLead: [Int],
+        q: Linear, k: Linear, v: Linear
+    ) -> [MLXArray]? {
+        guard on, block.K == 4096, context.K == block.K, context.group == block.group,
+            block.group == (w4Group ?? 64), (1 ... 16).contains(block.rows), (1 ... 16).contains(context.rows),
+            let oq = w4Operands(q, group: block.group), let ok4 = w4Operands(k, group: block.group),
+            let ov = w4Operands(v, group: block.group),
+            oq.k == block.K, ok4.k == block.K, ov.k == block.K, ok4.n == ov.n
+        else { return nil }
+        let ns = [oq.n, ok4.n, ov.n]
+        let sizes = MLXArray(
+            [Int32(block.K), Int32(block.rows)] + ns.map { Int32($0) } + [Int32(context.rows)])
+        let outs = w4DualKernel(
+            [block.xq, oq.w, ok4.w, ov.w, oq.sT, ok4.sT, ov.sT, oq.bT, ok4.bT, ov.bT, block.ascale, block.xs,
+             context.xq, context.ascale, context.xs, sizes],
+            template: [("SPLIT", split), ("KC", block.K)],
+            grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: ns.map { [block.rows, $0] } + [[context.rows, ok4.n], [context.rows, ov.n]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32])
+        return [
+            outs[0].reshaped(blockLead + [ns[0]]), outs[1].reshaped(blockLead + [ns[1]]),
+            outs[2].reshaped(blockLead + [ns[2]]),
+            outs[3].reshaped(contextLead + [ok4.n]), outs[4].reshaped(contextLead + [ov.n]),
+        ]
+    }
+
+    /// The block codes of `dynConv(h, dyn, base, part: 0)` exactly as `linearsConv0` builds them.
+    static func conv0Codes(_ h: MLXArray, dyn: MLXArray, base: MLXArray) -> W4Codes? {
+        guard on, let group = w4Group, (group == 64 || group == 128) else { return nil }
+        let K = h.dim(-1)
+        let rows = h.size / K
+        guard (1 ... 16).contains(rows), K % group == 0, K % 16 == 0, split > 0, K / group >= split
+        else { return nil }
+        let G = K / group
+        let totalThreads = K / 16
+        let tg = Swift.min(256, totalThreads)
+        let q = quantGConv0(
+            [h.reshaped([rows, K]), dyn, base, MLXArray([Int32(K), Int32(rows)])],
+            template: [("KG", group)],
+            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
+            outputShapes: [[16 * K], [16 * G], [16 * G]],
+            outputDTypes: [.int8, .float32, .float32])
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
+    }
+
     static func w4Quant(
         _ x: MLXArray, up: MLXArray?, group: Int, headMajor: Bool, rowsOverride: Int? = nil,
         kOverride: Int? = nil
@@ -2401,22 +2699,10 @@ enum DF2Fast {
     ) -> [MLXArray]? {
         guard on, (1 ... 6).contains(layers.count), let group = w4Group, (group == 64 || group == 128)
         else { return nil }
-        let K = h.dim(-1)
-        let rows = h.size / K
-        guard (1 ... 16).contains(rows), K % group == 0, K % 16 == 0, split > 0, K / group >= split
-        else { return nil }
         let ops = layers.compactMap { w4Operands($0, group: group) }
-        guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
-        let G = K / group
-        let totalThreads = K / 16
-        let tg = Swift.min(256, totalThreads)
-        let q = quantGConv0(
-            [h.reshaped([rows, K]), dyn, base, MLXArray([Int32(K), Int32(rows)])],
-            template: [("KG", group)],
-            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[16 * K], [16 * G], [16 * G]],
-            outputDTypes: [.int8, .float32, .float32])
-        let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
+        guard ops.count == layers.count, ops.allSatisfy({ $0.k == h.dim(-1) }),
+            let codes = conv0Codes(h, dyn: dyn, base: base)
+        else { return nil }
         return w4LinearsFromCodes(codes, leadShape: Array(h.shape.dropLast()), layers)
     }
 
