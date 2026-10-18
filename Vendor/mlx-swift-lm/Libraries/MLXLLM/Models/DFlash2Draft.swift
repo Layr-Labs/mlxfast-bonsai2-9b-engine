@@ -2637,26 +2637,36 @@ enum DF2Fast {
             const int offset = params[1];
             const float eps = fparams[0];
             const float mscale = fparams[1];
-            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
-            if (vecIdx >= 48 * L) return;
+            // Four heads at one position share each lane's rotary coefficients in registers.
+            const int quadIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            if (quadIdx >= 12 * L) return;
             const uint lane = thread_index_in_simdgroup;
-            const int hTotal = vecIdx / L;
-            const int s = vecIdx % L;
+            const int hQuad = quadIdx % 12;
+            const int s = quadIdx / 12;
             const int d0 = int(lane);
             const int d1 = d0 + 32;
-            if (hTotal >= 40) {
-              const int h = hTotal - 40;
+            if (hQuad >= 10) {
+              for (int head = 0; head < 4; ++head) {
+              const int h = (hQuad - 10) * 4 + head;
               const size_t srcBase = ((size_t)s * 8 + h) * 128;
               const size_t dstBase = ((size_t)h * L + s) * 128;
               v_out[dstBase + d0] = float(v[srcBase + d0]);
               v_out[dstBase + d0 + 64] = float(v[srcBase + d0 + 64]);
               v_out[dstBase + d1] = float(v[srcBase + d1]);
               v_out[dstBase + d1 + 64] = float(v[srcBase + d1 + 64]);
+              }
               return;
             }
-            const bool isK = hTotal >= 32;
-            const int h = isK ? (hTotal - 32) : hTotal;
+            const bool isK = hQuad >= 8;
+            const int hBase = (isK ? hQuad - 8 : hQuad) * 4;
             const int H = isK ? 8 : 32;
+            const float pos = float(offset + s);
+            const float th0 = pos * (1.0f / freqs[d0]);
+            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
+            const float th1 = pos * (1.0f / freqs[d1]);
+            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+            for (int head = 0; head < 4; ++head) {
+            const int h = hBase + head;
             const size_t srcBase = ((size_t)s * H + h) * 128;
             const size_t dstBase = ((size_t)h * L + s) * 128;
             const device float* src = isK ? k : q;
@@ -2675,16 +2685,13 @@ enum DF2Fast {
             const float ny0 = (w[d0 + 64] * (y0 * inv_mean)) * mscale;
             const float nx1 = (w[d1] * (x1 * inv_mean)) * mscale;
             const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
-            const float pos = float(offset + s);
-            const float th0 = pos * (1.0f / freqs[d0]);
-            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
-            const float th1 = pos * (1.0f / freqs[d1]);
-            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+
             device float* dst = isK ? k_out : q_out;
             dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
             dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            }
             """)
 
     /// Fused `kNorm` + `YarnRoPE` (`mscale` + `RoPE`) + `[1, C, 8, 128] -> [1, 8, C, 128]` transpose
@@ -2750,8 +2757,8 @@ enum DF2Fast {
         guard on, L > 0 else { return nil }
         let qw = normWeight(qNorm)
         let kw = normWeight(kNorm)
-        let totalVecs = 48 * L
-        let tgs = (totalVecs + 3) / 4
+        let totalQuads = 12 * L
+        let tgs = (totalQuads + 3) / 4
         let outs = qkvNormRopeKernel(
             [
                 q, k, v, qw, kw, ropeSpec.freqs,
