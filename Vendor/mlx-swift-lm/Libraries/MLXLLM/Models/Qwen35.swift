@@ -4501,9 +4501,12 @@ public class Qwen35TextModelInner: Module {
                 unpacked[0].dim(2) == 4096, unpacked.allSatisfy({ $0.dtype == .float32 })
             {
                 let s = unpacked[0].dim(1)
-                dFlash2Tap.tappedHidden = Self.packTapsBF16Kernel(
+                // Small verify windows amortize dispatch by packing all tap slots per thread.
+                // Keep the wider launch for prompt rows, where memory-level parallelism dominates.
+                let packTaps = s <= 16 ? Self.packTapsBF16ShortKernel : Self.packTapsBF16Kernel
+                dFlash2Tap.tappedHidden = packTaps(
                     unpacked + [MLXArray([Int32(s)])],
-                    grid: (8192, s, 1),
+                    grid: (s <= 16 ? 1024 : 8192, s, 1),
                     threadGroup: (256, 1, 1),
                     outputShapes: [[1, s, 32768]],
                     outputDTypes: [.bfloat16]
@@ -4514,6 +4517,53 @@ public class Qwen35TextModelInner: Module {
         }
         return (hiddenStates, pendingDelta)
     }
+
+    private static let packTapsBF16ShortKernel = MLXFast.metalKernel(
+        name: "qwen35_pack_taps8_short_bf16",
+        inputNames: ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "params"],
+        outputNames: ["out"],
+        source: """
+            const int S = params[0];
+            const uint c4 = thread_position_in_grid.x;
+            const uint s = thread_position_in_grid.y;
+            if (c4 >= 1024u || int(s) >= S) return;
+            const size_t srcIdx = (size_t)s * 1024u + c4;
+            device bfloat4* dst = (device bfloat4*)out;
+            const size_t dstBase = (size_t)s * 8192u + c4;
+            {
+                const float4 v = ((const device float4*)t0)[srcIdx];
+                dst[dstBase + 0u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t1)[srcIdx];
+                dst[dstBase + 1024u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t2)[srcIdx];
+                dst[dstBase + 2048u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t3)[srcIdx];
+                dst[dstBase + 3072u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t4)[srcIdx];
+                dst[dstBase + 4096u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t5)[srcIdx];
+                dst[dstBase + 5120u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t6)[srcIdx];
+                dst[dstBase + 6144u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            {
+                const float4 v = ((const device float4*)t7)[srcIdx];
+                dst[dstBase + 7168u] = bfloat4(bfloat(v.x), bfloat(v.y), bfloat(v.z), bfloat(v.w));
+            }
+            """
+    )
 
     private static let packTapsBF16Kernel = MLXFast.metalKernel(
         name: "qwen35_pack_taps8_bf16",
