@@ -3270,17 +3270,15 @@ enum DF2Fast {
               }
               const size_t outBase = ((size_t)row * 8u + blk) * 16u;
               for (int r = 0; r < 16; r++) {
-                float bv = NEG; int bi = 0x7fffffff; int bk = 0;
-                for (int k = 0; k < 4; k++) {
-                  const float v = sv[k]; const int id = si[k];
-                  if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; bk = k; }
-                }
+                // Each lane owns four consecutive, already sorted stage-one winners.
+                const float bv = sv[0]; const int bi = si[0];
                 const float m = simd_max(bv);
                 const int best_id = simd_min(bv == m ? bi : 0x7fffffff);
                 if (bv == m && bi == best_id) {
                   ids[outBase + r] = best_id;
                   vals[outBase + r] = m;
-                  sv[bk] = NEG;
+                  sv[0] = sv[1]; sv[1] = sv[2]; sv[2] = sv[3]; sv[3] = NEG;
+                  si[0] = si[1]; si[1] = si[2]; si[2] = si[3]; si[3] = 0x7fffffff;
                 }
               }
             }
