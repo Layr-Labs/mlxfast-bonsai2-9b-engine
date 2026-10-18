@@ -544,14 +544,8 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = attention.dim(2)
-        let tile = VerifyInt8Matmul.tileRows
-        let groups = rows * (width / 128)
-        let outputs = Self.attentionGateQuantized4096Kernel(
-            [attention, queryProjection.reshaped([rows, 8192]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups]],
-            outputDTypes: [.int8, .float32, .float32])
+        let outputs = Self.wideRowVerify(
+            .attentionGate, [attention, queryProjection.reshaped([rows, 8192]), signs], rows: rows)
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
@@ -856,19 +850,19 @@ public struct SignedBlockHadamard {
     func quantizedForVerify(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
         validate(x)
         let rows = x.size / width
-        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
+        guard blockSize == 4096, x.dtype == .float32, (2 ... 16).contains(rows),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         if let up, up.shape != x.shape || up.dtype != x.dtype { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        let groups = rows * (width / 128)
-        let kernel = up == nil ? Self.quantized4096Kernel : Self.quantizedSwiGLU4096Kernel
-        let outputs = kernel(
+        let kind: WideRowKind = up == nil ? .plain : .swiglu
+        let blocks = width / 4096
+        guard (blocks == kind.checkBlocks && Self.wideRowUsesWide(kind))
+            || VerifyInt8Matmul.rowRange.contains(rows)
+        else { return nil }
+        let outputs = Self.wideRowVerify(
+            kind,
             [x.reshaped([rows, width])] + (up.map { [$0.reshaped([rows, width])] } ?? []) + [signs],
-            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
-            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups]],
-            outputDTypes: [.int8, .float32, .float32])
+            rows: rows, blocks: blocks)
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
@@ -878,17 +872,16 @@ public struct SignedBlockHadamard {
     func quantizedForVerifyWithRotated(_ x: MLXArray) -> (activation: PromptInt8Activation, rotated: MLXArray)? {
         validate(x)
         let rows = x.size / width
-        guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
+        guard blockSize == 4096, x.dtype == .float32, (2 ... 16).contains(rows),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        let groups = rows * (width / 128)
-        let outputs = Self.quantized4096RotatedKernel(
-            [x.reshaped([rows, width]), signs],
-            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
-            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups], x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32])
+        let blocks = width / 4096
+        guard (blocks == WideRowKind.plainRot.checkBlocks && Self.wideRowUsesWide(.plainRot))
+            || VerifyInt8Matmul.rowRange.contains(rows)
+        else { return nil }
+        let outputs = Self.wideRowVerify(
+            .plainRot, [x.reshaped([rows, width]), signs], rows: rows, blocks: blocks,
+            sideShape: x.shape)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
@@ -1199,12 +1192,16 @@ enum WideRowSource {
 // WIDEROW-GEN END
 
 extension SignedBlockHadamard {
-    /// The verify-width forms whose rows carry an RMS reduction before the
-    /// rotation (the residual and input norms, the GDN head norm): each one
-    /// runs `WideRowSource` at `wideRowThreads` lanes per row once its load
-    /// check passed, and the record kernel otherwise.
+    /// The verify-width per-row forms: those whose rows carry an RMS
+    /// reduction before the rotation (the residual and input norms, the GDN
+    /// head norm), and the elementwise ones (the plain rotation and its
+    /// rotated-output twin, the SwiGLU down-projection input at three blocks
+    /// per row, the attention output gate). Each one runs `WideRowSource` at
+    /// `wideRowThreads` lanes per row once its load check passed, and the
+    /// record kernel otherwise.
     enum WideRowKind: String, CaseIterable {
         case residualNorm, residualNormNormed, residualNormRot, normNormed, gatedNorm
+        case plain, plainRot, swiglu, attentionGate
 
         var form: WideRowSource.Form {
             var f = WideRowSource.Form()
@@ -1214,9 +1211,25 @@ extension SignedBlockHadamard {
             case .residualNormRot: f.residualNorm = true; f.rotatedOutput = true
             case .normNormed: f.normOnly = true; f.normalizedOutput = true
             case .gatedNorm: f.gatedNorm = true
+            case .plain: break
+            case .plainRot: f.rotatedOutput = true
+            case .swiglu: f.swiglu = true
+            case .attentionGate: f.attentionGate = true
             }
             return f
         }
+
+        /// The elementwise forms, switched by `MLXFAST_WIDE_ROWS_ELEMENTWISE`.
+        var elementwise: Bool {
+            switch self {
+            case .plain, .plainRot, .swiglu, .attentionGate: return true
+            default: return false
+            }
+        }
+
+        /// 4096-wide blocks per row in the load check (the SwiGLU input is
+        /// the 12288-wide down-projection input).
+        var checkBlocks: Int { self == .swiglu ? 3 : 1 }
     }
 
     /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel; `MLXFAST_WIDE_ROWS_THREADS`
@@ -1226,6 +1239,17 @@ extension SignedBlockHadamard {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
+    /// `MLXFAST_WIDE_ROWS_ELEMENTWISE=0` keeps the record kernel for the
+    /// elementwise forms only (`WideRowKind.elementwise`).
+    static let wideRowElementwiseEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_ELEMENTWISE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static func wideRowKindEnabled(_ kind: WideRowKind) -> Bool {
+        wideRowEnabled && (!kind.elementwise || wideRowElementwiseEnabled)
+    }
     static let wideRowThreads: Int = {
         ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_THREADS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) == "1024" ? 1024 : 512
@@ -1238,6 +1262,10 @@ extension SignedBlockHadamard {
         case .residualNormRot: return residualNormRotatedQuantized4096Kernel
         case .normNormed: return normNormedQuantized4096Kernel
         case .gatedNorm: return gatedNormQuantized4096Kernel
+        case .plain: return quantized4096Kernel
+        case .plainRot: return quantized4096RotatedKernel
+        case .swiglu: return quantizedSwiGLU4096Kernel
+        case .attentionGate: return attentionGateQuantized4096Kernel
         }
     }
 
@@ -1247,6 +1275,9 @@ extension SignedBlockHadamard {
             return ["x", "residual", "norm_weight", "epsilon", "signs"]
         case .normNormed: return ["x", "norm_weight", "epsilon", "signs"]
         case .gatedNorm: return ["x", "gate", "norm_weight", "epsilon", "signs"]
+        case .plain, .plainRot: return ["x", "signs"]
+        case .swiglu: return ["x", "up", "signs"]
+        case .attentionGate: return ["x", "gate", "signs"]
         }
     }
 
@@ -1256,13 +1287,14 @@ extension SignedBlockHadamard {
         case .residualNormNormed: return ["codes", "ascale", "rsb", "residual_out", "normed_out"]
         case .residualNormRot: return ["codes", "ascale", "rsb", "residual_out", "rotated_out"]
         case .normNormed: return ["codes", "ascale", "rsb", "normed_out"]
-        case .gatedNorm: return ["codes", "ascale", "rsb"]
+        case .gatedNorm, .plain, .swiglu, .attentionGate: return ["codes", "ascale", "rsb"]
+        case .plainRot: return ["codes", "ascale", "rsb", "rotated_out"]
         }
     }
 
     private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] = {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
-        for kind in WideRowKind.allCases {
+        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
             kernels[kind] = MLXFast.metalKernel(
                 name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
@@ -1288,7 +1320,7 @@ extension SignedBlockHadamard {
         defer { wideRowLock.unlock() }
         guard !wideRowChecked else { return }
         wideRowChecked = true
-        for kind in WideRowKind.allCases {
+        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
             // An MLX error in the check (a pipeline that cannot run this
             // many threads per threadgroup on this GPU, a compile error)
             // keeps the record kernel instead of stopping the process.
@@ -1307,7 +1339,7 @@ extension SignedBlockHadamard {
     }
 
     private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
-        guard wideRowEnabled else { return false }
+        guard wideRowKindEnabled(kind) else { return false }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         return wideRowVerdict[kind] == true
@@ -1315,16 +1347,20 @@ extension SignedBlockHadamard {
 
     /// The record kernel's outputs bit for bit (`WideRowSource`): codes,
     /// constants and every FP32 side output, on synthetic rows (one all-zero
-    /// row, one at 30x scale) at 3, 11 and 16 verify rows.
+    /// row, one at 30x scale) at 3, 11 and 16 verify rows, at each form's
+    /// real shapes (the SwiGLU input 12288 wide, the attention output in its
+    /// `[1, 16, rows, 256]` head-major layout beside the `[rows, 8192]`
+    /// query projection).
     private static func wideRowCheck(_ kind: WideRowKind) -> Bool {
         var same: [MLXArray] = []
         for rows in [3, 11, 16] {
             let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
             let scale = MLXArray((0 ..< rows).map { Float($0 == 0 ? 0 : ($0 == 1 ? 30 : 1)) })
                 .reshaped([rows, 1])
-            let x = MLXRandom.uniform(low: -3, high: 3, [rows, 4096], key: parts[0]) * scale
-            let other = MLXRandom.uniform(low: -4, high: 4, [rows, 4096], key: parts[1])
-            let signs = MLX.floor(MLXRandom.uniform(low: 0, high: 2, [4096], key: parts[2])) * 2 - 1
+            let rowWidth = 4096 * kind.checkBlocks
+            let x = MLXRandom.uniform(low: -3, high: 3, [rows, rowWidth], key: parts[0]) * scale
+            let other = MLXRandom.uniform(low: -4, high: 4, [rows, rowWidth], key: parts[1])
+            let signs = MLX.floor(MLXRandom.uniform(low: 0, high: 2, [rowWidth], key: parts[2])) * 2 - 1
             let width = kind == .gatedNorm ? 128 : 4096
             let weight = MLXRandom.uniform(low: 0.5, high: 1.5, [width], key: parts[3])
             let eps = MLXArray([Float(1e-6)])
@@ -1334,9 +1370,19 @@ extension SignedBlockHadamard {
                 inputs = [x, other, weight, eps, signs]
             case .normNormed: inputs = [x, weight, eps, signs]
             case .gatedNorm: inputs = [x, other, weight, eps, signs]
+            case .plain, .plainRot: inputs = [x, signs]
+            case .swiglu: inputs = [x, other, signs]
+            case .attentionGate:
+                let attention = x.reshaped([rows, 16, 256]).transposed(1, 0, 2)
+                    .reshaped([1, 16, rows, 256])
+                let gate = MLXRandom.uniform(low: -4, high: 4, [rows, 8192], key: parts[4])
+                    * scale
+                inputs = [attention, gate, signs]
             }
-            let record = wideRowDispatch(kind, inputs, rows: rows, wide: false)
-            let wide = wideRowDispatch(kind, inputs, rows: rows, wide: true)
+            let record = wideRowDispatch(
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: false)
+            let wide = wideRowDispatch(
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: true)
             same.append(MLX.all(record[0] .== wide[0]))
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
@@ -1346,30 +1392,38 @@ extension SignedBlockHadamard {
     }
 
     /// One verify-width launch of `kind` over `inputs` (`x` first, `[rows,
-    /// 4096]` in any leading shape): `[codes [16, 4096], ascale, rsb,
-    /// side outputs shaped as x]`.
+    /// 4096 * blocks]` in any leading shape): `[codes [16, 4096 * blocks],
+    /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
     private static func wideRowDispatch(
-        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, wide: Bool
+        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
+        sideShape: [Int]? = nil, wide: Bool
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
-        let shapes = [[tile, 4096], [rows * 32], [rows * 32]]
-            + Array(repeating: inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
+        let shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
+            + Array(
+                repeating: sideShape ?? inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         if wide, let kernel = wideRowWideKernels[kind] {
             return kernel(
-                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", 1)],
-                grid: (wideRowThreads, tile, 1), threadGroup: (wideRowThreads, 1, 1),
+                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
+                grid: (wideRowThreads, tile * blocks, 1), threadGroup: (wideRowThreads, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
         }
         return wideRowRecordKernel(kind)(
-            inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
+            inputs, template: [("BLOCKS_PER_ROW", blocks), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * blocks, 1), threadGroup: (256, 1, 1),
             outputShapes: shapes, outputDTypes: dtypes)
     }
 
-    /// `wideRowDispatch` with the wide kernel when its load check passed.
-    static func wideRowVerify(_ kind: WideRowKind, _ inputs: [MLXArray], rows: Int) -> [MLXArray] {
-        wideRowDispatch(kind, inputs, rows: rows, wide: wideRowUsesWide(kind))
+    /// `wideRowDispatch` with the wide kernel when its load check passed at
+    /// this many blocks per row.
+    static func wideRowVerify(
+        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
+        sideShape: [Int]? = nil
+    ) -> [MLXArray] {
+        wideRowDispatch(
+            kind, inputs, rows: rows, blocks: blocks, sideShape: sideShape,
+            wide: blocks == kind.checkBlocks && wideRowUsesWide(kind))
     }
 }
 

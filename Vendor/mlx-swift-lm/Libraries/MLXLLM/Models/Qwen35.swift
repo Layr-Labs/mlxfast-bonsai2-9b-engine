@@ -1816,6 +1816,14 @@ enum Qwen35RegisterGatedSIMD {
         swap(
             "k_ += Hk * Dk; v_ += Hv * Dv; a_ += Hv; bb_ += Hv;",
             "k_ += k_strides[1]; v_ += v_strides[1]; a_ += a_strides[1]; bb_ += b_strides[1];")
+        // Replay is state-only and has no output rows.
+        swap(
+            "device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;",
+            "")
+        swap(
+            "if (lane % LPD == 0) {\n      *((device float2*)y_) = float2(out[0], out[1]);\n    }",
+            "")
+        swap("y_ += Hv * Dv;", "")
         return s + """
             {
               // Boundary conv rows T ..< T + 3 of conv_in, copied as raw bits.
@@ -1843,7 +1851,7 @@ enum Qwen35RegisterGatedSIMD {
     private static let replayKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_gate_simd_replay",
         inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in"],
-        outputNames: ["y", "state_out", "conv_tail"],
+        outputNames: ["state_out", "conv_tail"],
         source: replaySource,
         header: gateHeader,
         ensureRowContiguous: false)
@@ -1876,7 +1884,7 @@ enum Qwen35RegisterGatedSIMD {
 
     /// `(state after T rows, conv rows T ..< T + 3 of convInput)`: the bits of
     /// `runStateOnly` and of `contiguous(convInput[:, T ..< T + 3])`, with every
-    /// input read in place through its strides. `T` is `k.dim(1)`.
+    /// input read in place through its strides. `T` is `q.dim(1)`.
     static func runReplay(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                           b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
                           state: MLXArray, convInput: MLXArray) -> (MLXArray, MLXArray) {
@@ -1886,9 +1894,9 @@ enum Qwen35RegisterGatedSIMD {
             [q, k, v, a, b, aLog, dtBias, state, convInput],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[1], state.shape, [B, 3, convInput.dim(2)]],
-            outputDTypes: [.float32, .float32, .float32])
-        return (result[1], result[2])
+            outputShapes: [state.shape, [B, 3, convInput.dim(2)]],
+            outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
     }
 }
 
@@ -1898,7 +1906,7 @@ enum Qwen35RegisterGatedSIMD {
 /// head, 32 value columns) first forms, with the same code, the conv and
 /// SiLU of its key head's q/k channels and of its 32 value channels, then
 /// the q/k RMSNorm, and keeps them in threadgroup memory for the scan.
-/// Every output (conv input and output, normalized q/k, y, final state) is
+/// Every output (conv input, packed V, normalized q/k, y, final state) is
 /// the bits of the four-kernel graph; each element is written by exactly
 /// one threadgroup.
 enum Qwen35FusedGDNVerify {
@@ -1907,7 +1915,7 @@ enum Qwen35FusedGDNVerify {
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_verify_fused",
         inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
         source: """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
@@ -1983,7 +1991,6 @@ enum Qwen35FusedGDNVerify {
                 const float sig = acc < 0.0f ? e : 1.0f - e;
                 const float out = acc * sig;
                 qk_raw[(part * MAX_T + p) * Dk + tid] = out;
-                if (owns_qk) conv_out[p * C + c] = out;
               }
             }
           }
@@ -2010,7 +2017,7 @@ enum Qwen35FusedGDNVerify {
               const float sig = acc < 0.0f ? e : 1.0f - e;
               const float out = acc * sig;
               v_tile[p * DVPT + col] = out;
-              conv_out[p * C + c] = out;
+              v_out[(p * uint(Hv) + hv_idx) * uint(Dv) + dvblock * uint(DVPT) + col] = out;
             }
           }
         }
@@ -2141,7 +2148,7 @@ enum Qwen35FusedGDNVerify {
         """,
         header: Qwen35RegisterGatedSIMD.gateHeader)
 
-    /// `(convIn, convOut, q, k, y, finalState, convTail)` of the verify
+    /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
     /// is `convIn[:, S...] + 0` (the full-acceptance conv state) in its own
     /// buffer.
@@ -2170,7 +2177,7 @@ enum Qwen35FusedGDNVerify {
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+            outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
                 [1, S, valueHeads, 128], state.shape, [1, 3, C]],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
         return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
@@ -2805,10 +2812,10 @@ final class Qwen35GatedDeltaNet: Module {
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
             let (boundarySsm, boundaryConv) = Qwen35RegisterGatedSIMD.runReplay(
                 q: tape.q[0..., rows, 0...],
-                k: tape.k[0..., rows, 0...],
-                v: tape.v[0..., rows, 0...],
-                a: tape.a[0..., rows, 0...],
-                b: tape.b[0..., rows, 0...],
+                k: tape.k,
+                v: tape.v,
+                a: tape.a,
+                b: tape.b,
                 aLog: aLog,
                 dtBias: dtBias,
                 state: floatState,
@@ -3096,7 +3103,8 @@ final class Qwen35GatedDeltaNet: Module {
 
         let (qNormed, kNormed) = fusedMiddle.map { ($0.2, $0.3) }
             ?? normalizedQK(convOut, B: B, S: S)
-        let v = convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
+        let v = fusedMiddle?.1
+            ?? convOut[0..., 0..., (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
 
         let out: MLXArray
         if S >= 3 {
@@ -3134,7 +3142,8 @@ final class Qwen35GatedDeltaNet: Module {
                 // `finalConv` aliases `convInput` until full acceptance detaches
                 // its exact tail at commit. A one-row `ssmPre` aliases the
                 // already-accounted committed generation when it existed before
-                // this verify. `v` retains the whole conv output backing.
+                // this verify. The fused path retains packed V; the fallback
+                // retains the whole conv output backing through its V view.
                 let convOutBacking = convOut[rowRange]
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
