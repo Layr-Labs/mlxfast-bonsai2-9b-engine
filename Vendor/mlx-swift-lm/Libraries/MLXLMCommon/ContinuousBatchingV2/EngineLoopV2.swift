@@ -3651,6 +3651,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishRequest(id, reason: .error(constraintFailure))
                 continue
             }
+            // The first round's drafter block is proposed before the first
+            // token leaves the engine (no-op unless a block drafter seeds).
+            if firstToken, step.mtpRound != nil, !rec.request.stopTokens.contains(token) {
+                mtpPrestageSeedRound(step, rec: rec)
+            }
 
             // A stop TOKEN's text is never emitted (OpenAI behavior: the
             // stop token terminates the stream and its rendering is

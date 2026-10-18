@@ -33,6 +33,43 @@ extension EngineLoopV2 {
         }
     }
 
+    /// `DARKBLOOM_BONSAI_DFLASH_ROUND1_IN_BEGIN=0` restores the parent: the
+    /// first round proposes its block at its own launch.
+    static let dflashRound1InBeginEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFLASH_ROUND1_IN_BEGIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Seed boundary, called for a prompt row's FIRST sampled token before
+    /// that token is emitted. The token is the first round's anchor and the
+    /// prompt context is already absorbed, so the block drafter proposes the
+    /// first round's block here, through the same `prestageBlock` a verified
+    /// round uses for its successor, and the step waits for it. The round
+    /// then takes the prestaged block exactly as every later round does.
+    /// Guards mirror that successor prestage: one row, no lookup chain, a
+    /// fixed depth the next plan offers, and room for a full round.
+    func mtpPrestageSeedRound(_ step: CBv2InFlightStep, rec: CBv2ScheduledRequest) {
+        guard Self.dflashRound1InBeginEnabled, let mtp, let round = step.mtpRound,
+            round.verify == nil, step.sampledRows.count == 1,
+            let block = mtp.blockDrafter, mtp.lookupNgram == nil,
+            mtp.config.fixedDraftTokens != nil,
+            round.prefillCarries.contains(where: { $0.id == rec.id }),
+            rec.pendingSamples == 0,
+            rec.tokens.count > rec.request.promptTokens.count,
+            let anchor = rec.tokens.last,
+            let state = round.committedObservationRows.first(where: { $0.id == rec.id })?
+                .assistantState
+        else { return }
+        let k = mtp.previewDecision(plannedDecodeRows: 1, canSpeculate: true).depth
+        guard k > 0, k == mtp.config.fixedDraftTokens,
+            rec.request.maxTokens - rec.generatedTokenCount > k
+        else { return }
+        block.prepareDraft(history: rec.tokens, depth: k, requestState: state)
+        block.prestageBlock(anchor: anchor, depth: k, requestState: state)
+        eval(block.evaluationTargets(for: state))
+    }
+
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
