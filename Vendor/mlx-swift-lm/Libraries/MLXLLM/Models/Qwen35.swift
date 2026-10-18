@@ -2023,7 +2023,39 @@ enum Qwen35FusedGDNVerify {
         name: "qwen35_gdn_verify_fused",
         inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
         outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+        source: source,
+        header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// The record kernel without its normalized-q output. Nothing reads the
+    /// q rows: the verify scan takes q from threadgroup memory, and the
+    /// prefix replay is state-only (`STATE_ONLY 1` loads no q and reads only
+    /// its row count). The text is the record's with the q device store
+    /// removed; q is still normalized into threadgroup memory for the scan,
+    /// so the six remaining outputs keep their bits.
+    private static let qcutKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused_qcut",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["conv_in", "v_out", "k_out", "y", "state_out", "conv_tail"],
+        source: qcutSource,
+        header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    private static let qcutSource: String = {
+        let from = "    if (owns_qk) {\n      device float* dst = (part == 0u ? q_out : k_out) + "
+        let to = "    if (owns_qk && part == 1u) {\n      device float* dst = k_out + "
+        precondition(
+            source.components(separatedBy: from).count == 2,
+            "qwen35 fused verify q cut: anchor")
+        precondition(
+            source.components(separatedBy: "q_out").count == 2,
+            "qwen35 fused verify q cut: q_out")
+        return source.replacingOccurrences(of: from, with: to)
+    }()
+
+    /// `DARKBLOOM_BONSAI_VERIFY_QCUT=0` keeps the record kernel.
+    static let qcutOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_QCUT"] != "0"
+
+    private static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -2250,8 +2282,7 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
-        header: Qwen35RegisterGatedSIMD.gateHeader)
+        """
 
     /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -2274,6 +2305,23 @@ enum Qwen35FusedGDNVerify {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let S = qkv.dim(1)
+        if qcutOffered {
+            let outputs = qcutKernel(
+                [convState, qkv, convWeight, a, b, aLog, dtBias, state],
+                template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                    ("CONV_DIM", C), ("MAX_T", maximumRows),
+                    ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                    ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                    ("K_SCALE_BITS", Int(invScale.bitPattern))],
+                grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
+                outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128],
+                    [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+                outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32])
+            // The q slot carries k: the same shape and dtype, so the replay
+            // tape's guards and byte counts are unchanged, and no reader
+            // loads its values (see `qcutKernel`).
+            return (outputs[0], outputs[1], outputs[2], outputs[2], outputs[3], outputs[4], outputs[5])
+        }
         let outputs = kernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
