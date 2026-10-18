@@ -1242,8 +1242,8 @@ extension SignedBlockHadamard {
     /// head norm), and the elementwise ones (the plain rotation and its
     /// rotated-output twin, the SwiGLU down-projection input at three blocks
     /// per row, the attention output gate). Each one runs `WideRowSource` at
-    /// `wideRowThreads` lanes per row once its load check passed, and the
-    /// record kernel otherwise.
+    /// the widest lane count of `wideRowLaneCandidates` whose load check
+    /// passed, and the record kernel otherwise.
     enum WideRowKind: String, CaseIterable {
         case residualNorm, residualNormNormed, residualNormRot, normNormed, gatedNorm
         case plain, plainRot, swiglu, attentionGate
@@ -1277,8 +1277,7 @@ extension SignedBlockHadamard {
         var checkBlocks: Int { self == .swiglu ? 3 : 1 }
     }
 
-    /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel; `MLXFAST_WIDE_ROWS_THREADS`
-    /// picks 512 (default) or 1024 lanes per row.
+    /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel.
     static let wideRowEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1295,10 +1294,25 @@ extension SignedBlockHadamard {
     private static func wideRowKindEnabled(_ kind: WideRowKind) -> Bool {
         wideRowEnabled && (!kind.elementwise || wideRowElementwiseEnabled)
     }
-    static let wideRowThreads: Int = {
-        ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_THREADS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines) == "1024" ? 1024 : 512
+    static let wideRowThreadsSetting: String? = ProcessInfo.processInfo
+        .environment["MLXFAST_WIDE_ROWS_THREADS"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    static let wideRow1024Enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WIDE_ROWS_1024"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
     }()
+
+    /// Lane counts tried in order. The norm forms try 1024 lanes (four
+    /// elements per lane, half the per-thread chain of 512) before 512; the
+    /// elementwise forms keep 512, where a wider row showed no gain.
+    /// `DARKBLOOM_BONSAI_WIDE_ROWS_1024=0` or `MLXFAST_WIDE_ROWS_THREADS=512`
+    /// keeps 512 for every form; `MLXFAST_WIDE_ROWS_THREADS=1024` tries 1024
+    /// for every form.
+    static func wideRowLaneCandidates(_ kind: WideRowKind) -> [Int] {
+        if wideRowThreadsSetting == "512" || !wideRow1024Enabled { return [512] }
+        if wideRowThreadsSetting == "1024" || !kind.elementwise { return [1024, 512] }
+        return [512]
+    }
 
     private static func wideRowRecordKernel(_ kind: WideRowKind) -> MLXFast.MLXFastKernel {
         switch kind {
@@ -1345,26 +1359,32 @@ extension SignedBlockHadamard {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    private static func wideRowMakeKernels(hoist: Bool) -> [WideRowKind: MLXFast.MLXFastKernel] {
+    private static func wideRowMakeKernels(hoist: Bool, threads: Int)
+        -> [WideRowKind: MLXFast.MLXFastKernel]
+    {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
-        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
+        for kind in WideRowKind.allCases
+        where wideRowKindEnabled(kind) && wideRowLaneCandidates(kind).contains(threads) {
             var form = kind.form
             form.hoist = hoist
             let hoisted = hoist && (form.residualNorm || form.normOnly || form.gatedNorm)
             kernels[kind] = MLXFast.metalKernel(
-                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)\(hoisted ? "_h" : "")",
+                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
                 outputNames: wideRowOutputNames(kind),
-                source: WideRowSource.source(threads: wideRowThreads, form: form),
-                header: WideRowSource.header(threads: wideRowThreads), ensureRowContiguous: true)
+                source: WideRowSource.source(threads: threads, form: form),
+                header: WideRowSource.header(threads: threads), ensureRowContiguous: true)
         }
         return kernels
     }
 
-    private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] =
-        wideRowMakeKernels(hoist: wideRowLoadHoist)
+    private static let wideRowWideKernels: [Int: [WideRowKind: MLXFast.MLXFastKernel]] = [
+        512: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 512),
+        1024: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 1024),
+    ]
 
-    nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Bool] = [:]
+    /// The lane count each form serves (absent: the record kernel).
+    nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Int] = [:]
     nonisolated(unsafe) private static var wideRowChecked = false
     private static let wideRowLock = NSLock()
 
@@ -1380,28 +1400,38 @@ extension SignedBlockHadamard {
         guard !wideRowChecked else { return }
         wideRowChecked = true
         for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
-            // An MLX error in the check (a pipeline that cannot run this
-            // many threads per threadgroup on this GPU, a compile error)
-            // keeps the record kernel instead of stopping the process.
-            var verdict = false
-            var note = "mismatch, record kernel kept"
-            do {
-                verdict = try withError { wideRowCheck(kind) }
-                if verdict { note = "passed" }
-            } catch {
-                note = "error, record kernel kept: \(error)"
+            let candidates = wideRowLaneCandidates(kind)
+            for threads in candidates {
+                // An MLX error in the check (a pipeline that cannot run this
+                // many threads per threadgroup on this GPU, a compile error)
+                // falls to the next lane count, then to the record kernel,
+                // instead of stopping the process.
+                var note = "mismatch"
+                do {
+                    if try withError({ wideRowCheck(kind, threads: threads) }) {
+                        wideRowVerdict[kind] = threads
+                        note = "passed"
+                    }
+                } catch {
+                    note = "error: \(error)"
+                }
+                let next = threads == candidates.last ? "record kernel kept" : "next lane count"
+                FileHandle.standardError.write(Data(
+                    "hadamard wide rows: \(kind.rawValue) w\(threads) load check \(note == "passed" ? note : note + ", " + next) (rows 3, 11, 16)\n".utf8))
+                if wideRowVerdict[kind] != nil { break }
             }
-            wideRowVerdict[kind] = verdict
-            FileHandle.standardError.write(Data(
-                "hadamard wide rows: \(kind.rawValue) w\(wideRowThreads) load check \(note) (rows 3, 11, 16)\n".utf8))
         }
     }
 
     private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
-        guard wideRowKindEnabled(kind) else { return false }
+        wideRowLanes(kind) > 0
+    }
+
+    private static func wideRowLanes(_ kind: WideRowKind) -> Int {
+        guard wideRowKindEnabled(kind) else { return 0 }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
-        return wideRowVerdict[kind] == true
+        return wideRowVerdict[kind] ?? 0
     }
 
     /// The record kernel's outputs bit for bit (`WideRowSource`): codes,
@@ -1410,7 +1440,7 @@ extension SignedBlockHadamard {
     /// real shapes (the SwiGLU input 12288 wide, the attention output in its
     /// `[1, 16, rows, 256]` head-major layout beside the `[rows, 8192]`
     /// query projection).
-    private static func wideRowCheck(_ kind: WideRowKind) -> Bool {
+    private static func wideRowCheck(_ kind: WideRowKind, threads: Int) -> Bool {
         var same: [MLXArray] = []
         for rows in [3, 11, 16] {
             let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
@@ -1439,9 +1469,9 @@ extension SignedBlockHadamard {
                 inputs = [attention, gate, signs]
             }
             let record = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: false)
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: 0)
             let wide = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: true)
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads)
             same.append(MLX.all(record[0] .== wide[0]))
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
@@ -1455,17 +1485,17 @@ extension SignedBlockHadamard {
     /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
     private static func wideRowDispatch(
         _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
-        sideShape: [Int]? = nil, wide: Bool
+        sideShape: [Int]? = nil, lanes: Int
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
         let shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
             + Array(
                 repeating: sideShape ?? inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
-        if wide, let kernel = wideRowWideKernels[kind] {
+        if lanes > 0, let kernel = wideRowWideKernels[lanes]?[kind] {
             return kernel(
                 inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
-                grid: (wideRowThreads, tile * blocks, 1), threadGroup: (wideRowThreads, 1, 1),
+                grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
         }
         return wideRowRecordKernel(kind)(
@@ -1482,7 +1512,7 @@ extension SignedBlockHadamard {
     ) -> [MLXArray] {
         wideRowDispatch(
             kind, inputs, rows: rows, blocks: blocks, sideShape: sideShape,
-            wide: blocks == kind.checkBlocks && wideRowUsesWide(kind))
+            lanes: blocks == kind.checkBlocks ? wideRowLanes(kind) : 0)
     }
 }
 
