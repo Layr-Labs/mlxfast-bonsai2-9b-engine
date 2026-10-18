@@ -273,9 +273,11 @@ extension EngineLoopV2 {
                         committedTargetHidden: committedHidden)
                     if finishReason == nil, confirmed > 0, mtp.lookupNgram == nil,
                         verify.rows.count == 1,
-                        rec.request.maxTokens - rec.generatedTokenCount >= k,
+                        rec.request.maxTokens - rec.generatedTokenCount > k,
                         let block = mtp.blockDrafter
                     {
+                        block.prepareDraft(
+                            history: rec.tokens, depth: k, requestState: state)
                         block.prestageBlock(
                             anchor: kept[confirmed - 1], depth: k, requestState: state)
                     }

@@ -143,6 +143,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// absorbed yet.
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
+        var promptDraft: [Int32]?
         /// Committed context rows the next block will consume, oldest first.
         var pending: [MLXArray] = []
         var pendingRows = 0
@@ -205,6 +206,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
 
         func clearAll() {
+            promptDraft = nil
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
@@ -257,6 +259,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     // MARK: - Proposing
 
+    public func prepareDraft(
+        history: [Int], depth: Int, requestState: any CBv2MTPRequestState
+    ) {
+        let state = self.state(requestState)
+        precondition(!state.isReleased)
+        state.promptDraft = DFlash2PromptLookup.continuation(history: history, depth: depth)
+    }
+
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
@@ -269,6 +279,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         guard !state.pending.isEmpty || state.contextAbsorbed else {
             throw DFlash2Error.emptyBlockContext
+        }
+        if let ids = state.promptDraft, ids.count == depth {
+            // A lookup skips the block, but still advances committed context KV.
+            _ = absorbPendingContext(requestState: requestState)
+            if state.pending.isEmpty, state.contextAbsorbed {
+                let tokens = MLXArray(ids).reshaped([1, depth])
+                state.roots.append(tokens)
+                return tokens
+            }
         }
         let context =
             state.pending.isEmpty
@@ -378,6 +397,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         committedTargetHidden: MLXArray
     ) {
         let state = self.state(requestState)
+        state.promptDraft = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
         append(committedTargetHidden, to: requestState)
@@ -388,7 +408,50 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let state = self.state(requestState)
+        state.promptDraft = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
+    }
+}
+
+// MARK: - Committed-history lookup
+
+/// A longest suffix match must have one full, unambiguous committed continuation.
+enum DFlash2PromptLookup {
+    /// Set DARKBLOOM_DFLASH_PROMPT_LOOKUP=0 to use the neural drafter throughout.
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    static func continuation(history: [Int], depth: Int) -> [Int32]? {
+        let count = history.count
+        guard enabled, depth >= 1, count >= 16 + depth else { return nil }
+        let longest = min(64, count - depth)
+        var best = 15
+        var chosenEnd: Int?
+        var ambiguous = false
+        for end in 16 ... (count - depth) {
+            guard history[end - 1] == history[count - 1] else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit && history[end - length - 1] == history[count - length - 1] {
+                length += 1
+            }
+            guard length >= 16, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if let chosenEnd {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
+            }
+        }
+        guard let chosenEnd, !ambiguous else { return nil }
+        return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
     }
 }

@@ -230,9 +230,36 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// decode and wide prefill keep the stock matmul.
 private enum Qwen35DenseGateProjection {
     static let maximumRows = 16
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_dense_ba_rows",
+        inputNames: ["x", "wb", "wa"], outputNames: ["b", "a"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint n = threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup;
+            const int K = x_shape[1];
+            const uint N = wb_shape[0];
+            const bool is_a = n >= N;
+            const uint col = is_a ? n - N : n;
+            const device float4* wr = (const device float4*)((is_a ? wa : wb) + col * K);
+            float acc[ROWS];
+            for (int v = 0; v < ROWS; v++) acc[v] = 0.0f;
+            for (int k4 = lane; k4 < K / 4; k4 += 32) {
+              const float4 wv = wr[k4];
+              for (int v = 0; v < ROWS; v++) {
+                const float4 xv = ((const device float4*)(x + v * K))[k4];
+                acc[v] = fma(xv.x, wv.x, acc[v]);
+                acc[v] = fma(xv.y, wv.y, acc[v]);
+                acc[v] = fma(xv.z, wv.z, acc[v]);
+                acc[v] = fma(xv.w, wv.w, acc[v]);
+              }
+            }
+            for (int v = 0; v < ROWS; v++) {
+              const float total = simd_sum(acc[v]);
+              if (lane == 0) (is_a ? a : b)[v * N + col] = total;
+            }
+            """)
 
-    /// The eligibility `apply` checks; the rows of `x` when it holds.
-    static func eligibleRows(_ x: MLXArray, b: Linear, a: Linear) -> Int? {
+    static func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
         guard !(b is QuantizedLinear), !(a is QuantizedLinear), b.bias == nil, a.bias == nil,
             x.dtype == .float32, b.weight.dtype == .float32, a.weight.dtype == .float32,
             b.weight.ndim == 2, b.weight.shape == a.weight.shape, x.ndim == 3,
@@ -240,16 +267,14 @@ private enum Qwen35DenseGateProjection {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.dim(0) * x.dim(1)
-        return (2 ... maximumRows).contains(rows) ? rows : nil
-    }
-
-    static func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
-        guard let rows = eligibleRows(x, b: b, a: a) else { return nil }
+        guard (2 ... maximumRows).contains(rows) else { return nil }
         let N = b.weight.dim(0)
-        let outputs = VerifyDenseBA.standalone(
-            x.reshaped([rows, x.dim(2)]), wb: b.weight, wa: a.weight)
+        let outputs = kernel(
+            [x.reshaped([rows, x.dim(2)]), b.weight, a.weight], template: [("ROWS", rows)],
+            grid: (32, 2 * N, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, N], [rows, N]], outputDTypes: [.float32, .float32])
         let shape = [x.dim(0), x.dim(1), N]
-        return (outputs.0.reshaped(shape), outputs.1.reshaped(shape))
+        return (outputs[0].reshaped(shape), outputs[1].reshaped(shape))
     }
 }
 
@@ -978,6 +1003,368 @@ private enum Qwen35PromptConvQKNorm {
             outputDTypes: [.float32, .float32, .float32])
         return (outputs[0], outputs[1], outputs[2])
     }
+}
+
+/// Fresh B1 prompt scan on the current q/k/V and stacked BA producers.
+/// The FP32 matrix operations use the checked order for 8 rows. It differs
+/// from the serial fallback; adoption requires the unchanged 2e-5 state gate
+/// and the target-token gate. Retained and verify states use the fallback.
+private enum Qwen35Fresh8PromptGDN {
+    static func run(
+        q: MLXArray, k: MLXArray, v: MLXArray, ba: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard q.ndim == 4, q.shape == k.shape, q.dim(0) == 1,
+            (64 ... 1365).contains(q.dim(1)), q.dim(1) % 8 == 0,
+            q.dim(2) == 16, q.dim(3) == 128,
+            v.shape == [1, q.dim(1), 32, 128], ba.shape == [1, q.dim(1), 64],
+            aLog.size == 32, dtBias.size == 32,
+            q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            ba.dtype == .float32, aLog.dtype == .float32, dtBias.dtype == .float32,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let T = q.dim(1)
+        let q = q.contiguous(), k = k.contiguous(), v = v.contiguous(), ba = ba.contiguous()
+        let rows = MLXArray(Int32(T))
+        let prepared = prepKernel(
+            [q, k, ba, aLog, dtBias, rows],
+            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
+            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
+            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+            outputDTypes: [.float32, .float32, .float32])
+        let result = scanKernel(
+            [q, k, v, prepared[0], prepared[1], prepared[2], rows],
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
+            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
+    private static let prepKernel = MLXFast.metalKernel(
+        name: "qwen35_fresh8_prompt_prep",
+        inputNames: ["q", "k", "ba", "a_log", "dt_bias", "T"], outputNames: ["tp", "pm", "gf"],
+        source: """
+        // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
+        // Q K^T are formed once and serve the Hv / Hk value heads of this key
+        // head, which run side by side in lane groups of C lanes (lane = head
+        // group * C + row), GP heads per pass.
+        constexpr int HR = Hv / Hk;
+        constexpr int GP = (32 / C) < HR ? (32 / C) : HR;
+        constexpr int CT = C / 8;
+        constexpr int LD = C + 1;
+        threadgroup float KK[C * LD];
+        threadgroup float QK[C * LD];
+        threadgroup float Ah[GP * C * LD];
+        threadgroup float Th[GP * C * LD];
+        const uint lane = thread_index_in_simdgroup;
+        const int T_ = T;
+        const int NC = T_ / C;
+        const int n = int(thread_position_in_grid.y);
+        const int bk = int(thread_position_in_grid.z);
+        const int b_idx = bk / Hk;
+        const int hk = bk % Hk;
+        const int t0 = n * C;
+        const int ks = Hk * Dk;
+        const device float* k_ = k + ((uint)b_idx * T_ + t0) * ks + hk * Dk;
+        const device float* q_ = q + ((uint)b_idx * T_ + t0) * ks + hk * Dk;
+        
+        // lower tiles of K K^T and Q K^T
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          _Pragma("clang loop unroll(full)")
+          for (int tj = 0; tj <= ti; ++tj) {
+            simdgroup_float8x8 akk = simdgroup_float8x8(0);
+            simdgroup_float8x8 aqk = simdgroup_float8x8(0);
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < Dk / 8; ++d) {
+              simdgroup_float8x8 ka, qa, kb;
+              simdgroup_load(ka, k_ + (ti * 8) * ks + d * 8, ks);
+              simdgroup_load(qa, q_ + (ti * 8) * ks + d * 8, ks);
+              simdgroup_load(kb, k_ + (tj * 8) * ks + d * 8, ks, ulong2(0, 0), true);
+              simdgroup_multiply_accumulate(akk, ka, kb, akk);
+              simdgroup_multiply_accumulate(aqk, qa, kb, aqk);
+            }
+            simdgroup_store(akk, KK + (ti * 8) * LD + tj * 8, LD);
+            simdgroup_store(aqk, QK + (ti * 8) * LD + tj * 8, LD);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        const int grp = int(lane) / C;
+        const int row = int(lane) % C;
+        const int gbase = grp * C;
+        for (int h0 = 0; h0 < HR; h0 += GP) {
+          const int h = h0 + grp;
+          const bool live = grp < GP && h < HR;
+          const int hv = hk * HR + (live ? h : 0);
+          const uint slot = ((uint)b_idx * Hv + hv) * NC + n;
+          // in-chunk inclusive prefix of log g within each lane group. A row
+          // whose g underflowed (g == 0, or subnormal) has no finite log: it
+          // zeroes every decay product spanning it, so it adds 0 to the prefix
+          // and `zr` (the group's underflowed rows, one bit per row) masks
+          // the products that span it.
+          float gam = 0.0f;
+          float bet = 0.0f;
+          bool zero = false;
+          if (live) {
+            const uint gate_row = ((uint)b_idx * T_ + t0 + row) * (2u * Hv);
+            const float negative_a = -metal::precise::exp(a_log[hv]);
+            const float gv = qwen35_simd_gate_decay(
+                ba[gate_row + Hv + hv], dt_bias[hv], negative_a);
+            zero = !(gv >= FLT_MIN);
+            gam = zero ? 0.0f : metal::precise::log(zero ? 1.0f : gv);
+            bet = qwen35_simd_gate_beta(ba[gate_row + hv]);
+          }
+          const uint zr = uint(static_cast<simd_vote::vote_t>(simd_ballot(zero)) >> gbase) & ((1u << C) - 1u);
+          _Pragma("clang loop unroll(full)")
+          for (int off = 1; off < C; off <<= 1) {
+            const float up = simd_shuffle_up(gam, ushort(off));
+            gam += row >= off ? up : 0.0f;
+          }
+          const float gam_last = simd_shuffle(gam, ushort(gbase + C - 1));
+          // rows (j, i] as a bit mask: ((2 << i) - 1) & ~((2 << j) - 1)
+          const uint upto = (2u << row) - 1u;
+          // decay factors for the scan: exp(gam_i), exp(gam_last - gam_i)
+          if (live) {
+            device float* gf_ = gf + slot * 2 * C;
+            gf_[row] = (zr & upto) == 0u ? metal::precise::exp(gam) : 0.0f;
+            gf_[C + row] = (zr & ~upto) == 0u ? metal::precise::exp(gam_last - gam) : 0.0f;
+          }
+          // P row (lower incl. diagonal) to device; A row (strict lower) to Ah
+          threadgroup float* A_ = Ah + grp * C * LD;
+          threadgroup float* M_ = Th + grp * C * LD;
+          device float* pm_ = pm + slot * C * C;
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < C; ++j) {
+            const float gj = simd_shuffle(gam, ushort(gbase + j));
+            if (live) {
+              float pv = 0.0f;
+              float av = 0.0f;
+              if (j <= row) {
+                const uint span = upto & ~((2u << j) - 1u);
+                const float e = (zr & span) == 0u ? metal::precise::exp(gam - gj) : 0.0f;
+                pv = QK[row * LD + j] * e;
+                if (j < row) av = bet * KK[row * LD + j] * e;
+              }
+              pm_[row * C + j] = pv;
+              A_[row * LD + j] = av;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          // T = (I + A)^-1, column m = row per lane, stored transposed in M_[m][i]
+          if (live) {
+            const int m = row;
+            for (int i = 0; i < C; ++i) M_[m * LD + i] = (i == m) ? 1.0f : 0.0f;
+            for (int i = m + 1; i < C; ++i) {
+              float s0 = 0.0f, s1 = 0.0f;
+              int j = m;
+              for (; j + 1 < i; j += 2) {
+                s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+                s1 = metal::fma(A_[i * LD + j + 1], M_[m * LD + j + 1], s1);
+              }
+              if (j < i) s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+              M_[m * LD + i] = -(s0 + s1);
+            }
+            // T' = T diag(beta): T'[i][m] = T[i][m] * beta_m
+            device float* tp_ = tp + slot * C * C;
+            for (int i = 0; i < C; ++i) tp_[i * C + m] = M_[m * LD + i] * bet;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    private static let scanKernel = MLXFast.metalKernel(
+        name: "qwen35_fresh8_prompt_scan",
+        inputNames: ["q", "k", "v", "tp", "pm", "gf", "T"], outputNames: ["y", "state_out"],
+        source: """
+        // grid: (32, Dv / 8, B * Hv), threadgroup (32, NS, 1). One simdgroup per
+        // 8 state rows (its S^T columns held in registers across the chunks); the
+        // threadgroup shares each chunk's K, Q, T' and P through threadgroup
+        // memory.
+        constexpr int CT = C / 8;
+        constexpr int DT = Dk / 8;
+        constexpr int LK = Dk + 8;
+        constexpr int LC = C + 8;
+        constexpr int NT = 32 * NS;
+        constexpr int KQ4 = C * (Dk / 4);        // float4s of one chunk of K (or Q)
+        constexpr int TP4 = C * (C / 4);         // float4s of one chunk of T' (or P)
+        threadgroup float Ksh[C * LK];
+        threadgroup float Qsh[C * LK];
+        threadgroup float TPsh[2 * C * LC];
+        const uint lane = thread_index_in_simdgroup;
+        const int tid = int(thread_index_in_threadgroup);
+        const int T_ = T;
+        const int NC = T_ / C;
+        const int r0 = int(thread_position_in_grid.y) * 8;
+        const int bh = int(thread_position_in_grid.z);
+        const int b_idx = bh / Hv;
+        const int hv = bh % Hv;
+        const int hk = hv / (Hv / Hk);
+        const int ks = Hk * Dk;
+        const int vs = Hv * Dv;
+        const short qid = lane / 4;
+        const short fm = (qid & 4) + ((lane / 2) % 4);
+        const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+        const device float* kbase = k + (uint)b_idx * T_ * ks + hk * Dk;
+        const device float* qbase = q + (uint)b_idx * T_ * ks + hk * Dk;
+        const device float* tbase = tp + (uint)bh * NC * C * C;
+        const device float* pbase = pm + (uint)bh * NC * C * C;
+        
+        const device float* vbase = v + (uint)b_idx * T_ * vs + hv * Dv + r0;
+        simdgroup_float8x8 St[DT];
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; ++d)
+          St[d] = simdgroup_float8x8(0);
+        
+        constexpr int RK = (KQ4 + NT - 1) / NT;
+        constexpr int RT = (2 * TP4 + NT - 1) / NT;
+        float4 pk_[RK], pq_[RK], pt_[RT];
+        auto pf_load = [&](int nn) {
+          const int tt0 = nn * C;
+          _Pragma("clang loop unroll(full)")
+          for (int i = 0; i < RK; ++i) {
+            const int e = tid + i * NT;
+            if (e < KQ4) {
+              const int row = e / (Dk / 4);
+              const int c4 = (e % (Dk / 4)) * 4;
+              const uint src = (uint)(tt0 + row) * ks + c4;
+              pk_[i] = *(const device float4*)(kbase + src);
+              pq_[i] = *(const device float4*)(qbase + src);
+            }
+          }
+          _Pragma("clang loop unroll(full)")
+          for (int i = 0; i < RT; ++i) {
+            const int e = tid + i * NT;
+            if (e < 2 * TP4) {
+              const int which = e / TP4;
+              const int f = e % TP4;
+              const device float* src = (which == 0 ? tbase : pbase) + (uint)nn * C * C;
+              pt_[i] = *(const device float4*)(src + f * 4);
+            }
+          }
+        };
+        auto pf_store = [&]() {
+          _Pragma("clang loop unroll(full)")
+          for (int i = 0; i < RK; ++i) {
+            const int e = tid + i * NT;
+            if (e < KQ4) {
+              const int row = e / (Dk / 4);
+              const int c4 = (e % (Dk / 4)) * 4;
+              *(threadgroup float4*)(Ksh + row * LK + c4) = pk_[i];
+              *(threadgroup float4*)(Qsh + row * LK + c4) = pq_[i];
+            }
+          }
+          _Pragma("clang loop unroll(full)")
+          for (int i = 0; i < RT; ++i) {
+            const int e = tid + i * NT;
+            if (e < 2 * TP4) {
+              const int which = e / TP4;
+              const int f = e % TP4;
+              const int row = f / (C / 4);
+              const int c4 = (f % (C / 4)) * 4;
+              *(threadgroup float4*)(TPsh + which * C * LC + row * LC + c4) = pt_[i];
+            }
+          }
+        };
+        pf_load(0);
+        
+        for (int n = 0; n < NC; ++n) {
+          const int t0 = n * C;
+          
+          device float* y_ = y + ((uint)b_idx * T_ + t0) * vs + hv * Dv + r0;
+          const device float* v_ = vbase + (uint)t0 * vs;
+          const device float* gf_ = gf + ((uint)bh * NC + n) * 2 * C;
+          // The next chunk is prefetched while this chunk computes.
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          pf_store();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (n + 1 < NC) { pf_load(n + 1); }
+        
+          // X = K S^T, Xq = Q S^T (C x 8 each)
+          simdgroup_float8x8 Xk[CT];
+          simdgroup_float8x8 Xq[CT];
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            Xk[ti] = simdgroup_float8x8(0);
+            Xq[ti] = simdgroup_float8x8(0);
+          }
+          _Pragma("clang loop unroll(full)")
+          for (int d = 0; d < DT; ++d) {
+            _Pragma("clang loop unroll(full)")
+            for (int ti = 0; ti < CT; ++ti) {
+              simdgroup_float8x8 ka, qa;
+              simdgroup_load(ka, Ksh + (ti * 8) * LK + d * 8, LK);
+              simdgroup_load(qa, Qsh + (ti * 8) * LK + d * 8, LK);
+              simdgroup_multiply_accumulate(Xk[ti], ka, St[d], Xk[ti]);
+              simdgroup_multiply_accumulate(Xq[ti], qa, St[d], Xq[ti]);
+            }
+          }
+          // Z = V - diag(exp gam) Xk (in Xk); Xq <- diag(exp gam) Xq
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            const int row = ti * 8 + fm;
+            const float eg = gf_[row];
+            thread auto& zk = Xk[ti].thread_elements();
+            thread auto& zq = Xq[ti].thread_elements();
+            const float2 vv = *(const device float2*)(v_ + row * vs + fn);
+            zk[0] = vv.x - eg * zk[0];
+            zk[1] = vv.y - eg * zk[1];
+            zq[0] = eg * zq[0];
+            zq[1] = eg * zq[1];
+          }
+          // Delta = T' Z (T' lower triangular)
+          simdgroup_float8x8 Dl[CT];
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            Dl[ti] = simdgroup_float8x8(0);
+            _Pragma("clang loop unroll(full)")
+            for (int tj = 0; tj <= ti; ++tj) {
+              simdgroup_float8x8 ta;
+              simdgroup_load(ta, TPsh + (ti * 8) * LC + tj * 8, LC);
+              simdgroup_multiply_accumulate(Dl[ti], ta, Xk[tj], Dl[ti]);
+            }
+          }
+          // Y = diag(exp gam) Q S^T + P Delta
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            _Pragma("clang loop unroll(full)")
+            for (int tj = 0; tj <= ti; ++tj) {
+              simdgroup_float8x8 pa;
+              simdgroup_load(pa, TPsh + C * LC + (ti * 8) * LC + tj * 8, LC);
+              simdgroup_multiply_accumulate(Xq[ti], pa, Dl[tj], Xq[ti]);
+            }
+            const int row = ti * 8 + fm;
+            thread auto& ye = Xq[ti].thread_elements();
+            *(device float2*)(y_ + row * vs + fn) = float2(ye[0], ye[1]);
+          }
+          // Delta~ = diag(exp(gam_C - gam)) Delta
+          _Pragma("clang loop unroll(full)")
+          for (int ti = 0; ti < CT; ++ti) {
+            const int row = ti * 8 + fm;
+            const float r = gf_[C + row];
+            thread auto& de = Dl[ti].thread_elements();
+            de[0] = de[0] * r;
+            de[1] = de[1] * r;
+          }
+          // S^T <- exp(gam_C) S^T + K^T Delta~
+          const float eC = gf_[C - 1];
+          _Pragma("clang loop unroll(full)")
+          for (int d = 0; d < DT; ++d) {
+            thread auto& se = St[d].thread_elements();
+            se[0] = se[0] * eC;
+            se[1] = se[1] * eC;
+            _Pragma("clang loop unroll(full)")
+            for (int ti = 0; ti < CT; ++ti) {
+              simdgroup_float8x8 kt;
+              simdgroup_load(kt, Ksh + (ti * 8) * LK + d * 8, LK, ulong2(0, 0), true);
+              simdgroup_multiply_accumulate(St[d], kt, Dl[ti], St[d]);
+            }
+          }
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; ++d)
+          simdgroup_store(St[d], state_out + ((uint)bh * Dv + r0) * Dk + d * 8, Dk, ulong2(0, 0), true);
+        """, ensureRowContiguous: true)
 }
 
 /// Prompt-width register recurrence: `qwen35_gdn_register_v3` (same per-lane
@@ -2006,15 +2393,6 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
-            if prompt == nil, let boundary,
-                Qwen35DenseGateProjection.eligibleRows(inputs, b: inProjB, a: inProjA) != nil,
-                let fused = HadamardQuantizedLinear.boundaryProjectionsWithDenseBA(
-                    boundary, [inProjQKV, inProjZ], x: inputs, wb: inProjB.weight, wa: inProjA.weight)
-            {
-                return (
-                    fused.outputs[0], fused.outputs[1].reshaped(B, S, numVHeads, headVDim),
-                    fused.b, fused.a)
-            }
             let shared = prompt ?? boundary.flatMap {
                 HadamardQuantizedLinear.boundaryProjections($0, [inProjQKV, inProjZ])
             } ?? (S >= 128
@@ -2124,14 +2502,17 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     /// The prompt-width (S >= 64, one row) middle of `cbv2Forward`: the
-    /// stacked b/a projection, `Qwen35PromptConvQKNorm` and
-    /// `Qwen35PromptGatedGDN`. Every output has the bits of `processChunk`'s
-    /// fold path with separate b/a projections: the same projection columns,
-    /// the same convolution, SiLU and norms, the same register recurrence and
-    /// gates; the retained convolution tail is the last three QKV rows. Nil
+    /// current conv/QK/V producer is unchanged. If the stacked b/a matmul
+    /// does not preserve each column's bits, an eligible fresh scan uses the
+    /// separate b/a values already made by `projectInputs`.
+    /// An eligible empty B1 state uses the FP32 fresh8 matrix scan. Other
+    /// requests keep `Qwen35PromptGatedGDN` and its serial operation order.
+    /// The retained convolution tail is the last three QKV rows. Nil
     /// when the shapes, dtypes or layers do not qualify.
     private func promptMiddle(
-        _ inputs: MLXArray, qkv: MLXArray, convState: MLXArray, ssmState: MLXArray
+        _ inputs: MLXArray, qkv: MLXArray, a: MLXArray, b: MLXArray,
+        convState: MLXArray, ssmState: MLXArray,
+        freshState: Bool = false
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)? {
         let S = qkv.dim(1)
         guard inputs.ndim == 3, inputs.dim(0) == 1, (64 ... 1365).contains(S),
@@ -2143,14 +2524,24 @@ final class Qwen35GatedDeltaNet: Module {
             inProjB.weight.shape == [numVHeads, inputs.dim(2)], inProjA.weight.shape == inProjB.weight.shape,
             conv1d.bias == nil, conv1d.weight.dtype == .float32,
             aLog.dtype == .float32, dtBias.dtype == .float32, aLog.size == numVHeads, dtBias.size == numVHeads,
-            ssmState.dtype == .float32, ssmState.shape == [1, numVHeads, headVDim, headKDim],
-            let stacked = promptGateWeights.get(b: inProjB.weight, a: inProjA.weight),
-            let (q, k, v) = Qwen35PromptConvQKNorm.apply(
+            ssmState.dtype == .float32, ssmState.shape == [1, numVHeads, headVDim, headKDim]
+        else { return nil }
+        let stacked = promptGateWeights.get(b: inProjB.weight, a: inProjA.weight)
+        guard stacked != nil || (freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32
+            && a.dtype == .float32 && b.dtype == .float32
+            && a.shape == [1, S, numVHeads] && b.shape == a.shape)
+        else { return nil }
+        guard let (q, k, v) = Qwen35PromptConvQKNorm.apply(
                 state: convState, qkv: qkv, weight: conv1d.weight,
                 keyHeads: numKHeads, valueHeads: numVHeads)
         else { return nil }
-        let ba = matmul(inputs, stacked.T)
-        let (out, newSsmState) = Qwen35PromptGatedGDN.run(
+        let ba = stacked.map { matmul(inputs, $0.T) } ?? concatenated([b, a], axis: -1)
+        let fresh = freshState ? Qwen35Fresh8PromptGDN.run(
+            q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias) : nil
+        // A declined stack check can use only the eligible fresh scan.
+        // If that scan declines, retain the exact processChunk fallback.
+        guard stacked != nil || fresh != nil else { return nil }
+        let (out, newSsmState) = fresh ?? Qwen35PromptGatedGDN.run(
             q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias, state: ssmState)
         return (out, contiguous(qkv[0..., (S - 3)...]), newSsmState)
     }
@@ -2507,7 +2898,8 @@ final class Qwen35GatedDeltaNet: Module {
         let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
         let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         let (out, newConvState, newSsmState) = promptMiddle(
-            inputs, qkv: qkv, convState: convState, ssmState: ssmState)
+            inputs, qkv: qkv, a: a, b: b, convState: convState, ssmState: ssmState,
+            freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil)
             ?? processChunk(
                 qkv: qkv, a: a, b: b,
                 convState: convState, ssmState: ssmState, mask: nil)
@@ -2801,13 +3193,16 @@ enum Qwen35VerifyQKNormRoPE {
             constexpr uint D = 256;
             constexpr uint HALF_ROT = uint(ROPE_DIMS) / 2u;
             const uint lane = thread_index_in_simdgroup;
-            const uint head = threadgroup_position_in_grid.y;
-            const uint t = threadgroup_position_in_grid.z;
-            const uint L = threadgroups_per_grid.z;
+            const uint block = threadgroup_position_in_grid.z;
+            const uint L = LAST_QUERY ? k_proj_shape[1] : threadgroups_per_grid.z;
+            const uint head = LAST_QUERY ? block : threadgroup_position_in_grid.y;
             const bool is_q = head < uint(Q_HEADS);
-            const uint h = is_q ? head : head - uint(Q_HEADS);
+            const uint h = LAST_QUERY && !is_q ? (head - uint(Q_HEADS)) / L
+                : (is_q ? head : head - uint(Q_HEADS));
+            const uint t = LAST_QUERY ? (is_q ? L - 1u : (head - uint(Q_HEADS)) % L) : block;
+            const uint qt = LAST_QUERY ? 0u : t;
             const device float* src = is_q
-                ? q_proj + (t * uint(Q_HEADS) + h) * (2u * D)
+                ? q_proj + (qt * uint(Q_HEADS) + h) * (2u * D)
                 : k_proj + (t * uint(KV_HEADS) + h) * D;
             const device float* w = is_q ? q_weight : k_weight;
             const float epsilon = eps[is_q ? 0 : 1];
@@ -2844,7 +3239,9 @@ enum Qwen35VerifyQKNormRoPE {
                     : metal::fma(partner, sintheta, y[0][j] * costheta);
               }
             }
-            device float* dst = (is_q ? q_out : k_out) + (h * L + t) * D;
+            const uint outL = LAST_QUERY && is_q ? 1u : L;
+            const uint outT = LAST_QUERY && is_q ? 0u : t;
+            device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;
             for (uint part = 0; part < 2u; ++part) {
               for (uint j = 0; j < 4u; ++j) dst[part * 128u + lane * 4u + j] = y[part][j];
             }
@@ -2854,11 +3251,15 @@ enum Qwen35VerifyQKNormRoPE {
     static func apply(
         queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
         keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
-        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float
+        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, lastQueryOnly: Bool = false
     ) -> (MLXArray, MLXArray)? {
         guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
-            (2 ... 16).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1)),
-            queryProjection.dim(2) == queryHeads * 512, keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
+            keyProjection.ndim == 3,
+            lastQueryOnly
+                ? (queryProjection.dim(1) == 1 && keyProjection.dim(1) >= 128 && keyProjection.dim(1) % 64 == 0)
+                : ((2 ... 16).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1))),
+            queryProjection.dim(2) == queryHeads * 512,
+            keyProjection.shape == [1, lastQueryOnly ? keyProjection.dim(1) : queryProjection.dim(1), keyHeads * 256],
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
             queryWeight.shape == [256], keyWeight.shape == [256],
@@ -2866,13 +3267,16 @@ enum Qwen35VerifyQKNormRoPE {
             ropeDims % 8 == 0, (8 ... 128).contains(ropeDims),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let L = queryProjection.dim(1)
+        let L = keyProjection.dim(1)
+        let queryRows = lastQueryOnly ? 1 : L
         let outputs = kernel(
             [queryProjection, keyProjection, queryWeight, keyWeight,
                 MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
-            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims)],
-            grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
-            outputShapes: [[1, queryHeads, L, 256], [1, keyHeads, L, 256]],
+            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
+                ("LAST_QUERY", lastQueryOnly)],
+            grid: lastQueryOnly ? (32, 1, queryHeads + keyHeads * L) : (32, queryHeads + keyHeads, L),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[1, queryHeads, queryRows, 256], [1, keyHeads, L, 256]],
             outputDTypes: [.float32, .float32])
         return (outputs[0], outputs[1])
     }
@@ -2971,31 +3375,59 @@ final class Qwen35Attention: Module {
         return oProj(sigmoidMultiply(output, gate))
     }
 
+    func canUseLastQueryPrefill(
+        _ x: MLXArray, cache: any CBv2AttendingLayerCache,
+        positionIds: MLXArray? = nil, exactTargetVerify: Bool = false
+    ) -> Bool {
+        guard x.ndim == 3, x.dim(0) == 1,
+            x.dim(1) >= 128, x.dim(2) == 4096,
+            attentionHeads == 16, kvHeads == 4, qNorm.weight.dim(0) == 256,
+            positionIds == nil, !exactTargetVerify,
+            cache.kind.attention == .full, cache.kind.sharesKVWithLayer == nil,
+            (cache as? CBv2LayerCache)?.mtpSerializesRectangularAttention != true,
+            cache is any CBv2LastQueryPrefillLayerCache,
+            let packedQuery = qProj as? HadamardQuantizedLinear,
+            let packedOutput = oProj as? HadamardQuantizedLinear
+        else { return false }
+        return packedQuery.canCallPromptLastRow(x) && packedOutput.canCallPromptLastRow(x)
+    }
+
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
         exactTargetVerify: Bool = false,
         boundary: HadamardQuantizedLinear.VerifyBoundary? = nil,
-        promptProjections: [MLXArray]? = nil
+        promptProjections: [MLXArray]? = nil, lastQueryOnly: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
+        let narrowsToLastQuery = lastQueryOnly && canUseLastQueryPrefill(
+            x, cache: cache, positionIds: positionIds, exactTargetVerify: exactTargetVerify)
+        let queryRows = narrowsToLastQuery ? 1 : L
+        let projectionLayers = narrowsToLastQuery ? [kProj, vProj] : [qProj, kProj, vProj]
 
         let shared = promptProjections ?? (!exactTargetVerify
             ? boundary.flatMap {
-                HadamardQuantizedLinear.boundaryProjections($0, [qProj, kProj, vProj])
+                HadamardQuantizedLinear.boundaryProjections($0, projectionLayers)
             } ?? (L >= 128
-                ? HadamardQuantizedLinear.sharedPromptProjections(x, [qProj, kProj, vProj])
-                : HadamardQuantizedLinear.sharedShortProjections(x, [qProj, kProj, vProj]))
+                ? HadamardQuantizedLinear.sharedPromptProjections(x, projectionLayers)
+                : HadamardQuantizedLinear.sharedShortProjections(x, projectionLayers))
             : nil)
-        let qProjOutput = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
-        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        let gate = qSplit[1].reshaped(B, L, -1)
+        let qProjOutput: MLXArray
+        if narrowsToLastQuery {
+            qProjOutput = promptProjections?[0] ?? (qProj as! HadamardQuantizedLinear).callPromptLastRow(x)!
+        } else {
+            qProjOutput = exactTargetVerify
+                ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
+        }
+        let qSplit = qProjOutput.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)
+        let gate = qSplit[1].reshaped(B, queryRows, -1)
+        let keyIndex = narrowsToLastQuery && promptProjections == nil ? 0 : 1
+        let valueIndex = narrowsToLastQuery && promptProjections == nil ? 1 : 2
         let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[1] ?? kProj(x))
+            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[keyIndex] ?? kProj(x))
         let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[2] ?? vProj(x))
+            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[valueIndex] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -3007,7 +3439,7 @@ final class Qwen35Attention: Module {
                 queryWeight: qNorm.weight, keyWeight: kNorm.weight,
                 queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
                 queryHeads: attentionHeads, keyHeads: kvHeads,
-                ropeDims: plainRope.dims, ropeBase: plainRope.base)
+                ropeDims: plainRope.dims, ropeBase: plainRope.base, lastQueryOnly: narrowsToLastQuery)
         {
             // Verify window: q/k RMSNorm and RoPE in one kernel, same bits.
             (queries, keys) = fused
@@ -3024,31 +3456,41 @@ final class Qwen35Attention: Module {
                     queries: queries, keys: keys, positionIds: positionIds)
             } else {
                 let offsets = cache.positionOffsets + 0
-                queries = rope(queries, offset: offsets)
+                queries = rope(queries, offset: narrowsToLastQuery ? offsets + Int32(L - 1) : offsets)
                 keys = rope(keys, offset: offsets)
             }
         }
 
-        let attended = cache.updateAndAttend(
-            queries: queries, keys: keys, values: values,
-            scale: scale, sinks: nil)
-        if !exactTargetVerify, B == 1, let packed = oProj as? HadamardQuantizedLinear,
+        let attended: MLXArray
+        if narrowsToLastQuery {
+            attended = (cache as! any CBv2LastQueryPrefillLayerCache).updateAndAttendLastQuery(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        } else {
+            attended = cache.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        }
+        if !narrowsToLastQuery, !exactTargetVerify, B == 1, let packed = oProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterAttentionGate(attended, queryProjection: qProjOutput)
         {
             return gated
         }
-        if !exactTargetVerify, B == 1, L >= 64, let packed = oProj as? HadamardQuantizedLinear,
+        if !narrowsToLastQuery, !exactTargetVerify, B == 1, L >= 64, let packed = oProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: qProjOutput)
         {
             return gated
         }
         let output = attended
             .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+            .reshaped(B, queryRows, -1)
         let projectionInput = sigmoidMultiply(output, gate)
-        return exactTargetVerify
+        if narrowsToLastQuery {
+            let projected = (oProj as! HadamardQuantizedLinear).callPromptLastRow(projectionInput)!
+            return projected
+        }
+        let projected = exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
             : oProj(projectionInput)
+        return projected
     }
 }
 
@@ -3396,20 +3838,24 @@ final class Qwen35DecoderLayer: Module {
             guard let attentionCache else {
                 preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
             }
+            let lastQueryOnly = lastPositionOnly && !captureRecurrentWindow
+                && selfAttn!.canUseLastQueryPrefill(
+                    x, cache: attentionCache, positionIds: positionIds, exactTargetVerify: exactTargetVerify)
             if !exactTargetVerify, x.ndim == 3, x.dim(1) >= 128, let attention = selfAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
                     x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [attention.qProj, attention.kProj, attention.vProj], normalized: false)
+                    projections: [attention.qProj, attention.kProj, attention.vProj], normalized: false,
+                    firstProjectionLastRow: lastQueryOnly)
             {
                 // Prompt width: the input RMSNorm formed in the quantizing
                 // kernel of the q/k/v projections (their only consumer).
                 r = attention.cbv2Forward(
                     x, cache: attentionCache, positionIds: positionIds,
-                    exactTargetVerify: false, promptProjections: prompt.projections)
+                    exactTargetVerify: false, promptProjections: prompt.projections, lastQueryOnly: lastQueryOnly)
             } else {
                 r = selfAttn!.cbv2Forward(
                     inputLayerNorm(x), cache: attentionCache, positionIds: positionIds,
-                    exactTargetVerify: exactTargetVerify)
+                    exactTargetVerify: exactTargetVerify, lastQueryOnly: lastQueryOnly)
             }
         }
         let xPost = lastPositionOnly && x.dim(1) > 1
@@ -3609,15 +4055,18 @@ extension Qwen35DecoderLayer {
                 normalized, modelLayerIndex: modelLayerIndex,
                 recurrentState: recurrentState, promptProjections: prompt.projections)
         } else {
-            guard let attention = selfAttn, let attentionCache,
-                let prompt = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
+            guard let attention = selfAttn, let attentionCache else { return nil }
+            let lastQueryOnly = lastPositionOnly && attention.canUseLastQueryPrefill(
+                x, cache: attentionCache, positionIds: positionIds)
+            guard let prompt = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
                     x, delta: delta, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [attention.qProj, attention.kProj, attention.vProj], normalized: false)
+                    projections: [attention.qProj, attention.kProj, attention.vProj], normalized: false,
+                    firstProjectionLastRow: lastQueryOnly)
             else { return nil }
             inputResidual = prompt.residual
             r = attention.cbv2Forward(
                 inputResidual, cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: false, promptProjections: prompt.projections)
+                exactTargetVerify: false, promptProjections: prompt.projections, lastQueryOnly: lastQueryOnly)
         }
         let xPost = lastPositionOnly && inputResidual.dim(1) > 1
             ? inputResidual[0..., (inputResidual.dim(1) - 1)..., 0...] : inputResidual
