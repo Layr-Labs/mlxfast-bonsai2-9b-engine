@@ -1938,6 +1938,17 @@ enum Qwen35FusedGDNVerify {
         const uint dk0 = (lane % LPD) * R;
         const uint dvlocal = sg * DVPS + (lane / LPD) * DVPL;
         const uint dvbase = dvblock * DVPT + dvlocal;
+        // Form every row's gates concurrently, before the existing conv/norm
+        // barrier. All four simdgroups reuse the same bits in the scan.
+        threadgroup float gate_g[MAX_T];
+        threadgroup float gate_beta[MAX_T];
+        if (tid < T) {
+          const float negative_a = -metal::precise::exp(a_log[hv_idx]);
+          const float bias = dt_bias[hv_idx];
+          const uint gate_idx = (b_idx * T + tid) * Hv + hv_idx;
+          gate_g[tid] = qwen35_simd_gate_decay(a[gate_idx], bias, negative_a);
+          gate_beta[tid] = qwen35_simd_gate_beta(b[gate_idx]);
+        }
         // The scan state loads first, so they overlap the conv and norm below.
         float state[DVPL][R];
         #pragma clang loop unroll(full)
@@ -2056,25 +2067,12 @@ enum Qwen35FusedGDNVerify {
         threadgroup const float* q_ = qk_raw + dk0;
         threadgroup const float* k_ = qk_raw + MAX_T * Dk + dk0;
         threadgroup const float* v_ = v_tile + dvlocal;
-        const device float* a_ = a + b_idx * T * Hv + hv_idx;
-        const device float* bb_ = b + b_idx * T * Hv + hv_idx;
-        float negative_a = 0.0f;
-        float bias = 0.0f;
-        if (lane == 0) {
-          negative_a = -metal::precise::exp(a_log[hv_idx]);
-          bias = dt_bias[hv_idx];
-        }
         device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
         float kr[R];
         float qr[R];
         for (int t = 0; t < int(T); ++t) {
-          float local_g = 0.0f, local_beta = 0.0f;
-          if (lane == 0) {
-            local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);
-            local_beta = qwen35_simd_gate_beta(bb_[0]);
-          }
-          const float gt = simd_broadcast(local_g, 0);
-          const float bt = simd_broadcast(local_beta, 0);
+          const float gt = gate_g[t];
+          const float bt = gate_beta[t];
           #pragma clang loop unroll(full)
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((threadgroup const float4*)k_)[j];
@@ -2135,7 +2133,7 @@ enum Qwen35FusedGDNVerify {
           }
           q_ += Dk;
           y_ += Hv * Dv;
-          k_ += Dk; v_ += DVPT; a_ += Hv; bb_ += Hv;
+          k_ += Dk; v_ += DVPT;
         }
         #pragma clang loop unroll(full)
         for (int d = 0; d < DVPL; ++d) {
