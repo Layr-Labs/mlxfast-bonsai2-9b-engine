@@ -3379,6 +3379,21 @@ enum VerifyInt8Matmul {
     /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
     /// N0, N1, ...]; outputs `out0`....
     static func naxFastSource(layers: Int) -> String {
+        naxFastPick(layers: layers) + naxFastBody
+    }
+
+    /// `naxFastSource` with K a compile-time constant (template `KC`, the
+    /// loop bound and the word and group strides) and every `size_t` index
+    /// computed in 32 bits. Each index is below 2^32 on every shape this
+    /// route takes (`formsFit`), so each address, and so each value read and
+    /// each FP32 step, is the same: the same bits, which `checkForms` checks
+    /// at each real K before a form is used.
+    static func naxFormsSource(layers: Int) -> String {
+        naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + naxFastBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    private static func naxFastPick(layers: Int) -> String {
         var pick = """
             #pragma clang fp contract(off)
             #pragma clang fp reassociate(off)
@@ -3394,7 +3409,7 @@ enum VerifyInt8Matmul {
         for l in 1 ..< layers {
             pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); scalesT = s\(l); biasesT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + naxFastBody
+        return pick
     }
 
     private static let naxKernel = MLXFast.metalKernel(
@@ -3423,6 +3438,44 @@ enum VerifyInt8Matmul {
             source: naxFastSource(layers: layers),
             header: PromptInt8Matmul.naxHeader,
             ensureRowContiguous: true)
+    }
+
+    /// `naxFormsSource` for one, two and three layers (index `layers - 1`).
+    private static let naxFormsKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_nax_forms\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxFormsSource(layers: layers),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
+    /// The model's verify K values (hidden 4096, MLP 12288); each gets its
+    /// own compile-time form, used only after `checkForms` matched it at
+    /// that K. Any other K keeps the record kernel.
+    static let formsK = [4096, 12288]
+    /// `"\(k) \(layers)"` for each form that matched the record kernel at
+    /// load, both offset forms included.
+    nonisolated(unsafe) private static var formsMatched: Set<String> = []
+    /// `DARKBLOOM_BONSAI_VERIFY_FORMS=0` keeps the record kernel everywhere.
+    static let formsAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_FORMS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Every 32-bit index the forms compute stays below 2^31: word offsets
+    /// below N * K / 16, scale and offset offsets below K / 128 * N, output
+    /// offsets below 16 * N (the head, N 248320 at K 4096, needs 63.6M).
+    static func formsFit(k: Int, n: Int) -> Bool {
+        n * (k / 16) < 1 << 31 && (k / 128) * n < 1 << 31 && 16 * n < 1 << 31
+    }
+
+    private static func usesForms(k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]) -> Bool {
+        formsAllowed && formsMatched.contains("\(k) \(layers.count)")
+            && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
     }
 
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
@@ -3454,12 +3507,19 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
+        if forms ?? usesForms(k: k, layers: layers) {
+            let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
+            return naxFormsKernels[layers.count - 1](
+                inputs, template: template,
+                grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+        }
         let template = [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
         return naxFastKernels[layers.count - 1](
             inputs, template: template,
@@ -3555,6 +3615,64 @@ enum VerifyInt8Matmul {
         return matched
     }
 
+    nonisolated(unsafe) private static var formsFailed = false
+
+    /// Runs each compile-time form against the record's fast kernel on a
+    /// fixed, input-independent 16 x 64 x K problem at each real K (16 rows,
+    /// the verify width, so these pipelines are also built here, before any
+    /// timed work) and compares output bits: one layer with `NEG = 0` and,
+    /// where the offset skip is on, `NEG = 1`; two and three layers on
+    /// column slices where the shared forms are on. A form is used only at
+    /// a K and layer count where every comparison matched; a compile error
+    /// or any differing bit keeps the record kernel there.
+    private static func checkForms() -> String {
+        formsMatched = []
+        guard formsAllowed else { return "off (DARKBLOOM_BONSAI_VERIFY_FORMS=0)" }
+        let m = tileRows, n = 64
+        for k in formsK {
+            let kg = k / 128
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
+            let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
+            func bits(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>], forms: Bool) -> MLXArray {
+                let outputs = runFast(
+                    codes: codes, ascale: ascale, rsb: rsb,
+                    layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
+                    m: m, k: k, negative: negative, forms: forms)
+                return concatenated(outputs, axis: 1).view(dtype: .uint32)
+            }
+            func matches(_ columns: [Range<Int>]) -> Bool {
+                formsFailed = false
+                var cases = [(biasesT, false)]
+                if negativeForms { cases.append((negatedT, true)) }
+                for (offsets, negative) in cases {
+                    let equal = MLX.all(
+                        bits(offsets, negative: negative, columns, forms: true)
+                            .== bits(offsets, negative: negative, columns, forms: false))
+                    eval(equal)
+                    if formsFailed || !equal.item(Bool.self) { return false }
+                }
+                return !formsFailed
+            }
+            withErrorHandler({ _ in VerifyInt8Matmul.formsFailed = true }) {
+                if matches([0 ..< n]) { formsMatched.insert("\(k) 1") }
+                if naxShared, matches([0 ..< 32, 32 ..< 64]) { formsMatched.insert("\(k) 2") }
+                if naxShared, matches([0 ..< 32, 32 ..< 64, 0 ..< 32]) { formsMatched.insert("\(k) 3") }
+            }
+        }
+        formsFailed = false
+        return "matched " + formsK.map { k in
+            let layers = (1 ... 3).filter { formsMatched.contains("\(k) \($0)") }.map { String($0) }
+            return "K \(k): layers " + (layers.isEmpty ? "none" : layers.joined(separator: ","))
+        }.joined(separator: "; ")
+    }
+
     /// Decided once, at the first packed module's init. A NAX device takes
     /// the tensor kernel only when it compiles and matches the plain kernel
     /// bit for bit; otherwise it keeps the record's float path. Any other
@@ -3574,8 +3692,9 @@ enum VerifyInt8Matmul {
             checkKernels(nax: false)
             chosen = .plain
         }
+        let forms = chosen == .nax && naxFast ? "; compile-time K forms: \(checkForms())" : ""
         FileHandle.standardError.write(
-            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote))\n"
+            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote)\(forms))\n"
                 .data(using: .utf8)!)
         return chosen
     }()
