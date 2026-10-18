@@ -1922,7 +1922,7 @@ enum Qwen35FusedGDNVerify {
         constexpr int DVPL = 2;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
-        constexpr int DVPT = DVPS * 4;
+        constexpr int DVPT = DVPS * 8;
         constexpr uint C = uint(CONV_DIM);
         threadgroup float qk_raw[2 * MAX_T * Dk];
         threadgroup float v_tile[MAX_T * DVPT];
@@ -1967,7 +1967,7 @@ enum Qwen35FusedGDNVerify {
           #pragma clang fp reassociate(off)
           // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
           #pragma clang loop unroll(full)
-          for (uint part = 0; part < 2; ++part) {
+          for (uint part = 0; part < (tid < 128u ? 2u : 0u); ++part) {
             const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + tid;
             // All loads first; the taps then run in Qwen35FusedConvSilu's order.
             float xin[3 + MAX_T];
@@ -2005,11 +2005,11 @@ enum Qwen35FusedGDNVerify {
               }
             }
           }
-          // The same for this threadgroup's 32 value channels.
+          // Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.
           {
             const uint col = tid % uint(DVPT);
             const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
-            for (uint t = tid / uint(DVPT); t < 3u + T; t += 128u / uint(DVPT)) {
+            for (uint t = tid / uint(DVPT); t < 3u + T; t += 256u / uint(DVPT)) {
               const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
               conv_in[t * C + c] = xv;
               if (t >= T) {
@@ -2017,7 +2017,7 @@ enum Qwen35FusedGDNVerify {
                 conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
               }
             }
-            for (uint p = tid / uint(DVPT); p < T; p += 128u / uint(DVPT)) {
+            for (uint p = tid / uint(DVPT); p < T; p += 256u / uint(DVPT)) {
               float acc = 0.0f;
               for (uint tap = 0; tap < 4u; ++tap) {
                 const uint r = p + tap;
@@ -2036,7 +2036,7 @@ enum Qwen35FusedGDNVerify {
         {
           #pragma clang fp reassociate(off)
           // q/k RMSNorm (Qwen35FusedQKNorm): one simdgroup per (row, q or k).
-          for (uint job = sg; job < 2u * T; job += 4u) {
+          for (uint job = sg; job < 2u * T; job += 8u) {
             const uint part = job % 2u;
             const uint t = job / 2u;
             threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
@@ -2174,7 +2174,7 @@ enum Qwen35FusedGDNVerify {
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+            grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
                 [1, S, valueHeads, 128], state.shape, [1, 3, C]],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
