@@ -3352,24 +3352,10 @@ enum DF2Fast {
             const float eps = fparams[0];
             const float mscale = fparams[1];
             const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
-            if (vecIdx >= 32 * L + 16 * CL) return;
+            if (vecIdx >= 32 * L + 8 * CL) return;
             const uint lane = thread_index_in_simdgroup;
             const int d0 = int(lane);
             const int d1 = d0 + 32;
-            if (vecIdx >= 32 * L + 8 * CL) {
-              const int vIdx = vecIdx - (32 * L + 8 * CL);
-              const int h = vIdx / CL;
-              const int t = vIdx % CL;
-              const device float* vsrc = (t < C) ? cv : bv;
-              const int s = (t < C) ? t : (t - C);
-              const size_t srcBase = ((size_t)s * 8 + h) * 128;
-              const size_t dstBase = ((size_t)h * CL + t) * 128;
-              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
-              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
-              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
-              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
-              return;
-            }
             const bool isK = vecIdx >= 32 * L;
             int h, t, s, H, S_out;
             const device float* src;
@@ -3422,6 +3408,14 @@ enum DF2Fast {
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
             dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            if (isK) {
+              // The matching key SIMD group already has the value transpose indices.
+              const device float* vsrc = (t < C) ? cv : bv;
+              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
+              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
+              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
+              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
+            }
             """)
 
     static func qkvAllNormRope(
@@ -3434,7 +3428,7 @@ enum DF2Fast {
         let qw = normWeight(qNorm)
         let kw = normWeight(kNorm)
         let CL = C + L
-        let totalVecs = 32 * L + 16 * CL
+        let totalVecs = 32 * L + 8 * CL
         let tgs = (totalVecs + 3) / 4
         let outs = qkvAllNormRopeKernel(
             [
