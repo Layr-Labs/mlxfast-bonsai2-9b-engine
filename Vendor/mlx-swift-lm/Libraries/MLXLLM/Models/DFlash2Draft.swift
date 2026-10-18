@@ -335,14 +335,13 @@ extension DFlash2Target {
     }
 }
 
-/// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 96k
-/// are the tokenizer's Latin, code and byte-level merges (rounded to 98304 = 96 * 1024);
-/// the rows above 96k are the CJK and other scripts block. A draft never
-/// reaches the output unverified: the target's full head checks every drafted
-/// token, so a narrower draft vocabulary changes only which tokens are proposed.
-/// `DF2_VOCAB=0` restores the full head.
+/// The drafter proposes from the first `DF2Vocab.rows` token ids. Restricting
+/// the proposal head trades proposal coverage for fewer head-weight bytes and
+/// a shorter selector scan. It never restricts the full-vocabulary target head:
+/// every proposal is verified, and rejected/out-of-prefix tokens come from the target.
+/// `DF2_VOCAB=0` restores the full proposal head.
 enum DF2Vocab {
-    static let rows: Int = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "") ?? 98304
+    static let rows: Int = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "") ?? 65536
 }
 
 /// The target head's prefix rows as one module, kept OFF the module tree (see
