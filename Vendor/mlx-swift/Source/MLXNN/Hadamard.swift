@@ -4132,6 +4132,59 @@ enum VerifyInt8Matmul {
 
         """
 
+    // The two-layer compile-time form with an even last wave. Threadgroups
+    // below `head` = (N0 + N1) / 32 - TAIL run `naxFastBody` on 32 columns,
+    // exactly as `naxFormsSource(layers: 2)`; the last TAIL 32-column tiles
+    // run as 2 x TAIL `naxNarrow16Body` threadgroups of 16 columns each, so
+    // the grid's last, part-filled wave is made of half-length work. Both
+    // bodies keep their own tensor op, layout guard and FP32 steps per
+    // output, in order, and share one threadgroup array the size of the
+    // fast body's, so no threadgroup holds more memory than the record's.
+    static let naxTailPick = """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = KC;
+        const int gx = int(threadgroup_position_in_grid.x);
+        const int head = (ksz[2] + ksz[3]) / 32 - TAIL;
+        const bool tail = gx >= head;
+        int bx = tail ? head + ((gx - head) >> 1) : gx;
+        const device uint32_t* w = w0;
+        const device half* scalesT = s0;
+        const device half* biasesT = b0;
+        device float* out = out0;
+        int N = ksz[2];
+        if (bx >= N / 32) { bx -= N / 32; w = w1; scalesT = s1; biasesT = b1; out = out1; N = ksz[3]; }
+        threadgroup uint32_t bs[4][32 * 32];
+        if (!tail) {
+
+        """
+
+    static let naxTailMid = """
+        } else {
+        bx = 2 * bx + ((gx - head) & 1);
+
+        """
+
+    static var naxTailSource: String {
+        naxTailPick
+            + naxFastBody
+                .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];\n", with: "")
+                .replacingOccurrences(of: "(size_t)", with: "(uint)")
+            + naxTailMid
+            + naxNarrow16Body
+                .replacingOccurrences(of: "threadgroup uint32_t bs[4][16 * 32];\n", with: "")
+                .replacingOccurrences(of: "(size_t)", with: "(uint)")
+            + "}\n"
+    }
+
+    private static let naxTailKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_forms2_tail",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz"],
+        outputNames: ["out0", "out1"],
+        source: naxTailSource,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_verify_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -4302,6 +4355,100 @@ enum VerifyInt8Matmul {
             inputs, template: template,
             grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    /// 32-column tiles at the end of a two-layer call that run as two
+    /// 16-column threadgroups each. The MLP gate|up call (2 x 12288 columns,
+    /// 768 tiles) is 19.2 tiles per core on a 40-core GPU; its last 8 tiles
+    /// become 16 half-length threadgroups (776 in all).
+    static let tailTiles = 8
+    /// The two-layer shapes the tail form takes: `"\(k) \(n0) \(n1)"`.
+    static let tailCandidates = [(k: 4096, n0: 12288, n1: 12288)]
+    /// Shapes in `tailCandidates` whose tail form matched the record
+    /// two-layer form at load. `DARKBLOOM_BONSAI_VERIFY_TAIL=0` leaves it empty.
+    nonisolated(unsafe) private static var tailShapes = Set<String>()
+    static let tailAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_TAIL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The two-layer compile-time form with its last `tailTiles` tiles in
+    /// half-width threadgroups (`naxTailSource`).
+    private static func runTail(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
+        m: Int, k: Int, negative: Bool
+    ) -> [MLXArray] {
+        let ns = layers.map { $0.weight.dim(0) }
+        let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
+        let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
+            + [ascale, rsb, dims]
+        let template = [
+            ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("TAIL", tailTiles),
+        ] as [(String, any KernelTemplateArg)]
+        return naxTailKernel(
+            inputs, template: template,
+            grid: ((ns.reduce(0, +) / 32 + tailTiles) * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    private static func usesTail(k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]) -> Bool {
+        layers.count == 2 && usesForms(k: k, layers: layers)
+            && tailShapes.contains("\(k) \(layers[0].weight.dim(0)) \(layers[1].weight.dim(0))")
+    }
+
+    nonisolated(unsafe) private static var tailFailed = false
+
+    /// Compares the tail form with the record two-layer compile-time form
+    /// (the kernel it replaces) on each shape of `tailCandidates` at its
+    /// real size: two distinct layers, every verify row count 2 ... 16 and
+    /// both offset forms where the offset skip is on, all 16 code rows
+    /// filled. A shape joins `tailShapes` only when every output word of
+    /// both layers matches, the tail output holds no NaN and no kernel
+    /// raised an error; anything else keeps the record form there.
+    private static func checkTail() -> String {
+        tailShapes = []
+        guard tailAllowed else { return "off (DARKBLOOM_BONSAI_VERIFY_TAIL=0)" }
+        for shape in tailCandidates {
+            let k = shape.k, kg = k / 128, n = shape.n0 + shape.n1
+            guard formsMatched.contains("\(k) 2"), formsFit(k: k, n: shape.n0), formsFit(k: k, n: shape.n1)
+            else { continue }
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+            let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+            let parts = [0 ..< shape.n0, shape.n0 ..< n]
+            tailFailed = false
+            var matched = true
+            withErrorHandler({ _ in VerifyInt8Matmul.tailFailed = true }) {
+                for m in 2 ... tileRows {
+                    for negative in negativeForms ? [false, true] : [false] where matched {
+                        let offsets = negative ? negatedT : biasesT
+                        let layers = parts.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) }
+                        let record = runFast(
+                            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
+                            negative: negative, forms: true)
+                        let tail = runTail(
+                            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative)
+                        let equal = MLX.all(record[0].view(dtype: .uint32) .== tail[0].view(dtype: .uint32))
+                            .&& MLX.all(record[1].view(dtype: .uint32) .== tail[1].view(dtype: .uint32))
+                            .&& .!MLX.any(isNaN(tail[0])) .&& .!MLX.any(isNaN(tail[1]))
+                        eval(equal)
+                        matched = !tailFailed && equal.item(Bool.self)
+                    }
+                }
+            }
+            if matched { tailShapes.insert("\(k) \(shape.n0) \(shape.n1)") }
+        }
+        tailFailed = false
+        return "matched " + (tailShapes.isEmpty ? "none" : tailShapes.sorted().joined(separator: ", "))
+            + " of " + tailCandidates.map { "\($0.k) \($0.n0) \($0.n1)" }.joined(separator: ", ")
     }
 
     private static func runNarrow(
@@ -4562,6 +4709,11 @@ enum VerifyInt8Matmul {
         FileHandle.standardError.write(
             "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote)\(forms))\n"
                 .data(using: .utf8)!)
+        if chosen == .nax, naxFast, naxShared {
+            FileHandle.standardError.write(
+                "int8 verify tail (last \(tailTiles) tiles in 16-column threadgroups): \(checkTail())\n"
+                    .data(using: .utf8)!)
+        }
         let narrowValue = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_NARROW"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if chosen == .nax, naxFast, !["0", "false", "no", "off"].contains(narrowValue ?? "") {
@@ -4612,9 +4764,17 @@ enum VerifyInt8Matmul {
     ) -> [MLXArray]? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
+            let operands: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] =
+                layers.map { ($0.weight, $0.scalesT, $0.biasesT) }
+            if usesTail(k: activation.k, layers: operands) {
+                return runTail(
+                    codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                    layers: operands, m: activation.rows, k: activation.k,
+                    negative: negativeForms && layers.allSatisfy { $0.negative })
+            }
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
-                layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
+                layers: operands,
                 m: activation.rows, k: activation.k,
                 negative: negativeForms && layers.allSatisfy { $0.negative })
         }
