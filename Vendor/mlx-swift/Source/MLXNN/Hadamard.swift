@@ -3464,6 +3464,36 @@ enum PromptInt8Matmul {
         }
     }
 
+    // `naxRegBody` on a 64 x 64 tile per threadgroup of four simdgroups, two
+    // row halves by two column halves on `naxSgBody`'s grid (sum N / 64 *
+    // 128, M / 64). The two simdgroups that share a column half fetch the same
+    // words at the same time on one core, so each word leaves L2 once per 64
+    // rows instead of once per 32. Each simdgroup runs `naxRegBody`'s guard,
+    // operand build, op, epilogue and stores on its own 32 x 32 tile; `tbase`
+    // already indexes `ms` inside its 64-row tile, so it stands. Every output
+    // is `naxSgBody`'s bits (checked at load, `checkRegisterRows64`).
+    static let naxRegRows64Body = swapped(naxRegBody, [
+        (of: """
+            const int ms = int(threadgroup_position_in_grid.y) * 32;
+            const int ns = bx * 64 + 32 * int(sg);
+            """, with: """
+            const int ms = int(threadgroup_position_in_grid.y) * 64 + 32 * int(sg >> 1);
+            const int ns = bx * 64 + 32 * int(sg & 1);
+            """),
+    ])
+
+    /// `naxRegRows64Body` for one, two and three layers (index `layers - 1`).
+    private static let naxRegRows64Kernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_matmul_nax_reg_rows64_\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxSgSource(layers: layers, body: naxRegRows64Body),
+            header: naxHeader,
+            ensureRowContiguous: true)
+    }
+
     // `naxRegBody` on a 32 x 128 tile per threadgroup of four simdgroups, all
     // on the same 32 rows, so one activation slice serves 128 columns instead
     // of 64. Simdgroups 2 h and 2 h + 1 take the 64-column unit 2 x + h through
@@ -3496,16 +3526,18 @@ enum PromptInt8Matmul {
     }
 
     /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its
-    /// register-weight forms `naxRegBody` and `naxRegCols128Source`. Each names its kernels (index `layers - 1`), its
+    /// register-weight forms `naxRegBody`, `naxRegCols128Source` and
+    /// `naxRegRows64Body`. Each names its kernels (index `layers - 1`), its
     /// threads per threadgroup and its rows and columns per threadgroup.
     enum SgForm {
-        case staged, register, registerCols128
+        case staged, register, registerCols128, registerRows64
 
         var launch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
             switch self {
             case .staged: return (PromptInt8Matmul.naxSgKernels, 128, 64, 64)
             case .register: return (PromptInt8Matmul.naxRegKernels, 64, 32, 64)
             case .registerCols128: return (PromptInt8Matmul.naxRegCols128Kernels, 128, 32, 128)
+            case .registerRows64: return (PromptInt8Matmul.naxRegRows64Kernels, 128, 64, 64)
             }
         }
     }
@@ -3669,6 +3701,18 @@ enum PromptInt8Matmul {
         return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
     }
 
+    /// `naxRegRows64Body` against `naxSgBody`, once a register-weight form
+    /// matched: `sgForm` becomes `.registerRows64` when every bit matched, else
+    /// the form selected before it stays. Returns the verdict for the stderr
+    /// line.
+    private static func checkRegisterRows64() -> String {
+        if switchedOff("DARKBLOOM_BONSAI_PROMPT_REG_ROWS64") { return "off (DARKBLOOM_BONSAI_PROMPT_REG_ROWS64=0)" }
+        guard sgForm != .staged else { return "off (the register-weight kernel is not in use)" }
+        let (same, detail) = matchesStaged(.registerRows64)
+        if same { sgForm = .registerRows64 }
+        return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
+    }
+
     /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
     /// or later, 18 or later for a `p` part.
     static func architectureHasNAX(_ name: String) -> Bool {
@@ -3795,6 +3839,8 @@ enum PromptInt8Matmul {
                 "int8 prompt register-weight kernel: \(checkRegister())\n".data(using: .utf8)!)
             FileHandle.standardError.write(
                 "int8 prompt register-weight 128-column kernel: \(checkRegisterCols128())\n".data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "int8 prompt register-weight 64-row kernel: \(checkRegisterRows64())\n".data(using: .utf8)!)
         }
         return chosen
     }()
