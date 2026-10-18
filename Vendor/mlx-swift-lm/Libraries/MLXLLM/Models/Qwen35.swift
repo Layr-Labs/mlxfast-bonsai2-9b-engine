@@ -1003,6 +1003,76 @@ private enum Qwen35PromptConvQKNorm {
             outputDTypes: [.float32, .float32, .float32])
         return (outputs[0], outputs[1], outputs[2])
     }
+
+    /// The q/k half of `kernel`, op for op: the same threadgroups for the
+    /// q and k heads, none for the value heads (the staged prompt scan forms
+    /// the values itself). Same bits for q and k.
+    private static let keyKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_only",
+        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            const uint groups = uint(2 * HK);
+            const uint t = threadgroup_position_in_grid.y / groups;
+            const uint gi = threadgroup_position_in_grid.y % groups;
+            const uint lane = thread_index_in_simdgroup;
+            const uint C = uint(CONV_DIM);
+            const uint c0 = gi * 128u + lane * 4u;
+            float val[4];
+            for (int i = 0; i < 4; ++i) {
+              const uint c = c0 + uint(i);
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = t + tap;
+                const float v = r < 3u ? state[r * C + c] : qkv[(r - 3u) * C + c];
+                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              val[i] = acc * sig;
+            }
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              sum += val[i] * val[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+            const bool is_q = gi < uint(HK);
+            const float scale = as_type<float>(uint(is_q ? Q_SCALE_BITS : K_SCALE_BITS));
+            const uint o = (t * uint(HK) + (is_q ? gi : gi - uint(HK))) * 128u + lane * 4u;
+            ((device float4*)((is_q ? q_out : k_out) + o))[0] = float4(
+              scale * (val[0] * inv),
+              scale * (val[1] * inv),
+              scale * (val[2] * inv),
+              scale * (val[3] * inv)
+            );
+            """,
+        ensureRowContiguous: true)
+
+    /// `apply`'s q and k only.
+    static func applyKeys(
+        state: MLXArray, qkv: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int
+    ) -> (MLXArray, MLXArray)? {
+        let C = qkv.dim(-1)
+        guard state.ndim == 3, state.dim(0) == 1, state.dim(1) == 3, qkv.ndim == 3, qkv.dim(0) == 1,
+            qkv.dim(1) >= 3, C == state.dim(2), C == (2 * keyHeads + valueHeads) * 128,
+            state.dtype == .float32, qkv.dtype == .float32, weight.dtype == .float32,
+            weight.shape == [C, 4, 1], qkv.size <= Int(Int32.max),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let S = qkv.dim(1)
+        let invScale = pow(Float(128), -0.5)
+        let outputs = keyKernel(
+            [state, qkv, weight],
+            template: [("HK", keyHeads), ("HV", valueHeads), ("CONV_DIM", C),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (32, S * (2 * keyHeads), 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
 }
 
 /// Prompt-width register recurrence: `qwen35_gdn_register_v3` (same per-lane
@@ -1154,6 +1224,241 @@ private enum Qwen35PromptGatedGDN {
             grid: (64, Dv / 16, B * Hv), threadGroup: (64, 1, 1),
             outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
+    }
+}
+
+/// `Qwen35PromptGatedGDN` with the value and key rows staged in threadgroup
+/// memory: every 16 steps the threadgroup forms the tile's values (the
+/// depthwise conv over the retained state and the raw QKV value channels,
+/// then SiLU, with the arithmetic of `Qwen35PromptConvQKNorm`) and copies
+/// the tile's key rows, so the conv kernel skips the value heads and no
+/// value array is written or read. The scan is `Qwen35PromptGatedGDN`'s,
+/// op for op. A load-time check on a synthetic input must reproduce the
+/// record pair's y and state bit for bit, else the record pair runs.
+/// `MLXFAST_GDN_PROMPT_STAGED=0` turns it off.
+private enum Qwen35PromptStagedGDN {
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_gated_staged",
+        inputNames: ["q", "k", "qkv", "conv_state", "conv_weight", "ba", "a_log", "dt_bias", "state_in"],
+        outputNames: ["y", "state_out"],
+        source: """
+        const uint T = q_shape[1];
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 2;
+        constexpr uint TS = 16u;
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = n / Hv;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint ltid = thread_index_in_threadgroup;
+        threadgroup float gate_g[MAX_T];
+        threadgroup float gate_beta[MAX_T];
+        threadgroup float vts[TS][DVPT];
+        threadgroup float4 kts[TS][Dk / 4];
+        {
+          const float negative_a = -metal::precise::exp(a_log[hv_idx]);
+          const float bias = dt_bias[hv_idx];
+          const device float* ba_ = ba + b_idx * T * (2 * Hv);
+          for (uint t = ltid; t < T; t += 64u) {
+            gate_g[t] = qwen35_simd_gate_decay(ba_[t * (2 * Hv) + Hv + hv_idx], bias, negative_a);
+            gate_beta[t] = qwen35_simd_gate_beta(ba_[t * (2 * Hv) + hv_idx]);
+          }
+        }
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvbase = threadgroup_position_in_grid.y * DVPT + sg * DVPS + (lane / LPD) * DVPL;
+        const uint vloc = sg * DVPS + (lane / LPD) * DVPL;
+        const uint C = uint(CONV_DIM);
+        const uint ch_tg = 2u * Hk * Dk + hv_idx * Dv + threadgroup_position_in_grid.y * DVPT;
+        const device float4* k_tile4 = (const device float4*)(k + (b_idx * T * Hk + hk_idx) * Dk);
+        const device float* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + dk0;
+        device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
+        float kr[R];
+        float qr[R];
+        for (uint t = 0; t < T; ++t) {
+          const uint s = t % TS;
+          if (s == 0u) {
+            const uint tn = metal::min(TS, T - t);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = ltid; idx < tn * uint(DVPT); idx += 64u) {
+              #pragma clang fp reassociate(off)
+              const uint ss = idx / uint(DVPT), c = idx % uint(DVPT);
+              const uint channel = ch_tg + c;
+              const uint p = t + ss;
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = p + tap;
+                const float x = r < 3u ? conv_state[r * C + channel] : qkv[(r - 3u) * C + channel];
+                acc = fma(x, conv_weight[channel * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              vts[ss][c] = acc * sig;
+            }
+            for (uint idx = ltid; idx < tn * uint(Dk / 4); idx += 64u) {
+              const uint ss = idx / uint(Dk / 4), c = idx % uint(Dk / 4);
+              kts[ss][c] = k_tile4[(t + ss) * uint(Hk * Dk / 4) + c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          const float gt = gate_g[t];
+          const float bt = gate_beta[t];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = kts[s][(lane % LPD) * (R / 4) + j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((const device float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            vt[d] = vts[s][vloc + d];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              kv[d] += simd_shuffle_xor(kv[d], o);
+            }
+          }
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          #pragma clang loop unroll(full)
+          for (int o = LPD / 2; o > 0; o >>= 1) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              out[d] += simd_shuffle_xor(out[d], o);
+            }
+          }
+          if (lane % LPD == 0) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              y_[d] = out[d];
+            }
+          }
+          q_ += Hk * Dk; y_ += Hv * Dv;
+        }
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+          }
+        }
+        """,
+        header: Qwen35RegisterGatedSIMD.gateHeader,
+        ensureRowContiguous: true)
+
+    static func run(
+        q: MLXArray, k: MLXArray, qkv: MLXArray, convState: MLXArray, convWeight: MLXArray,
+        ba: MLXArray, aLog: MLXArray, dtBias: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = state.dim(1), Dv = state.dim(2)
+        let result = kernel(
+            [q, k, qkv, convState, convWeight, ba, aLog, dtBias, state],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+                ("MAX_T", T <= 512 ? 512 : Qwen35PromptGatedGDN.maximumSteps),
+                ("CONV_DIM", qkv.dim(2))],
+            grid: (64, Dv / 16, Hv), threadGroup: (64, 1, 1),
+            outputShapes: [[1, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
+    private static let switchedOn: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_PROMPT_STAGED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+    private static let lock = NSLock()
+
+    /// Once per process and geometry: the staged pair against the record
+    /// pair on a synthetic 67-step prompt (one partial tile, conv-state rows).
+    static func enabled(keyHeads: Int, valueHeads: Int) -> Bool {
+        guard switchedOn, StreamOrDevice.default == StreamOrDevice.gpu else { return false }
+        let key = "\(keyHeads)x\(valueHeads)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let verdict = verdicts[key] { return verdict }
+        let T = 67
+        let C = (2 * keyHeads + valueHeads) * 128
+        let parts = MLXRandom.split(key: MLXRandom.key(0x6764_6e73), into: 7)
+        let convState = MLXRandom.uniform(low: -3, high: 3, [1, 3, C], key: parts[0])
+        let qkv = MLXRandom.uniform(low: -3, high: 3, [1, T, C], key: parts[1])
+        let weight = MLXRandom.uniform(low: -0.7, high: 0.7, [C, 4, 1], key: parts[2])
+        let ba = MLXRandom.uniform(low: -4, high: 4, [1, T, 2 * valueHeads], key: parts[3])
+        let aLog = MLXRandom.uniform(low: -2, high: 1, [valueHeads], key: parts[4])
+        let dtBias = MLXRandom.uniform(low: -1, high: 1, [valueHeads], key: parts[5])
+        let state = MLXRandom.uniform(low: -1, high: 1, [1, valueHeads, 128, 128], key: parts[6])
+        var verdict = false
+        if let (q, k, v) = Qwen35PromptConvQKNorm.apply(
+                state: convState, qkv: qkv, weight: weight, keyHeads: keyHeads, valueHeads: valueHeads),
+            let (q1, k1) = Qwen35PromptConvQKNorm.applyKeys(
+                state: convState, qkv: qkv, weight: weight, keyHeads: keyHeads, valueHeads: valueHeads)
+        {
+            let (y0, s0) = Qwen35PromptGatedGDN.run(
+                q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias, state: state)
+            let (y1, s1) = run(
+                q: q1, k: k1, qkv: qkv, convState: convState, convWeight: weight,
+                ba: ba, aLog: aLog, dtBias: dtBias, state: state)
+            let same = MLX.all(y0.view(dtype: .uint32) .== y1.view(dtype: .uint32))
+                .&& MLX.all(s0.view(dtype: .uint32) .== s1.view(dtype: .uint32))
+            verdict = same.item(Bool.self)
+        }
+        verdicts[key] = verdict
+        if !verdict {
+            FileHandle.standardError.write(
+                Data("qwen35 gdn: staged prompt scan mismatch, falling back\n".utf8))
+        }
+        return verdict
     }
 }
 
@@ -2160,8 +2465,20 @@ final class Qwen35GatedDeltaNet: Module {
             conv1d.bias == nil, conv1d.weight.dtype == .float32,
             aLog.dtype == .float32, dtBias.dtype == .float32, aLog.size == numVHeads, dtBias.size == numVHeads,
             ssmState.dtype == .float32, ssmState.shape == [1, numVHeads, headVDim, headKDim],
-            let stacked = promptGateWeights.get(b: inProjB.weight, a: inProjA.weight),
-            let (q, k, v) = Qwen35PromptConvQKNorm.apply(
+            let stacked = promptGateWeights.get(b: inProjB.weight, a: inProjA.weight)
+        else { return nil }
+        if Qwen35PromptStagedGDN.enabled(keyHeads: numKHeads, valueHeads: numVHeads),
+            let (q, k) = Qwen35PromptConvQKNorm.applyKeys(
+                state: convState, qkv: qkv, weight: conv1d.weight,
+                keyHeads: numKHeads, valueHeads: numVHeads)
+        {
+            let ba = matmul(inputs, stacked.T)
+            let (out, newSsmState) = Qwen35PromptStagedGDN.run(
+                q: q, k: k, qkv: qkv, convState: convState, convWeight: conv1d.weight,
+                ba: ba, aLog: aLog, dtBias: dtBias, state: ssmState)
+            return (out, contiguous(qkv[0..., (S - 3)...]), newSsmState)
+        }
+        guard let (q, k, v) = Qwen35PromptConvQKNorm.apply(
                 state: convState, qkv: qkv, weight: conv1d.weight,
                 keyHeads: numKHeads, valueHeads: numVHeads)
         else { return nil }
