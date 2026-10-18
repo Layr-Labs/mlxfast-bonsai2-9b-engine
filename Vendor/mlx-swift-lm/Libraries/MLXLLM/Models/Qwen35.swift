@@ -2056,20 +2056,6 @@ enum Qwen35FusedGDNVerify {
           gate_g[tid] = qwen35_simd_gate_decay(a[gate_idx], bias, negative_a);
           gate_beta[tid] = qwen35_simd_gate_beta(b[gate_idx]);
         }
-        // The scan state loads first, so they overlap the conv and norm below.
-        float state[DVPL][R];
-        #pragma clang loop unroll(full)
-        for (int d = 0; d < DVPL; ++d) {
-          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < R / 4; ++j) {
-            const float4 s4 = s_in4[j];
-            state[d][4 * j + 0] = s4.x;
-            state[d][4 * j + 1] = s4.y;
-            state[d][4 * j + 2] = s4.z;
-            state[d][4 * j + 3] = s4.w;
-          }
-        }
         {
           #pragma clang fp reassociate(off)
           // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
@@ -2170,6 +2156,20 @@ enum Qwen35FusedGDNVerify {
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Load state immediately before recurrence to shorten register live range across conv and norm.
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
         // Qwen35RegisterGatedSIMD with q/k/v read from threadgroup memory.
         threadgroup const float* q_ = qk_raw + dk0;
         threadgroup const float* k_ = qk_raw + MAX_T * Dk + dk0;
