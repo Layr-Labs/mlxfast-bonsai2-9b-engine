@@ -3086,9 +3086,7 @@ enum DF2Fast {
     }
 
     /// Multi-block parallel top-16 per (row, block): 8 blocks of 256 threads per row (120 blocks for P=15).
-    static let topk = MLXFast.metalKernel(
-        name: "df2_topk16_mb8", inputNames: ["logits", "vsz"], outputNames: ["ids", "vals"],
-        source: """
+    static let topkSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint blk = threadgroup_position_in_grid.y;
             const uint tid = thread_position_in_threadgroup.x;
@@ -3141,12 +3139,12 @@ enum DF2Fast {
                 }
               }
             }
-            """)
+            """
+    static let topk = MLXFast.metalKernel(
+        name: "df2_topk16_mb8", inputNames: ["logits", "vsz"], outputNames: ["ids", "vals"],
+        source: topkSource)
 
-    static let selector = MLXFast.metalKernel(
-        name: "df2_selector_mb8", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor"],
-        outputNames: ["path"],
-        source: """
+    static let selectorSource = """
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
             const int P = int(cand_shape[0]);
@@ -3195,21 +3193,60 @@ enum DF2Fast {
               pr = tc[p][best];
               if (tid == 0) { path[p] = pr; }
             }
-            """)
+            """
+    static let selector = MLXFast.metalKernel(
+        name: "df2_selector_mb8", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor"],
+        outputNames: ["path"], source: selectorSource)
+
+    // Preserve the 2048 logical vocabulary-scan lanes and their local top-4,
+    // but expose twice as many, half-sized blocks. The two merge stages keep
+    // the same global top-16 (including the parent's token-id tie breaks).
+    static let topkMB16On = ProcessInfo.processInfo.environment["DF2_TOPK_MB16"] != "0"
+    static let topkMB16 = MLXFast.metalKernel(
+        name: "df2_topk16_mb16", inputNames: ["logits", "vsz"], outputNames: ["ids", "vals"],
+        source: topkSource
+            .replacingOccurrences(of: "blk * 256u + tid", with: "blk * 128u + tid")
+            .replacingOccurrences(of: "wv[128]", with: "wv[64]")
+            .replacingOccurrences(of: "wi[128]", with: "wi[64]")
+            .replacingOccurrences(of: "float sv[4]; int si[4];", with: "float sv[2]; int si[2];")
+            .replacingOccurrences(of: "lane * 4 + k", with: "lane * 2 + k")
+            .replacingOccurrences(of: "k < 4; k++", with: "k < 2; k++")
+            .replacingOccurrences(of: "(size_t)row * 8u + blk", with: "(size_t)row * 16u + blk"))
+    static let selectorMB16 = MLXFast.metalKernel(
+        name: "df2_selector_mb16", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor"],
+        outputNames: ["path"], source: selectorSource
+            .replacingOccurrences(of: "float cv[4]; int ci[4];", with: "float cv[8]; int ci[8];")
+            .replacingOccurrences(of: "(size_t)p * 128u + lane * 4u", with: "(size_t)p * 256u + lane * 8u")
+            .replacingOccurrences(of: "k < 4; k++", with: "k < 8; k++"))
+    nonisolated(unsafe) static var topkMB16Checked: [String: Bool] = [:]
 
     /// Fused top-16 + greedy selector for `selectGreedy` (B = 1).
     static func select(
         logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray
     ) -> MLXArray {
         let V = logits.dim(-1), P = logits.size / V
-        let top = topk(
-            [logits.reshaped([P, V]).asType(.float32), MLXArray([Int32(V)])],
-            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
-        let path = selector(
-            [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32)],
-            grid: (512, 1, 1), threadGroup: (512, 1, 1),
-            outputShapes: [[P]], outputDTypes: [.int32])[0]
+        let key = "\(P)/\(V)"
+        let useMB16 = topkMB16On && topkMB16Checked[key] != false
+        let scan = [logits.reshaped([P, V]).asType(.float32), MLXArray([Int32(V)])]
+        let tail = [projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32)]
+        func run(_ mb16: Bool) -> MLXArray {
+            let threads = mb16 ? 128 : 256, blocks = mb16 ? 16 : 8
+            let top = (mb16 ? topkMB16 : topk)(
+                scan, grid: (P * threads, blocks, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[P, blocks * 16], [P, blocks * 16]], outputDTypes: [.int32, .float32])
+            return (mb16 ? selectorMB16 : selector)(
+                [top[0], top[1]] + tail,
+                grid: (512, 1, 1), threadGroup: (512, 1, 1),
+                outputShapes: [[P]], outputDTypes: [.int32])[0]
+        }
+        let path = run(useMB16)
+        if useMB16 && topkMB16Checked[key] == nil {
+            let reference = run(false)
+            let same = (path .== reference).all().item(Bool.self)
+            topkMB16Checked[key] = same
+            FileHandle.standardError.write(Data("DF2 topk MB16 \(key): \(same ? "path equal" : "mismatch; parent kept")\n".utf8))
+            if !same { return reference.reshaped([1, P]) }
+        }
         return path.reshaped([1, P])
     }
 }
