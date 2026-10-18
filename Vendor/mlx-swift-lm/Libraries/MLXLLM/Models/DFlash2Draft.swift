@@ -584,7 +584,8 @@ private final class DFlash2Attention: Module {
         conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil,
         ropeSpec: DF2Fast.RopeSpec? = nil,
         contextCodes: DF2Fast.W4Codes? = nil,
-        precomputedContextKV: (MLXArray, MLXArray)? = nil
+        precomputedContextKV: (MLXArray, MLXArray)? = nil,
+        normalizedContextKV: (k: MLXArray, v: MLXArray, offset: Int)? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -592,6 +593,7 @@ private final class DFlash2Attention: Module {
         var contextLength = context.dim(1)
         var activeContextCodes = contextCodes
         var activePrecomputedKV = precomputedContextKV
+        var activeNormalizedKV = normalizedContextKV
 
         if let slidingWindow {
             let skip = DFlash2SlidingMask.contextSkip(
@@ -601,6 +603,7 @@ private final class DFlash2Attention: Module {
                 contextLength = context.dim(1)
                 activeContextCodes = nil
                 activePrecomputedKV = nil
+                activeNormalizedKV = nil
                 // The dropped rows still happened, so the cache's notion of
                 // where the block sits has to move with them.
                 if let base = cache as? BaseKVCache {
@@ -645,7 +648,20 @@ private final class DFlash2Attention: Module {
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         var combinedKV: (k: MLXArray, v: MLXArray)? = nil
-        if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
+        if let normalized = activeNormalizedKV, let ropeSpec,
+            B == 1, heads == 32, kvHeads == 8, contextLength > 0, contextLength <= 16,
+            cache is DFlash2LayerKVCache, normalized.offset == cache.offset,
+            normalized.k.shape == [1, 8, contextLength, 128],
+            normalized.v.shape == normalized.k.shape,
+            let allOut = DF2Fast.qkvPreparedNormRope(
+                q: queries, k: blockKeys, v: blockValues,
+                ck: normalized.k, cv: normalized.v,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                L: L, C: contextLength, blockOffset: blockOffset, ctxOffset: cache.offset)
+        {
+            queries = allOut.0
+            combinedKV = (allOut.1, allOut.2)
+        } else if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
             contextLength > 0, contextLength <= 16,
             let fastCache = cache as? DFlash2LayerKVCache,
             let allOut = DF2Fast.qkvAllNormRope(
@@ -1147,6 +1163,7 @@ private final class DFlash2DecoderLayer: Module {
         context: MLXArray, rope: RoPELayer, cache: KVCache,
         ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.W4Codes?,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
+        normalizedContextKV: (k: MLXArray, v: MLXArray, offset: Int)? = nil,
         submitAttention: Bool = false
     ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
         let n1 = normedInput ?? DF2Fast.rms(x, inputLayerNorm)
@@ -1162,13 +1179,13 @@ private final class DFlash2DecoderLayer: Module {
                 n1, context: context, rope: rope, cache: cache,
                 conv0: (n: n1, dyn: p1, base: base1),
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
+                precomputedContextKV: precomputedContextKV, normalizedContextKV: normalizedContextKV)
         } else {
             let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
             attnOut = selfAttn(
                 a, context: context, rope: rope, cache: cache,
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
+                precomputedContextKV: precomputedContextKV, normalizedContextKV: normalizedContextKV)
         }
         // Hand the attention half to the GPU while the rest is built.
         if submitAttention { asyncEval(attnOut) }
@@ -1708,6 +1725,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     context: context, rope: rope, cache: cache[index],
                     ropeSpec: rSpec, contextCodes: cCodes,
                     precomputedContextKV: precomputedKV?[index],
+                    normalizedContextKV: projected?.normalizedContextKV?[index],
                     submitAttention: index == 0 && projected != nil)
                 h = step.h
                 normed = step.nextNormed
@@ -1791,7 +1809,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// round that confirms `c` columns reads the first `c` rows of each and the
     /// anchor row `c - 1` instead of recomputing them. nil when the fast path
     /// does not apply.
-    public func projectContext(targetHidden: MLXArray, anchors: MLXArray) -> DFlash2ContextProjection? {
+    public func projectContext(
+        targetHidden: MLXArray, anchors: MLXArray, cache: [KVCache]? = nil
+    ) -> DFlash2ContextProjection? {
         guard let target, DF2Fast.on, fc is QuantizedLinear, layers.count == 6,
             let group = DF2Fast.w4Group, targetHidden.ndim == 3, targetHidden.dim(0) == 1,
             (1 ... 16).contains(targetHidden.dim(1)),
@@ -1803,7 +1823,25 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let context = normed.0
         guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
-        return DFlash2ContextProjection(anchorEmbeddings: embeddings, context: context, contextKV: kv)
+        var normalizedKV: [(k: MLXArray, v: MLXArray, offset: Int)]? = nil
+        if let cache, cache.count == layers.count,
+            cache.allSatisfy({ $0 is DFlash2LayerKVCache }),
+            config.slidingWindow.map({ context.dim(1) < $0 }) ?? true,
+            let ropeSpec = DF2Fast.ropeSpec(self)
+        {
+            var values: [(k: MLXArray, v: MLXArray, offset: Int)] = []
+            for (index, pair) in kv.enumerated() {
+                guard let out = DF2Fast.ctxKVNormRope(
+                    k: pair.0, v: pair.1, kNorm: layers[index].selfAttn.kNorm,
+                    ropeSpec: ropeSpec, C: context.dim(1), offset: cache[index].offset)
+                else { break }
+                values.append((out.0, out.1, cache[index].offset))
+            }
+            if values.count == layers.count { normalizedKV = values }
+        }
+        return DFlash2ContextProjection(
+            anchorEmbeddings: embeddings, context: context, contextKV: kv,
+            normalizedContextKV: normalizedKV)
     }
 
     /// Every layer's context keys and values from the context codes, in the
@@ -3340,6 +3378,102 @@ enum DF2Fast {
     /// Fused `qNorm` + `kNorm` + `YarnRoPE` + `[1, S, H, 128] -> [1, H, S, 128]` transpose for BOTH
     /// block `(queries, blockKeys, blockValues)` and context `(contextKeys, contextValues)`, producing
     /// `queries` `[1, 32, L, 128]`, `combinedKeys` `[1, 8, C + L, 128]`, `combinedValues` `[1, 8, C + L, 128]`.
+    static let qkvPreparedNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_prepared_norm_rope",
+        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
+        outputNames: ["q_out", "k_out", "v_out"],
+        source: """
+            const int L = params[0];
+            const int C = params[1];
+            const int offset = params[2];
+            const int CL = C + L;
+            const float eps = fparams[0];
+            const float mscale = fparams[1];
+            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            if (vecIdx >= 32 * L + 16 * CL) return;
+            const uint lane = thread_index_in_simdgroup;
+            const int d0 = int(lane);
+            const int d1 = d0 + 32;
+            if (vecIdx >= 32 * L + 8 * CL) {
+              const int vIdx = vecIdx - (32 * L + 8 * CL);
+              const int h = vIdx / CL;
+              const int t = vIdx % CL;
+              const device float* vsrc = (t < C) ? cv : bv;
+              const int s = (t < C) ? t : (t - C);
+              const size_t srcBase = (t < C)
+                  ? ((size_t)h * C + t) * 128
+                  : ((size_t)s * 8 + h) * 128;
+              const size_t dstBase = ((size_t)h * CL + t) * 128;
+              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
+              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
+              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
+              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
+              return;
+            }
+            const bool isK = vecIdx >= 32 * L;
+            int h, t, s, H, S_out;
+            const device float* src;
+            const device float* w;
+            device float* dst;
+            float pos;
+            if (!isK) {
+              h = vecIdx / L;
+              s = vecIdx % L;
+              t = s;
+              H = 32;
+              S_out = L;
+              src = q;
+              w = qw;
+              dst = q_out;
+              pos = float(offset + C + s);
+            } else {
+              const int kIdx = vecIdx - 32 * L;
+              h = kIdx / CL;
+              t = kIdx % CL;
+              s = (t < C) ? t : (t - C);
+              H = 8;
+              S_out = CL;
+              src = (t < C) ? ck : bk;
+              w = kw;
+              dst = k_out;
+              pos = float(offset + t);
+            }
+            if (isK && t < C) {
+              // The context was normalized/rotated behind the preceding verify.
+              const size_t ctxBase = ((size_t)h * C + t) * 128;
+              const size_t outBase = ((size_t)h * CL + t) * 128;
+              k_out[outBase + d0] = float(ck[ctxBase + d0]);
+              k_out[outBase + d0 + 64] = float(ck[ctxBase + d0 + 64]);
+              k_out[outBase + d1] = float(ck[ctxBase + d1]);
+              k_out[outBase + d1 + 64] = float(ck[ctxBase + d1 + 64]);
+              return;
+            }
+            const size_t srcBase = ((size_t)s * H + h) * 128;
+            const size_t dstBase = ((size_t)h * S_out + t) * 128;
+            float acc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+              const float xi = float(src[srcBase + 4 * int(lane) + i]);
+              acc += xi * xi;
+            }
+            const float inv_mean = metal::precise::rsqrt(simd_sum(acc) / 128u + eps);
+            const float x0 = float(src[srcBase + d0]);
+            const float y0 = float(src[srcBase + d0 + 64]);
+            const float x1 = float(src[srcBase + d1]);
+            const float y1 = float(src[srcBase + d1 + 64]);
+            const float nx0 = (w[d0] * (x0 * inv_mean)) * mscale;
+            const float ny0 = (w[d0 + 64] * (y0 * inv_mean)) * mscale;
+            const float nx1 = (w[d1] * (x1 * inv_mean)) * mscale;
+            const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
+            const float th0 = pos * (1.0f / freqs[d0]);
+            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
+            const float th1 = pos * (1.0f / freqs[d1]);
+            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+            dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
+            dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
+            dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
+            dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            """)
+
     static let qkvAllNormRopeKernel = MLXFast.metalKernel(
         name: "df2_qkv_all_norm_rope",
         inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
@@ -3423,6 +3557,30 @@ enum DF2Fast {
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
             dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
             """)
+
+    static func qkvPreparedNormRope(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
+        L: Int, C: Int, blockOffset: Int, ctxOffset: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard on, L > 0, C > 0, blockOffset == ctxOffset + C else { return nil }
+        let qw = normWeight(qNorm)
+        let kw = normWeight(kNorm)
+        let CL = C + L
+        let totalVecs = 32 * L + 16 * CL
+        let tgs = (totalVecs + 3) / 4
+        let outs = qkvPreparedNormRopeKernel(
+            [
+                q, k, v, ck, cv, qw, kw, ropeSpec.freqs,
+                MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
+                MLXArray([qNorm.eps, ropeSpec.mscale]),
+            ],
+            grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outs[0], outs[1], outs[2])
+    }
 
     static func qkvAllNormRope(
         q: MLXArray, k: MLXArray, v: MLXArray,
@@ -3983,11 +4141,16 @@ public final class DFlash2ContextProjection {
     let anchorEmbeddings: MLXArray
     let context: MLXArray
     let contextKV: [(MLXArray, MLXArray)]
+    let normalizedContextKV: [(k: MLXArray, v: MLXArray, offset: Int)]?
 
-    init(anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)]) {
+    init(
+        anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)],
+        normalizedContextKV: [(k: MLXArray, v: MLXArray, offset: Int)]? = nil
+    ) {
         self.anchorEmbeddings = anchorEmbeddings
         self.context = context
         self.contextKV = contextKV
+        self.normalizedContextKV = normalizedContextKV
     }
 
     /// The columns the projection covers.
@@ -3999,6 +4162,9 @@ public final class DFlash2ContextProjection {
             arrays.append(keys)
             arrays.append(values)
         }
+        if let normalizedContextKV {
+            for pair in normalizedContextKV { arrays += [pair.k, pair.v] }
+        }
         return arrays
     }
 
@@ -4007,6 +4173,7 @@ public final class DFlash2ContextProjection {
         let anchorEmbedding: MLXArray
         let context: MLXArray
         let contextKV: [(MLXArray, MLXArray)]
+        let normalizedContextKV: [(k: MLXArray, v: MLXArray, offset: Int)]?
     }
 
     func use(rows: Int) -> Use {
@@ -4016,7 +4183,10 @@ public final class DFlash2ContextProjection {
         return Use(
             anchorEmbedding: anchorEmbeddings[0..., (rows - 1) ..< rows, 0...],
             context: context[0..., 0 ..< rows, 0...],
-            contextKV: kv)
+            contextKV: kv,
+            normalizedContextKV: normalizedContextKV?.map {
+                ($0.k[0..., 0..., 0 ..< rows, 0...], $0.v[0..., 0..., 0 ..< rows, 0...], $0.offset)
+            })
     }
 }
 

@@ -441,7 +441,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         // queue unused work in front of its verify.
         guard !state.lastProposalLookup, blockContext.ndim == 3, blockContext.dim(0) == 1,
             let projection = drafter.projectContext(
-                targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens)
+                targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens, cache: state.caches)
         else { return [] }
         state.projection = projection
         return projection.evaluationTargets
