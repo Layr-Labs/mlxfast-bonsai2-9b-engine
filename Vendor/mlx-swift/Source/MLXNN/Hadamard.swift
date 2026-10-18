@@ -3253,6 +3253,7 @@ enum VerifyInt8Matmul {
     static let naxFastBody = """
         const int Kg = K / 128;
         const int KW = K / 16;
+        const int KW2 = KW / 2;
         const int n0 = bx * 32;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
@@ -3283,17 +3284,18 @@ enum VerifyInt8Matmul {
         const int mr1 = min(mrow + 8, ROWS - 1);
         const device half* scol = scalesT + n0 + nb;
         const device half* bcol = biasesT + n0 + nb;
-        const int j = int(lane & 7u);
+        const int p = int(lane & 3u);
+        const int hh = int((lane >> 2) & 1u);
         const int c = int(lane >> 3);
-        const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
-        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
-        uint32_t wv[8];
+        const device uint2* wcol = reinterpret_cast<const device uint2*>(w) + (size_t)(n0 + c) * KW2 + p;
+        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + 2 * p + 128 * hh;
+        uint2 wv[4];
         half4 sA, sB, bA = half4(0.0h), bB = half4(0.0h);
         float fa, frb, fa1 = 0.0f, frb1 = 0.0f;
         {
           const int gl = int(sg);
           #pragma clang loop unroll(full)
-          for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+          for (int tl = 0; tl < 4; tl++) { wv[tl] = wcol[(size_t)(4 * (4 * hh + tl)) * KW2 + gl * 4]; }
           sA = *(const device half4*)(scol + (size_t)gl * N);
           sB = *(const device half4*)(scol + (size_t)gl * N + 16);
           if (!NEG) {
@@ -3306,9 +3308,12 @@ enum VerifyInt8Matmul {
         }
         for (int g = int(sg); g < Kg; g += 4) {
           #pragma clang loop unroll(full)
-          for (int t = 0; t < 8; t++) {
-            const uint32_t v = wv[t];
-            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+          for (int tl = 0; tl < 4; tl++) {
+            #pragma clang loop unroll(full)
+            for (int s = 0; s < 2; s++) {
+              const uint32_t v = s == 0 ? wv[tl].x : wv[tl].y;
+              dst[32 * tl + s] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+            }
           }
           const half4 cA = sA, cB = sB;
           const half4 dA = NEG ? -sA : bA, dB = NEG ? -sB : bB;
@@ -3316,7 +3321,7 @@ enum VerifyInt8Matmul {
           if (g + 4 < Kg) {
             const int gl = g + 4;
             #pragma clang loop unroll(full)
-            for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+            for (int tl = 0; tl < 4; tl++) { wv[tl] = wcol[(size_t)(4 * (4 * hh + tl)) * KW2 + gl * 4]; }
             sA = *(const device half4*)(scol + (size_t)gl * N);
             sB = *(const device half4*)(scol + (size_t)gl * N + 16);
             if (!NEG) {
@@ -3421,6 +3426,7 @@ enum VerifyInt8Matmul {
     static let naxNarrowBody = """
         const int Kg = K / 128;
         const int KW = K / 16;
+        const int KW2 = KW / 2;
         const int n0 = bx * 16;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
@@ -3451,17 +3457,18 @@ enum VerifyInt8Matmul {
         const int mr1 = min(mrow + 8, ROWS - 1);
         const device half* scol = scalesT + n0 + nb;
         const device half* bcol = biasesT + n0 + nb;
-        const int j = int(lane & 7u);
+        const int p = int(lane & 3u);
+        const int hh = int((lane >> 2) & 1u);
         const int c = int(lane >> 3);
-        const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
-        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
-        uint32_t wv[4];
+        const device uint2* wcol = reinterpret_cast<const device uint2*>(w) + (size_t)(n0 + c) * KW2 + p;
+        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + 2 * p + 64 * hh;
+        uint2 wv[2];
         half4 sA, bA = half4(0.0h);
         float fa, frb, fa1 = 0.0f, frb1 = 0.0f;
         {
           const int gl = int(sg);
           #pragma clang loop unroll(full)
-          for (int t = 0; t < 4; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+          for (int tl = 0; tl < 2; tl++) { wv[tl] = wcol[(size_t)(4 * (2 * hh + tl)) * KW2 + gl * 4]; }
           sA = *(const device half4*)(scol + (size_t)gl * N);
           if (!NEG) { bA = *(const device half4*)(bcol + (size_t)gl * N); }
           fa = ascale[mr * Kg + gl];
@@ -3470,9 +3477,12 @@ enum VerifyInt8Matmul {
         }
         for (int g = int(sg); g < Kg; g += 4) {
           #pragma clang loop unroll(full)
-          for (int t = 0; t < 4; t++) {
-            const uint32_t v = wv[t];
-            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+          for (int tl = 0; tl < 2; tl++) {
+            #pragma clang loop unroll(full)
+            for (int s = 0; s < 2; s++) {
+              const uint32_t v = s == 0 ? wv[tl].x : wv[tl].y;
+              dst[32 * tl + s] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+            }
           }
           const half4 cA = sA;
           const half4 dA = NEG ? -sA : bA;
@@ -3480,7 +3490,7 @@ enum VerifyInt8Matmul {
           if (g + 4 < Kg) {
             const int gl = g + 4;
             #pragma clang loop unroll(full)
-            for (int t = 0; t < 4; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+            for (int tl = 0; tl < 2; tl++) { wv[tl] = wcol[(size_t)(4 * (2 * hh + tl)) * KW2 + gl * 4]; }
             sA = *(const device half4*)(scol + (size_t)gl * N);
             if (!NEG) { bA = *(const device half4*)(bcol + (size_t)gl * N); }
             fa = ascale[mr * Kg + gl];
