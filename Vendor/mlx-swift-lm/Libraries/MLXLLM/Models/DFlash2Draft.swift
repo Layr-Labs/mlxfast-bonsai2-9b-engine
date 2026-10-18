@@ -2406,15 +2406,13 @@ enum DF2Fast {
     /// Fused `dynConv(part: 1, residual: res)` + `rmsNorm(out_res, weight, eps)` for `D = 4096`.
     static let convRms = MLXFast.metalKernel(
         name: "df2_dyn_conv_rms",
-        inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
+        inputNames: ["h", "dyn", "base", "res", "weight", "eps_arr"],
         outputNames: ["out_res", "out_norm"],
         source: """
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup;
             const uint sg = simdgroup_index_in_threadgroup;
             const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
-            if (l >= L) return;
             const int dw = 4 * (D / 16);
             const int g = int(tid);
             const int c0 = g * 16;
@@ -2458,7 +2456,7 @@ enum DF2Fast {
         guard on, D == 4096 else { return nil }
         let w = normWeight(norm)
         let outs = convRms(
-            [h, dyn, base, residual, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
+            [h, dyn, base, residual, w, MLXArray([norm.eps])],
             template: [("D", D)],
             grid: (256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape, h.shape], outputDTypes: [.float32, .float32])
