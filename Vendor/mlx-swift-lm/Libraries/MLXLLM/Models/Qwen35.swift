@@ -1911,7 +1911,6 @@ enum Qwen35FusedGDNVerify {
         source: """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
-        constexpr int DVPL = 2;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
         constexpr int DVPT = DVPS * 4;
@@ -2077,8 +2076,11 @@ enum Qwen35FusedGDNVerify {
           }
           float kv[DVPL];
           float vt[DVPL];
-          const float2 v2 = *((threadgroup const float2*)v_);
-          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; d += 2) {
+            const float2 v2 = *((threadgroup const float2*)(v_ + d));
+            vt[d] = v2.x; vt[d + 1] = v2.y;
+          }
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
@@ -2093,12 +2095,12 @@ enum Qwen35FusedGDNVerify {
             }
             kv[d] = (a0 + a1) + (a2 + a3);
           }
-          kv[0] += simd_shuffle_xor(kv[0], 4);
-          kv[1] += simd_shuffle_xor(kv[1], 4);
-          kv[0] += simd_shuffle_xor(kv[0], 2);
-          kv[1] += simd_shuffle_xor(kv[1], 2);
-          kv[0] += simd_shuffle_xor(kv[0], 1);
-          kv[1] += simd_shuffle_xor(kv[1], 1);
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            kv[d] += simd_shuffle_xor(kv[d], 4);
+            kv[d] += simd_shuffle_xor(kv[d], 2);
+            kv[d] += simd_shuffle_xor(kv[d], 1);
+          }
           float out[DVPL];
           #pragma clang loop unroll(full)
           for (int d = 0; d < DVPL; ++d) {
@@ -2117,14 +2119,17 @@ enum Qwen35FusedGDNVerify {
             }
             out[d] = (o0 + o1) + (o2 + o3);
           }
-          out[0] += simd_shuffle_xor(out[0], 4);
-          out[1] += simd_shuffle_xor(out[1], 4);
-          out[0] += simd_shuffle_xor(out[0], 2);
-          out[1] += simd_shuffle_xor(out[1], 2);
-          out[0] += simd_shuffle_xor(out[0], 1);
-          out[1] += simd_shuffle_xor(out[1], 1);
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            out[d] += simd_shuffle_xor(out[d], 4);
+            out[d] += simd_shuffle_xor(out[d], 2);
+            out[d] += simd_shuffle_xor(out[d], 1);
+          }
           if (lane % LPD == 0) {
-            *((device float2*)y_) = float2(out[0], out[1]);
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; d += 2) {
+              *((device float2*)(y_ + d)) = float2(out[d], out[d + 1]);
+            }
           }
           q_ += Dk;
           y_ += Hv * Dv;
@@ -2145,10 +2150,29 @@ enum Qwen35FusedGDNVerify {
     /// window, or nil when the shapes do not take the fused path. `convTail`
     /// is `convIn[:, S...] + 0` (the full-acceptance conv state) in its own
     /// buffer.
+    /// Value rows per lane (template `DVPL`): 2 in the record, 4 when the
+    /// load-time trial (`chooseRowsPerLane`, from `prepareDFlash2Verify`)
+    /// found the 4-row layout bit-identical and faster on this GPU. Value
+    /// rows never mix: each column's state update, its dot products and its
+    /// 8-lane shuffle reductions are the same operations on the same operands
+    /// in either layout; a threadgroup covers `16 * DVPL` value columns and
+    /// recomputes its key head's q/k conv and norm once, so 4 rows halve that
+    /// duplicated work. `DARKBLOOM_GDN_VERIFY_DVPL=2|4` forces a layout.
+    nonisolated(unsafe) static var rowsPerLane = 2
+
+    static let rowsPerLaneForced: Int? = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_GDN_VERIFY_DVPL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value == "4" ? 4 : value == "2" ? 2 : nil
+    }()
+
     static func apply(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int,
+        rowsPerLane dvpl: Int? = nil
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+        let dvpl = dvpl ?? rowsPerLane
+        guard dvpl == 2 || dvpl == 4 else { return nil }
         let C = qkv.dim(-1)
         guard convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
             qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
@@ -2165,15 +2189,106 @@ enum Qwen35FusedGDNVerify {
         let outputs = kernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
-                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("CONV_DIM", C), ("MAX_T", maximumRows), ("DVPL", dvpl),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+            grid: (128, 128 / (16 * dvpl), valueHeads), threadGroup: (128, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
                 [1, S, valueHeads, 128], state.shape, [1, 3, C]],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
         return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
+    }
+
+    /// Picks `rowsPerLane` once, at load (`prepareDFlash2Verify`), before any
+    /// timed work. Fixed synthetic inputs, independent of any request: the
+    /// 4-row layout must match the 2-row layout bit for bit in all seven
+    /// outputs at 16, 7 and 3 verify rows, and then run 24 back-to-back
+    /// launches (one round's layers) at 16 rows at least 3 % faster than the
+    /// 2-row layout (median of alternating batches). Otherwise the record's
+    /// 2-row layout stays. A compile or runtime error keeps it too.
+    nonisolated(unsafe) private static var trialFailed = false
+    nonisolated(unsafe) private static var trialDone = false
+
+    static func chooseRowsPerLane(keyHeads: Int, valueHeads: Int) {
+        guard !trialDone else { return }
+        trialDone = true
+        if let forced = rowsPerLaneForced {
+            rowsPerLane = forced
+            FileHandle.standardError.write(
+                "gdn verify rows per lane: \(forced) (forced)\n".data(using: .utf8)!)
+            return
+        }
+        guard keyHeads > 0, valueHeads % keyHeads == 0 else { return }
+        let C = 2 * keyHeads * 128 + valueHeads * 128
+        let key = MLXRandom.key(0x6D4E)
+        let keys = MLXRandom.split(key: key, into: 7)
+        let maxRows = maximumRows
+        let convState = MLXRandom.normal([1, 3, C], key: keys[0])
+        let qkvAll = MLXRandom.normal([1, maxRows, C], key: keys[1])
+        let convWeight = MLXRandom.normal([C, 4, 1], key: keys[2]) * 0.5
+        let aAll = MLXRandom.normal([1, maxRows, valueHeads], key: keys[3])
+        let bAll = MLXRandom.normal([1, maxRows, valueHeads], key: keys[4])
+        let aLog = MLXRandom.uniform(low: -1.0, high: 1.0, [valueHeads], key: keys[5])
+        let dtBias = MLXArray.zeros([valueHeads], dtype: .float32) + 0.5
+        let state = MLXRandom.normal([1, valueHeads, 128, 128], key: keys[6]) * 0.1
+        eval(convState, qkvAll, convWeight, aAll, bAll, aLog, dtBias, state)
+        func run(_ rows: Int, _ dvpl: Int) -> [MLXArray]? {
+            guard let out = apply(
+                convState: convState, qkv: qkvAll[0..., 0 ..< rows], convWeight: convWeight,
+                a: aAll[0..., 0 ..< rows], b: bAll[0..., 0 ..< rows], aLog: aLog, dtBias: dtBias,
+                state: state, keyHeads: keyHeads, valueHeads: valueHeads, rowsPerLane: dvpl)
+            else { return nil }
+            return [out.0, out.1, out.2, out.3, out.4, out.5, out.6]
+        }
+        var matched = true
+        var note = ""
+        withErrorHandler({ _ in Qwen35FusedGDNVerify.trialFailed = true }) {
+            trialFailed = false
+            for rows in [maxRows, 7, 3] where matched {
+                guard let two = run(rows, 2), let four = run(rows, 4) else {
+                    matched = false
+                    break
+                }
+                let checks: [MLXArray] = zip(two, four).map { pair in
+                    MLX.all(pair.0.view(dtype: .uint32) .== pair.1.view(dtype: .uint32))
+                }
+                eval(checks)
+                matched = !trialFailed && checks.allSatisfy { $0.item(Bool.self) }
+            }
+            guard matched else { return }
+            func batch(_ dvpl: Int) -> UInt64 {
+                var outs: [MLXArray] = []
+                outs.reserveCapacity(24)
+                let start = DispatchTime.now().uptimeNanoseconds
+                for _ in 0 ..< 24 {
+                    if let out = run(maxRows, dvpl) { outs.append(out[4]) }
+                }
+                eval(outs)
+                return DispatchTime.now().uptimeNanoseconds &- start
+            }
+            _ = batch(2)
+            _ = batch(4)
+            var times2: [UInt64] = []
+            var times4: [UInt64] = []
+            for _ in 0 ..< 9 {
+                times2.append(batch(2))
+                times4.append(batch(4))
+            }
+            let median2 = times2.sorted()[times2.count / 2]
+            let median4 = times4.sorted()[times4.count / 2]
+            note = " (24 launches: 2 rows \(median2 / 1000) us, 4 rows \(median4 / 1000) us)"
+            if !trialFailed, Double(median4) <= 0.97 * Double(median2) {
+                rowsPerLane = 4
+            }
+        }
+        if trialFailed {
+            rowsPerLane = 2
+            note = " (trial error)"
+        }
+        FileHandle.standardError.write(
+            "gdn verify rows per lane: \(rowsPerLane)\(matched ? "" : " (4-row layout not bit-identical)")\(note)\n"
+                .data(using: .utf8)!)
     }
 }
 
@@ -5003,6 +5118,9 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// head's lazily built constants and its one-time bit-exact self-check at
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
+        Qwen35FusedGDNVerify.chooseRowsPerLane(
+            keyHeads: configuration.linearNumKeyHeads,
+            valueHeads: configuration.linearNumValueHeads)
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }
