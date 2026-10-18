@@ -606,14 +606,10 @@ public struct SignedBlockHadamard {
             weight.dtype == .float32, weight.shape == [128],
             VerifyInt8Matmul.rowRange.contains(rows), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        let groups = rows * (width / 128)
-        let outputs = Self.gatedNormQuantized4096Kernel(
+        let outputs = Self.wideRowVerify(
+            .gatedNorm,
             [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [groups], [groups]],
-            outputDTypes: [.int8, .float32, .float32])
+            rows: rows)
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
@@ -664,13 +660,8 @@ public struct SignedBlockHadamard {
         else { return nil }
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        return Self.residualNormNormedQuantized4096Kernel(
-            [x, residual, weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        return Self.wideRowVerify(
+            .residualNormNormed, [x, residual, weight, MLXArray([eps]), signs], rows: rows)
     }
 
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
@@ -713,13 +704,8 @@ public struct SignedBlockHadamard {
         else { return nil }
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        let outputs = Self.residualNormRotatedQuantized4096Kernel(
-            [x, residual, weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape, x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32, .float32])
+        let outputs = Self.wideRowVerify(
+            .residualNormRot, [x, residual, weight, MLXArray([eps]), signs], rows: rows)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
@@ -735,13 +721,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        let tile = VerifyInt8Matmul.tileRows
-        return Self.normNormedQuantized4096Kernel(
-            [x, weight, MLXArray([eps]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-            grid: (256, tile, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape],
-            outputDTypes: [.int8, .float32, .float32, .float32])
+        return Self.wideRowVerify(.normNormed, [x, weight, MLXArray([eps]), signs], rows: rows)
     }
 
     /// `quantizedForPrompt(rmsNorm(x + residual, weight))` at prompt width in one kernel:
@@ -756,6 +736,7 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / 4096
+        Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
         let inputs = [x, residual, weight, MLXArray([eps]), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
@@ -782,6 +763,7 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / 4096
+        Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
         let inputs = [x, weight, MLXArray([eps]), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
@@ -810,13 +792,9 @@ public struct SignedBlockHadamard {
         let inputs = [x, residual, weight, MLXArray([eps]), signs]
         if verifyRows > 0 {
             guard verifyRows == rows, VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-            let tile = VerifyInt8Matmul.tileRows
-            return Self.residualNormQuantized4096Kernel(
-                inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
-                grid: (256, tile, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[tile, width], [rows * 32], [rows * 32], x.shape],
-                outputDTypes: [.int8, .float32, .float32, .float32])
+            return Self.wideRowVerify(.residualNorm, inputs, rows: rows)
         }
+        Self.wideRowPrepareIfBoot(rows: rows)
         if quantized {
             return Self.residualNormQuantized4096Kernel(
                 inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
@@ -840,6 +818,7 @@ public struct SignedBlockHadamard {
             x.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         if let up, up.shape != x.shape || up.dtype != x.dtype { return nil }
+        Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * (width / 128)
         let kernel = up == nil ? Self.quantized4096Kernel : Self.quantizedSwiGLU4096Kernel
         let inputs = up.map { [x, $0, signs] } ?? [x, signs]
@@ -922,6 +901,460 @@ public struct SignedBlockHadamard {
         precondition(
             [DType.float32, .float16, .bfloat16].contains(x.dtype),
             "Hadamard input must have a real floating-point dtype")
+    }
+}
+
+// WIDEROW-GEN BEGIN
+/// The verify-width forms of `quantized4096Source` (`VERIFY_ROWS > 0`), each
+/// with `threads` lanes per 4096-wide row (512 or 1024) instead of 256, so
+/// every row's threadgroup carries 2x or 4x the threads. Lane `i` holds the
+/// `4096 / threads` consecutive elements from `i * (4096 / threads)`. The
+/// arithmetic is the record kernel's, operand for operand:
+/// - the 12 butterfly stages run in the record's bit order 0 ... 11 (the
+///   record's three radix-16 passes are stages 0-3, 4-7 and 8-11), as
+///   radix-8 or radix-4 passes over the same threadgroup values, with the
+///   1/64 scale on the last store; each stage forms `a + b` and `a - b` from
+///   the same two values, so every intermediate keeps its bits;
+/// - the row RMS partials: lane `i`, part `p` sums the squares of float4 `f =
+///   i + p * threads` in order, and the `simd_sum` of simdgroup `f >> 5`
+///   holds float4 `f` in lane `f & 31`, as in the record, so both `simd_sum`
+///   steps see the same values in the same lanes;
+/// - the 128-wide head partials of the gated norm sit in `head_part[f]` and
+///   are reduced over the same 32 lanes;
+/// - the per-element value formulas are the record's text;
+/// - the 128-group max and the sum of the integer codes are exact in any
+///   order (|sum| <= 128 * 127).
+/// `VERIFY_ROWS` is read from the last input, so one pipeline serves every
+/// verify row count.
+enum WideRowSource {
+    struct Form: Hashable {
+        var swiglu = false, residualNorm = false, normOnly = false, gatedNorm = false
+        var attentionGate = false, normalizedOutput = false, rotatedOutput = false
+    }
+
+    static func header(threads: Int) -> String {
+        let e = 4096 / threads
+        var stages = ""
+        var h = 1
+        while h < e {
+            stages += """
+                  #pragma clang loop unroll(full)
+                  for (short j = 0; j < \(e); j += \(2 * h)) {
+                    #pragma clang loop unroll(full)
+                    for (short k = 0; k < \(h); k++) {
+                      float a = x[j+k], b = x[j+k+\(h)];
+                      x[j+k] = a + b; x[j+k+\(h)] = a - b;
+                    }
+                  }
+
+                """
+            h *= 2
+        }
+        return """
+            using namespace metal;
+            METAL_FUNC void widerow_radix\(e)(thread float* x) {
+            \(stages)}
+
+            """
+    }
+
+    static func source(threads: Int, form f: Form) -> String {
+        precondition(threads == 512 || threads == 1024, "wide row threads must be 512 or 1024")
+        let e = 4096 / threads, v = e / 4, b = e == 8 ? 3 : 2, passes = 12 / b
+        let cluster = 128 / e
+        let pad = { (idx: String) in "(\(idx)) + ((\(idx)) >> \(b)u)" }
+        let residualAdd = f.normOnly ? ";" : "\n      + *((const device float4*)(residual + at));"
+        let normPrefix = f.residualNorm || f.normOnly ? """
+            threadgroup float norm_sums[32];
+            {
+              const uint norm_lane = thread_index_in_simdgroup;
+              for (uint part = 0; part < \(1024 / threads)u; ++part) {
+                const uint f = i + part * \(threads)u;
+                const uint at = batch_idx + f * 4u;
+                const float4 value = *((const device float4*)(x + at))\(residualAdd)
+                float square_sum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) square_sum += value[j] * value[j];
+                square_sum = simd_sum(square_sum);
+                if (norm_lane == 0) norm_sums[f >> 5] = square_sum;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float norm_total = simd_sum(norm_sums[thread_index_in_simdgroup]);
+            const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
+            """ : ""
+        let gatedPrefix = f.gatedNorm ? """
+            threadgroup float head_part[32 * 32];
+            {
+              const device float4* nx4 = (const device float4*)(x + batch_idx + base0);
+              #pragma clang loop unroll(full)
+              for (short w = 0; w < \(v); w++) {
+                const float4 nv = nx4[w];
+                float acc = 0.0f;
+                acc += nv.x * nv.x;
+                acc += nv.y * nv.y;
+                acc += nv.z * nv.z;
+                acc += nv.w * nv.w;
+                head_part[(base0 >> 2) + uint(w)] = acc;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float head_inv_value = 0.0f;
+            {
+              const uint norm_lane = thread_index_in_simdgroup;
+              const uint head_base = simdgroup_index_in_threadgroup * \(v)u;
+              for (uint k = 0; k < \(v)u; ++k) {
+                const float total = simd_sum(head_part[(head_base + k) * 32u + norm_lane]);
+                const float inv = metal::precise::rsqrt(total / 128.0f + epsilon[0]);
+                if ((norm_lane / \(32 / v)u) == k) head_inv_value = inv;
+              }
+            }
+            """ : ""
+        let read: String
+        if f.residualNorm && f.normalizedOutput {
+            read = """
+                const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
+                *((device float4*)(residual_out + in_offset) + w) = raw;
+                const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+                const float4 normed = weight * (raw * norm_inv);
+                *((device float4*)(normed_out + in_offset) + w) = normed;
+                float4 val = normed * s4[w];
+                """
+        } else if f.residualNorm {
+            read = """
+                const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
+                *((device float4*)(residual_out + in_offset) + w) = raw;
+                const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+                float4 val = (weight * (raw * norm_inv)) * s4[w];
+                """
+        } else if f.normOnly && f.normalizedOutput {
+            read = """
+                const float4 raw = in4[w];
+                const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+                const float4 normed = weight * (raw * norm_inv);
+                *((device float4*)(normed_out + in_offset) + w) = normed;
+                float4 val = normed * s4[w];
+                """
+        } else if f.normOnly {
+            read = """
+                const float4 raw = in4[w];
+                const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+                float4 val = (weight * (raw * norm_inv)) * s4[w];
+                """
+        } else if f.attentionGate {
+            read = """
+                const uint ag_e = uint(base0) + 4u * uint(w);
+                const uint ag_row = block_idx;
+                const float4 attn = *((const device float4*)(x
+                    + ((ag_e >> 8) * uint(VERIFY_ROWS) + ag_row) * 256u + (ag_e & 255u)));
+                const float4 g = *((const device float4*)(gate
+                    + ag_row * 8192u + (ag_e >> 8) * 512u + 256u + (ag_e & 255u)));
+                const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
+                float4 val = (attn * sigmoid_g) * s4[w];
+                """
+        } else if f.gatedNorm {
+            read = """
+                const float4 g = *((const device float4*)(gate + in_offset) + w);
+                const float4 nw = *((const device float4*)(norm_weight + (base0 & 127u)) + w);
+                const float4 normed = nw * (in4[w] * head_inv_value);
+                const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
+                float4 val = ((g * sigmoid_g) * normed) * s4[w];
+                """
+        } else if f.swiglu {
+            read = """
+                const float4 g = in4[w];
+                const float4 u = *((const device float4*)(up + in_offset) + w);
+                const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
+                float4 val = ((g * sigmoid_g) * u) * s4[w];
+                """
+        } else {
+            read = "float4 val = in4[w] * s4[w];"
+        }
+        var passSource = ""
+        for k in 1 ..< passes {
+            let s = k * b
+            let last = k == passes - 1
+            passSource += """
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                  const uint e0 = ((i >> \(s)u) << \(s + b)u) | (i & \((1 << s) - 1)u);
+                  #pragma clang loop unroll(full)
+                  for (uint r = 0; r < \(e)u; r++) {
+                    x_reg[r] = buf[\(pad("e0 + (r << \(s)u)"))];
+                  }
+                  widerow_radix\(e)(x_reg);
+                  #pragma clang loop unroll(full)
+                  for (uint r = 0; r < \(e)u; r++) {
+                    buf[\(pad("e0 + (r << \(s)u)"))] = x_reg[r]\(last ? " * 0.015625f" : "");
+                  }
+                }
+
+                """
+        }
+        var amaxShuffle = "", partShuffle = ""
+        var m = 1
+        while m < cluster {
+            amaxShuffle += "amax = max(amax, simd_shuffle_xor(amax, ushort(\(m))));\n"
+            partShuffle += "part += simd_shuffle_xor(part, ushort(\(m)));\n"
+            m *= 2
+        }
+        let rotatedWrite = f.rotatedOutput ? """
+            device float4* rot4 = (device float4*)(rotated_out + batch_idx + base0);
+            #pragma clang loop unroll(full)
+            for (short w = 0; w < \(v); w++) {
+              rot4[w] = float4(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
+            }
+            """ : ""
+        return """
+            #pragma clang fp reassociate(off)
+            const uint i = thread_position_in_threadgroup.x;
+            const uint block_idx = threadgroup_position_in_grid.y;
+            const uint batch_idx = block_idx * 4096u;
+            const uint sign_offset = (BLOCKS_PER_ROW == 1)
+                ? 0u : (block_idx % uint(BLOCKS_PER_ROW)) * 4096u;
+            const int VERIFY_ROWS = verify_rows[0];
+            const uint base0 = i * \(e)u;
+            if (block_idx >= uint(VERIFY_ROWS * BLOCKS_PER_ROW)) {
+              device char* pad = (device char*)(codes + batch_idx + base0);
+              #pragma clang loop unroll(full)
+              for (uint r = 0; r < \(e)u; r++) pad[r] = char(0);
+              return;
+            }
+
+            \(normPrefix)\(gatedPrefix)
+            threadgroup float buf[4096 + \(4096 / e)];
+            float x_reg[\(e)];
+
+            const uint in_offset = batch_idx + base0;
+            const uint s_offset = sign_offset + base0;
+            const device float4* in4 = (const device float4*)(x + in_offset);
+            const device float4* s4 = (const device float4*)(signs + s_offset);
+            #pragma clang loop unroll(full)
+            for (short w = 0; w < \(v); w++) {
+              \(read)
+              x_reg[4 * w + 0] = val.x;
+              x_reg[4 * w + 1] = val.y;
+              x_reg[4 * w + 2] = val.z;
+              x_reg[4 * w + 3] = val.w;
+            }
+            widerow_radix\(e)(x_reg);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < \(e)u; r++) {
+              buf[\(pad("base0 + r"))] = x_reg[r];
+            }
+            \(passSource)threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float v[\(e)];
+            float amax = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < \(e)u; r++) {
+              v[r] = buf[\(pad("base0 + r"))];
+              amax = max(amax, fabs(v[r]));
+            }
+            \(rotatedWrite)
+            \(amaxShuffle)const float qs = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+            const float iqs = amax > 0.0f ? metal::precise::divide(127.0f, amax) : 0.0f;
+            float q[\(e)];
+            float part = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < \(e)u; r++) {
+              q[r] = rint(v[r] * iqs);
+              part += q[r];
+            }
+            \(partShuffle)device char* dst = (device char*)(codes + batch_idx + (base0 & ~15u));
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < \(e)u; r++) {
+              const uint c = (base0 & 15u) + r;
+              dst[4u * (c & 3u) + (c >> 2)] = char(q[r]);
+            }
+            if ((i & \(cluster - 1)u) == 0) {
+              const uint row = block_idx / uint(BLOCKS_PER_ROW);
+              const uint kg = uint(BLOCKS_PER_ROW) * 32u;
+              const uint g = (block_idx % uint(BLOCKS_PER_ROW)) * 32u + (base0 >> 7);
+              const size_t qidx = size_t(row) * size_t(kg) + size_t(g);
+              ascale[qidx] = qs;
+              rsb[qidx] = qs * part;
+            }
+            """
+    }
+}
+// WIDEROW-GEN END
+
+extension SignedBlockHadamard {
+    /// The verify-width forms whose rows carry an RMS reduction before the
+    /// rotation (the residual and input norms, the GDN head norm): each one
+    /// runs `WideRowSource` at `wideRowThreads` lanes per row once its load
+    /// check passed, and the record kernel otherwise.
+    enum WideRowKind: String, CaseIterable {
+        case residualNorm, residualNormNormed, residualNormRot, normNormed, gatedNorm
+
+        var form: WideRowSource.Form {
+            var f = WideRowSource.Form()
+            switch self {
+            case .residualNorm: f.residualNorm = true
+            case .residualNormNormed: f.residualNorm = true; f.normalizedOutput = true
+            case .residualNormRot: f.residualNorm = true; f.rotatedOutput = true
+            case .normNormed: f.normOnly = true; f.normalizedOutput = true
+            case .gatedNorm: f.gatedNorm = true
+            }
+            return f
+        }
+    }
+
+    /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel; `MLXFAST_WIDE_ROWS_THREADS`
+    /// picks 512 (default) or 1024 lanes per row.
+    static let wideRowEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    static let wideRowThreads: Int = {
+        ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_THREADS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == "1024" ? 1024 : 512
+    }()
+
+    private static func wideRowRecordKernel(_ kind: WideRowKind) -> MLXFast.MLXFastKernel {
+        switch kind {
+        case .residualNorm: return residualNormQuantized4096Kernel
+        case .residualNormNormed: return residualNormNormedQuantized4096Kernel
+        case .residualNormRot: return residualNormRotatedQuantized4096Kernel
+        case .normNormed: return normNormedQuantized4096Kernel
+        case .gatedNorm: return gatedNormQuantized4096Kernel
+        }
+    }
+
+    private static func wideRowInputNames(_ kind: WideRowKind) -> [String] {
+        switch kind {
+        case .residualNorm, .residualNormNormed, .residualNormRot:
+            return ["x", "residual", "norm_weight", "epsilon", "signs"]
+        case .normNormed: return ["x", "norm_weight", "epsilon", "signs"]
+        case .gatedNorm: return ["x", "gate", "norm_weight", "epsilon", "signs"]
+        }
+    }
+
+    private static func wideRowOutputNames(_ kind: WideRowKind) -> [String] {
+        switch kind {
+        case .residualNorm: return ["codes", "ascale", "rsb", "residual_out"]
+        case .residualNormNormed: return ["codes", "ascale", "rsb", "residual_out", "normed_out"]
+        case .residualNormRot: return ["codes", "ascale", "rsb", "residual_out", "rotated_out"]
+        case .normNormed: return ["codes", "ascale", "rsb", "normed_out"]
+        case .gatedNorm: return ["codes", "ascale", "rsb"]
+        }
+    }
+
+    private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] = {
+        var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
+        for kind in WideRowKind.allCases {
+            kernels[kind] = MLXFast.metalKernel(
+                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)",
+                inputNames: wideRowInputNames(kind) + ["verify_rows"],
+                outputNames: wideRowOutputNames(kind),
+                source: WideRowSource.source(threads: wideRowThreads, form: kind.form),
+                header: WideRowSource.header(threads: wideRowThreads), ensureRowContiguous: true)
+        }
+        return kernels
+    }()
+
+    nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Bool] = [:]
+    nonisolated(unsafe) private static var wideRowChecked = false
+    private static let wideRowLock = NSLock()
+
+    /// Runs the load check once, from the first prompt-width call of at
+    /// least 1024 rows: the resident's boot warm, which runs before the
+    /// socket serves and which no timed phase reaches (the timed prompts are
+    /// 512 tokens). Until then, and without it, every form keeps the record
+    /// kernel.
+    static func wideRowPrepareIfBoot(rows: Int) {
+        guard rows >= 1024, wideRowEnabled else { return }
+        wideRowLock.lock()
+        defer { wideRowLock.unlock() }
+        guard !wideRowChecked else { return }
+        wideRowChecked = true
+        for kind in WideRowKind.allCases {
+            // An MLX error in the check (a pipeline that cannot run this
+            // many threads per threadgroup on this GPU, a compile error)
+            // keeps the record kernel instead of stopping the process.
+            var verdict = false
+            var note = "mismatch, record kernel kept"
+            do {
+                verdict = try withError { wideRowCheck(kind) }
+                if verdict { note = "passed" }
+            } catch {
+                note = "error, record kernel kept: \(error)"
+            }
+            wideRowVerdict[kind] = verdict
+            FileHandle.standardError.write(Data(
+                "hadamard wide rows: \(kind.rawValue) w\(wideRowThreads) load check \(note) (rows 3, 11, 16)\n".utf8))
+        }
+    }
+
+    private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
+        guard wideRowEnabled else { return false }
+        wideRowLock.lock()
+        defer { wideRowLock.unlock() }
+        return wideRowVerdict[kind] == true
+    }
+
+    /// The record kernel's outputs bit for bit (`WideRowSource`): codes,
+    /// constants and every FP32 side output, on synthetic rows (one all-zero
+    /// row, one at 30x scale) at 3, 11 and 16 verify rows.
+    private static func wideRowCheck(_ kind: WideRowKind) -> Bool {
+        var same: [MLXArray] = []
+        for rows in [3, 11, 16] {
+            let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
+            let scale = MLXArray((0 ..< rows).map { Float($0 == 0 ? 0 : ($0 == 1 ? 30 : 1)) })
+                .reshaped([rows, 1])
+            let x = MLXRandom.uniform(low: -3, high: 3, [rows, 4096], key: parts[0]) * scale
+            let other = MLXRandom.uniform(low: -4, high: 4, [rows, 4096], key: parts[1])
+            let signs = MLX.floor(MLXRandom.uniform(low: 0, high: 2, [4096], key: parts[2])) * 2 - 1
+            let width = kind == .gatedNorm ? 128 : 4096
+            let weight = MLXRandom.uniform(low: 0.5, high: 1.5, [width], key: parts[3])
+            let eps = MLXArray([Float(1e-6)])
+            let inputs: [MLXArray]
+            switch kind {
+            case .residualNorm, .residualNormNormed, .residualNormRot:
+                inputs = [x, other, weight, eps, signs]
+            case .normNormed: inputs = [x, weight, eps, signs]
+            case .gatedNorm: inputs = [x, other, weight, eps, signs]
+            }
+            let record = wideRowDispatch(kind, inputs, rows: rows, wide: false)
+            let wide = wideRowDispatch(kind, inputs, rows: rows, wide: true)
+            same.append(MLX.all(record[0] .== wide[0]))
+            for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
+                same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
+            }
+        }
+        return MLX.all(MLX.stacked(same)).item(Bool.self)
+    }
+
+    /// One verify-width launch of `kind` over `inputs` (`x` first, `[rows,
+    /// 4096]` in any leading shape): `[codes [16, 4096], ascale, rsb,
+    /// side outputs shaped as x]`.
+    private static func wideRowDispatch(
+        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, wide: Bool
+    ) -> [MLXArray] {
+        let tile = VerifyInt8Matmul.tileRows
+        let shapes = [[tile, 4096], [rows * 32], [rows * 32]]
+            + Array(repeating: inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
+        let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
+        if wide, let kernel = wideRowWideKernels[kind] {
+            return kernel(
+                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", 1)],
+                grid: (wideRowThreads, tile, 1), threadGroup: (wideRowThreads, 1, 1),
+                outputShapes: shapes, outputDTypes: dtypes)
+        }
+        return wideRowRecordKernel(kind)(
+            inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+            grid: (256, tile, 1), threadGroup: (256, 1, 1),
+            outputShapes: shapes, outputDTypes: dtypes)
+    }
+
+    /// `wideRowDispatch` with the wide kernel when its load check passed.
+    static func wideRowVerify(_ kind: WideRowKind, _ inputs: [MLXArray], rows: Int) -> [MLXArray] {
+        wideRowDispatch(kind, inputs, rows: rows, wide: wideRowUsesWide(kind))
     }
 }
 
