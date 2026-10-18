@@ -993,7 +993,9 @@ enum CBv2VerifyVectorAttention {
             constexpr int D = 256;
             constexpr int G = 4;
             const uint L = uint(N_QUERIES);
-            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint t = threadgroup_position_in_grid.y * uint(QPG)
+                + simdgroup_index_in_threadgroup / uint(CPT);
+            if (t >= L) return;
             const uint kvh = threadgroup_position_in_grid.z;
             const uint h0 = kvh * G;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -1022,13 +1024,25 @@ enum CBv2VerifyVectorAttention {
             const device float* vp = values + kvh * values_strides[1] + simd_lid * 8;
             const int64_t ks = keys_strides[2];
             const int64_t vs = values_strides[2];
-            for (int i = c; i <= limit; i += 32) {
-              float k[8];
-              float v[8];
+            float k[8];
+            float v[8];
+            if (c <= limit) {
               #pragma clang loop unroll(full)
               for (int j = 0; j < 8; j++) {
-                k[j] = kp[i * ks + j];
-                v[j] = vp[i * vs + j];
+                k[j] = kp[c * ks + j];
+                v[j] = vp[c * vs + j];
+              }
+            }
+            for (int i = c; i <= limit; i += 32) {
+              float next_k[8];
+              float next_v[8];
+              const bool has_next = i + 32 <= limit;
+              if (has_next) {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  next_k[j] = kp[(i + 32) * ks + j];
+                  next_v[j] = vp[(i + 32) * vs + j];
+                }
               }
               #pragma clang loop unroll(full)
               for (int h = 0; h < G; h++) {
@@ -1046,6 +1060,13 @@ enum CBv2VerifyVectorAttention {
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 8; j++) {
                   o[h][j] = metal::fma(o[h][j], factor, exp_score * v[j]);
+                }
+              }
+              if (has_next) {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  k[j] = next_k[j];
+                  v[j] = next_v[j];
                 }
               }
             }
@@ -1117,10 +1138,17 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
+        // Queries share no partial-kernel state. Tile whole SIMD groups without
+        // changing a query's key classes, causal limit or reduction sequence.
+        let queriesPerGroup = min(L, 8 / classesPerGroup)
+        let queryGroups = (L + queriesPerGroup - 1) / queriesPerGroup
         let parts = partial(
             [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
-            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
-            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            template: [
+                ("N_QUERIES", L), ("CPT", classesPerGroup), ("QPG", queriesPerGroup),
+            ],
+            grid: (32 * 32 * queriesPerGroup, queryGroups, 4),
+            threadGroup: (32 * classesPerGroup * queriesPerGroup, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
             outputDTypes: [.float32, .float32, .float32])
         return combine(
