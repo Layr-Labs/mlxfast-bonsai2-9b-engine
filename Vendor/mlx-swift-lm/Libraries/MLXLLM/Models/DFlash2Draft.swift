@@ -3243,9 +3243,16 @@ enum DF2Fast {
             for (int n = int(blk * 256u + tid); n < Vn; n += 2048) {
               const float v = lr[n];
               if (v > tv[3]) {
-                int k = 3;
-                while (k > 0 && v > tv[k - 1]) { tv[k] = tv[k - 1]; ti[k] = ti[k - 1]; k--; }
-                tv[k] = v; ti[k] = n;
+                if (v > tv[2]) {
+                  tv[3] = tv[2]; ti[3] = ti[2];
+                  if (v > tv[1]) {
+                    tv[2] = tv[1]; ti[2] = ti[1];
+                    if (v > tv[0]) {
+                      tv[1] = tv[0]; ti[1] = ti[0];
+                      tv[0] = v; ti[0] = n;
+                    } else { tv[1] = v; ti[1] = n; }
+                  } else { tv[2] = v; ti[2] = n; }
+                } else { tv[3] = v; ti[3] = n; }
               }
             }
             threadgroup float wv[128]; threadgroup int wi[128];
