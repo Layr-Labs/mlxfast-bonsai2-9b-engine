@@ -1856,6 +1856,92 @@ enum Qwen35RegisterGatedSIMD {
         header: gateHeader,
         ensureRowContiguous: false)
 
+    /// The replay kernel with its serial scan fed from threadgroup memory.
+    /// Before the scan, threads `tid < T` form every row's gates (decay and
+    /// beta, the same calls on the same inputs) into threadgroup arrays, and
+    /// all 128 threads stage the T rows of this key head's `k` (Dk floats a
+    /// row) and of this threadgroup's DVPT value columns of `v`. The scan then
+    /// reads gates, `k` and `v` from threadgroup memory instead of lane 0
+    /// computing the gates from device loads and every lane loading `k` and
+    /// `v` from device memory at each step. Every value the recurrence reads
+    /// is the same float, and its arithmetic text is unchanged, so `state_out`
+    /// and `conv_tail` are the parent kernel's bits. `T <= 16` (the caller's
+    /// guard). `DARKBLOOM_BONSAI_REPLAY_STAGE=0` selects `replayKernel`.
+    private static let replayStagedSource: String = {
+        var s = replaySource
+        func swap(_ from: String, _ to: String) {
+            precondition(
+                s.components(separatedBy: from).count == 2,
+                "qwen35 staged replay kernel source: \(from)")
+            s = s.replacingOccurrences(of: from, with: to)
+        }
+        swap(
+            "const device float* k_ = k + b_idx * k_strides[0] + hk_idx * k_strides[2] + dk0;",
+            "const device float* k_src = k + b_idx * k_strides[0] + hk_idx * k_strides[2];")
+        swap(
+            "const device float* v_ = v + b_idx * v_strides[0] + hv_idx * v_strides[2] + dvbase;",
+            "const device float* v_src = v + b_idx * v_strides[0] + hv_idx * v_strides[2] + threadgroup_position_in_grid.y * DVPT;")
+        swap(
+            "float negative_a = 0.0f;\nfloat bias = 0.0f;\nif (lane == 0) {\n  negative_a = -metal::precise::exp(a_log[hv_idx]);\n  bias = dt_bias[hv_idx];\n}\n",
+            "")
+        swap(
+            "float kr[R];",
+            """
+            threadgroup float k_tile[16 * Dk];
+            threadgroup float v_tile[16 * DVPT];
+            threadgroup float gate_g[16];
+            threadgroup float gate_beta[16];
+            const uint tid = sg * 32 + lane;
+            if (tid < T) {
+              const float negative_a = -metal::precise::exp(a_log[hv_idx]);
+              const float bias = dt_bias[hv_idx];
+              gate_g[tid] = qwen35_simd_gate_decay(a_[tid * a_strides[1]], bias, negative_a);
+              gate_beta[tid] = qwen35_simd_gate_beta(bb_[tid * b_strides[1]]);
+            }
+            for (uint i = tid; i < T * uint(Dk / 4); i += 128) {
+              const uint t = i / uint(Dk / 4);
+              const uint c = i - t * uint(Dk / 4);
+              ((threadgroup float4*)k_tile)[i] = ((const device float4*)(k_src + t * k_strides[1]))[c];
+            }
+            for (uint i = tid; i < T * uint(DVPT / 2); i += 128) {
+              const uint t = i / uint(DVPT / 2);
+              const uint c = i - t * uint(DVPT / 2);
+              ((threadgroup float2*)v_tile)[i] = ((const device float2*)(v_src + t * v_strides[1]))[c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup const float* k_ = k_tile + dk0;
+            threadgroup const float* v_ = v_tile + sg * DVPS + (lane / LPD) * DVPL;
+            float kr[R];
+            """)
+        swap(
+            "float local_g = 0.0f, local_beta = 0.0f;\n  if (lane == 0) {\n    local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);\n    local_beta = qwen35_simd_gate_beta(bb_[0]);\n  }\n  const float gt = simd_broadcast(local_g, 0);\n  const float bt = simd_broadcast(local_beta, 0);",
+            "const float gt = gate_g[t];\n  const float bt = gate_beta[t];")
+        swap(
+            "const float4 k4 = ((const device float4*)k_)[j];",
+            "const float4 k4 = ((threadgroup const float4*)k_)[j];")
+        swap(
+            "const float2 v2 = *((const device float2*)v_);",
+            "const float2 v2 = *((threadgroup const float2*)v_);")
+        swap(
+            "k_ += k_strides[1]; v_ += v_strides[1]; a_ += a_strides[1]; bb_ += b_strides[1];",
+            "k_ += Dk; v_ += DVPT;")
+        return s
+    }()
+
+    private static let replayStagedKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_gate_simd_replay_staged",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in"],
+        outputNames: ["state_out", "conv_tail"],
+        source: replayStagedSource,
+        header: gateHeader,
+        ensureRowContiguous: false)
+
+    private static let replayStaged: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_REPLAY_STAGE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                     b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
                     state: MLXArray) -> (MLXArray, MLXArray) {
@@ -1890,7 +1976,7 @@ enum Qwen35RegisterGatedSIMD {
                           state: MLXArray, convInput: MLXArray) -> (MLXArray, MLXArray) {
         let B = k.dim(0), Hk = k.dim(2), Dk = k.dim(3)
         let Hv = v.dim(2), Dv = v.dim(3)
-        let result = replayKernel(
+        let result = (replayStaged ? replayStagedKernel : replayKernel)(
             [q, k, v, a, b, aLog, dtBias, state, convInput],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
