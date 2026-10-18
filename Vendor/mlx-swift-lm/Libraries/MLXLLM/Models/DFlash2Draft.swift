@@ -2206,8 +2206,23 @@ enum DF2Fast {
 
     final class W4Operands {
         let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        var pair24: W4Pair24? = nil
+        private let sizeLock = NSLock()
+        private var cachedSizes: (words: [Int32], array: MLXArray)?
         init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
+        }
+
+        func dispatchSizes(K: Int, rows: Int, ns: [Int]) -> MLXArray {
+            let words = [Int32(K), Int32(rows)] + ns.map { Int32($0) }
+            sizeLock.lock()
+            defer { sizeLock.unlock() }
+            if let cachedSizes, cachedSizes.words == words {
+                return cachedSizes.array
+            }
+            let array = MLXArray(words)
+            cachedSizes = (words, array)
+            return array
         }
     }
     nonisolated(unsafe) static var w4Cache: [ObjectIdentifier: W4Operands] = [:]
@@ -2262,6 +2277,11 @@ enum DF2Fast {
         let bT = contiguous(b.asType(.float16).transposed())
         eval(packed, sT, bT)
         let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
+        if group == 64 && ((N == 4096 && K == 32768)
+            || (N == 12288 && K == 4096) || (N == 4096 && K == 12288))
+        {
+            o.pair24 = W4Pair24(sT, bT)
+        }
         w4Cache[ObjectIdentifier(layer)] = o
         return o
     }
@@ -2386,6 +2406,444 @@ enum DF2Fast {
               xs[m * G + g] = seq_sum;
             }
             """)
+
+    /// Optional FC metadata. Original half arrays remain available for the accepted fallback.
+    final class W4Pair24 {
+        let words: MLXArray, bases: MLXArray
+        let shape: [Int]
+        let count: Int
+        let selection = W4Pair24SelectionCache()
+
+        init?(_ scales: MLXArray, _ offsets: MLXArray) {
+            guard scales.dtype == .float16, offsets.dtype == .float16,
+                scales.ndim == 2, scales.shape == offsets.shape, scales.dim(1) % 4 == 0,
+                scales.strides == [scales.dim(1), 1], offsets.strides == scales.strides,
+                scales.size > 0, scales.size % 4 == 0, scales.size / 4 <= Int.max / 3
+            else { return nil }
+            let s = scales.view(dtype: .uint16).asArray(UInt16.self)
+            let b = offsets.view(dtype: .uint16).asArray(UInt16.self)
+            let sb = UInt32(s.min()!), bb = UInt32(b.min()!)
+            guard UInt32(s.max()!) - sb <= 4095, UInt32(b.max()!) - bb <= 4095 else { return nil }
+            func pair(_ i: Int) -> UInt32 {
+                (UInt32(s[i]) - sb) | ((UInt32(b[i]) - bb) << 12)
+            }
+            var packed = [UInt32](repeating: 0, count: s.count / 4 * 3)
+            for i in stride(from: 0, to: s.count, by: 4) {
+                let a = pair(i), c = pair(i + 1), d = pair(i + 2), e = pair(i + 3)
+                let j = i / 4 * 3
+                packed[j] = a | (c << 24)
+                packed[j + 1] = (c >> 8) | (d << 16)
+                packed[j + 2] = (d >> 16) | (e << 8)
+            }
+            // Check every inverse before admitting this representation.
+            for i in s.indices {
+                let bit = (i & 3) * 24, j = i / 4 * 3 + bit / 32, shift = bit & 31
+                var value = packed[j] >> shift
+                if shift > 8 { value |= packed[j + 1] << (32 - shift) }
+                guard sb + (value & 4095) == UInt32(s[i]),
+                    bb + ((value >> 12) & 4095) == UInt32(b[i])
+                else { return nil }
+            }
+            shape = scales.shape
+            count = s.count
+            words = MLXArray(packed)
+            bases = MLXArray([sb | (bb << 16)])
+        }
+    }
+
+    /// Three scalar loads; uint3 would add padding between these12-byte tiles.
+    static let pair24Header = """
+        inline void df2_pair24_load(const device uint* words, uint bases, size_t tile,
+                                   thread half4& scales, thread half4& offsets) {
+            const uint a = words[3 * tile], b = words[3 * tile + 1], c = words[3 * tile + 2];
+            const uint4 pairs(a & 0x00ffffffu, ((a >> 24) | (b << 8)) & 0x00ffffffu,
+                              ((b >> 16) | (c << 16)) & 0x00ffffffu, c >> 8);
+            const ushort4 s = ushort4(pairs & uint4(4095u)) + ushort(bases & 65535u);
+            const ushort4 o = ushort4((pairs >> 12) & uint4(4095u)) + ushort(bases >> 16);
+            scales = as_type<half4>(s);
+            offsets = as_type<half4>(o);
+        }
+
+        """
+
+    /// Only metadata loads change. The original raw generator and FP32 arithmetic stay intact.
+    static func w4Pair24Source(form: Int, narrow: Bool) -> String {
+        var source = w4Source(layers: 1, group: 64, form: form, narrow: narrow)
+        func change(_ before: String, _ after: String) {
+            precondition(source.contains(before))
+            source = source.replacingOccurrences(of: before, with: after)
+        }
+        change("const device half* sT = s0; const device half* bT = b0;",
+               "const device uint* metadata = s0; const uint metadataBases = b0[0];")
+        if form == 0 {
+            change("const device half* sr = sT + (size_t)g * N + n0 + nb;", """
+                half4 sm0, sm1, om0, om1;
+                const size_t tile = ((size_t)g * N + n0 + nb) / 4;
+                df2_pair24_load(metadata, metadataBases, tile, sm0, om0);
+                df2_pair24_load(metadata, metadataBases, tile + 4, sm1, om1);
+                """)
+            change("const device half* br = bT + (size_t)g * N + n0 + nb;", "")
+            change("const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));",
+                   "const float4 s0v = float4(sm0), s1v = float4(sm1);")
+            change("float4(*(const device half4*)br)", "float4(om0)")
+            change("float4(*(const device half4*)(br + 16))", "float4(om1)")
+        } else {
+            change("const device half* sc = sT + n0 + nb;", "const size_t tile = (n0 + nb) / 4;")
+            change("const device half* oc = bT + n0 + nb;", "")
+            if narrow {
+                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);", """
+                    half4 ps0, po0;
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
+                    """)
+                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N);", "")
+                change("ps0 = *(const device half4*)(sc + r);",
+                       "df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);")
+                change("po0 = *(const device half4*)(oc + r);", "")
+            } else {
+                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);", """
+                    half4 ps0, ps1, po0, po1;
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile + 4, ps1, po1);
+                    """)
+                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);", "")
+                change("ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);", """
+                    df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);
+                    df2_pair24_load(metadata, metadataBases, r / 4 + tile + 4, ps1, po1);
+                    """)
+                change("po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);", "")
+            }
+        }
+        precondition(!source.contains("sT") && !source.contains("bT") && !source.contains("const device half4*"))
+        return source
+    }
+
+    static let w4Pair24Kernels: [Int: MLXFast.MLXFastKernel] = {
+        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+        for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)] {
+            kernels[form * 2 + (narrow ? 1 : 0)] = MLXFast.metalKernel(
+                name: "df2_w4g64_pair24f\(form)_n\(narrow ? 16 : 32)",
+                inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+                source: w4Pair24Source(form: form, narrow: narrow), header: header + pair24Header,
+                ensureRowContiguous: true)
+        }
+        return kernels
+    }()
+
+    static func w4Pair24Run(
+        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        op: W4Operands, metadata: W4Pair24, sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        let columns = narrow ? 16 : 32
+        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(rows), Int32(4096)])
+        return w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!(
+            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+            template: [("SPLIT", split)], grid: (4096 / columns * split * 32, 1, 1),
+            threadGroup: (split * 32, 1, 1), outputShapes: [[rows, 4096]], outputDTypes: [.float32])
+    }
+
+    /// Shared by the compact MLP consumer and its metadata-only proof.
+    static func w4Pair24MLPSelection(layers: Int) -> String {
+        precondition(layers == 1 || layers == 2)
+        var source = """
+            const device uint* metadata = s0;
+            uint metadataBases = b0[0];
+
+            """
+        if layers == 2 {
+            source += "if (li == 1) { metadata = s1; metadataBases = b1[0]; }\n"
+        }
+        return source
+    }
+
+    /// Keep the FC bodies exact; the MLP adds sibling selection and the accepted static-K form.
+    static func w4Pair24MLPSource(layers: Int, form: Int, narrow: Bool) -> String {
+        precondition(layers == 1 || (layers == 2 && !narrow))
+        var source = w4Pair24Source(form: form, narrow: narrow)
+        let pointer = "const device uint* metadata = s0; const uint metadataBases = b0[0];"
+        precondition(source.contains(pointer))
+        source = source.replacingOccurrences(of: pointer, with: "int li = 0;")
+        if layers == 2 {
+            let pick = "device float* out = out0; int N = ksz[2];"
+            precondition(source.contains(pick))
+            source = source.replacingOccurrences(of: pick, with: pick + """
+
+                if (bx >= N / 32) { bx -= N / 32; w = w1; li = 1; out = out1; N = ksz[3]; }
+                """)
+        }
+        precondition(source.contains("#define LO(v)"))
+        source = source.replacingOccurrences(of: "#define LO(v)",
+            with: w4Pair24MLPSelection(layers: layers) + "#define LO(v)")
+        return w4Specialize(source)
+    }
+
+    static let w4Pair24MLPKernels: [Int: MLXFast.MLXFastKernel] = {
+        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+        for layers in 1 ... 2 {
+            for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)]
+                where layers == 1 || !narrow
+            {
+                let key = (layers - 1) * 6 + form * 2 + (narrow ? 1 : 0)
+                kernels[key] = MLXFast.metalKernel(
+                    name: "df2_w4g64_pair24_mlp_f\(form)_n\(narrow ? 16 : 32)_forms_\(layers)",
+                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+                    outputNames: (0 ..< layers).map { "out\($0)" },
+                    source: w4Pair24MLPSource(layers: layers, form: form, narrow: narrow),
+                    header: header + pair24Header, ensureRowContiguous: true)
+            }
+        }
+        return kernels
+    }()
+
+    static func w4Pair24MLPMetadata(_ ops: [W4Operands]) -> [W4Pair24]? {
+        let gateUp = ops.count == 2 && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 }
+        let down = ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
+        guard gateUp || down else { return nil }
+        let metadata = ops.compactMap(\.pair24)
+        return metadata.count == ops.count ? metadata : nil
+    }
+
+    /// These ordered inputs are also used by the proof; each payload keeps its own data header.
+    static func w4Pair24MLPMetadataInputs(_ metadata: [W4Pair24]) -> [MLXArray] {
+        metadata.map(\.words) + metadata.map(\.bases)
+    }
+
+    static func w4Pair24MLPRun(
+        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        ops: [W4Operands], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        let K = ops[0].k, ns = ops.map(\.n)
+        precondition(w4FormsFit(K: K, rows: rows, ns: ns) && ops.count == metadata.count)
+        let key = (ops.count - 1) * 6 + form * 2 + (narrow ? 1 : 0)
+        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        return w4Pair24MLPKernels[key]!(
+            [xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata)
+                + [ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", K)],
+            grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
+            threadGroup: (split * 32, 1, 1),
+            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    enum W4Pair24Method: Int {
+        case raw, compact, quartet
+    }
+    struct W4Pair24Choice: Equatable {
+        let ordinary: W4Pair24Method
+        let full16: W4Pair24Method
+        func method(rows: Int) -> W4Pair24Method { rows == 16 ? full16 : ordinary }
+    }
+    struct W4Pair24SelectionKey: Equatable {
+        let operands: [ObjectIdentifier]
+        let K: Int
+        let ns: [Int]
+        let group: Int
+        let form: Int
+        let narrow: Bool
+        let split: Int
+    }
+    final class W4Pair24SelectionCache {
+        private let lock = NSLock()
+        private var cached: (key: W4Pair24SelectionKey, choice: W4Pair24Choice)?
+        func resolve(_ key: W4Pair24SelectionKey, build: () -> W4Pair24Choice) -> W4Pair24Choice {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached {
+                return cached.key == key ? cached.choice : W4Pair24Choice(ordinary: .raw, full16: .raw)
+            }
+            let choice = build()
+            cached = (key, choice)
+            return choice
+        }
+    }
+
+    /// Raw is the incumbent.3% in all3 rounds is a conservative initial policy.
+    static func w4Pair24Choose(valid: [Bool], samples: [[UInt64]]) -> W4Pair24Choice {
+        func wins(_ candidate: W4Pair24Method, _ control: W4Pair24Method) -> Bool {
+            let a = candidate.rawValue, b = control.rawValue
+            guard valid[a], valid[b], samples[a].count == 3, samples[b].count == 3 else { return false }
+            return zip(samples[a], samples[b]).allSatisfy {
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+            }
+        }
+        let ordinary: W4Pair24Method = wins(.compact, .raw) ? .compact : .raw
+        let full16: W4Pair24Method =
+            wins(.quartet, .raw) && (ordinary == .raw || wins(.quartet, .compact)) ? .quartet : ordinary
+        return W4Pair24Choice(ordinary: ordinary, full16: full16)
+    }
+
+    /// Build plus eval/encoding/default-stream completion; output roots live past the stop clock.
+    static func w4Pair24Time(_ build: () -> [MLXArray]) -> UInt64? {
+        do {
+            return try withError {
+                Stream.gpu.synchronize()
+                let start = DispatchTime.now().uptimeNanoseconds
+                let outputs = build()
+                eval(outputs)
+                Stream.gpu.synchronize()
+                let end = DispatchTime.now().uptimeNanoseconds
+                withExtendedLifetime(outputs) {}
+                return end > start ? end - start : nil
+            }
+        } catch { return nil }
+    }
+
+    static func w4Pair24Exact(_ build: () -> [MLXArray], reference: MLXArray) -> Bool {
+        (try? withError {
+            let output = concatenated(build(), axis: 1)
+            let finite = isFinite(output).all()
+            eval(finite)
+            guard finite.item(Bool.self) else { return false }
+            let exact = (reference.view(dtype: .uint32) .== output.view(dtype: .uint32)).all()
+            eval(exact)
+            return exact.item(Bool.self)
+        }) ?? false
+    }
+
+    static func w4Pair24Output(
+        _ method: W4Pair24Method, form: Int, narrow: Bool,
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        ops: [W4Operands], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        switch method {
+        case .raw:
+            return w4Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs, rows: rows,
+                K: ops[0].k, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                ns: ops.map(\.n), sizeDescriptor: sizeDescriptor)
+        case .compact:
+            if ops[0].k == 32768 {
+                return w4Pair24Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
+                    rows: rows, op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
+            }
+            return w4Pair24MLPRun(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
+                rows: rows, ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
+        case .quartet:
+            precondition(rows == 16 && ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
+                && form == 2 && narrow)
+            return w4Pair24QuartetRun(xq: xq, ascale: ascale, xs: xs,
+                op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
+        }
+    }
+
+    /// The existing bind preparation reaches this R16 key; runtime row changes do not retune it.
+    static func w4Pair24Selected(
+        _ ops: [W4Operands], metadata: [W4Pair24], form: Int, narrow: Bool
+    ) -> W4Pair24Choice {
+        let K = ops[0].k, ns = ops.map(\.n), G = K / 64
+        let key = W4Pair24SelectionKey(operands: ops.map { ObjectIdentifier($0) }, K: K, ns: ns,
+            group: 64, form: form, narrow: narrow, split: split)
+        return metadata[0].selection.resolve(key) {
+            let coldStart = DispatchTime.now().uptimeNanoseconds
+            let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
+            let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
+            let x = MLXArray((0 ..< 16 * G).map { Float($0 % 17 - 8) / 64 }, [16 * G])
+            let sizes = MLXArray([Int32(K), Int32(16)] + ns.map { Int32($0) })
+            func build(_ index: Int) -> [MLXArray] {
+                w4Pair24Output(W4Pair24Method(rawValue: index)!, form: form, narrow: narrow,
+                    xq: xq, ascale: a, xs: x, rows: 16, ops: ops, metadata: metadata, sizeDescriptor: sizes)
+            }
+            let quartet = ops.count == 1 && K == 12288 && ns == [4096] && form == 2 && narrow
+            let methods = quartet ? [0, 1, 2] : [0, 1]
+            var valid = [Bool](repeating: false, count: 3)
+            var reference: MLXArray?
+            valid[0] = (try? withError {
+                let output = concatenated(build(0), axis: 1)
+                let finite = isFinite(output).all()
+                eval(finite)
+                reference = output
+                return finite.item(Bool.self)
+            }) ?? false
+            if valid[0], let reference {
+                for index in methods.dropFirst() {
+                    valid[index] = w4Pair24Exact({ build(index) }, reference: reference)
+                }
+            }
+            reference = nil
+            var warm = [UInt64](repeating: 0, count: 3)
+            var samples = [[UInt64]](repeating: [], count: 3)
+            var legs = [[[UInt64]]](repeating: [], count: 3)
+            if valid[0] {
+                for index in methods where valid[index] {
+                    if let elapsed = w4Pair24Time({ build(index) }) { warm[index] = elapsed }
+                    else { valid[index] = false }
+                }
+                if valid[0] {
+                    for order in [[0, 1, 2], [1, 2, 0], [2, 0, 1]] {
+                        if !valid[0] { break }
+                        var round = [[UInt64]](repeating: [], count: 3)
+                        for mirrored in [order, Array(order.reversed())] {
+                            if !valid[0] { break }
+                            for index in mirrored where methods.contains(index) && valid[index] {
+                                if let elapsed = w4Pair24Time({ build(index) }) { round[index].append(elapsed) }
+                                else { valid[index] = false; samples[index] = [] }
+                            }
+                        }
+                        for index in methods {
+                            legs[index].append(round[index])
+                            if valid[index] && round[index].count == 2 {
+                                samples[index].append(round[index][0] + round[index][1])
+                            }
+                        }
+                    }
+                }
+            }
+            let choice = w4Pair24Choose(valid: valid, samples: samples)
+            withExtendedLifetime((xq, a, x, sizes)) {}
+            let cold = DispatchTime.now().uptimeNanoseconds - coldStart
+            FileHandle.standardError.write(Data(
+                "DF2 pair24 select K\(K) N\(ns) form\(form) narrow=\(narrow) R16 policy=all3>=1.03 valid=\(valid) warm_ns=\(warm) legs_ns=\(legs) round_sums_ns=\(samples) ordinary=\(choice.ordinary) full16=\(choice.full16) calibration_ns=\(cold)\n".utf8))
+            return choice
+        }
+    }
+
+    /// All32 lanes reach each gather; bits4,3,0 identify one four-lane quartet.
+    static let pair24QuartetHeader = """
+        inline void df2_pair24_quartet_load(const device uint* words, uint bases, uint lane, size_t tile,
+                                           thread half4& scales, thread half4& offsets) {
+            const uint component = (lane >> 1) & 3u;
+            const uint bit = 24u * component, shift = bit & 31u;
+            const size_t word = 3 * tile + bit / 32u;
+            uint value = words[word] >> shift;
+            if (shift > 8u) value |= words[word + 1] << (32u - shift);
+            const ushort s = ushort(bases & 65535u) + ushort(value & 4095u);
+            const ushort o = ushort(bases >> 16) + ushort((value >> 12) & 4095u);
+            const uint pair = uint(s) | (uint(o) << 16);
+            uint4 pairs(pair, simd_shuffle_xor(pair, 2), simd_shuffle_xor(pair, 4),
+                        simd_shuffle_xor(pair, 6));
+            pairs = (component & 1u) != 0u ? pairs.yxwz : pairs;
+            pairs = (component & 2u) != 0u ? pairs.zwxy : pairs;
+            scales = as_type<half4>(ushort4(pairs & uint4(65535u)));
+            offsets = as_type<half4>(ushort4(pairs >> 16));
+        }
+        
+        """
+
+    static func w4Pair24QuartetSource() -> String {
+        let source = w4Pair24MLPSource(layers: 1, form: 2, narrow: true)
+        let call = "df2_pair24_load(metadata, metadataBases, "
+        precondition(source.components(separatedBy: call).count == 3)
+        return source.replacingOccurrences(of: call,
+            with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
+    }
+
+    static let w4Pair24QuartetKernel = MLXFast.metalKernel(
+        name: "df2_w4g64_pair24_quartet_xor_mlp_f2_n16_forms_1",
+        inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+        source: w4Pair24QuartetSource(), header: header + pair24Header + pair24QuartetHeader,
+        ensureRowContiguous: true)
+
+    static func w4Pair24QuartetRun(
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, metadata: W4Pair24,
+        sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        precondition(op.k == 12288 && op.n == 4096)
+        let sizes = sizeDescriptor ?? MLXArray([Int32(12288), Int32(16), Int32(4096)])
+        return w4Pair24QuartetKernel(
+            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", 12288)],
+            grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: [[16, 4096]], outputDTypes: [.float32])
+    }
 
     /// int8 activations x the 4-bit codes on the NAX tensor units, one 16 x 32 x `group` op per group,
     /// SPLIT simdgroups over K, 32 output columns per threadgroup, the codes of the next group
@@ -2679,9 +3137,10 @@ enum DF2Fast {
 
     static func w4Run(
         form: Int, narrow: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int]
+        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
+        sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
-        let sizes = MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
         let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
         let kernels =
             narrow
@@ -3055,10 +3514,26 @@ enum DF2Fast {
         let preferredForm = w4SelectedForm
         let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
         let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
-        let outs = w4Run(
-            form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
-            rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-            ns: ns)
+        let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
+        let metadata: [W4Pair24]?
+        if codes.group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
+            metadata = ops[0].pair24.map { [$0] }
+        } else if codes.group == 64, w4FormsFit(K: codes.K, rows: codes.rows, ns: ns) {
+            metadata = w4Pair24MLPMetadata(ops)
+        } else {
+            metadata = nil
+        }
+        let outs: [MLXArray]
+        if let metadata {
+            let method = w4Pair24Selected(ops, metadata: metadata, form: form, narrow: narrow).method(rows: codes.rows)
+            outs = w4Pair24Output(method, form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale,
+                xs: codes.xs, rows: codes.rows, ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
+        } else {
+            outs = w4Run(
+                form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                ns: ns, sizeDescriptor: sizeDescriptor)
+        }
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
     }
 
