@@ -774,15 +774,22 @@ private final class DFlash2Attention: Module {
         return (state[0], state[1])
     }
 
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+    func absorbContext(
+        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
+        contextCodes: DF2Fast.W4Codes? = nil
+    ) {
         var context = context
         var contextLength = context.dim(1)
+        var activeCodes = contextCodes
         if let slidingWindow {
             let skip = DFlash2SlidingMask.contextSkip(
                 contextLength: contextLength, slidingWindow: slidingWindow)
             if skip > 0 {
                 context = context[0..., skip..., 0...]
                 contextLength = context.dim(1)
+                // Packed rows describe the whole chunk; a trimmed layer keeps
+                // its original projection route instead of indexing stale codes.
+                activeCodes = nil
                 if let base = cache as? BaseKVCache {
                     base.offset += skip
                 }
@@ -790,7 +797,12 @@ private final class DFlash2Attention: Module {
         }
         let B = context.dim(0)
         var contextKeys: MLXArray, contextValues: MLXArray
-        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+        if let activeCodes,
+            let kv = DF2Fast.w4LinearsFromCodes(
+                activeCodes, leadShape: Array(context.shape.dropLast()), [kProj, vProj])
+        {
+            (contextKeys, contextValues) = (kv[0], kv[1])
+        } else if let kv = DF2Fast.linears(context, [kProj, vProj]) {
             (contextKeys, contextValues) = (kv[0], kv[1])
         } else if let kv = DF2Fast.fusedKVLinear(context, kProj: kProj, vProj: vProj) {
             (contextKeys, contextValues) = (kv.0, kv.1)
@@ -1234,8 +1246,11 @@ private final class DFlash2DecoderLayer: Module {
     /// Context-only: nothing of the block runs (no norms, convolutions, MLP
     /// or attention output), only the attention sub-layer's context keys and
     /// values enter the cache.
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
-        selfAttn.absorbContext(context, rope: rope, cache: cache)
+    func absorbContext(
+        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
+        contextCodes: DF2Fast.W4Codes? = nil
+    ) {
+        selfAttn.absorbContext(context, rope: rope, cache: cache, contextCodes: contextCodes)
     }
 }
 
@@ -1767,8 +1782,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
         }
         let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
+        // Every attention layer consumes the same normalized activation chunk.
+        // Quantize it once; each layer still uses its own operands and cache.
+        let contextCodes: DF2Fast.W4Codes?
+        if DF2Fast.on, let group = DF2Fast.w4Group {
+            contextCodes = DF2Fast.w4Quant(context, up: nil, group: group, headMajor: false)
+        } else {
+            contextCodes = nil
+        }
         for (index, layer) in layers.enumerated() {
-            layer.absorbContext(context, rope: rope, cache: cache[index])
+            layer.absorbContext(context, rope: rope, cache: cache[index], contextCodes: contextCodes)
         }
     }
 
