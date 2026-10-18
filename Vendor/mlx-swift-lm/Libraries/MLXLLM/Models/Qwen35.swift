@@ -1589,6 +1589,11 @@ final class Qwen35PromptGateWeights {
     private var stacked: MLXArray?
     nonisolated(unsafe) private static var checked: Bool?
 
+    func prepared(b: MLXArray, a: MLXArray) -> MLXArray? {
+        guard let (sb, sa) = sources, sb === b, sa === a else { return nil }
+        return stacked
+    }
+
     func get(b: MLXArray, a: MLXArray) -> MLXArray? {
         guard Self.columnsMatch(rows: 512, inputs: b.dim(1), outputs: b.dim(0)) else { return nil }
         if let (sb, sa) = sources, sb === b, sa === a, let stacked { return stacked }
@@ -2560,7 +2565,8 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(
         _ inputs: MLXArray, B: Int, S: Int,
         boundary: HadamardQuantizedLinear.VerifyBoundary? = nil,
-        prompt: [MLXArray]? = nil
+        prompt: [MLXArray]? = nil,
+        promptGates: MLXArray? = nil
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
@@ -2581,6 +2587,10 @@ final class Qwen35GatedDeltaNet: Module {
                 : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjQKV, inProjZ]))
             let qkv = shared?[0] ?? inProjQKV(inputs)
             let z = (shared?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
+            if let promptGates {
+                return (qkv, z, promptGates[0..., 0..., 0 ..< numVHeads],
+                    promptGates[0..., 0..., numVHeads...])
+            }
             if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
                 return (qkv, z, ba.0, ba.1)
             }
@@ -2682,6 +2692,21 @@ final class Qwen35GatedDeltaNet: Module {
         ).1
     }
 
+    private func canUsePromptMiddle(_ inputs: MLXArray, ssmState: MLXArray) -> Bool {
+        guard inputs.ndim == 3 else { return false }
+        let S = inputs.dim(1)
+        return inputs.dim(0) == 1 && (64 ... 1365).contains(S) &&
+            S <= Qwen35PromptGatedGDN.maximumSteps && inputs.dtype == .float32 &&
+            headKDim == 128 && headVDim == 128 && convKernelSize == 4 &&
+            !(inProjB is QuantizedLinear) && !(inProjA is QuantizedLinear) &&
+            inProjB.bias == nil && inProjA.bias == nil &&
+            inProjB.weight.dtype == .float32 && inProjA.weight.dtype == .float32 &&
+            inProjB.weight.shape == [numVHeads, inputs.dim(2)] && inProjA.weight.shape == inProjB.weight.shape &&
+            conv1d.bias == nil && conv1d.weight.dtype == .float32 &&
+            aLog.dtype == .float32 && dtBias.dtype == .float32 && aLog.size == numVHeads && dtBias.size == numVHeads &&
+            ssmState.dtype == .float32 && ssmState.shape == [1, numVHeads, headVDim, headKDim]
+    }
+
     /// The prompt-width (S >= 64, one row) middle of `cbv2Forward`: the
     /// current Q/K math is unchanged; eligible fresh scans fold V convolution.
     /// If the stacked b/a matmul
@@ -2694,26 +2719,17 @@ final class Qwen35GatedDeltaNet: Module {
     private func promptMiddle(
         _ inputs: MLXArray, qkv: MLXArray, a: MLXArray, b: MLXArray,
         convState: MLXArray, ssmState: MLXArray,
-        freshState: Bool = false
+        freshState: Bool = false, promptGates: MLXArray? = nil
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray)? {
         let S = qkv.dim(1)
-        guard inputs.ndim == 3, inputs.dim(0) == 1, (64 ... 1365).contains(S),
-            S <= Qwen35PromptGatedGDN.maximumSteps, inputs.dtype == .float32,
-            headKDim == 128, headVDim == 128, convKernelSize == 4,
-            !(inProjB is QuantizedLinear), !(inProjA is QuantizedLinear),
-            inProjB.bias == nil, inProjA.bias == nil,
-            inProjB.weight.dtype == .float32, inProjA.weight.dtype == .float32,
-            inProjB.weight.shape == [numVHeads, inputs.dim(2)], inProjA.weight.shape == inProjB.weight.shape,
-            conv1d.bias == nil, conv1d.weight.dtype == .float32,
-            aLog.dtype == .float32, dtBias.dtype == .float32, aLog.size == numVHeads, dtBias.size == numVHeads,
-            ssmState.dtype == .float32, ssmState.shape == [1, numVHeads, headVDim, headKDim]
-        else { return nil }
-        let stacked = promptGateWeights.get(b: inProjB.weight, a: inProjA.weight)
-        guard stacked != nil || (freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32
+        guard promptGates != nil || canUsePromptMiddle(inputs, ssmState: ssmState) else { return nil }
+        let joined = promptGates ?? promptGateWeights.get(b: inProjB.weight, a: inProjA.weight)
+            .map { matmul(inputs, $0.T) }
+        guard joined != nil || (freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32
             && a.dtype == .float32 && b.dtype == .float32
             && a.shape == [1, S, numVHeads] && b.shape == a.shape)
         else { return nil }
-        let ba = stacked.map { matmul(inputs, $0.T) } ?? concatenated([b, a], axis: -1)
+        let ba = joined ?? concatenated([b, a], axis: -1)
         if freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32 {
             let foldState = convState.contiguous(), foldQKV = qkv.contiguous()
             let foldWeight = conv1d.weight.contiguous()
@@ -2736,7 +2752,7 @@ final class Qwen35GatedDeltaNet: Module {
             q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias) : nil
         // A declined stack check can use only the eligible fresh scan.
         // If that scan declines, retain the exact processChunk fallback.
-        guard stacked != nil || fresh != nil else { return nil }
+        guard joined != nil || fresh != nil else { return nil }
         let (out, newSsmState) = fresh ?? Qwen35PromptGatedGDN.run(
             q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias, state: ssmState)
         return (out, contiguous(qkv[0..., (S - 3)...]), newSsmState)
@@ -3073,8 +3089,6 @@ final class Qwen35GatedDeltaNet: Module {
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
-        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, prompt: promptProjections)
-
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
         convRows.reserveCapacity(B)
@@ -3093,11 +3107,18 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
         let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+        let promptGates = canUsePromptMiddle(inputs, ssmState: ssmState)
+            ? promptGateWeights.prepared(b: inProjB.weight, a: inProjA.weight).map { matmul(inputs, $0.T) }
+            : nil
+        let (qkv, z, b, a) = projectInputs(
+            inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
         let (out, newConvState, newSsmState) = promptMiddle(
             inputs, qkv: qkv, a: a, b: b, convState: convState, ssmState: ssmState,
-            freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil)
+            freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil,
+            promptGates: promptGates)
             ?? processChunk(
-                qkv: qkv, a: a, b: b,
+                qkv: qkv, a: promptGates == nil ? a : inProjA(inputs),
+                b: promptGates == nil ? b : inProjB(inputs),
                 convState: convState, ssmState: ssmState, mask: nil)
 
         for (row, evaluation) in recurrentState.enumerated() {
