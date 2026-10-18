@@ -1482,11 +1482,7 @@ enum Qwen35RegisterGatedSIMD {
 enum Qwen35FusedGDNVerify {
     static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
-        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+    private static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -1716,8 +1712,113 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
-        header: Qwen35RegisterGatedSIMD.gateHeader)
+        """
+
+    private static func metalKernel(_ name: String, _ source: String) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["conv_in", "conv_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+            source: source,
+            header: Qwen35RegisterGatedSIMD.gateHeader)
+    }
+
+    private static let kernel = metalKernel("qwen35_gdn_verify_fused", source)
+
+    /// The same kernel at one value column per lane group (`DVPL = 1`): 16
+    /// value columns per threadgroup, so a verify launch runs 8 threadgroups
+    /// per value head instead of 4. Each column's dot products, its
+    /// xor-4/2/1 shuffle sums and its state update are the record text with
+    /// the second column's lines removed, so every output keeps its bits.
+    private static let wideKernel: MLXFast.MLXFastKernel? = {
+        var s = source
+        for (from, to) in [
+            ("constexpr int DVPL = 2;", "constexpr int DVPL = 1;"),
+            ("const float2 v2 = *((threadgroup const float2*)v_);", "const float v1 = *v_;"),
+            ("vt[0] = v2.x; vt[1] = v2.y;", "vt[0] = v1;"),
+            ("kv[1] += simd_shuffle_xor(kv[1], 4);", ""),
+            ("kv[1] += simd_shuffle_xor(kv[1], 2);", ""),
+            ("kv[1] += simd_shuffle_xor(kv[1], 1);", ""),
+            ("out[1] += simd_shuffle_xor(out[1], 4);", ""),
+            ("out[1] += simd_shuffle_xor(out[1], 2);", ""),
+            ("out[1] += simd_shuffle_xor(out[1], 1);", ""),
+            ("*((device float2*)y_) = float2(out[0], out[1]);", "*y_ = out[0];"),
+        ] {
+            guard s.components(separatedBy: from).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: from, with: to)
+        }
+        return metalKernel("qwen35_gdn_verify_fused_w1", s)
+    }()
+
+    /// `MLXFAST_GDN_VERIFY_W1=0` keeps the record kernel. Otherwise the wide
+    /// kernel serves only after it reproduced all seven outputs of the record
+    /// kernel bit for bit on synthetic inputs at every row count 3 ... 16 of
+    /// the served head shape. The check runs once per process and shape,
+    /// from the first prompt forward (the unmeasured warm prefill) or else
+    /// the first verify.
+    private static let wideEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["MLXFAST_GDN_VERIFY_W1"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var wideVerdict: [String: Bool] = [:]
+    private static let wideLock = NSLock()
+
+    static func prepare(keyHeads: Int, valueHeads: Int) {
+        _ = useWide(keyHeads: keyHeads, valueHeads: valueHeads)
+    }
+
+    private static func useWide(keyHeads: Int, valueHeads: Int) -> Bool {
+        guard wideEnabled, let wideKernel else { return false }
+        let key = "\(keyHeads)x\(valueHeads)"
+        wideLock.lock()
+        defer { wideLock.unlock() }
+        if let verdict = wideVerdict[key] { return verdict }
+        let C = 2 * keyHeads * 128 + valueHeads * 128
+        var same: [MLXArray] = []
+        for T in 3 ... maximumRows {
+            let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x7731_0000 + T)), into: 8)
+            let inputs = [
+                MLXRandom.uniform(low: -3, high: 3, [1, 3, C], key: parts[0]),
+                MLXRandom.uniform(low: -3, high: 3, [1, T, C], key: parts[1]),
+                MLXRandom.uniform(low: -0.7, high: 0.7, [C, 4, 1], key: parts[2]),
+                MLXRandom.uniform(low: -2, high: 2, [1, T, valueHeads], key: parts[3]),
+                MLXRandom.uniform(low: -3, high: 3, [1, T, valueHeads], key: parts[4]),
+                MLXRandom.uniform(low: -1, high: 1.5, [valueHeads], key: parts[5]),
+                MLXRandom.uniform(low: -1, high: 1, [valueHeads], key: parts[6]),
+                MLXRandom.uniform(low: -1, high: 1, [1, valueHeads, 128, 128], key: parts[7]),
+            ]
+            let reference = dispatch(kernel, groupsPerHead: 4, inputs, keyHeads: keyHeads, valueHeads: valueHeads)
+            let wide = dispatch(wideKernel, groupsPerHead: 8, inputs, keyHeads: keyHeads, valueHeads: valueHeads)
+            for (r, w) in zip(reference, wide) {
+                same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
+            }
+        }
+        let verdict = MLX.all(MLX.stacked(same)).item(Bool.self)
+        wideVerdict[key] = verdict
+        FileHandle.standardError.write(Data(
+            "qwen35 gdn: verify_fused_w1 load check \(verdict ? "passed" : "mismatch, falling back") (rows 3...\(maximumRows))\n".utf8))
+        return verdict
+    }
+
+    private static func dispatch(
+        _ kernel: MLXFast.MLXFastKernel, groupsPerHead: Int, _ inputs: [MLXArray],
+        keyHeads: Int, valueHeads: Int
+    ) -> [MLXArray] {
+        let S = inputs[1].dim(1), C = inputs[1].dim(2)
+        let state = inputs[7]
+        return kernel(
+            inputs,
+            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (128, groupsPerHead, valueHeads), threadGroup: (128, 1, 1),
+            outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+    }
 
     /// `(convIn, convOut, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -1739,18 +1840,11 @@ enum Qwen35FusedGDNVerify {
             state.shape == [1, valueHeads, 128, 128],
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let S = qkv.dim(1)
-        let outputs = kernel(
+        let wide = useWide(keyHeads: keyHeads, valueHeads: valueHeads)
+        let outputs = dispatch(
+            wide ? wideKernel! : kernel, groupsPerHead: wide ? 8 : 4,
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
-            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
-                ("CONV_DIM", C), ("MAX_T", maximumRows),
-                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
-                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
-                ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, C], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+            keyHeads: keyHeads, valueHeads: valueHeads)
         return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
     }
 }
@@ -2030,6 +2124,9 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
+        if S > Qwen35FusedGDNVerify.maximumRows {
+            Qwen35FusedGDNVerify.prepare(keyHeads: numKHeads, valueHeads: numVHeads)
+        }
         guard prepareFusedInputProjection(), let fusedInProj else {
             let shared = prompt ?? boundary.flatMap {
                 HadamardQuantizedLinear.boundaryProjections($0, [inProjQKV, inProjZ])
