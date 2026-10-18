@@ -4068,10 +4068,10 @@ enum DF2WideLanes {
         name: "df2_act_q8g_conv0_e\(e)", inputNames: ["h", "dyn", "base", "ksz"],
         outputNames: ["xq", "ascale", "xs"], source: DF2WideLaneSource.source(.quantGConv0, e: e))
     static let rmsQuant = MLXFast.metalKernel(
-        name: "df2_rms_q8g_e\(e)", inputNames: ["x", "weight", "dsz", "eps_arr"],
+        name: "df2_rms_q8g_e\(e)\(DF2WideLaneSource.hoistWeights ? "_h" : "")", inputNames: ["x", "weight", "dsz", "eps_arr"],
         outputNames: ["out_norm", "xq", "ascale", "xs"], source: DF2WideLaneSource.source(.rmsQuant, e: e))
     static let convRmsQuant = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g_e\(e)",
+        name: "df2_dyn_conv_rms_q8g_e\(e)\(DF2WideLaneSource.hoistWeights ? "_h" : "")",
         inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
         outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
         source: DF2WideLaneSource.source(.convRmsQuant, e: e))
@@ -4214,6 +4214,23 @@ enum DF2WideLanes {
 /// sum stays strictly sequential in column order, chained over KG/e lanes, and the group max is order-free.
 /// So every output bit equals the 16-column kernel's.
 enum DF2WideLaneSource {
+    /// The row-norm kernels' norm-weight loads issued into registers before the RMS reduction's
+    /// barriers (`DARKBLOOM_BONSAI_DF2_WEIGHT_HOIST=0` keeps the parent text). Same addresses, same
+    /// values, same arithmetic: only the loads move ahead of the barrier.
+    static let hoistWeights: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_WEIGHT_HOIST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `float wv[e]` = this lane's norm weights, loaded before the reduction (empty when off).
+    static func weightPrefetch(e: Int) -> String {
+        hoistWeights ? "float wv[\(e)];\nfor (int u = 0; u < \(e); u++) { wv[u] = float(weight[c0 + u]); }\n" : ""
+    }
+
+    /// The norm weight of column `u` in the main phase: the register copy, or the parent's device load.
+    static var weightRead: String { hoistWeights ? "wv[u]" : "float(weight[c0 + u])" }
+
     enum Kind: String, CaseIterable {
         case quantG, quantGConv0, rmsQuant, convRmsQuant
         var hasRowNorm: Bool { self == .rmsQuant || self == .convRmsQuant }
@@ -4383,11 +4400,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + weightPrefetch(e: e) + rowScale(e: e) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(weightRead) * (v[u] * scale);
                   if (WRITE_NORM) { out_norm[rowBase + u] = y; }
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
@@ -4438,11 +4455,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + weightPrefetch(e: e) + rowScale(e: e) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(weightRead) * (v[u] * scale);
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
                 }
