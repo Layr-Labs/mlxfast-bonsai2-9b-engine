@@ -4180,6 +4180,192 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    // `naxNarrow16Body` with each simdgroup's K slice in its own one-simdgroup
+    // threadgroup: threadgroup x runs column tile x >> 2 as the narrow
+    // kernel's simdgroup x & 3 (groups g = s, s + 4, ..., the same tensor op
+    // and FP32 steps in the same order), so each partial is that simdgroup's
+    // `acc` bit for bit. Each threadgroup stores its partial in `scratch`
+    // (tile, simdgroup, row, column), then counts itself in `counts[tile]`;
+    // the fourth to arrive (the count only grows, by 4 per call, so
+    // `old & 3 == 3`) sums ((p0 + p1) + p2) + p3, the narrow kernel's order,
+    // and writes the output with its layout guard. Partials go through
+    // device-scope atomics and fences, so the last threadgroup reads what the
+    // other three wrote.
+    static let naxSplitPick = """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = ksz[0];
+        const int bx = int(threadgroup_position_in_grid.x) >> 2;
+        const int split = int(threadgroup_position_in_grid.x) & 3;
+        const int N = ksz[2];
+
+        """
+
+    static let naxSplitTail = """
+        device atomic_uint* part = (device atomic_uint*)scratch;
+        const uint own = uint(bx * 4 + split) * 256u;
+        if (mrow < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) {
+            atomic_store_explicit(part + own + uint(mrow * 16 + nb + e), as_type<uint>(acc[e]), memory_order_relaxed);
+          }
+        }
+        if (ROWS > 8 && mrow + 8 < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) {
+            atomic_store_explicit(part + own + uint((mrow + 8) * 16 + nb + e), as_type<uint>(acc[4 + e]), memory_order_relaxed);
+          }
+        }
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        simdgroup_barrier(mem_flags::mem_device);
+        uint old = 0u;
+        if (lane == 0u) {
+          old = atomic_fetch_add_explicit((device atomic_uint*)counts + bx, 1u, memory_order_relaxed);
+        }
+        old = simd_broadcast_first(old);
+        if ((old & 3u) != 3u) { return; }
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const uint tb = uint(bx * 4) * 256u;
+        for (int e = int(lane); e < ROWS * 4; e += 32) {
+          const uint at = tb + uint((e >> 2) * 16 + 4 * (e & 3));
+          float4 p[4];
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 4; q++) {
+            #pragma clang loop unroll(full)
+            for (int u = 0; u < 4; u++) {
+              p[q][u] = as_type<float>(atomic_load_explicit(part + at + uint(q * 256 + u), memory_order_relaxed));
+            }
+          }
+          float4 v = p[0] + p[1];
+          v = v + p[2];
+          v = v + p[3];
+          *(device float4*)(out + (size_t)(e >> 2) * N + n0 + 4 * (e & 3)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
+    /// The split body: `naxNarrow16Body` up to its threadgroup reduction,
+    /// with the simdgroup index taken from the grid and one B tile, then
+    /// `naxSplitTail`.
+    static var naxSplitBody: String {
+        let body = naxNarrow16Body
+        let loop = body[..<body.range(of: "threadgroup float* red = ")!.lowerBound]
+        return String(loop)
+            .replacingOccurrences(of: "const uint sg = simdgroup_index_in_threadgroup;", with: "const uint sg = uint(split);")
+            .replacingOccurrences(of: "threadgroup uint32_t bs[4][16 * 32];", with: "threadgroup uint32_t bs[1][16 * 32];")
+            .replacingOccurrences(of: "bs[sg]", with: "bs[0]")
+            + naxSplitTail
+    }
+
+    private static let splitInputs = ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz", "scratch", "counts"]
+
+    private static let naxSplitKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_split",
+        inputNames: splitInputs, outputNames: ["out"],
+        source: naxSplitPick + naxSplitBody,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true, mutableInputs: ["scratch", "counts"])
+
+    private static let naxSplitFormsKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_split_forms",
+        inputNames: splitInputs, outputNames: ["out"],
+        source: naxSplitPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + naxSplitBody.replacingOccurrences(of: "(size_t)", with: "(uint)"),
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true, mutableInputs: ["scratch", "counts"])
+
+    /// Partials for up to `narrowColumns / 16` tiles of 16 x 16 floats per
+    /// simdgroup, and one arrival count per tile. Allocated once; every
+    /// split call uses them and MLX orders the calls (mutable inputs).
+    nonisolated(unsafe) private static let splitScratch: (partials: MLXArray, counts: MLXArray) = {
+        let tiles = narrowColumns / 16
+        let partials = MLXArray([Float](repeating: 0, count: tiles * 4 * 256), [tiles * 4 * 256])
+        let counts = MLXArray([UInt32](repeating: 0, count: tiles), [tiles])
+        eval(partials, counts)
+        return (partials, counts)
+    }()
+
+    /// Inner sizes whose split kernel matched the narrow kernel at load.
+    /// `DARKBLOOM_BONSAI_DOWN_SPLIT=0` leaves it empty.
+    nonisolated(unsafe) private static var splitK = Set<Int>()
+
+    private static func runSplit(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool
+    ) -> MLXArray {
+        let n = weight.dim(0)
+        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims, splitScratch.partials, splitScratch.counts]
+        if forms {
+            return naxSplitFormsKernel(
+                inputs, template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
+                grid: (n / 16 * 4 * 32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
+        return naxSplitKernel(
+            inputs, template: [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
+            grid: (n / 16 * 4 * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// The narrow call `matmul` makes at inner size `k` (N16 operation and
+    /// compile-time form where those matched at load).
+    private static func narrowForms(k: Int, n: Int, compact: Bool) -> Bool {
+        formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)
+    }
+
+    /// Compares the split kernel's output bits with the narrow call `matmul`
+    /// would make, at each of `narrowDepths` where the N16 operation matched,
+    /// on the full 4096-column grid (256 tiles, 1024 threadgroups), every
+    /// verify row count and both offset forms. Each case runs the split
+    /// kernel `splitRepeats` times back to back in one evaluation (shared
+    /// partials and counts, as consecutive calls in a round) and every run
+    /// must match. An inner size joins `splitK` only when every run matches;
+    /// a compile error or any differing bit keeps the narrow kernel there.
+    static let splitRepeats = 8
+
+    private static func checkSplit() -> Set<Int> {
+        let n = narrowColumns
+        var passed = Set<Int>()
+        for k in narrowDepths where narrowK.contains(k) && narrow16K.contains(k) {
+            let kg = k / 128
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+            let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+            let forms = narrowForms(k: k, n: n, compact: true)
+            checkFailed = false
+            var matched = true
+            withErrorHandler({ _ in VerifyInt8Matmul.checkFailed = true }) {
+                for m in 2 ... 16 {
+                    for negative in [false, true] where matched {
+                        let offsets = negative ? negatedT : biasesT
+                        let narrow = runNarrow(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative,
+                            forms: forms, compact: true).view(dtype: .uint32)
+                        var equal = MLXArray(true)
+                        for _ in 0 ..< splitRepeats {
+                            let split = runSplit(
+                                codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                                scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: forms)
+                            equal = equal .&& MLX.all(narrow .== split.view(dtype: .uint32))
+                        }
+                        eval(equal)
+                        matched = !checkFailed && equal.item(Bool.self)
+                    }
+                }
+            }
+            if matched { passed.insert(k) }
+        }
+        checkFailed = false
+        return passed
+    }
+
     /// The widest one-layer call that takes the narrow kernel, and the
     /// inner sizes of the model's calls that fit: attention o and GDN out
     /// (4096) and MLP down (12288).
@@ -4514,6 +4700,14 @@ enum VerifyInt8Matmul {
             FileHandle.standardError.write(
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
+            let splitValue = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DOWN_SPLIT"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !["0", "false", "no", "off"].contains(splitValue ?? "") {
+                splitK = checkSplit()
+                FileHandle.standardError.write(
+                    "int8 verify narrow split: K \(splitK.sorted()) of \(narrowDepths) (\(splitRepeats) runs per case)\n"
+                        .data(using: .utf8)!)
+            }
         }
         return chosen
     }()
@@ -4524,6 +4718,13 @@ enum VerifyInt8Matmul {
     ) -> MLXArray? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
+            if splitK.contains(activation.k), weight.dim(0) % 16 == 0 {
+                return runSplit(
+                    codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
+                    scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
+                    negative: negative && negativeForms,
+                    forms: narrowForms(k: activation.k, n: weight.dim(0), compact: true))
+            }
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
                 scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
