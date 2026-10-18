@@ -3404,11 +3404,17 @@ enum Qwen35VerifyQKNormRoPE {
                 : k_proj + (t * uint(KV_HEADS) + h) * D;
             const device float* w = is_q ? q_weight : k_weight;
             const float epsilon = eps[is_q ? 0 : 1];
+            // Fetch the two contiguous lane vectors and invariant weights
+            // before the norm reduction; retain every scalar FMA's order.
             float x[2][4];
+            float normWeights[2][4];
             float acc[2] = {0.0f, 0.0f};
             for (uint part = 0; part < 2u; ++part) {
+              const float4 xv = ((const device float4*)src)[part * 32u + lane];
+              const float4 wv = ((const device float4*)w)[part * 32u + lane];
               for (uint j = 0; j < 4u; ++j) {
-                x[part][j] = src[part * 128u + lane * 4u + j];
+                x[part][j] = xv[j];
+                normWeights[part][j] = wv[j];
                 acc[part] = metal::fma(x[part][j], x[part][j], acc[part]);
               }
             }
@@ -3417,7 +3423,7 @@ enum Qwen35VerifyQKNormRoPE {
             float y[2][4];
             for (uint part = 0; part < 2u; ++part) {
               for (uint j = 0; j < 4u; ++j) {
-                y[part][j] = w[part * 128u + lane * 4u + j] * (x[part][j] * inv);
+                y[part][j] = normWeights[part][j] * (x[part][j] * inv);
               }
             }
             const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
