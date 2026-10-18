@@ -3566,8 +3566,7 @@ enum PromptInt8Matmul {
 enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
 
-    // The plain kernel maps one row to lane & 7.
-    static var rowRange: ClosedRange<Int> { 2 ... (route == .plain ? 8 : 16) }
+    static let rowRange = 2 ... 16
     static let tileRows = 16
 
     private static let plainSource = """
@@ -3577,6 +3576,8 @@ enum VerifyInt8Matmul {
         const int Kg = K / 128;
         const int KW = K / 16;
         const int n0 = int(threadgroup_position_in_grid.x) * 32;
+        const int row0 = int(threadgroup_position_in_grid.y) * ROWS;
+        const int valid_rows = min(ROWS, ksz[1] - row0);
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint tid = thread_position_in_threadgroup.x;
@@ -3590,8 +3591,8 @@ enum VerifyInt8Matmul {
         for (int g = int(sg); g < Kg; g += 4) {
           float q[ROWS][16];
           #pragma clang loop unroll(full)
-          for (int m = 0; m < ROWS; m++) {
-            const device char4* src = (const device char4*)(xq + (size_t)m * K + g * 128 + 16 * j);
+          for (int m = 0; m < valid_rows; m++) {
+            const device char4* src = (const device char4*)(xq + (size_t)(row0 + m) * K + g * 128 + 16 * j);
             #pragma clang loop unroll(full)
             for (int u = 0; u < 4; u++) {
               const char4 v = src[u];
@@ -3599,9 +3600,9 @@ enum VerifyInt8Matmul {
               q[m][4 * u + 2] = float(v.z); q[m][4 * u + 3] = float(v.w);
             }
           }
-          const int jr = min(j, ROWS - 1);
-          const float a = j < ROWS ? ascale[jr * Kg + g] : 0.0f;
-          const float rb = j < ROWS ? rsb[jr * Kg + g] : 0.0f;
+          const int jr = row0 + min(j, valid_rows - 1);
+          const float a = j < valid_rows ? ascale[jr * Kg + g] : 0.0f;
+          const float rb = j < valid_rows ? rsb[jr * Kg + g] : 0.0f;
           #pragma clang loop unroll(full)
           for (int t = 0; t < 8; t++) {
             const int n = c + 4 * t;
@@ -3614,7 +3615,7 @@ enum VerifyInt8Matmul {
             }
             float cm = 0.0f;
             #pragma clang loop unroll(full)
-            for (int m = 0; m < ROWS; m++) {
+            for (int m = 0; m < valid_rows; m++) {
               float d = 0.0f;
               #pragma clang loop unroll(full)
               for (int p = 0; p < 16; p++) { d = fma(q[m][p], wf[p], d); }
@@ -3623,7 +3624,7 @@ enum VerifyInt8Matmul {
               d += simd_shuffle_xor(d, ushort(4));
               cm = (j == m) ? d : cm;
             }
-            if (j < ROWS) {
+            if (j < valid_rows) {
               const float s = float(scalesT[(size_t)g * N + n0 + n]);
               const float bb = NEG ? -s : float(biasesT[(size_t)g * N + n0 + n]);
               const float tt = s * cm;
@@ -3631,16 +3632,16 @@ enum VerifyInt8Matmul {
             }
           }
         }
-        if (j < ROWS) {
+        if (j < valid_rows) {
           #pragma clang loop unroll(full)
           for (int t = 0; t < 8; t++) { red[sg][j * 32 + c + 4 * t] = acc[t]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int e = int(tid); e < ROWS * 32; e += 128) {
+        for (int e = int(tid); e < valid_rows * 32; e += 128) {
           float v = red[0][e] + red[1][e];
           v = v + red[2][e];
           v = v + red[3][e];
-          out[(size_t)(e >> 5) * N + n0 + (e & 31)] = v;
+          out[(size_t)(row0 + (e >> 5)) * N + n0 + (e & 31)] = v;
         }
         """
 
@@ -4271,12 +4272,14 @@ enum VerifyInt8Matmul {
     ) -> MLXArray {
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
-        let rows = [("ROWS", m)] as [(String, any KernelTemplateArg)]
+        let tile = route == .nax ? m : min(m, 8)
+        let rows = [("ROWS", tile)] as [(String, any KernelTemplateArg)]
         let neg = rows + [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
         let kernel = route == .nax ? (vector ? naxVectorKernel : naxKernel) : plainKernel
         return kernel(
             inputs, template: route == .nax && !vector ? rows : neg,
-            grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            grid: (n / 32 * 128, route == .nax ? 1 : (m + tile - 1) / tile, 1),
+            threadGroup: (128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
@@ -4581,7 +4584,7 @@ enum VerifyInt8Matmul {
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool
     ) -> MLXArray? {
-        guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        guard route != .off else { return nil }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
@@ -4610,7 +4613,7 @@ enum VerifyInt8Matmul {
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
-        guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        guard route != .off else { return nil }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
