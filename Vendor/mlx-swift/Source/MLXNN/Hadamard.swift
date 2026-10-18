@@ -3405,7 +3405,10 @@ enum VerifyInt8Matmul {
     /// Every (row, word) slot of the staged tile receives the same device word
     /// through the same expansion, the stores rotated by (l >> 1) & 3 to keep
     /// the threadgroup banks spread; the multiply, the accumulation order and
-    /// the epilogue are the parent's. Nil when a replaced fragment is missing.
+    /// the epilogue are the parent's. The weight words are prefetched two
+    /// groups ahead (a register pair per group in flight) where the parent
+    /// prefetches one; the small per-group constants keep the parent's
+    /// one-ahead prefetch. Nil when a replaced fragment is missing.
     static let naxFastWideBody: String? = {
         var body = naxFastBody
         let swaps: [(String, String)] = [
@@ -3424,7 +3427,7 @@ enum VerifyInt8Matmul {
                 const device uint4* wcol1 = (const device uint4*)(w + (size_t)(n0 + wr + 16) * KW + wq);
                 threadgroup uint4* dst0 = (threadgroup uint4*)bs[sg] + wr * 8 + wq;
                 threadgroup uint4* dst1 = (threadgroup uint4*)bs[sg] + (wr + 16) * 8 + wq;
-                uint4 wv0, wv1;
+                uint4 wv0, wv1, nv0 = uint4(0u), nv1 = uint4(0u);
                 """),
             ("""
                   #pragma clang loop unroll(full)
@@ -3443,6 +3446,7 @@ enum VerifyInt8Matmul {
                 """,
              """
                   wv0 = wcol0[(size_t)gl * 2]; wv1 = wcol1[(size_t)gl * 2];
+                  if (gl + 4 < Kg) { nv0 = wcol0[(size_t)(gl + 4) * 2]; nv1 = wcol1[(size_t)(gl + 4) * 2]; }
                   sA = *(const device half4*)(scol + (size_t)gl * N);
                   sB = *(const device half4*)(scol + (size_t)gl * N + 16);
                   if (!NEG) {
@@ -3476,7 +3480,8 @@ enum VerifyInt8Matmul {
                     sA = *(const device half4*)(scol + (size_t)gl * N);
                 """,
              """
-                    wv0 = wcol0[(size_t)gl * 2]; wv1 = wcol1[(size_t)gl * 2];
+                    wv0 = nv0; wv1 = nv1;
+                    if (gl + 4 < Kg) { nv0 = wcol0[(size_t)(gl + 4) * 2]; nv1 = wcol1[(size_t)(gl + 4) * 2]; }
                     sA = *(const device half4*)(scol + (size_t)gl * N);
                 """),
         ]
@@ -3675,12 +3680,13 @@ enum VerifyInt8Matmul {
     }
 
     /// The wide-staging fast kernel against the fast kernel, bit for bit, on
-    /// a fixed input-independent 64 x 1024 problem at 4 and 16 rows, for the
+    /// a fixed input-independent 64 x 2048 problem (four groups per
+    /// simdgroup, so the in-loop two-ahead prefetch runs) at 4 and 16 rows, for the
     /// one-, two- and three-layer forms and both offset forms in use. Any
     /// mismatch or compile error keeps the fast kernel.
     private static func checkWide() -> Bool {
         guard naxFastWideKernels != nil else { wideNote = "wide forms not built"; return false }
-        let n = 64, k = 1024, kg = k / 128
+        let n = 64, k = 2048, kg = k / 128
         let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 3) &* 2_654_435_761) }, [n, k / 16])
         let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
         let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
