@@ -1674,6 +1674,15 @@ enum Qwen35RegisterGatedSIMD {
           negative_a = -metal::precise::exp(a_log[hv_idx]);
           bias = dt_bias[hv_idx];
         }
+        float row_g = 0.0f, row_beta = 0.0f;
+        if (T <= 32u) {
+          negative_a = simd_broadcast(negative_a, 0);
+          bias = simd_broadcast(bias, 0);
+          if (lane < T) {
+            row_g = qwen35_simd_gate_decay(a_[lane * a_strides[1]], bias, negative_a);
+            row_beta = qwen35_simd_gate_beta(bb_[lane * b_strides[1]]);
+          }
+        }
         device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
         float state[DVPL][R];
         #pragma clang loop unroll(full)
@@ -1692,12 +1701,15 @@ enum Qwen35RegisterGatedSIMD {
         float qr[R];
         for (int t = 0; t < T; ++t) {
           float local_g = 0.0f, local_beta = 0.0f;
-          if (lane == 0) {
+          if (T <= 32u) {
+            local_g = simd_broadcast(row_g, ushort(t));
+            local_beta = simd_broadcast(row_beta, ushort(t));
+          } else if (lane == 0) {
             local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);
             local_beta = qwen35_simd_gate_beta(bb_[0]);
           }
-          const float gt = simd_broadcast(local_g, 0);
-          const float bt = simd_broadcast(local_beta, 0);
+          const float gt = T <= 32u ? local_g : simd_broadcast(local_g, 0);
+          const float bt = T <= 32u ? local_beta : simd_broadcast(local_beta, 0);
           #pragma clang loop unroll(full)
           for (int j = 0; j < R / 4; ++j) {
             const float4 k4 = ((const device float4*)k_)[j];
