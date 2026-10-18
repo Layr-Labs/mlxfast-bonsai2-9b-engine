@@ -1509,6 +1509,101 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
+        checkSpeculativeContext()
+    }
+
+    /// The 12 context K/V projections (two six-projection groups) from the context codes.
+    private func contextKVFromCodes(_ cCodes: DF2Fast.W4Codes, rows: Int) -> [(MLXArray, MLXArray)]? {
+        let lead = [1, rows]
+        guard
+            let kv012 = DF2Fast.w4LinearsFromCodes(
+                cCodes, leadShape: lead,
+                [
+                    layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
+                    layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
+                    layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
+                ]),
+            let kv345 = DF2Fast.w4LinearsFromCodes(
+                cCodes, leadShape: lead,
+                [
+                    layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
+                    layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
+                    layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
+                ])
+        else { return nil }
+        return [
+            (kv012[0], kv012[1]), (kv012[2], kv012[3]), (kv012[4], kv012[5]),
+            (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
+        ]
+    }
+
+    /// `DARKBLOOM_BONSAI_DF2_SPECULATIVE_CONTEXT=0` keeps the context projection in the proposal.
+    static let speculativeContextOffered =
+        DF2Fast.on
+        && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_SPECULATIVE_CONTEXT"] != "0"
+    /// This drafter's own verdict: reset, then written by `checkSpeculativeContext` at bind.
+    private(set) var speculativeContextPassed = false
+
+    /// The context K/V a proposal would compute for `targetHidden`'s rows as its pending
+    /// context: the same fc, codes-only RMS+Q8 and `contextKVFromCodes` sequence as
+    /// `hiddenStatesWithCodes`. nil when a fast-path guard declines.
+    func contextKV(_ targetHidden: MLXArray) -> [(MLXArray, MLXArray)]? {
+        guard DF2Fast.on, let group = DF2Fast.w4Group, layers.count == 6,
+            targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            (1 ... 16).contains(targetHidden.dim(1)),
+            targetHidden.dim(-1) == config.targetHiddenSize,
+            config.slidingWindow.map({ targetHidden.dim(1) < $0 }) ?? true
+        else { return nil }
+        let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
+        guard let rq = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group, writeNorm: false),
+            let kv = contextKVFromCodes(rq.1, rows: fcOut.dim(1))
+        else { return nil }
+        return kv
+    }
+
+    /// Load-time check: the context K/V of a row prefix, projected alone, against the same
+    /// prefix of the full-width projection, every output bit, at every row count 1 ... width.
+    /// Any difference or error keeps every proposal projecting its own context.
+    private func checkSpeculativeContext() {
+        func log(_ s: String) {
+            FileHandle.standardError.write(Data("DF2 speculative context: \(s)\n".utf8))
+        }
+        speculativeContextPassed = false
+        guard Self.speculativeContextOffered else { return log("off") }
+        let width = config.dflash.blockSize
+        var verdict = "mismatch or non-finite output"
+        do {
+            let equal = try withError { () -> Bool in
+                let n = width * config.targetHiddenSize
+                let i = MLXArray(0 ..< n).asType(.float32)
+                let wave = MLX.sin(i * 0.7548776) * (1 + 0.5 * MLX.cos(i * 0.0137)) * 3
+                let x = wave.reshaped([1, width, config.targetHiddenSize]).asType(.bfloat16)
+                guard let full = contextKV(x) else { return false }
+                var eqs: [MLXArray] = []
+                // Equal garbage proves nothing: every full-width output must be finite.
+                for f in full {
+                    eqs.append(MLX.all(MLX.isFinite(f.0)))
+                    eqs.append(MLX.all(MLX.isFinite(f.1)))
+                }
+                for rows in 1 ... width {
+                    guard let part = contextKV(x[0..., 0 ..< rows, 0...]) else { return false }
+                    for (f, p) in zip(full, part) {
+                        let fk = f.0[0..., 0 ..< rows, 0...].view(dtype: .uint32)
+                        let fv = f.1[0..., 0 ..< rows, 0...].view(dtype: .uint32)
+                        eqs.append(MLX.all(fk .== p.0.view(dtype: .uint32)))
+                        eqs.append(MLX.all(fv .== p.1.view(dtype: .uint32)))
+                    }
+                }
+                return MLX.all(MLX.stacked(eqs)).item(Bool.self)
+            }
+            if equal {
+                speculativeContextPassed = true
+                verdict = "prefix projections bitwise equal at rows 1 ... \(width)"
+            }
+        } catch {
+            verdict = "error \(error)"
+        }
+        log(verdict)
     }
 
     // MARK: The cache
@@ -1581,7 +1676,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         _ inputs: MLXArray,
         targetHidden: MLXArray,
         cache: [KVCache],
-        logitsStart: Int
+        logitsStart: Int,
+        precomputedContextKV: [(MLXArray, MLXArray)]? = nil
     ) throws -> (hidden: MLXArray, codes: DF2Fast.W4Codes?) {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
@@ -1619,8 +1715,20 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         var context: MLXArray
         let cCodes: DF2Fast.W4Codes?
         var deferredContextNorm: (input: MLXArray, group: Int)? = nil
+        let givenContextKV =
+            precomputedContextKV.flatMap { kv in
+                kv.count == 6 && DF2Fast.on && h.ndim == 3 && h.dim(0) == 1
+                    && h.size / h.dim(-1) <= 16 && targetHidden.dim(0) == 1
+                    && kv.allSatisfy { $0.0.dim(1) == targetHidden.dim(1) }
+                    && (config.slidingWindow.map { targetHidden.dim(1) < $0 } ?? true)
+                    ? kv : nil
+            }
         if targetHidden.dim(1) == 0 {
             context = MLXArray.zeros([targetHidden.dim(0), 0, config.hiddenSize], dtype: dtype)
+            cCodes = nil
+        } else if givenContextKV != nil {
+            // Shape carrier only: every layer reads the given context K/V.
+            context = targetHidden
             cCodes = nil
         } else {
             let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
@@ -1647,6 +1755,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             }
         }
 
+        // Hand the context projection to the GPU now: it is the round's first
+        // drafter work, and the host still has the block layers to build.
+        if DF2Fast.earlySubmit, let cCodes {
+            asyncEval(cCodes.xq, cCodes.ascale, cCodes.xs)
+        }
         if DF2Fast.on, h.ndim == 3, h.dim(0) == 1, h.size / h.dim(-1) <= 16, !layers.isEmpty {
             let rSpec = DF2Fast.ropeSpec(self)
             var normed: MLXArray?
@@ -1659,34 +1772,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 normed = DF2Fast.rms(h, layers[0].inputLayerNorm)
                 normedCodes = nil
             }
-            var precomputedKV: [(MLXArray, MLXArray)]? = nil
+            var precomputedKV: [(MLXArray, MLXArray)]? = givenContextKV
             if let cCodes, layers.count == 6 {
-                let lead = [1, context.dim(1)]
-                if let kv012 = DF2Fast.w4LinearsFromCodes(
-                    cCodes, leadShape: lead,
-                    [
-                        layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
-                        layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
-                        layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
-                    ]),
-                    let kv345 = DF2Fast.w4LinearsFromCodes(
-                        cCodes, leadShape: lead,
-                        [
-                            layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
-                            layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
-                            layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
-                        ])
-                {
-                    precomputedKV = [
-                        (kv012[0], kv012[1]), (kv012[2], kv012[3]), (kv012[4], kv012[5]),
-                        (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
-                    ]
-                }
+                precomputedKV = contextKVFromCodes(cCodes, rows: context.dim(1))
             }
             if precomputedKV == nil, let deferredContextNorm {
                 // Preserve the original full-output path for any ineligible K/V group.
                 context = DF2Fast.rmsQuant(
                     deferredContextNorm.input, hiddenNorm, group: deferredContextNorm.group)!.0
+            }
+            if DF2Fast.earlySubmit {
+                var early: [MLXArray] = [h]
+                if let normed { early.append(normed) }
+                if let normedCodes {
+                    early.append(contentsOf: [normedCodes.xq, normedCodes.ascale, normedCodes.xs])
+                }
+                for (k, v) in precomputedKV ?? [] { early.append(contentsOf: [k, v]) }
+                asyncEval(early)
             }
             let blockLen = h.dim(1)
             for (index, layer) in layers.enumerated() {
@@ -1788,7 +1890,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         anchor: [Int],
         targetHidden: MLXArray,
         cache: [KVCache],
-        blockSize: Int
+        blockSize: Int,
+        precomputedContextKV: [(MLXArray, MLXArray)]? = nil
     ) throws -> MLXArray {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
@@ -1796,7 +1899,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let block = MLXArray(rows, [anchor.count, blockSize])
 
         let (hidden, finalCodes) = try hiddenStatesWithCodes(
-            block, targetHidden: targetHidden, cache: cache, logitsStart: 1)
+            block, targetHidden: targetHidden, cache: cache, logitsStart: 1,
+            precomputedContextKV: precomputedContextKV)
         if DF2Fast.on, anchor.count == 1 {
             let sel = candidateSelector
             let projected =
@@ -1889,6 +1993,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// fused grouped dynamic convolution; fused top-16 and greedy selector.
 enum DF2Fast {
     static let on = ProcessInfo.processInfo.environment["DF2_FAST"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_EARLY_SUBMIT=0` keeps the first submit at layer 0's end.
+    static let earlySubmit =
+        on && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_EARLY_SUBMIT"] != "0"
     static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
     static let header = """
         #include <metal_tensor>

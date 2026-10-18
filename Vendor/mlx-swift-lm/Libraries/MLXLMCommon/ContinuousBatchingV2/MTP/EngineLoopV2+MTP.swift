@@ -62,6 +62,19 @@ extension EngineLoopV2 {
         mtp.recordSeedSteps(graph.seedRows.count)
 
         asyncEval(graph.asyncEvalTargets)
+        // The next proposal's context rows are a prefix of this verify's tap
+        // rows: project them in their own command buffer behind the verify, so
+        // the acceptance packet completes first and the GPU keeps working
+        // while the host reads it.
+        if let verify = graph.verify, verify.rows.count == 1,
+            let blockContext = verify.blockContext, let block = mtp.blockDrafter,
+            verify.rows[0].lookupCarry == nil, let state = verify.rows[0].assistantState,
+            let rec = scheduler.record(for: verify.rows[0].id),
+            rec.request.maxTokens - rec.generatedTokenCount > verify.k + 1
+        {
+            let targets = block.speculateRoundContext(blockContext, requestState: state)
+            if !targets.isEmpty { asyncEval(targets) }
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)

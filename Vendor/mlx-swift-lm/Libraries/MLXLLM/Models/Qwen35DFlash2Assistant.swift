@@ -160,6 +160,10 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var prestaged: (anchor: Int, depth: Int, tokens: MLXArray)?
+        /// Context K/V projected for every tap row of the verify in flight, and
+        /// how many of those rows the round confirmed (set at its finalize).
+        var speculativeContext: (rows: Int, kv: [(MLXArray, MLXArray)])?
+        var speculativeConfirmed: Int?
         var isReleased = false
 
         init(caches: [any KVCache]) { self.caches = caches }
@@ -174,6 +178,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
         var materializedBytes: Int {
             let arrays = caches.flatMap { $0.innerState() } + pending + roots
+                + (speculativeContext?.kv.flatMap { [$0.0, $0.1] } ?? [])
             return arrays.reduce(0) { total, array in
                 let (next, overflow) = total.addingReportingOverflow(array.nbytes)
                 return overflow ? Int.max : next
@@ -204,6 +209,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         func absorbPending() {
             pending.removeAll(keepingCapacity: true)
             pendingRows = 0
+            speculativeContext = nil
+            speculativeConfirmed = nil
         }
 
         func clearAll() {
@@ -213,6 +220,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
             prestaged = nil
+            speculativeContext = nil
+            speculativeConfirmed = nil
             pendingRows = 0
             isReleased = true
         }
@@ -315,9 +324,16 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             }
             state.cacheSeeded = true
         }
+        var given: [(MLXArray, MLXArray)]?
+        if let n = state.speculativeConfirmed, let spec = state.speculativeContext,
+            state.pending.count == 1, state.pendingRows == n, n <= spec.rows
+        {
+            given = n == spec.rows
+                ? spec.kv : spec.kv.map { ($0.0[0..., 0 ..< n, 0...], $0.1[0..., 0 ..< n, 0...]) }
+        }
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1)
+            blockSize: depth + 1, precomputedContextKV: given)
         state.absorbPending()
         state.contextAbsorbed = false
         state.roots.append(tokens)
@@ -414,6 +430,27 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
         append(committedTargetHidden, to: requestState)
+        let confirmed = committedTargetHidden.dim(1)
+        if let spec = state.speculativeContext, state.pending.count == 1,
+            state.pendingRows == confirmed, confirmed <= spec.rows
+        {
+            state.speculativeConfirmed = confirmed
+        } else {
+            state.speculativeContext = nil
+            state.speculativeConfirmed = nil
+        }
+    }
+
+    public func speculateRoundContext(
+        _ blockContext: MLXArray, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        guard drafter.speculativeContextPassed else { return [] }
+        let state = self.state(requestState)
+        state.speculativeContext = nil
+        state.speculativeConfirmed = nil
+        guard state.pending.isEmpty, let kv = drafter.contextKV(blockContext) else { return [] }
+        state.speculativeContext = (rows: blockContext.dim(1), kv: kv)
+        return kv.flatMap { [$0.0, $0.1] }
     }
 
     /// Nothing to undo: the round wrote no speculative state here. The rows
@@ -421,6 +458,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let state = self.state(requestState)
+        state.speculativeContext = nil
+        state.speculativeConfirmed = nil
         state.promptDraft = nil
         state.preparedLookup = nil
         state.roots.removeAll(keepingCapacity: true)

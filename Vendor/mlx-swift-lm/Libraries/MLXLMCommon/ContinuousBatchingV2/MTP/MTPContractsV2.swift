@@ -516,6 +516,14 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 
     func prestageBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState)
+
+    /// OPTIONAL (defaulted): the next round's committed context rows are a
+    /// prefix of this verify's context tap rows. Project all of them now and
+    /// return the arrays for the engine to submit in their own command buffer
+    /// after the verify, so the GPU runs them while the host waits for the
+    /// acceptance packet. The next proposal uses the confirmed prefix.
+    func speculateRoundContext(
+        _ blockContext: MLXArray, requestState: any CBv2MTPRequestState) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
@@ -532,6 +540,12 @@ extension CBv2MTPBlockDrafter {
     public func prestageBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) {}
+
+    public func speculateRoundContext(
+        _ blockContext: MLXArray, requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        []
+    }
 
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
