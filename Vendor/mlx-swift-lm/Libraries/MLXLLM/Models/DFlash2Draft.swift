@@ -3460,91 +3460,10 @@ enum DF2Fast {
 
     /// Fused `rmsNorm(x, weight, eps)` + `W4Codes` int8 group quantization for `D = 4096, L <= 16`.
     static let rmsQuantKernel = MLXFast.metalKernel(
-        name: "df2_rms_q8g",
+        name: DF2HoistSource.on ? "df2_rms_q8g_h" : "df2_rms_q8g",
         inputNames: ["x", "weight", "dsz", "eps_arr"],
         outputNames: ["out_norm", "xq", "ascale", "xs"],
-        source: """
-            const uint tid = thread_position_in_threadgroup.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
-            const int c0 = int(tid) * 16;
-            const int G = D / KG;
-            const int g = int(tid) / (KG / 16);
-            if (l >= L) {
-              if (l < 16) {
-                const size_t qRowBase = (size_t)l * D + c0;
-                device char4* dst = (device char4*)(xq + qRowBase);
-                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-                if ((int(tid) & ((KG / 16) - 1)) == 0) {
-                  ascale[l * G + g] = 0.0f;
-                  xs[l * G + g] = 0.0f;
-                }
-              }
-              return;
-            }
-            const size_t rowBase = (size_t)l * D + c0;
-            float v[16];
-            float s4[4];
-            for (int k = 0; k < 4; k++) {
-              float ak = 0.0f;
-              for (int i = 0; i < 4; i++) {
-                const int u = 4 * k + i;
-                const float a = float(x[rowBase + u]);
-                v[u] = a;
-                ak += a * a;
-              }
-              s4[k] = ak;
-            }
-            float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
-            sq += simd_shuffle_xor(sq, 1);
-            sq += simd_shuffle_xor(sq, 2);
-            sq += simd_shuffle_xor(sq, 4);
-            threadgroup float shared_sq[32];
-            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-              const float tot = simd_sum(shared_sq[lane]);
-              if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float scale = shared_sq[0];
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              const float y = float(weight[c0 + u]) * (v[u] * scale);
-              if (WRITE_NORM) { out_norm[rowBase + u] = y; }
-              nv[u] = y;
-              local_amax = max(local_amax, fabs(y));
-            }
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-            if (KG == 128) {
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-            }
-            float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
-            for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
-            }
-            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-            const float ia = 1.0f / a;
-            device char4* dst = (device char4*)(xq + rowBase);
-            for (int u = 0; u < 4; u++) {
-              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-              dst[u] = char4(int4(rint(fv * ia)));
-            }
-            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-              ascale[l * G + g] = a;
-              xs[l * G + g] = seq_sum;
-            }
-            """)
+        source: DF2HoistSource.rmsQ8g(hoist: DF2HoistSource.on))
 
     static func rmsQuant(
         _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true
@@ -3677,108 +3596,10 @@ enum DF2Fast {
     /// Fused `dynConv(part: 1, residual: res)` + `rmsNorm(out_res, weight, eps)` + `W4Codes` int8 quantization
     /// on rows `qStart ..< L` for `D = 4096`.
     static let convRmsQuantKernel = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g",
+        name: DF2HoistSource.on ? "df2_dyn_conv_rms_q8g_h" : "df2_dyn_conv_rms_q8g",
         inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
         outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
-        source: """
-            const uint tid = thread_position_in_threadgroup.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
-            const int qStart = dsz[2];
-            const int qm = l - qStart;
-            const int c0 = int(tid) * 16;
-            const int G = D / KG;
-            const int qg = int(tid) / (KG / 16);
-            if (!WRITE_RES && l < qStart) return;
-            if (l >= L) {
-              if (qm >= 0 && qm < 16) {
-                const size_t qRowBase = (size_t)qm * D + c0;
-                device char4* dst = (device char4*)(xq + qRowBase);
-                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
-                if ((int(tid) & ((KG / 16) - 1)) == 0) {
-                  ascale[qm * G + qg] = 0.0f;
-                  xs[qm * G + qg] = 0.0f;
-                }
-              }
-              return;
-            }
-            const int dw = 4 * (D / 16);
-            const int g = int(tid);
-            const size_t rowBase = (size_t)l * D + c0;
-            const float d0 = float(dyn[l * dw + (dw / 2) + g]);
-            const float d1 = l >= 1 ? float(dyn[l * dw + (dw / 2) + (D / 16) + g]) : 0.0f;
-            float v[16];
-            float s4[4];
-            for (int k = 0; k < 4; k++) {
-              float ak = 0.0f;
-              for (int i = 0; i < 4; i++) {
-                const int u = 4 * k + i;
-                const int c = c0 + u;
-                float acc = float(res[rowBase + u]) + (float(base[2 * D + c]) + d0) * float(h[rowBase + u]);
-                if (l >= 1) {
-                  acc += (float(base[3 * D + c]) + d1) * float(h[rowBase - D + u]);
-                }
-                v[u] = acc;
-                if (WRITE_RES) { out_res[rowBase + u] = acc; }
-                ak += acc * acc;
-              }
-              s4[k] = ak;
-            }
-            float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
-            sq += simd_shuffle_xor(sq, 1);
-            sq += simd_shuffle_xor(sq, 2);
-            sq += simd_shuffle_xor(sq, 4);
-            threadgroup float shared_sq[32];
-            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0) {
-              const float tot = simd_sum(shared_sq[lane]);
-              if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
-              }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float scale = shared_sq[0];
-            float nv[16];
-            float local_amax = 0.0f;
-            for (int u = 0; u < 16; u++) {
-              const float y = float(weight[c0 + u]) * (v[u] * scale);
-              nv[u] = y;
-              local_amax = max(local_amax, fabs(y));
-            }
-            if (qm >= 0 && qm < 16) {
-              const size_t qRowBase = (size_t)qm * D + c0;
-              for (int u = 0; u < 16; u++) {
-                out_norm[qRowBase + u] = nv[u];
-              }
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
-              if (KG == 128) {
-                local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
-              }
-              float seq_sum = 0.0f;
-              const uint grpBase = lane & ~uint((KG / 16) - 1);
-              for (int step = 0; step < (KG / 16); step++) {
-                seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-                if ((int(lane) & ((KG / 16) - 1)) == step) {
-                  for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-                }
-              }
-              const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
-              const float ia = 1.0f / a;
-              device char4* dst = (device char4*)(xq + qRowBase);
-              for (int u = 0; u < 4; u++) {
-                const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
-                dst[u] = char4(int4(rint(fv * ia)));
-              }
-              if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
-                ascale[qm * G + qg] = a;
-                xs[qm * G + qg] = seq_sum;
-              }
-            }
-            """)
+        source: DF2HoistSource.convRmsQ8g(hoist: DF2HoistSource.on))
 
     static func dynConvRms(
         _ h: MLXArray, dyn: MLXArray, base: MLXArray, residual: MLXArray, norm: RMSNorm,
@@ -3966,6 +3787,12 @@ enum DF2Fast {
             }
             """)
 
+    /// `df2_selector_mb8` with each step's device loads issued one step ahead (`DF2HoistSource.selector`).
+    /// Packed codebooks only; any other input form keeps `selector`.
+    static let selectorHoisted = MLXFast.metalKernel(
+        name: "df2_selector_mb8_h", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+        outputNames: ["path"], source: DF2HoistSource.selector)
+
     private static var selectorLookupSentinel: MLXArray { MLXArray([UInt16(0)]) }
 
     /// Fused top-16 + greedy selector for `selectGreedy` (B = 1).
@@ -3978,7 +3805,8 @@ enum DF2Fast {
             [logits.reshaped([P, V]).asType(.float32)],
             grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
             outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
-        let path = selector(
+        let hoisted = DF2HoistSource.on && predLookup != nil && succLookup != nil
+        let path = (hoisted ? selectorHoisted : selector)(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
             template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
@@ -4068,13 +3896,14 @@ enum DF2WideLanes {
         name: "df2_act_q8g_conv0_e\(e)", inputNames: ["h", "dyn", "base", "ksz"],
         outputNames: ["xq", "ascale", "xs"], source: DF2WideLaneSource.source(.quantGConv0, e: e))
     static let rmsQuant = MLXFast.metalKernel(
-        name: "df2_rms_q8g_e\(e)", inputNames: ["x", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_norm", "xq", "ascale", "xs"], source: DF2WideLaneSource.source(.rmsQuant, e: e))
+        name: "df2_rms_q8g_e\(e)\(DF2HoistSource.on ? "_h" : "")", inputNames: ["x", "weight", "dsz", "eps_arr"],
+        outputNames: ["out_norm", "xq", "ascale", "xs"],
+        source: DF2WideLaneSource.source(.rmsQuant, e: e, hoist: DF2HoistSource.on))
     static let convRmsQuant = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g_e\(e)",
+        name: "df2_dyn_conv_rms_q8g_e\(e)\(DF2HoistSource.on ? "_h" : "")",
         inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
         outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
-        source: DF2WideLaneSource.source(.convRmsQuant, e: e))
+        source: DF2WideLaneSource.source(.convRmsQuant, e: e, hoist: DF2HoistSource.on))
 
     /// Written once by `prepare` at bind, before any proposal; read-only afterwards.
     nonisolated(unsafe) static var passed: Set<Combo> = []
@@ -4262,7 +4091,7 @@ enum DF2WideLaneSource {
     }
 
     /// From the quad sums `s4[e / 4]` to `scale` = rsqrt(mean square + eps) with the record's tree.
-    static func rowScale(e: Int) -> String {
+    static func rowScale(e: Int, hoist: Bool = false) -> String {
         let lps = 16 / e  // lanes per record thread
         let first: String
         switch e {
@@ -4270,7 +4099,7 @@ enum DF2WideLaneSource {
         case 8: first = "float sq = s4[0] + s4[1];\nsq += simd_shuffle_xor(sq, 1);\n"
         default: first = "float sq = s4[0];\nsq += simd_shuffle_xor(sq, 1);\nsq += simd_shuffle_xor(sq, 2);\n"
         }
-        return first + """
+        return DF2HoistSource.preload(e, hoist) + first + """
             sq += simd_shuffle_xor(sq, \(lps));
             sq += simd_shuffle_xor(sq, \(2 * lps));
             sq += simd_shuffle_xor(sq, \(4 * lps));
@@ -4280,7 +4109,7 @@ enum DF2WideLaneSource {
             if (sg == 0) {
               const float tot = simd_sum(shared_sq[lane]);
               if (lane == 0) {
-                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
+                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + \(hoist ? "eps0" : "eps_arr[0]"));
               }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4289,7 +4118,7 @@ enum DF2WideLaneSource {
             """
     }
 
-    static func source(_ kind: Kind, e: Int) -> String {
+    static func source(_ kind: Kind, e: Int, hoist: Bool = false) -> String {
         switch kind {
         case .quantG:
             return """
@@ -4383,11 +4212,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + rowScale(e: e, hoist: hoist) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(hoist ? "wv[u]" : "float(weight[c0 + u])") * (v[u] * scale);
                   if (WRITE_NORM) { out_norm[rowBase + u] = y; }
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
@@ -4438,11 +4267,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + rowScale(e: e, hoist: hoist) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(hoist ? "wv[u]" : "float(weight[c0 + u])") * (v[u] * scale);
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
                 }
@@ -4460,3 +4289,360 @@ enum DF2WideLaneSource {
     }
 }
 // WIDELANES-GEN END
+
+// DFHOIST-GEN BEGIN
+/// Load-hoisted forms of the drafter's row-norm kernels (`df2_rms_q8g`, `df2_dyn_conv_rms_q8g` and their
+/// `DF2WideLaneSource` twins) and of its greedy selector (`df2_selector_mb8`). Each kernel runs as one or a
+/// few threadgroups on the round's critical path, so a device load issued only after a barrier, or after
+/// the selection it does not depend on, costs a full memory round trip per step. The hoisted forms issue
+/// the same loads earlier and keep every arithmetic expression, reduction order and selection rule:
+/// - row norms: the norm weight and eps are read into registers before the first barrier, not after the
+///   second; the values and the formulas that use them are unchanged.
+/// - selector: step p + 1's successor codes, projection values and the predecessor codes of each
+///   simdgroup's candidate are loaded during step p, before its barrier. The predecessor codes of all 16
+///   candidates of step p are staged in threadgroup memory (double-buffered by step parity), and step
+///   p + 1 reads the entry of the candidate step p selected. Integer decoding and the accumulation order
+///   are the parent's, so `path` is bit-identical.
+/// `DARKBLOOM_BONSAI_DF_HOIST=0` keeps the parent kernels and their text.
+enum DF2HoistSource {
+    static let on = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF_HOIST"] != "0"
+
+    /// The norm weight of this thread's `n` columns and eps, read before the row reduction's barrier.
+    static func preload(_ n: Int, _ hoist: Bool) -> String {
+        hoist
+            ? "float wv[\(n)];\nfor (int u = 0; u < \(n); u++) { wv[u] = float(weight[c0 + u]); }\n"
+                + "const float eps0 = eps_arr[0];\n"
+            : ""
+    }
+
+    static func rmsQ8g(hoist: Bool) -> String {
+        """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int l = int(threadgroup_position_in_grid.y);
+            const int L = dsz[1];
+            const int c0 = int(tid) * 16;
+            const int G = D / KG;
+            const int g = int(tid) / (KG / 16);
+            if (l >= L) {
+              if (l < 16) {
+                const size_t qRowBase = (size_t)l * D + c0;
+                device char4* dst = (device char4*)(xq + qRowBase);
+                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
+                if ((int(tid) & ((KG / 16) - 1)) == 0) {
+                  ascale[l * G + g] = 0.0f;
+                  xs[l * G + g] = 0.0f;
+                }
+              }
+              return;
+            }
+            const size_t rowBase = (size_t)l * D + c0;
+            float v[16];
+            float s4[4];
+            for (int k = 0; k < 4; k++) {
+              float ak = 0.0f;
+              for (int i = 0; i < 4; i++) {
+                const int u = 4 * k + i;
+                const float a = float(x[rowBase + u]);
+                v[u] = a;
+                ak += a * a;
+              }
+              s4[k] = ak;
+            }
+            \(preload(16, hoist))float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+            sq += simd_shuffle_xor(sq, 1);
+            sq += simd_shuffle_xor(sq, 2);
+            sq += simd_shuffle_xor(sq, 4);
+            threadgroup float shared_sq[32];
+            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float tot = simd_sum(shared_sq[lane]);
+              if (lane == 0) {
+                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + \(hoist ? "eps0" : "eps_arr[0]"));
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float scale = shared_sq[0];
+            float nv[16];
+            float local_amax = 0.0f;
+            for (int u = 0; u < 16; u++) {
+              const float y = \(hoist ? "wv[u]" : "float(weight[c0 + u])") * (v[u] * scale);
+              if (WRITE_NORM) { out_norm[rowBase + u] = y; }
+              nv[u] = y;
+              local_amax = max(local_amax, fabs(y));
+            }
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG == 128) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
+            }
+            float seq_sum = 0.0f;
+            const uint grpBase = lane & ~uint((KG / 16) - 1);
+            for (int step = 0; step < (KG / 16); step++) {
+              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if ((int(lane) & ((KG / 16) - 1)) == step) {
+                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              }
+            }
+            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+            const float ia = 1.0f / a;
+            device char4* dst = (device char4*)(xq + rowBase);
+            for (int u = 0; u < 4; u++) {
+              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+              dst[u] = char4(int4(rint(fv * ia)));
+            }
+            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
+              ascale[l * G + g] = a;
+              xs[l * G + g] = seq_sum;
+            }
+            """
+    }
+
+    static func convRmsQ8g(hoist: Bool) -> String {
+        """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int l = int(threadgroup_position_in_grid.y);
+            const int L = dsz[1];
+            const int qStart = dsz[2];
+            const int qm = l - qStart;
+            const int c0 = int(tid) * 16;
+            const int G = D / KG;
+            const int qg = int(tid) / (KG / 16);
+            if (!WRITE_RES && l < qStart) return;
+            if (l >= L) {
+              if (qm >= 0 && qm < 16) {
+                const size_t qRowBase = (size_t)qm * D + c0;
+                device char4* dst = (device char4*)(xq + qRowBase);
+                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
+                if ((int(tid) & ((KG / 16) - 1)) == 0) {
+                  ascale[qm * G + qg] = 0.0f;
+                  xs[qm * G + qg] = 0.0f;
+                }
+              }
+              return;
+            }
+            const int dw = 4 * (D / 16);
+            const int g = int(tid);
+            const size_t rowBase = (size_t)l * D + c0;
+            const float d0 = float(dyn[l * dw + (dw / 2) + g]);
+            const float d1 = l >= 1 ? float(dyn[l * dw + (dw / 2) + (D / 16) + g]) : 0.0f;
+            float v[16];
+            float s4[4];
+            for (int k = 0; k < 4; k++) {
+              float ak = 0.0f;
+              for (int i = 0; i < 4; i++) {
+                const int u = 4 * k + i;
+                const int c = c0 + u;
+                float acc = float(res[rowBase + u]) + (float(base[2 * D + c]) + d0) * float(h[rowBase + u]);
+                if (l >= 1) {
+                  acc += (float(base[3 * D + c]) + d1) * float(h[rowBase - D + u]);
+                }
+                v[u] = acc;
+                if (WRITE_RES) { out_res[rowBase + u] = acc; }
+                ak += acc * acc;
+              }
+              s4[k] = ak;
+            }
+            \(preload(16, hoist))float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+            sq += simd_shuffle_xor(sq, 1);
+            sq += simd_shuffle_xor(sq, 2);
+            sq += simd_shuffle_xor(sq, 4);
+            threadgroup float shared_sq[32];
+            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float tot = simd_sum(shared_sq[lane]);
+              if (lane == 0) {
+                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + \(hoist ? "eps0" : "eps_arr[0]"));
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float scale = shared_sq[0];
+            float nv[16];
+            float local_amax = 0.0f;
+            for (int u = 0; u < 16; u++) {
+              const float y = \(hoist ? "wv[u]" : "float(weight[c0 + u])") * (v[u] * scale);
+              nv[u] = y;
+              local_amax = max(local_amax, fabs(y));
+            }
+            if (qm >= 0 && qm < 16) {
+              const size_t qRowBase = (size_t)qm * D + c0;
+              for (int u = 0; u < 16; u++) {
+                out_norm[qRowBase + u] = nv[u];
+              }
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+              if (KG == 128) {
+                local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
+              }
+              float seq_sum = 0.0f;
+              const uint grpBase = lane & ~uint((KG / 16) - 1);
+              for (int step = 0; step < (KG / 16); step++) {
+                seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+                if ((int(lane) & ((KG / 16) - 1)) == step) {
+                  for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+                }
+              }
+              const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+              const float ia = 1.0f / a;
+              device char4* dst = (device char4*)(xq + qRowBase);
+              for (int u = 0; u < 4; u++) {
+                const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+                dst[u] = char4(int4(rint(fv * ia)));
+              }
+              if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
+                ascale[qm * G + qg] = a;
+                xs[qm * G + qg] = seq_sum;
+              }
+            }
+            """
+    }
+
+    /// `df2_selector_mb8` for packed predecessor and successor codebooks, loads issued one step ahead.
+    static let selector = """
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+        const int P = int(cand_shape[0]);
+        const float NEG = -INFINITY;
+        threadgroup int tc[16][16];
+        threadgroup float tu[16][16];
+        for (int p = int(sg); p < P; p += 16) {
+          float cv[4]; int ci[4];
+          const size_t base = (size_t)p * 128u + lane * 4u;
+          for (int k = 0; k < 4; k++) {
+            cv[k] = float(unary[base + k]);
+            ci[k] = cand[base + k];
+          }
+          for (int r = 0; r < 16; r++) {
+            float bv = NEG; int bi = 0x7fffffff; int bk = 0;
+            for (int k = 0; k < 4; k++) {
+              const float v = cv[k];
+              const int id = ci[k];
+              if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; bk = k; }
+            }
+            const float m = simd_max(bv);
+            const int best_id = simd_min(bv == m ? bi : 0x7fffffff);
+            if (bv == m && bi == best_id) {
+              tc[p][r] = best_id;
+              tu[p][r] = m;
+              cv[bk] = NEG;
+            }
+          }
+        }
+        threadgroup float ev[2][16];
+        // Step p stores the predecessor codes of its candidate tc[p][sg] (this lane's four fields) in
+        // buffer p & 1; step p + 1 reads the entry of the candidate step p selected.
+        threadgroup uint4 pcs[2][16][32];
+        threadgroup uint pbs[2][16];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int pr = anchor[0];
+        uint pbest = 0u;
+        // Per field i (r = lane + 64 i): the word offset and shift of the parent's packed read.
+        size_t off[4]; uint shf[4];
+        for (int i = 0; i < 4; i++) {
+          const int r = int(lane) + 64 * i;
+          const uint pair = uint(r >> 6) * 32u + lane;
+          const uint bit = (pair & 3u) * 24u;
+          off[i] = (pair >> 2u) * 3u + (bit >> 5u);
+          shf[i] = bit & 31u;
+        }
+        // Current step's operands: predecessor codes and base (row pr), successor codes and base (row c),
+        // projection values (row p); and the predecessor codes and base of candidate c, to be staged.
+        uint pc[4], sc[4], qn[4];
+        float pj[8];
+        uint predBase = 0u, succBase = 0u, qb = 0u;
+        if (P > 0) {
+          const int c = tc[0][sg];
+          predBase = predLookup[predLookup_shape[0] == 1 ? 0 : pr];
+          succBase = succLookup[succLookup_shape[0] == 1 ? 0 : c];
+          qb = predLookup[predLookup_shape[0] == 1 ? 0 : c];
+          for (int i = 0; i < 4; i++) {
+            const size_t offset = off[i];
+            const uint shift = shf[i];
+            {
+              const size_t word = (size_t)pr * 96u + offset;
+              uint predCodes = uint(pred[word]) >> shift;
+              if (shift > 8u) predCodes |= uint(pred[word + 1u]) << (32u - shift);
+              pc[i] = predCodes;
+            }
+            {
+              const size_t word = (size_t)c * 96u + offset;
+              uint succCodes = uint(succ[word]) >> shift;
+              if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
+              sc[i] = succCodes;
+              uint candCodes = uint(pred[word]) >> shift;
+              if (shift > 8u) candCodes |= uint(pred[word + 1u]) << (32u - shift);
+              qn[i] = candCodes;
+            }
+            const int r = int(lane) + 64 * i;
+            pj[2 * i] = float(proj[0 * 256 + r]);
+            pj[2 * i + 1] = float(proj[0 * 256 + r + 32]);
+          }
+        }
+        for (int p = 0; p < P; p++) {
+          if (p > 0) {
+            const uint4 staged = pcs[(p - 1) & 1][pbest][lane];
+            pc[0] = staged.x; pc[1] = staged.y; pc[2] = staged.z; pc[3] = staged.w;
+            predBase = pbs[(p - 1) & 1][pbest];
+          }
+          float acc = 0.0f;
+          for (int i = 0; i < 4; i++) {
+            const uint predCodes = pc[i], succCodes = sc[i];
+            for (int part = 0; part < 2; part++) {
+              float pv, sv;
+              {
+                const uint code = (predCodes >> (part * 12)) & 4095u;
+                const uint exponent = (code >> 7u) & 15u;
+                const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                    | ((exponent == 0u ? 0u : predBase + exponent - 1u) << 7u));
+                pv = cast_to<float>(uint16_to_bfloat16(value));
+              }
+              {
+                const uint code = (succCodes >> (part * 12)) & 4095u;
+                const uint exponent = (code >> 7u) & 15u;
+                const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                    | ((exponent == 0u ? 0u : succBase + exponent - 1u) << 7u));
+                sv = cast_to<float>(uint16_to_bfloat16(value));
+              }
+              acc += pv * pj[2 * i + part] * sv;
+            }
+          }
+          if (p + 1 < P) {
+            pcs[p & 1][sg][lane] = uint4(qn[0], qn[1], qn[2], qn[3]);
+            if (lane == 0) { pbs[p & 1][sg] = qb; }
+            const int c = tc[p + 1][sg];
+            succBase = succLookup[succLookup_shape[0] == 1 ? 0 : c];
+            qb = predLookup[predLookup_shape[0] == 1 ? 0 : c];
+            for (int i = 0; i < 4; i++) {
+              const size_t offset = off[i];
+              const uint shift = shf[i];
+              const size_t word = (size_t)c * 96u + offset;
+              uint succCodes = uint(succ[word]) >> shift;
+              if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
+              sc[i] = succCodes;
+              uint candCodes = uint(pred[word]) >> shift;
+              if (shift > 8u) candCodes |= uint(pred[word + 1u]) << (32u - shift);
+              qn[i] = candCodes;
+              const int r = int(lane) + 64 * i;
+              pj[2 * i] = float(proj[(p + 1) * 256 + r]);
+              pj[2 * i + 1] = float(proj[(p + 1) * 256 + r + 32]);
+            }
+          }
+          acc = simd_sum(acc);
+          const int buf = p & 1;
+          if (lane == 0) { ev[buf][sg] = tu[p][sg] + acc; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const float v = lane < 16u ? ev[buf][lane] : NEG;
+          const float m = simd_max(v);
+          const uint best = simd_min(v == m ? lane : 16u);
+          pr = tc[p][best];
+          pbest = best;
+          if (tid == 0) { path[p] = pr; }
+        }
+        """
+}
+// DFHOIST-GEN END
