@@ -1606,6 +1606,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         // Both crossings from the target cast here. The target's embedding is a
         // MODULE call, never a raw weight read.
         var h: MLXArray
+        var joinedNorm: (MLXArray, DF2Fast.W4Codes)?
         if DF2Fast.on, inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == config.dflash.blockSize,
             logitsStart == 1, fc is QuantizedLinear
         {
@@ -1622,7 +1623,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 DF2Fast.maskEmbedCache[key] = m
                 maskEmbed = m
             }
-            h = concatenated([anchorEmbed, maskEmbed], axis: 1)
+            if config.dflash.inputEmbeddingScale == 1, !layers.isEmpty,
+                let group = DF2Fast.w4Group,
+                let joined = DF2Fast.rmsQuantJoinedInput(
+                    anchorEmbed, masks: maskEmbed, layers[0].inputLayerNorm, group: group)
+            {
+                h = joined.0
+                joinedNorm = (joined.1, joined.2)
+            } else {
+                h = concatenated([anchorEmbed, maskEmbed], axis: 1)
+            }
         } else {
             h = target.embedTokensForDFlash2(inputs).asType(dtype)
         }
@@ -1667,7 +1677,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let rSpec = DF2Fast.ropeSpec(self)
             var normed: MLXArray?
             var normedCodes: DF2Fast.W4Codes?
-            if let group = DF2Fast.w4Group,
+            if let joinedNorm {
+                (normed, normedCodes) = joinedNorm
+            } else if let group = DF2Fast.w4Group,
                 let rq = DF2Fast.rmsQuant(h, layers[0].inputLayerNorm, group: group)
             {
                 (normed, normedCodes) = rq
@@ -3462,8 +3474,9 @@ enum DF2Fast {
     static let rmsQuantKernel = MLXFast.metalKernel(
         name: "df2_rms_q8g",
         inputNames: ["x", "weight", "dsz", "eps_arr"],
-        outputNames: ["out_norm", "xq", "ascale", "xs"],
-        source: """
+        outputNames: ["out_norm", "xq", "ascale", "xs"], source: rmsQuantSource)
+
+    static let rmsQuantSource = """
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup;
             const uint sg = simdgroup_index_in_threadgroup;
@@ -3544,7 +3557,57 @@ enum DF2Fast {
               ascale[l * G + g] = a;
               xs[l * G + g] = seq_sum;
             }
+            """
+
+    /// The first drafter row is a dynamic anchor; the other 15 rows are cached masks.
+    /// Replace only the input load of the same RMS/quant body, and materialize the
+    /// joined hidden activation for the residual path without a separate concatenate.
+    static func joinedRmsQuantSource(_ source: String) -> String {
+        source.replacingOccurrences(
+            of: "const float a = float(x[rowBase + u]);",
+            with: """
+            const auto value = l == 0 ? x[c0 + u] : masks[(size_t)(l - 1) * D + c0 + u];
+            out_joined[rowBase + u] = value;
+            const float a = float(value);
             """)
+    }
+
+    static let rmsQuantJoinedKernel = MLXFast.metalKernel(
+        name: "df2_joined_input_rms_q8g", inputNames: ["x", "masks", "weight", "dsz", "eps_arr"],
+        outputNames: ["out_joined", "out_norm", "xq", "ascale", "xs"],
+        source: joinedRmsQuantSource(rmsQuantSource))
+    static let rmsQuantJoinedWideKernel = MLXFast.metalKernel(
+        name: "df2_joined_input_rms_q8g_e\(DF2WideLanes.e)",
+        inputNames: ["x", "masks", "weight", "dsz", "eps_arr"],
+        outputNames: ["out_joined", "out_norm", "xq", "ascale", "xs"],
+        source: joinedRmsQuantSource(DF2WideLaneSource.source(.rmsQuant, e: DF2WideLanes.e)))
+
+    static func rmsQuantJoinedInput(
+        _ anchor: MLXArray, masks: MLXArray, _ norm: RMSNorm, group: Int
+    ) -> (MLXArray, MLXArray, W4Codes)? {
+        guard on, anchor.shape == [1, 1, 4096], masks.shape == [1, 15, 4096],
+            anchor.dtype == masks.dtype, anchor.dtype == .bfloat16 || anchor.dtype == .float32,
+            (group == 64 || group == 128), split > 0, 4096 / group >= split
+        else { return nil }
+        let w = normWeight(norm)
+        let wide = DF2WideLanes.serves(
+            .init(kind: .rmsQuant, dtype: anchor.dtype, dtype2: w.dtype, k: 4096, group: group, flag: 0))
+        let outs = rmsQuantJoinedRun(anchor, masks: masks, w, eps: norm.eps, group: group, wide: wide)
+        return (outs[0], outs[1], W4Codes(
+            xq: outs[2], ascale: outs[3], xs: outs[4], rows: 16, K: 4096, group: group))
+    }
+
+    static func rmsQuantJoinedRun(
+        _ anchor: MLXArray, masks: MLXArray, _ w: MLXArray, eps: Float, group: Int, wide: Bool
+    ) -> [MLXArray] {
+        let lanes = 4096 / (wide ? DF2WideLanes.e : 16)
+        return (wide ? rmsQuantJoinedWideKernel : rmsQuantJoinedKernel)(
+            [anchor, masks, w, MLXArray([Int32(4096), Int32(16)]), MLXArray([eps])],
+            template: [("D", 4096), ("KG", group), ("WRITE_NORM", 1)],
+            grid: (lanes, 16, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [[1, 16, 4096], [1, 16, 4096], [16 * 4096], [16 * (4096 / group)], [16 * (4096 / group)]],
+            outputDTypes: [anchor.dtype, .float32, .int8, .float32, .float32])
+    }
 
     static func rmsQuant(
         _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true
