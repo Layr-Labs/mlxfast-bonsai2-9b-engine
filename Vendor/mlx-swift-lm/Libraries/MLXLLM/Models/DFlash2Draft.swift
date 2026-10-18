@@ -2036,8 +2036,8 @@ enum DF2Fast {
 
     /// Input columns per 4-bit group (64 or 128); nil (`DF2_W4=0`) keeps the pinned 8-bit g32 codes.
     static let w4Group: Int? = {
-        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "64"
-        return v == "128" ? 128 : (v == "0" ? nil : 64)
+        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "128"
+        return v == "0" ? nil : (v == "64" ? 64 : 128)
     }()
 
     final class W4Operands {
