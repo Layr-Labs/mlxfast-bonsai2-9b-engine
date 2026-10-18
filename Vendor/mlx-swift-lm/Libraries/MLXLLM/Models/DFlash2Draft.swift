@@ -1616,8 +1616,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context: MLXArray
+        var context: MLXArray
         let cCodes: DF2Fast.W4Codes?
+        var deferredContextNorm: (input: MLXArray, group: Int)? = nil
         if targetHidden.dim(1) == 0 {
             context = MLXArray.zeros([targetHidden.dim(0), 0, config.hiddenSize], dtype: dtype)
             cCodes = nil
@@ -1625,9 +1626,21 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
             if let group = DF2Fast.w4Group, fcOut.dim(0) == 1,
                 (1 ... 16).contains(fcOut.dim(1)),
-                let rq = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group)
+                let rq = DF2Fast.rmsQuant(
+                    fcOut, hiddenNorm, group: group,
+                    writeNorm: !(DF2Fast.on && h.ndim == 3 && h.dim(0) == 1
+                        && h.size / h.dim(-1) <= 16 && layers.count == 6
+                        && (config.slidingWindow.map { fcOut.dim(1) < $0 } ?? true)))
             {
-                (context, cCodes) = rq
+                if rq.0.size == 1 {
+                    // Shape carrier only until every context K/V projection succeeds.
+                    // A failed projection below materializes the original normalized output.
+                    context = fcOut
+                    cCodes = rq.1
+                    deferredContextNorm = (fcOut, group)
+                } else {
+                    (context, cCodes) = rq
+                }
             } else {
                 context = DF2Fast.rms(fcOut, hiddenNorm)
                 cCodes = nil
@@ -1669,6 +1682,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                         (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
                     ]
                 }
+            }
+            if precomputedKV == nil, let deferredContextNorm {
+                // Preserve the original full-output path for any ineligible K/V group.
+                context = DF2Fast.rmsQuant(
+                    deferredContextNorm.input, hiddenNorm, group: deferredContextNorm.group)!.0
             }
             let blockLen = h.dim(1)
             for (index, layer) in layers.enumerated() {
@@ -3411,7 +3429,7 @@ enum DF2Fast {
             float local_amax = 0.0f;
             for (int u = 0; u < 16; u++) {
               const float y = float(weight[c0 + u]) * (v[u] * scale);
-              out_norm[rowBase + u] = y;
+              if (WRITE_NORM) { out_norm[rowBase + u] = y; }
               nv[u] = y;
               local_amax = max(local_amax, fabs(y));
             }
@@ -3441,7 +3459,9 @@ enum DF2Fast {
             }
             """)
 
-    static func rmsQuant(_ x: MLXArray, _ norm: RMSNorm, group: Int) -> (MLXArray, W4Codes)? {
+    static func rmsQuant(
+        _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true
+    ) -> (MLXArray, W4Codes)? {
         let D = x.dim(-1), L = x.size / D
         guard on, D == 4096, (1 ... 16).contains(L),
             (group == 64 || group == 128), split > 0, D / group >= split
@@ -3451,22 +3471,24 @@ enum DF2Fast {
         let w = normWeight(norm)
         let wide = DF2WideLanes.serves(
             .init(kind: .rmsQuant, dtype: x.dtype, dtype2: w.dtype, k: D, group: group, flag: 0))
-        let outs = rmsQuantRun(x, w, D: D, L: L, eps: norm.eps, group: group, wide: wide)
+        let outs = rmsQuantRun(
+            x, w, D: D, L: L, eps: norm.eps, group: group, wide: wide, writeNorm: writeNorm)
         let codes = W4Codes(xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
         return (outs[0], codes)
     }
 
     /// `df2_rms_q8g` at 256 lanes per row, or its `DF2WideLaneSource` twin (`wide`).
     static func rmsQuantRun(
-        _ x: MLXArray, _ w: MLXArray, D: Int, L: Int, eps: Float, group: Int, wide: Bool
+        _ x: MLXArray, _ w: MLXArray, D: Int, L: Int, eps: Float, group: Int, wide: Bool,
+        writeNorm: Bool = true
     ) -> [MLXArray] {
         let G = D / group
         let lanes = D / (wide ? DF2WideLanes.e : 16)
         return (wide ? DF2WideLanes.rmsQuant : rmsQuantKernel)(
             [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([eps])],
-            template: [("D", D), ("KG", group)],
+            template: [("D", D), ("KG", group), ("WRITE_NORM", writeNorm ? 1 : 0)],
             grid: (lanes, Swift.max(L, 16), 1), threadGroup: (lanes, 1, 1),
-            outputShapes: [x.shape, [16 * D], [16 * G], [16 * G]],
+            outputShapes: [writeNorm ? x.shape : [1], [16 * D], [16 * G], [16 * G]],
             outputDTypes: [.float32, .int8, .float32, .float32])
     }
 
@@ -4233,7 +4255,7 @@ enum DF2WideLaneSource {
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
                   const float y = float(weight[c0 + u]) * (v[u] * scale);
-                  out_norm[rowBase + u] = y;
+                  if (WRITE_NORM) { out_norm[rowBase + u] = y; }
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
                 }
