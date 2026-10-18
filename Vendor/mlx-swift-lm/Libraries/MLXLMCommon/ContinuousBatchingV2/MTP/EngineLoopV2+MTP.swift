@@ -61,6 +61,13 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        // One async eval signals one completion event after its last kernel,
+        // so a packet submitted with the off-path outputs (the drafter context
+        // taps, cache state) is readable only after they finish too. Submit
+        // the packet alone first; the rest follows in the record's order.
+        if Self.mtpPacketFirstEnabled, let verify = graph.verify {
+            asyncEval(verify.acceptancePacket)
+        }
         asyncEval(graph.asyncEvalTargets)
         if let verify = graph.verify {
             mtpQueueRoundContextProjection(verify, driver: mtp)
@@ -111,6 +118,14 @@ extension EngineLoopV2 {
         shapes?.attach()
         return step
     }
+
+    /// `DARKBLOOM_BONSAI_PACKET_FIRST=0` restores the parent: the acceptance
+    /// packet shares one async eval with the verify's other outputs.
+    static let mtpPacketFirstEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PACKET_FIRST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// `DARKBLOOM_DFLASH_CONTEXT_PROJECTION=0` keeps all of a block drafter's
     /// work after acceptance.
