@@ -3185,6 +3185,7 @@ enum PromptInt8Matmul {
     // and writes NaN on any mismatch, so the load-time check then fails.
     // Body of `naxSgSource`: reads K, M, N, bx, w, scalesT, biasesT and out.
     static let naxSgBody = """
+        using elem_index = metal::conditional_t<INDEX32, uint, size_t>;
         const int Kg = K / 128;
         const int n0 = bx * 64;
         const int m0 = int(threadgroup_position_in_grid.y) * 64;
@@ -3214,7 +3215,7 @@ enum PromptInt8Matmul {
         }
         const bool good = simd_all(ok);
         const int sc = int(tid >> 1); const int sh = int(tid & 1);
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
+        const device uint32_t* wrow = w + (elem_index)(n0 + sc) * (K / 16) + sh * 4;
         auto stage = [&](int g, int buf) {
           const uint4 v = *(const device uint4*)(wrow + g * 8);
           threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
@@ -3231,7 +3232,7 @@ enum PromptInt8Matmul {
         const device half4* bp0 = (const device half4*)(biasesT + nb);
         const device half4* bp1 = (const device half4*)(biasesT + nb + 16);
         const int NQ = N / 4;
-        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)(4 * fm + 2 * (q >> 1));
+        const elem_index tbase = (elem_index)(m0 / 64) * (elem_index)Kg * 64 + (elem_index)(4 * fm + 2 * (q >> 1));
         float acc[32];
         #pragma clang loop unroll(full)
         for (int i = 0; i < 32; i++) { acc[i] = 0.0f; }
@@ -3244,10 +3245,10 @@ enum PromptInt8Matmul {
           const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
           const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
           const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
-          const float2 a0 = *(const device float2*)(ascale + tbase + (size_t)g * 64);
-          const float2 a1 = *(const device float2*)(ascale + tbase + 32 + (size_t)g * 64);
-          const float2 r0 = *(const device float2*)(rsb + tbase + (size_t)g * 64);
-          const float2 r1 = *(const device float2*)(rsb + tbase + 32 + (size_t)g * 64);
+          const float2 a0 = *(const device float2*)(ascale + tbase + (elem_index)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tbase + 32 + (elem_index)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tbase + (elem_index)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tbase + 32 + (elem_index)g * 64);
           float as[4], rb[4];
           as[0] = a0.x; as[1] = a0.y; as[2] = a1.x; as[3] = a1.y;
           rb[0] = r0.x; rb[1] = r0.y; rb[2] = r1.x; rb[3] = r1.y;
@@ -3266,7 +3267,7 @@ enum PromptInt8Matmul {
         for (int i = 0; i < 32; i += 4) {
           const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
           const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
-          *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = good ? v : float4(as_type<float>(0x7fc00000u));
+          *(device float4*)(out + (elem_index)mm * N + nb + 16 * ((i >> 3) & 1)) = good ? v : float4(as_type<float>(0x7fc00000u));
         }
         """
 
@@ -3295,7 +3296,7 @@ enum PromptInt8Matmul {
     /// `naxSgSource` for one, two and three layers (index `layers - 1`).
     private static let naxSgKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
-            name: "bonsai_q8_prompt_matmul_nax_sg\(layers)",
+            name: "bonsai_q8_prompt_matmul_nax_sg\(layers)_checked_offsets_v1",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
@@ -3320,8 +3321,13 @@ enum PromptInt8Matmul {
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
+        let limit = Int(Int32.max)
+        let index32 = m > 0 && m % 64 == 0 && k >= 128 && k % 128 == 0
+            && m <= limit / k && ns.allSatisfy { n in
+                n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
+            }
         return naxSgKernels[layers.count - 1](
-            inputs, template: [("NEG", negative ? 1 : 0)],
+            inputs, template: [("NEG", negative ? 1 : 0), ("INDEX32", index32)],
             grid: (ns.reduce(0, +) / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
     }
