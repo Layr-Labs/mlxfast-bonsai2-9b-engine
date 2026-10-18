@@ -3532,6 +3532,182 @@ enum VerifyInt8Matmul {
 
         """
 
+    // REGDQ-GEN-BEGIN
+    /// Ints per lane in the layout probe's output: the right-input
+    /// cooperative tensor's capacity, then (k, n) of up to 256 entries.
+    static let regdqProbeStride = 513
+
+    /// One simdgroup writes the verify op's right-input cooperative tensor
+    /// layout: per lane its capacity, then `get_multidimensional_index` of
+    /// each entry, -1 past the capacity.
+    static let regdqProbeSource = """
+        const uint lane = thread_index_in_simdgroup;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        auto bR = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        const int cap = int(bR.get_capacity());
+        device int* o = probe + lane * 513;
+        o[0] = cap + seed[0];
+        for (int i = 0; i < 256; i++) {
+          int kk = -1, nn = -1;
+          if (i < cap) {
+            auto ids = bR.get_multidimensional_index(i);
+            kk = int(ids[0]); nn = int(ids[1]);
+          }
+          o[1 + 2 * i] = kk;
+          o[2 + 2 * i] = nn;
+        }
+        """
+
+    /// The verify op's right-input cooperative tensor as the device lays it
+    /// out, split into a lane part and an entry part: entry i of lane l is
+    /// the 2-bit code at bit `lane[l].shift + entry[i].shift` of word
+    /// `lane[l].word + entry[i].word` (of a group's eight) in tile column
+    /// `lane[l].column + entry[i].column`. The code at k (0-127) of a group
+    /// is bits 8 * (k & 3) + 2 * ((k >> 2) & 3) of word k >> 4.
+    struct RegdqLayout {
+        struct Part { var column: Int, word: Int, shift: Int }
+        let lane: [Part]
+        let entry: [Part]
+
+        /// Nil unless each of the 32 lanes holds 128 entries, the lanes
+        /// cover the 128 x 32 tile once, and every entry splits as above.
+        init?(probe: [Int32]) {
+            let lanes = 32, cap = 128, stride = VerifyInt8Matmul.regdqProbeStride
+            guard probe.count == lanes * stride else { return nil }
+            func part(_ k: Int, _ n: Int) -> Part { Part(column: n, word: k >> 4, shift: 8 * (k & 3) + 2 * ((k >> 2) & 3)) }
+            var seen = Set<Int>()
+            var at: [[Part]] = []
+            for l in 0 ..< lanes {
+                guard probe[l * stride] == cap else { return nil }
+                var row: [Part] = []
+                for i in 0 ..< cap {
+                    let k = Int(probe[l * stride + 1 + 2 * i]), n = Int(probe[l * stride + 2 + 2 * i])
+                    guard (0 ..< 128).contains(k), (0 ..< 32).contains(n), seen.insert(n * 128 + k).inserted else { return nil }
+                    row.append(part(k, n))
+                }
+                at.append(row)
+            }
+            var entry = at[0].map { Part(column: $0.column - at[0][0].column, word: $0.word - at[0][0].word, shift: $0.shift - at[0][0].shift) }
+            let low = Part(
+                column: entry.map { $0.column }.min()!, word: entry.map { $0.word }.min()!, shift: entry.map { $0.shift }.min()!)
+            entry = entry.map { Part(column: $0.column - low.column, word: $0.word - low.word, shift: $0.shift - low.shift) }
+            let lane = at.map { Part(column: $0[0].column - entry[0].column, word: $0[0].word - entry[0].word, shift: $0[0].shift - entry[0].shift) }
+            for l in 0 ..< lanes {
+                for i in 0 ..< cap {
+                    guard at[l][i].column == lane[l].column + entry[i].column, at[l][i].word == lane[l].word + entry[i].word,
+                        at[l][i].shift == lane[l].shift + entry[i].shift
+                    else { return nil }
+                }
+            }
+            self.lane = lane
+            self.entry = entry
+        }
+
+        /// The lane parts as a Metal constant table: column | word << 5 |
+        /// shift << 8.
+        var header: String {
+            "constant uint bonsai_regdq_lane[32] = {"
+                + lane.map { String($0.column | $0.word << 5 | $0.shift << 8) }.joined(separator: ", ") + "};\n"
+        }
+
+        var summary: String {
+            let columns = Set(entry.map { $0.column }).count, words = Set(entry.map { "\($0.column) \($0.word)" }).count
+            return "\(words) words in \(columns) columns per lane and group, \(Set(entry.map { $0.shift }).count) entry shifts"
+        }
+    }
+
+    /// The register form of a verify body (`naxFastBody` with `columns` 32
+    /// and `words` 8, `naxNarrowBody` with 16 and 4): each lane fills the
+    /// op's right-input cooperative tensor straight from the packed code
+    /// words in `layout`'s entry order, prefetched a group ahead as the
+    /// record prefetches its words, instead of expanding them into the
+    /// threadgroup tile (no tile store, no simdgroup barriers). Entries in
+    /// columns `columns` and up are zero and load nothing (the narrow body's
+    /// dead half). The op's integer C is the same, so every FP32 step after
+    /// it is. Nil if any anchor of `base` is missing or a dead entry's column
+    /// depends on the lane.
+    static func regdqBody(_ base: String, layout: RegdqLayout, columns: Int, words: Int) -> String? {
+        let live = layout.entry.map { e in layout.lane.map { $0.column + e.column < columns } }
+        guard live.allSatisfy({ Set($0).count == 1 }) else { return nil }
+        let liveEntries = (0 ..< layout.entry.count).filter { live[$0][0] }
+        let vector = layout.lane.allSatisfy { $0.word % 4 == 0 }
+        var keys: [String] = []
+        var loads: [String] = []
+        var value: [String: String] = [:]
+        for i in liveEntries {
+            let e = layout.entry[i]
+            let key = vector ? "\(e.column) \(e.word / 4)" : "\(e.column) \(e.word)"
+            if value["\(e.column) \(e.word)"] != nil { continue }
+            if !keys.contains(key) {
+                keys.append(key)
+                let column = e.column == 0 ? "" : "(size_t)\(e.column) * KW + "
+                loads.append(
+                    vector
+                        ? "wq[\(keys.count - 1)] = *(const device uint4*)(wb + \(column)gl * 8 + \(4 * (e.word / 4)));"
+                        : "wq[\(keys.count - 1)] = wb[\(column)gl * 8 + \(e.word)];")
+            }
+            let q = keys.firstIndex(of: key)!
+            value["\(e.column) \(e.word)"] = vector ? "wq[\(q)].\(["x", "y", "z", "w"][e.word % 4])" : "wq[\(q)]"
+        }
+        let declare = "\(vector ? "uint4" : "uint32_t") wq[\(max(keys.count, 1))];\n"
+        let loadText = loads.joined(separator: "\n") + "\n"
+        let fill = liveEntries.map { i -> String in
+            let e = layout.entry[i]
+            return "bR[\(i)] = int8_t(extract_bits(\(value["\(e.column) \(e.word)"]!), shL + \(e.shift)u, 2u));"
+        }.joined(separator: "\n") + "\n"
+        let dead = (0 ..< layout.entry.count).filter { !live[$0][0] }.map { "bR[\($0)] = 0;\n" }.joined()
+        let indent = { (text: String, spaces: Int) in
+            text.split(separator: "\n", omittingEmptySubsequences: false).map { $0.isEmpty ? "" : String(repeating: " ", count: spaces) + $0 }
+                .joined(separator: "\n")
+        }
+        let wordLoop = "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }\n"
+        let replacements: [(String, String)] = [
+            (
+                "threadgroup uint32_t bs[4][32 * 32];\ntensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, 32));\n",
+                "threadgroup uint32_t bs[4][16 * 32];\nauto bR = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();\n" + dead
+            ),
+            ("metal::remove_addrspace_t<decltype(B)>", "metal::remove_addrspace_t<decltype(bR)>"),
+            (
+                "const int j = int(lane & 7u);\nconst int c = int(lane >> 3);\nconst device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;\nthreadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;\nuint32_t wv[\(words)];\n",
+                "const uint rq = bonsai_regdq_lane[lane];\nconst uint shL = rq >> 8;\nconst device uint32_t* wb = w + (size_t)(n0 + int(rq & 31u)) * KW + int((rq >> 5) & 7u);\n" + declare
+            ),
+            ("  #pragma clang loop unroll(full)\n  " + wordLoop, indent(loadText, 2)),
+            ("    #pragma clang loop unroll(full)\n    " + wordLoop, indent(loadText, 4)),
+            (
+                "  #pragma clang loop unroll(full)\n  for (int t = 0; t < \(words); t++) {\n    const uint32_t v = wv[t];\n    dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);\n  }\n",
+                indent(fill, 2)
+            ),
+            ("op.run(tA, B, cT);", "op.run(tA, bR, cT);"),
+            ("  simdgroup_barrier(mem_flags::mem_threadgroup);\n", ""),
+        ]
+        var body = base
+        for (index, (anchor, text)) in replacements.enumerated() {
+            let count = body.components(separatedBy: anchor).count - 1
+            guard count == (index == replacements.count - 1 ? 2 : 1) else { return nil }
+            body = body.replacingOccurrences(of: anchor, with: text)
+        }
+        guard !body.contains("wcol"), !body.contains("dst["), !body.contains("wv[") else { return nil }
+        return body
+    }
+
+    /// The compile-time form (`naxFormsSource`) of the register bodies: the
+    /// one-to-three-layer fast source and the narrow source.
+    static func regdqFastSource(layers: Int, layout: RegdqLayout) -> String? {
+        regdqBody(naxFastBody, layout: layout, columns: 32, words: 8).map {
+            naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+                + $0.replacingOccurrences(of: "(size_t)", with: "(uint)")
+        }
+    }
+
+    static func regdqNarrowSource(layout: RegdqLayout) -> String? {
+        regdqBody(naxNarrowBody, layout: layout, columns: 16, words: 4).map {
+            naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+                + $0.replacingOccurrences(of: "(size_t)", with: "(uint)")
+        }
+    }
+    // REGDQ-GEN-END
+
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_verify_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -3636,6 +3812,138 @@ enum VerifyInt8Matmul {
     /// leaves it empty (the narrow kernel then runs in its record form).
     nonisolated(unsafe) private static var narrowFormsK = Set<Int>()
 
+    /// The register forms, built at load from the probed layout: the fast
+    /// kernel for one to three layers (index `layers - 1`) and the narrow
+    /// kernel. `regdqMatched` holds `"\(k) \(layers)"` and `regdqNarrowK` the
+    /// inner sizes where the form matched the record kernel at load.
+    nonisolated(unsafe) private static var regdqFastKernels: [MLXFast.MLXFastKernel] = []
+    nonisolated(unsafe) private static var regdqNarrowKernel: MLXFast.MLXFastKernel?
+    nonisolated(unsafe) private static var regdqMatched = Set<String>()
+    nonisolated(unsafe) private static var regdqNarrowK = Set<Int>()
+    nonisolated(unsafe) private static var regdqFailed = false
+    /// `DARKBLOOM_BONSAI_VERIFY_REGDQ=0` keeps the record kernels everywhere.
+    static let regdqAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_REGDQ"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static func usesRegdq(k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]) -> Bool {
+        regdqMatched.contains("\(k) \(layers.count)") && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
+    }
+
+    /// Probes the right-input layout, builds the register forms from it and
+    /// compares each with the record fast kernel (`forms: false`) on fixed,
+    /// input-independent data at each real K, every verify row count and
+    /// both offset forms (`NEG = 1` only where the offset skip is on): one
+    /// layer on 64 columns, two and three layers on column slices where the
+    /// shared forms are on, and the narrow form on 128 columns (eight
+    /// threadgroups). A form is used only at a K and layer count where
+    /// every comparison matched; a probe or compile error, a layout the
+    /// generator cannot split, or any differing bit keeps the record kernel.
+    private static func checkRegdq() -> String {
+        regdqFailed = false
+        var probed: [Int32] = []
+        withErrorHandler({ _ in VerifyInt8Matmul.regdqFailed = true }) {
+            let probe = MLXFast.metalKernel(
+                name: "bonsai_q8_verify_regdq_probe", inputNames: ["seed"], outputNames: ["probe"],
+                source: regdqProbeSource, header: PromptInt8Matmul.naxHeader)
+            let out = probe(
+                [MLXArray([Int32(0)])], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[32 * regdqProbeStride]], outputDTypes: [.int32])[0]
+            eval(out)
+            if !regdqFailed { probed = out.asArray(Int32.self) }
+        }
+        guard !regdqFailed, !probed.isEmpty else { return "probe failed" }
+        guard let layout = RegdqLayout(probe: probed) else { return "layout not split (cap \(probed[0]))" }
+        let inputs = ["xq"]
+        regdqFastKernels = (1 ... 3).compactMap { layers in
+            regdqFastSource(layers: layers, layout: layout).map {
+                MLXFast.metalKernel(
+                    name: "bonsai_q8_verify_matmul_nax_regdq\(layers)",
+                    inputNames: inputs + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+                    outputNames: (0 ..< layers).map { "out\($0)" },
+                    source: $0, header: PromptInt8Matmul.naxHeader + layout.header, ensureRowContiguous: true)
+            }
+        }
+        regdqNarrowKernel = regdqNarrowSource(layout: layout).map {
+            MLXFast.metalKernel(
+                name: "bonsai_q8_verify_matmul_nax_narrow_regdq",
+                inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"], outputNames: ["out"],
+                source: $0, header: PromptInt8Matmul.naxHeader + layout.header, ensureRowContiguous: true)
+        }
+        guard regdqFastKernels.count == 3 else {
+            regdqFastKernels = []
+            regdqNarrowKernel = nil
+            return "anchors missing"
+        }
+        var matched = Set<String>()
+        var narrow = Set<Int>()
+        for k in formsK {
+            let kg = k / 128, n = 128
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+            let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+            var cases = [(biasesT, false)]
+            if negativeForms { cases.append((negatedT, true)) }
+            func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+                let equal = MLX.all(a.view(dtype: .uint32) .== b.view(dtype: .uint32))
+                eval(equal)
+                return !regdqFailed && equal.item(Bool.self)
+            }
+            func fast(_ columns: [Range<Int>], m: Int, offsets: MLXArray, negative: Bool, regdq: Bool) -> MLXArray {
+                concatenated(
+                    runFast(
+                        codes: codes, ascale: ascale, rsb: rsb,
+                        layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
+                        m: m, k: k, negative: negative, forms: false, regdq: regdq), axis: 1)
+            }
+            regdqFailed = false
+            withErrorHandler({ _ in VerifyInt8Matmul.regdqFailed = true }) {
+                var shapes: [(layers: Int, columns: [Range<Int>])] = [(1, [0 ..< 64])]
+                if naxShared { shapes += [(2, [0 ..< 32, 32 ..< 64]), (3, [0 ..< 32, 32 ..< 64, 0 ..< 32])] }
+                for shape in shapes {
+                    var ok = formsFit(k: k, n: 64)
+                    for m in rowRange where ok {
+                        for (offsets, negative) in cases where ok {
+                            ok = same(
+                                fast(shape.columns, m: m, offsets: offsets, negative: negative, regdq: true),
+                                fast(shape.columns, m: m, offsets: offsets, negative: negative, regdq: false))
+                        }
+                    }
+                    if ok { matched.insert("\(k) \(shape.layers)") }
+                    regdqFailed = false
+                }
+                guard regdqNarrowKernel != nil, formsFit(k: k, n: n) else { return }
+                var ok = true
+                for m in rowRange where ok {
+                    for (offsets, negative) in cases where ok {
+                        let reference = fast([0 ..< n], m: m, offsets: offsets, negative: negative, regdq: false)
+                        let form = runNarrow(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scalesT, biasesT: offsets,
+                            m: m, k: k, negative: negative, forms: false, regdq: true)
+                        ok = same(form, reference)
+                    }
+                }
+                if ok { narrow.insert(k) }
+            }
+        }
+        regdqFailed = false
+        regdqMatched = matched
+        regdqNarrowK = narrow
+        return "\(layout.summary); fast matched " + formsK.map { k in
+            let layers = (1 ... 3).filter { matched.contains("\(k) \($0)") }.map { String($0) }
+            return "K \(k): layers " + (layers.isEmpty ? "none" : layers.joined(separator: ","))
+        }.joined(separator: "; ") + "; narrow K \(narrow.sorted())"
+    }
+
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
     /// `naxFast`: the fast kernel matched (it then replaces the vector one);
@@ -3665,12 +3973,19 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil, regdq: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
+        if regdq ?? (forms == nil && usesRegdq(k: k, layers: layers)) {
+            let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
+            return regdqFastKernels[layers.count - 1](
+                inputs, template: template,
+                grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+        }
         if forms ?? usesForms(k: k, layers: layers) {
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
             return naxFormsKernels[layers.count - 1](
@@ -3687,10 +4002,17 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, regdq: Bool? = nil
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        if regdq ?? (forms == nil && regdqNarrowK.contains(k) && formsFit(k: k, n: n)), let kernel = regdqNarrowKernel {
+            return kernel(
+                [codes, weight, scalesT, biasesT, ascale, rsb, dims],
+                template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
+                grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
         if forms ?? (formsAllowed && narrowFormsK.contains(k) && formsFit(k: k, n: n)) {
             return naxNarrowFormsKernel(
                 [codes, weight, scalesT, biasesT, ascale, rsb, dims],
@@ -3942,6 +4264,10 @@ enum VerifyInt8Matmul {
             FileHandle.standardError.write(
                 "int8 verify narrow: K \(narrowK.sorted()) of \(narrowDepths); compile-time K forms: K \(narrowFormsK.sorted())\n"
                     .data(using: .utf8)!)
+        }
+        if chosen == .nax, naxFast {
+            let regdq = regdqAllowed ? checkRegdq() : "off (DARKBLOOM_BONSAI_VERIFY_REGDQ=0)"
+            FileHandle.standardError.write("int8 verify register right input: \(regdq)\n".data(using: .utf8)!)
         }
         return chosen
     }()
