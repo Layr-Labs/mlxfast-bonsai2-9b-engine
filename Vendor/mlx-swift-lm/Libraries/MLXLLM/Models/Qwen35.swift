@@ -1790,7 +1790,12 @@ enum Qwen35RegisterGatedSIMD {
     /// slice of the verify conv output needs no contiguous copy, and it also
     /// writes the boundary conv rows `conv_in[:, T ..< T + 3]` as bit copies
     /// to their own buffer. The recurrence text is the record kernel's.
-    private static let replaySource: String = {
+    private static let replaySource: String = replaySource(hoistedGates: false)
+
+    /// `hoistedGates` forms every replayed row's gates once, before the scan
+    /// (as `qwen35_gdn_verify_fused` does), instead of lane 0 forming one per
+    /// step inside the serial chain. Same function, same inputs, same bits.
+    private static func replaySource(hoistedGates: Bool) -> String {
         var s = source
         func swap(_ from: String, _ to: String) {
             precondition(
@@ -1824,6 +1829,29 @@ enum Qwen35RegisterGatedSIMD {
             "if (lane % LPD == 0) {\n      *((device float2*)y_) = float2(out[0], out[1]);\n    }",
             "")
         swap("y_ += Hv * Dv;", "")
+        if hoistedGates {
+            swap(
+                "float state[DVPL][R];",
+                """
+                threadgroup float gate_g[16];
+                threadgroup float gate_beta[16];
+                if (thread_index_in_threadgroup < uint(T)) {
+                  const uint gt_row = thread_index_in_threadgroup;
+                  const float gate_negative_a = -metal::precise::exp(a_log[hv_idx]);
+                  const float gate_bias = dt_bias[hv_idx];
+                  gate_g[gt_row] = qwen35_simd_gate_decay(a_[gt_row * a_strides[1]], gate_bias, gate_negative_a);
+                  gate_beta[gt_row] = qwen35_simd_gate_beta(bb_[gt_row * b_strides[1]]);
+                }
+                float state[DVPL][R];
+                """)
+            swap(
+                "float kr[R];",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);\nfloat kr[R];")
+            swap("local_g = qwen35_simd_gate_decay(a_[0], bias, negative_a);", "")
+            swap("local_beta = qwen35_simd_gate_beta(bb_[0]);", "")
+            swap("const float gt = simd_broadcast(local_g, 0);", "const float gt = gate_g[t];")
+            swap("const float bt = simd_broadcast(local_beta, 0);", "const float bt = gate_beta[t];")
+        }
         return s + """
             {
               // Boundary conv rows T ..< T + 3 of conv_in, copied as raw bits.
@@ -1846,7 +1874,7 @@ enum Qwen35RegisterGatedSIMD {
             }
 
             """
-    }()
+    }
 
     private static let replayKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_register_gate_simd_replay",
@@ -1855,6 +1883,85 @@ enum Qwen35RegisterGatedSIMD {
         source: replaySource,
         header: gateHeader,
         ensureRowContiguous: false)
+
+    private static let hoistedReplayKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_register_gate_simd_replay_hg",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in"],
+        outputNames: ["state_out", "conv_tail"],
+        source: replaySource(hoistedGates: true),
+        header: gateHeader,
+        ensureRowContiguous: false)
+
+    /// `DARKBLOOM_BONSAI_REPLAY_GATE_HOIST=0` keeps the record replay kernel.
+    static let hoistedReplayOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_REPLAY_GATE_HOIST"] != "0"
+    /// Written once by `prepareHoistedReplay` at load; read-only afterwards.
+    nonisolated(unsafe) static var hoistedReplayPassed = false
+    nonisolated(unsafe) private static var hoistedReplayPrepared = false
+
+    /// Load-time check: the hoisted replay against the record replay at 1, 2,
+    /// 5, 8, 11 and 15 rows, every output bit. Any mismatch or error keeps
+    /// the record kernel.
+    static func prepareHoistedReplay() {
+        guard !hoistedReplayPrepared else { return }
+        hoistedReplayPrepared = true
+        guard hoistedReplayOffered else {
+            FileHandle.standardError.write(Data("qwen35 replay gate hoist: off\n".utf8))
+            return
+        }
+        var verdict = "mismatch"
+        do {
+            if try withError({ hoistedReplayCheck() }) {
+                hoistedReplayPassed = true
+                verdict = "bitwise equal at rows 1, 2, 5, 8, 11, 15"
+            }
+        } catch {
+            verdict = "error \(error)"
+        }
+        FileHandle.standardError.write(Data("qwen35 replay gate hoist: \(verdict)\n".utf8))
+    }
+
+    private static func checkRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
+        let n = shape.reduce(1, *)
+        let i = MLXArray(0 ..< n).asType(.float32)
+        let w = MLX.sin(i * (0.7548776 + seed)) * (1 + 0.5 * MLX.cos(i * 0.0137 + seed))
+        return (w * scale).reshaped(shape)
+    }
+
+    private static func hoistedReplayCheck() -> Bool {
+        let hk = 16, hv = 32, d = 128, width = 16, convDim = 2 * hk * d + hv * d
+        let qkv = checkRows([1, width, hk, d], seed: 0.01, scale: 0.1)
+        let kk = checkRows([1, width, hk, d], seed: 0.02, scale: 0.1)
+        let vv = checkRows([1, width, hv, d], seed: 0.03, scale: 1)
+        // Gate inputs span both softplus branches and the large-|x| paths.
+        let aa = checkRows([1, width, hv], seed: 0.04, scale: 30)
+        let bb = checkRows([1, width, hv], seed: 0.05, scale: 8)
+        let aLog = checkRows([hv], seed: 0.06, scale: 2)
+        let dtBias = checkRows([hv], seed: 0.07, scale: 3)
+        let state = checkRows([1, hv, d, d], seed: 0.08, scale: 0.5)
+        let conv = checkRows([1, width + 3, convDim], seed: 0.09, scale: 1)
+        var eqs: [MLXArray] = []
+        for rows in [1, 2, 5, 8, 11, 15] {
+            let q = qkv[0..., 0 ..< rows, 0...]
+            let inputs = [q, kk, vv, aa, bb, aLog, dtBias, state, conv]
+            let template: [(String, any KernelTemplateArg)] = [
+                ("Dk", d), ("Dv", d), ("Hk", hk), ("Hv", hv), ("STATE_ONLY", 1),
+            ]
+            let shapes = [state.shape, [1, 3, convDim]]
+            let record = replayKernel(
+                inputs, template: template, grid: (128, d / 32, hv), threadGroup: (128, 1, 1),
+                outputShapes: shapes, outputDTypes: [.float32, .float32])
+            let hoisted = hoistedReplayKernel(
+                inputs, template: template, grid: (128, d / 32, hv), threadGroup: (128, 1, 1),
+                outputShapes: shapes, outputDTypes: [.float32, .float32])
+            for j in 0 ..< 2 {
+                let x = record[j].view(dtype: .uint32)
+                let y = hoisted[j].view(dtype: .uint32)
+                eqs.append(MLX.all(x .== y))
+            }
+        }
+        return MLX.all(MLX.stacked(eqs)).item(Bool.self)
+    }
 
     static func run(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                     b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
@@ -1890,7 +1997,7 @@ enum Qwen35RegisterGatedSIMD {
                           state: MLXArray, convInput: MLXArray) -> (MLXArray, MLXArray) {
         let B = k.dim(0), Hk = k.dim(2), Dk = k.dim(3)
         let Hv = v.dim(2), Dv = v.dim(3)
-        let result = replayKernel(
+        let result = (hoistedReplayPassed ? hoistedReplayKernel : replayKernel)(
             [q, k, v, a, b, aLog, dtBias, state, convInput],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
@@ -1922,7 +2029,7 @@ enum Qwen35FusedGDNVerify {
         constexpr int DVPL = 2;
         constexpr int LPD = Dk / R;
         constexpr int DVPS = (32 / LPD) * DVPL;
-        constexpr int DVPT = DVPS * 4;
+        constexpr int DVPT = DVPS * 8;
         constexpr uint C = uint(CONV_DIM);
         threadgroup float qk_raw[2 * MAX_T * Dk];
         threadgroup float v_tile[MAX_T * DVPT];
@@ -1967,7 +2074,7 @@ enum Qwen35FusedGDNVerify {
           #pragma clang fp reassociate(off)
           // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
           #pragma clang loop unroll(full)
-          for (uint part = 0; part < 2; ++part) {
+          for (uint part = 0; part < (tid < 128u ? 2u : 0u); ++part) {
             const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + tid;
             // All loads first; the taps then run in Qwen35FusedConvSilu's order.
             float xin[3 + MAX_T];
@@ -2005,11 +2112,11 @@ enum Qwen35FusedGDNVerify {
               }
             }
           }
-          // The same for this threadgroup's 32 value channels.
+          // Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.
           {
             const uint col = tid % uint(DVPT);
             const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
-            for (uint t = tid / uint(DVPT); t < 3u + T; t += 128u / uint(DVPT)) {
+            for (uint t = tid / uint(DVPT); t < 3u + T; t += 256u / uint(DVPT)) {
               const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
               conv_in[t * C + c] = xv;
               if (t >= T) {
@@ -2017,7 +2124,7 @@ enum Qwen35FusedGDNVerify {
                 conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
               }
             }
-            for (uint p = tid / uint(DVPT); p < T; p += 128u / uint(DVPT)) {
+            for (uint p = tid / uint(DVPT); p < T; p += 256u / uint(DVPT)) {
               float acc = 0.0f;
               for (uint tap = 0; tap < 4u; ++tap) {
                 const uint r = p + tap;
@@ -2036,7 +2143,7 @@ enum Qwen35FusedGDNVerify {
         {
           #pragma clang fp reassociate(off)
           // q/k RMSNorm (Qwen35FusedQKNorm): one simdgroup per (row, q or k).
-          for (uint job = sg; job < 2u * T; job += 4u) {
+          for (uint job = sg; job < 2u * T; job += 8u) {
             const uint part = job % 2u;
             const uint t = job / 2u;
             threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
@@ -2174,7 +2281,7 @@ enum Qwen35FusedGDNVerify {
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+            grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
                 [1, S, valueHeads, 128], state.shape, [1, 3, C]],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
@@ -5010,6 +5117,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// head's lazily built constants and its one-time bit-exact self-check at
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
+        Qwen35RegisterGatedSIMD.prepareHoistedReplay()
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }

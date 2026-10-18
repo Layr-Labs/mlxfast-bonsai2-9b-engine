@@ -747,6 +747,13 @@ private final class DFlash2Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        // MLX's full-attention path (L > 8) writes the output token-major, so the
+        // [1, L, 4096] view is already row-contiguous: read it in place rather than
+        // have the head-major quantizer's input check copy it. Same values, same
+        // column order, same bits. The vector path (L <= 8) writes head-major.
+        if B == 1, heads == 32, L > 8, DF2Fast.tokenMajorOProj {
+            return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
+        }
         if B == 1, heads == 32, let y = DF2Fast.linearHeadMajor(output, oProj, L: L) {
             return y
         }
@@ -1966,6 +1973,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 /// fused grouped dynamic convolution; fused top-16 and greedy selector.
 enum DF2Fast {
     static let on = ProcessInfo.processInfo.environment["DF2_FAST"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
+    static let tokenMajorOProj =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
     static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
     static let header = """
         #include <metal_tensor>
@@ -4043,8 +4053,12 @@ enum DF2WideLanes {
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     static let enabled = !["0", "false", "no", "off"].contains(setting)
     static let e = setting.contains("1024") ? 4 : 8
+    /// `df2_act_q8g` runs wide by default too (still only after its load check);
+    /// `DARKBLOOM_BONSAI_DF2_QUANTG_WIDE=0` restores the `all`-only opt-in.
+    static let quantGDefault =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_QUANTG_WIDE"] != "0"
     static func offered(_ kind: Kind) -> Bool {
-        enabled && (kind != .quantG || setting.contains("all"))
+        enabled && (kind != .quantG || quantGDefault || setting.contains("all"))
     }
 
     static let quantG = MLXFast.metalKernel(
