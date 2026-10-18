@@ -3667,6 +3667,11 @@ final class Qwen35Attention: Module {
             attended = cache.updateAndAttend(
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
         }
+        if narrowsToLastQuery, let packed = oProj as? HadamardQuantizedLinear,
+            let gated = packed.callAfterAttentionGatePromptLastRow(attended, queryProjection: qProjOutput)
+        {
+            return gated
+        }
         if !narrowsToLastQuery, !exactTargetVerify, B == 1, let packed = oProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterAttentionGate(attended, queryProjection: qProjOutput)
         {
