@@ -3128,6 +3128,13 @@ enum DF2Fast {
         guard on, (1 ... 6).contains(layers.count) else { return nil }
         let ops = layers.compactMap { w4Operands($0, group: codes.group) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == codes.K }) else { return nil }
+        return w4LinearsFromOperands(codes, leadShape: leadShape, ops: ops)
+    }
+
+    /// Consume the same call's already-validated immutable operands, without redoing lookups.
+    static func w4LinearsFromOperands(
+        _ codes: W4Codes, leadShape: [Int], ops: [W4Operands]
+    ) -> [MLXArray] {
         let ns = ops.map(\.n)
         let preferredForm = w4SelectedForm
         let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
@@ -3161,7 +3168,7 @@ enum DF2Fast {
             .init(kind: .quantGConv0, dtype: h.dtype, dtype2: dyn.dtype, k: K, group: group, flag: base.dtype == .float32 ? 0 : 1))
         let q = conv0Run(h.reshaped([rows, K]), dyn: dyn, base: base, K: K, rows: rows, group: group, wide: wide)
         let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
-        return w4LinearsFromCodes(codes, leadShape: Array(h.shape.dropLast()), layers)
+        return w4LinearsFromOperands(codes, leadShape: Array(h.shape.dropLast()), ops: ops)
     }
 
     /// `layer(output.transposed(0, 2, 1, 3).reshaped(1, L, 4096))` reading head-major `[1, 32, L, 128]` directly.
