@@ -811,6 +811,14 @@ final class CBv2MTPRoundDriver {
         drafter is any CBv2MTPRequestStatefulDrafter
     }
 
+    /// Whether any consumer reads a carried target top-two margin: the
+    /// adaptive marginal depth policy or the prompt-lookup miss-deep choice.
+    /// Fixed-depth block drafting (DFlash) has neither, so finalize skips the
+    /// host readback of policy top-two values there.
+    var consumesPolicyTopTwoMargin: Bool {
+        usesMarginalPolicy || lookupMissDeep != nil
+    }
+
     /// The block drafter this driver speculates with, if any. One `propose`
     /// per round replaces the k-step chain; everything else is the ordinary
     /// request-stateful path.
