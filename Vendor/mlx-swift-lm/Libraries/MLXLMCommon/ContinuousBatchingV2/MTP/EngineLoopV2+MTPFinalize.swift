@@ -33,43 +33,6 @@ extension EngineLoopV2 {
         }
     }
 
-    /// `DARKBLOOM_BONSAI_DFLASH_ROUND1_IN_BEGIN=0` restores the parent: the
-    /// first round proposes its block at its own launch.
-    static let dflashRound1InBeginEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFLASH_ROUND1_IN_BEGIN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Seed boundary, called for a prompt row's FIRST sampled token before
-    /// that token is emitted. The token is the first round's anchor and the
-    /// prompt context is already absorbed, so the block drafter proposes the
-    /// first round's block here, through the same `prestageBlock` a verified
-    /// round uses for its successor, and the step waits for it. The round
-    /// then takes the prestaged block exactly as every later round does.
-    /// Guards mirror that successor prestage: one row, no lookup chain, a
-    /// fixed depth the next plan offers, and room for a full round.
-    func mtpPrestageSeedRound(_ step: CBv2InFlightStep, rec: CBv2ScheduledRequest) {
-        guard Self.dflashRound1InBeginEnabled, let mtp, let round = step.mtpRound,
-            round.verify == nil, step.sampledRows.count == 1,
-            let block = mtp.blockDrafter, mtp.lookupNgram == nil,
-            mtp.config.fixedDraftTokens != nil,
-            round.prefillCarries.contains(where: { $0.id == rec.id }),
-            rec.pendingSamples == 0,
-            rec.tokens.count > rec.request.promptTokens.count,
-            let anchor = rec.tokens.last,
-            let state = round.committedObservationRows.first(where: { $0.id == rec.id })?
-                .assistantState
-        else { return }
-        let k = mtp.previewDecision(plannedDecodeRows: 1, canSpeculate: true).depth
-        guard k > 0, k == mtp.config.fixedDraftTokens,
-            rec.request.maxTokens - rec.generatedTokenCount > k
-        else { return }
-        block.prepareDraft(history: rec.tokens, depth: k, requestState: state)
-        block.prestageBlock(anchor: anchor, depth: k, requestState: state)
-        eval(block.evaluationTargets(for: state))
-    }
-
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
@@ -93,8 +56,7 @@ extension EngineLoopV2 {
         // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
             let seedPolicyTopTwo =
-                mtp.consumesPolicyTopTwoMargin
-                ? round.seedPolicyTopTwoValues?.asArray(Float.self) : nil
+                round.seedPolicyTopTwoValues?.asArray(Float.self)
             if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
@@ -144,9 +106,7 @@ extension EngineLoopV2 {
         Self.mtpPollUntilAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost =
-            mtp.consumesPolicyTopTwoMargin
-            ? verify.policyTopTwoValues?.asArray(Float.self) : nil
+        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
@@ -275,51 +235,6 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
-            let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                let state = metadata.assistantState
-            {
-                let committedHidden: MLXArray
-                if let blockContext = verify.blockContext {
-                    committedHidden = blockContext[
-                        batchIndex ..< batchIndex + 1,
-                        CBv2MTPBlockContextIndex.confirmedColumns(
-                            confirmed: confirmed, verifyWidth: targetWidth),
-                        0...]
-                } else {
-                    committedHidden = verify.lastHidden[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount,
-                        0...]
-                }
-                let committedDraftTokens = verify.draftIDs[
-                    batchIndex ..< batchIndex + 1,
-                    0 ..< committedDraftCount]
-                if let carry = metadata.lookupCarry {
-                    stateful.commitLookupRound(
-                        requestState: state,
-                        seedToken: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
-                        seedHidden: carry.hidden,
-                        committedDraftTokens: committedDraftTokens,
-                        committedTargetHidden: committedHidden)
-                } else {
-                    stateful.finalizeRound(
-                        requestState: state,
-                        confirmedInputTokens: 1 + committedDraftCount,
-                        committedDraftTokens: committedDraftTokens,
-                        committedTargetHidden: committedHidden)
-                    if finishReason == nil, confirmed > 0, mtp.lookupNgram == nil,
-                        verify.rows.count == 1,
-                        rec.request.maxTokens - rec.generatedTokenCount > k,
-                        let block = mtp.blockDrafter
-                    {
-                        block.prepareDraft(
-                            history: rec.tokens, depth: k, requestState: state)
-                        block.prestageBlock(
-                            anchor: kept[confirmed - 1], depth: k, requestState: state)
-                    }
-                }
-            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -358,6 +273,54 @@ extension EngineLoopV2 {
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
+            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                // Target KV/recurrent truth is committed first. The assistant
+                // receives only accepted draft inputs and their trusted target
+                // hidden rows; every speculative head suffix is discarded.
+                //
+                // A BLOCK drafter's next block reads the tapped context of
+                // exactly the columns this round CONFIRMED — the reference's
+                // `hidden = hidden[:, :accepted + 1, :]`. That is one column
+                // wider than the chain drafter's accepted-draft slice,
+                // because the correction token's own position is context for
+                // the next block.
+                let committedHidden: MLXArray
+                if let blockContext = verify.blockContext {
+                    committedHidden = blockContext[
+                        batchIndex ..< batchIndex + 1,
+                        CBv2MTPBlockContextIndex.confirmedColumns(
+                            confirmed: confirmed, verifyWidth: targetWidth),
+                        0...]
+                } else {
+                    committedHidden = verify.lastHidden[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount,
+                        0...]
+                }
+                let committedDraftTokens = verify.draftIDs[
+                    batchIndex ..< batchIndex + 1,
+                    0 ..< committedDraftCount]
+                if let carry = metadata.lookupCarry {
+                    // A lookup round staged nothing. The carry transition
+                    // its skipped first draft step would have consumed joins
+                    // trusted history ahead of the same accepted rows.
+                    stateful.commitLookupRound(
+                        requestState: state,
+                        seedToken: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
+                        seedHidden: carry.hidden,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                } else {
+                    stateful.finalizeRound(
+                        requestState: state,
+                        confirmedInputTokens: 1 + committedDraftCount,
+                        committedDraftTokens: committedDraftTokens,
+                        committedTargetHidden: committedHidden)
+                }
+            }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)

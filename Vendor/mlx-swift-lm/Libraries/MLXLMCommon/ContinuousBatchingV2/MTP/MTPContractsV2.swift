@@ -489,10 +489,6 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// is still the last one. nil means the tap is off.
     func blockContextHidden() -> MLXArray?
 
-    /// Inspect only this request's committed host history before proposal or prestage.
-    func prepareDraft(
-        history: [Int], depth: Int, requestState: any CBv2MTPRequestState)
-
     /// One round, one proposal: `depth` draft token ids as `[1, depth]`
     /// int32, lazy. Row-local, like every other request-stateful call.
     func proposeBlock(
@@ -513,58 +509,12 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// of opening the first timed decode round. A drafter that absorbs
     /// lazily keeps the default and nothing changes.
     func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray]
-
-    func prestageBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState)
-
-    /// OPTIONAL (defaulted): build the next proposal's acceptance-independent
-    /// work from this round's verify outputs — its context tap over every
-    /// verify column (`[1, 1 + k, taps * hidden]`) and the target's token at
-    /// every column (`[1 + k]` int32, lazy) — and return the arrays the engine
-    /// queues right behind the verify. The next proposal of the same request
-    /// may read the committed prefix of it; nothing else changes. A drafter
-    /// that keeps the default does all of its work after acceptance.
-    func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
-    ) -> [MLXArray]
-
-    /// OPTIONAL (defaulted): committed-context work the drafter postponed
-    /// while proposing this round (it needs none of it for this round's
-    /// proposal). The engine queues the returned arrays right behind the
-    /// round's verify; `after` is a verify output the work must follow on the
-    /// GPU (it reads it, so it does not compete with the verify). The drafter
-    /// runs anything still postponed itself before its next use of the
-    /// request state.
-    func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
-    public func prepareDraft(
-        history: [Int], depth: Int, requestState: any CBv2MTPRequestState
-    ) {}
-
     /// Lazy absorption is the default: the next `proposeBlock` projects the
     /// pending rows itself, the parent behavior.
     public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
-        []
-    }
-
-    public func prestageBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
-    ) {}
-
-    public func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
-    ) -> [MLXArray] {
-        []
-    }
-
-    public func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray
-    ) -> [MLXArray] {
         []
     }
 

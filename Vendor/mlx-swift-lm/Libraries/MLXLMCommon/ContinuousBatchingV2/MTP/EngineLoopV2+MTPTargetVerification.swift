@@ -28,8 +28,7 @@ extension EngineLoopV2 {
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        tokens presetTokens: MLXArray? = nil
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -241,8 +240,7 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularAttention = false
                 }
             }
-            // `presetTokens` is the same [batch, columns] row, already joined.
-            let tokens = presetTokens ?? concatenated(columns, axis: 1)
+            let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole

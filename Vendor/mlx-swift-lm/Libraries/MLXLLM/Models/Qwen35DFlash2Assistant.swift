@@ -143,8 +143,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// absorbed yet.
     final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
-        var promptDraft: [Int32]?
-        var preparedLookup: (history: [Int], depth: Int)?
         /// Committed context rows the next block will consume, oldest first.
         var pending: [MLXArray] = []
         var pendingRows = 0
@@ -159,17 +157,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var contextAbsorbed = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
-        var prestaged: (anchor: Int, depth: Int, tokens: MLXArray)?
-        /// The in-flight verify's context projection (`projectRoundContext`),
-        /// and how many of its columns the round committed (0 until then).
-        var projection: DFlash2ContextProjection?
-        var projectionRows = 0
-        /// A lookup round's absorption of the pending rows, not yet built:
-        /// the engine submits it behind that round's verify
-        /// (`submitDeferredContext`); every other entry point runs it first.
-        var absorbDeferred = false
-        /// The newest proposal came from the committed-history lookup.
-        var lastProposalLookup = false
         var isReleased = false
 
         init(caches: [any KVCache]) { self.caches = caches }
@@ -217,16 +204,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
 
         func clearAll() {
-            promptDraft = nil
-            preparedLookup = nil
-            projection = nil
-            projectionRows = 0
-            absorbDeferred = false
-            lastProposalLookup = false
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
-            prestaged = nil
             pendingRows = 0
             isReleased = true
         }
@@ -269,72 +249,18 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// no-op for an already-BF16 tensor.
     private func append(_ hidden: MLXArray, to requestState: any CBv2MTPRequestState) {
         let state = self.state(requestState)
-        runDeferredAbsorption(state)
         guard hidden.dim(1) > 0 else { return }
         state.append(hidden.asType(drafter.dtype), limit: contextRowLimit)
     }
 
     // MARK: - Proposing
 
-    public func prepareDraft(
-        history: [Int], depth: Int, requestState: any CBv2MTPRequestState
-    ) {
-        let state = self.state(requestState)
-        precondition(!state.isReleased)
-        if let prepared = state.preparedLookup,
-            prepared.depth == depth, prepared.history == history
-        {
-            return
-        }
-        state.promptDraft = DFlash2PromptLookup.continuation(history: history, depth: depth)
-        state.preparedLookup = (history, depth)
-    }
-
     public func proposeBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
-        // Prestage restores this key until the engine consumes its proposal.
-        state.preparedLookup = nil
-        if let p = state.prestaged {
-            state.prestaged = nil
-            if p.anchor == anchor && p.depth == depth {
-                return p.tokens
-            }
-        }
-        runDeferredAbsorption(state)
-        state.lastProposalLookup = false
         guard !state.pending.isEmpty || state.contextAbsorbed else {
             throw DFlash2Error.emptyBlockContext
-        }
-        // The round's own committed columns, projected while its verify ran.
-        // Taken here so no later block can read a stale projection.
-        let projection =
-            state.projectionRows > 0 && state.pending.count == 1
-                && state.pendingRows == state.projectionRows
-            ? state.projection : nil
-        state.projection = nil
-        state.projectionRows = 0
-        if let ids = state.promptDraft, ids.count == depth {
-            // A lookup skips the block, but still advances committed context KV.
-            // Nothing in this round reads that KV, so the absorption is built
-            // after the round's verify (`submitDeferredContext`): the same
-            // rows through the same operations into the same cache, off the
-            // path from the readback to the verify.
-            if Self.deferLookupAbsorption, absorptionWillTakeAllPending(state) {
-                state.absorbDeferred = true
-                state.lastProposalLookup = true
-                let tokens = MLXArray(ids).reshaped([1, depth])
-                state.roots.append(tokens)
-                return tokens
-            }
-            _ = absorbPendingContext(requestState: requestState)
-            if state.pending.isEmpty, state.contextAbsorbed {
-                state.lastProposalLookup = true
-                let tokens = MLXArray(ids).reshaped([1, depth])
-                state.roots.append(tokens)
-                return tokens
-            }
         }
         let context =
             state.pending.isEmpty
@@ -354,24 +280,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1, projection: projection)
+            blockSize: depth + 1)
         state.absorbPending()
         state.contextAbsorbed = false
         state.roots.append(tokens)
         return tokens
-    }
-
-    public func prestageBlock(
-        anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
-    ) {
-        let state = self.state(requestState)
-        guard state.prestaged == nil else { return }
-        let preparedLookup = state.preparedLookup
-        guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
-        else { return }
-        state.prestaged = (anchor: anchor, depth: depth, tokens: tokens)
-        state.preparedLookup = preparedLookup
-        asyncEval(evaluationTargets(for: requestState))
     }
 
     /// Absorb every pending committed row into the drafter's caches now,
@@ -384,7 +297,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// empty pending set returns nothing and changes nothing.
     public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
-        state.absorbDeferred = false
         // EVERY pending row is absorbed, in the one pass the first block would
         // have run over them: the same rows through the same projections, so
         // the caches hold the bits the lazy path would have put there, and
@@ -426,72 +338,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         drafter.trimCache(state(requestState).caches, toCommittedLength: committed)
     }
 
-    /// Queue the next block's acceptance-independent work behind this
-    /// round's verify: every verify column's context projection and every
-    /// candidate anchor's embedding (`DFlash2DraftModel.projectContext`). The
-    /// GPU runs it while the host reads the verify back and accepts, and the
-    /// next proposal reads the committed prefix of it.
-    public func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray, requestState: any CBv2MTPRequestState
-    ) -> [MLXArray] {
-        let state = self.state(requestState)
-        state.projection = nil
-        state.projectionRows = 0
-        // Lookup rounds come in runs, and the next lookup round would only
-        // queue unused work in front of its verify.
-        guard !state.lastProposalLookup, blockContext.ndim == 3, blockContext.dim(0) == 1,
-            let projection = drafter.projectContext(
-                targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens)
-        else { return [] }
-        state.projection = projection
-        return projection.evaluationTargets
-    }
-
-    /// Build and return a lookup round's deferred absorption (see
-    /// `proposeBlock`); the engine evaluates it right behind the round's verify.
-    public func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray
-    ) -> [MLXArray] {
-        let state = self.state(requestState)
-        guard state.absorbDeferred, after.size > 0 else { return [] }
-        // An exact select that reads `after` puts the absorption behind it on
-        // the GPU: an encoder waits only for the arrays it reads, and the
-        // pending rows are long finished, so without it the absorption would
-        // run beside the verify and slow it down.
-        let gate = after[0 ..< 1] .== after[0 ..< 1]
-        state.pending = state.pending.map { which(gate, $0, $0) }
-        return absorbPendingContext(requestState: requestState)
-    }
-
-    /// `DARKBLOOM_DFLASH_DEFER_LOOKUP_ABSORB=0` absorbs a lookup round's
-    /// context before its verify, as the reference order does.
-    static let deferLookupAbsorption: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_DEFER_LOOKUP_ABSORB"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// `absorbPendingContext` would take every pending row: the cases where it
-    /// returns without absorbing (nothing pending, a window-sized backlog) are
-    /// left to the immediate path.
-    private func absorptionWillTakeAllPending(_ state: RequestState) -> Bool {
-        guard state.pendingRows > 0,
-            state.pending.allSatisfy({ $0.dim(-1) == drafter.config.targetHiddenSize })
-        else { return false }
-        if let window = drafter.config.slidingWindow {
-            return state.pendingRows < window
-        }
-        return true
-    }
-
-    /// A deferred absorption that the engine has not submitted yet runs
-    /// before anything else reads or extends the pending rows or the caches.
-    private func runDeferredAbsorption(_ state: RequestState) {
-        guard state.absorbDeferred else { return }
-        let arrays = absorbPendingContext(requestState: state)
-        if !arrays.isEmpty { asyncEval(arrays) }
-    }
-
     // MARK: - Round lifecycle
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
@@ -513,82 +359,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         committedTargetHidden: MLXArray
     ) {
         let state = self.state(requestState)
-        runDeferredAbsorption(state)
-        state.promptDraft = nil
-        state.preparedLookup = nil
         state.roots.removeAll(keepingCapacity: true)
-        state.prestaged = nil
-        // Armed by this round's `projectRoundContext` (no rows committed yet).
-        let projection = state.projectionRows == 0 ? state.projection : nil
-        let pendingWasEmpty = state.pending.isEmpty
-        state.projection = nil
-        state.projectionRows = 0
         append(committedTargetHidden, to: requestState)
-        // The committed rows are the verify's leading columns, the ones the
-        // projection covers; it stands in for them only if nothing else is
-        // pending.
-        let rows = committedTargetHidden.dim(1)
-        if let projection, pendingWasEmpty, rows >= 1, rows <= projection.rows,
-            state.pending.count == 1, state.pendingRows == rows
-        {
-            state.projection = projection
-            state.projectionRows = rows
-        }
     }
 
     /// Nothing to undo: the round wrote no speculative state here. The rows
     /// the proposal absorbed were committed before it ran, and the proposal
     /// itself is discarded with its graph.
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        let state = self.state(requestState)
-        runDeferredAbsorption(state)
-        state.promptDraft = nil
-        state.preparedLookup = nil
-        state.projection = nil
-        state.projectionRows = 0
-        state.roots.removeAll(keepingCapacity: true)
-        state.prestaged = nil
-    }
-}
-
-// MARK: - Committed-history lookup
-
-/// A longest suffix match must have one full, unambiguous committed continuation.
-enum DFlash2PromptLookup {
-    /// Set DARKBLOOM_DFLASH_PROMPT_LOOKUP=0 to use the neural drafter throughout.
-    private static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    static func continuation(history: [Int], depth: Int) -> [Int32]? {
-        let count = history.count
-        guard enabled, depth >= 1, count >= 16 + depth else { return nil }
-        let longest = min(64, count - depth)
-        var best = 15
-        var chosenEnd: Int?
-        var ambiguous = false
-        for end in 16 ... (count - depth) {
-            guard history[end - 1] == history[count - 1] else { continue }
-            var length = 1
-            let limit = min(longest, end)
-            while length < limit && history[end - length - 1] == history[count - length - 1] {
-                length += 1
-            }
-            guard length >= 16, length >= best else { continue }
-            if length > best {
-                best = length
-                chosenEnd = end
-                ambiguous = false
-            } else if let chosenEnd {
-                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
-                    ambiguous = true
-                    break
-                }
-            }
-        }
-        guard let chosenEnd, !ambiguous else { return nil }
-        return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
+        state(requestState).roots.removeAll(keepingCapacity: true)
     }
 }
