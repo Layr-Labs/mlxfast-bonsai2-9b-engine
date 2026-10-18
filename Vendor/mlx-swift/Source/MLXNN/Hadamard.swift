@@ -3270,12 +3270,112 @@ enum PromptInt8Matmul {
         }
         """
 
-    /// `naxSgBody` for `layers` sibling projections of one activation in one
-    /// dispatch: threadgroups x < N0 / 64 take layer 0, the next N1 / 64
-    /// layer 1, and so on, each running the one-layer body unchanged. Inputs
-    /// `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`, `ksz` = [K, rows,
-    /// N0, N1, ...]; outputs `out0`....
-    static func naxSgSource(layers: Int) -> String {
+    // `naxSgBody` with each simdgroup's weight operand built in registers:
+    // the 32 x 32 x 128 op takes a right-input cooperative tensor that each
+    // lane fills from the packed code words of its own columns, so the
+    // weights pass through no threadgroup memory and the group loop has no
+    // barriers. Lane l holds columns nl + 8c (c = 0..3) of its simdgroup's
+    // 32 and the k-quad kq of every 16-k block of the group: storage word
+    // c + 4j is plane kq of the column's word j, (w >> 2 kq) & 0x03030303,
+    // whose byte u is the code at k = 16 j + 4 kq + u. The op's integer C
+    // per group is the staged kernel's, the epilogue, the group order and
+    // the store are unchanged, so every output is `naxSgBody`'s bits. Each
+    // simdgroup checks the right-input layout (element i at k = 16 (i >> 4)
+    // + 4 kq + (i & 3), n = nl + 8 ((i >> 2) & 3)) and the destination
+    // layout against `get_multidimensional_index` before any fill, and on a
+    // mismatch skips the loop and writes NaN, so the load-time check fails.
+    static let naxSgRegBody = """
+        const int Kg = K / 128;
+        const int n0 = bx * 64;
+        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int q = int(sg & 3);
+        const int sm = 32 * (q >> 1), sn = 32 * (q & 1);
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto bR = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        auto tA0 = A.template slice<128, 32>(0, m0 + sm);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(bR)>, int32_t>();
+        const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+        const int kq = int((lane & 1) + 2 * ((lane >> 3) & 1));
+        bool ok = int(cT.get_capacity()) == 32 && int(bR.get_capacity()) == 128;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i++) {
+          auto ids = cT.get_multidimensional_index(i);
+          ok = ok && int(ids[1]) == fm + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1)
+                  && int(ids[0]) == fn + 16 * ((i >> 3) & 1) + (i & 3);
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 128; i++) {
+          auto ids = bR.get_multidimensional_index(i);
+          ok = ok && int(ids[0]) == 16 * (i >> 4) + 4 * kq + (i & 3) && int(ids[1]) == nl + 8 * ((i >> 2) & 3);
+        }
+        const bool good = simd_all(ok);
+        thread uint32_t* bw = (thread uint32_t*)&bR;
+        const uint shq = uint(2 * kq);
+        const device uint4* wcol = (const device uint4*)(w + (size_t)(n0 + sn + nl) * (size_t)(K / 16));
+        const size_t cstride = (size_t)(K / 16) * 2;
+        const int nb = n0 + sn + fn;
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 16);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 16);
+        const int NQ = N / 4;
+        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)(4 * fm + 2 * (q >> 1));
+        float acc[32];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i++) { acc[i] = 0.0f; }
+        for (int g = 0; good && g < Kg; g++) {
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) {
+            const device uint4* src = wcol + (size_t)c * cstride + (size_t)g * 2;
+            const uint4 lo = src[0];
+            const uint4 hi = src[1];
+            bw[c + 0] = (lo.x >> shq) & 0x03030303u; bw[c + 4] = (lo.y >> shq) & 0x03030303u;
+            bw[c + 8] = (lo.z >> shq) & 0x03030303u; bw[c + 12] = (lo.w >> shq) & 0x03030303u;
+            bw[c + 16] = (hi.x >> shq) & 0x03030303u; bw[c + 20] = (hi.y >> shq) & 0x03030303u;
+            bw[c + 24] = (hi.z >> shq) & 0x03030303u; bw[c + 28] = (hi.w >> shq) & 0x03030303u;
+          }
+          auto tA = A.template slice<128, 32>(g * 128, m0 + sm);
+          op.run(tA, bR, cT);
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
+          const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
+          const float2 a0 = *(const device float2*)(ascale + tbase + (size_t)g * 64);
+          const float2 a1 = *(const device float2*)(ascale + tbase + 32 + (size_t)g * 64);
+          const float2 r0 = *(const device float2*)(rsb + tbase + (size_t)g * 64);
+          const float2 r1 = *(const device float2*)(rsb + tbase + 32 + (size_t)g * 64);
+          float as[4], rb[4];
+          as[0] = a0.x; as[1] = a0.y; as[2] = a1.x; as[3] = a1.y;
+          rb[0] = r0.x; rb[1] = r0.y; rb[2] = r1.x; rb[3] = r1.y;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 32; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float t = s * float(cT[i]);
+            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
+          }
+        }
+        const int mb = m0 + sm + fm;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i += 4) {
+          const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+          const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+          *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
+    /// `naxSgBody` (or `body`) for `layers` sibling projections of one
+    /// activation in one dispatch: threadgroups x < N0 / 64 take layer 0,
+    /// the next N1 / 64 layer 1, and so on, each running the one-layer body
+    /// unchanged. Inputs `xq`, `w0`..., `s0`..., `b0`..., `ascale`, `rsb`,
+    /// `ksz` = [K, rows, N0, N1, ...]; outputs `out0`....
+    static func naxSgSource(layers: Int, body: String = naxSgBody) -> String {
         var pick = """
             const int K = ksz[0]; const int M = ksz[1];
             int bx = int(threadgroup_position_in_grid.x);
@@ -3289,7 +3389,7 @@ enum PromptInt8Matmul {
         for l in 1 ..< layers {
             pick += "if (bx >= N / 64) { bx -= N / 64; w = w\(l); scalesT = s\(l); biasesT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + naxSgBody
+        return pick + body
     }
 
     /// `naxSgSource` for one, two and three layers (index `layers - 1`).
@@ -3304,23 +3404,43 @@ enum PromptInt8Matmul {
             ensureRowContiguous: true)
     }
 
+    /// `naxSgSource(layers:body: naxSgRegBody)` for one, two and three layers.
+    private static let naxSgRegKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_matmul_nax_sg_reg\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxSgSource(layers: layers, body: naxSgRegBody),
+            header: naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// `naxSg`: the per-simdgroup kernel matched at load (it then replaces
     /// the vector one); `naxSgShared`: its two- and three-layer forms did too.
     nonisolated(unsafe) private static var naxSg = false
     nonisolated(unsafe) private static var naxSgShared = false
+    /// The register-weight forms (`naxSgRegBody`) matched the per-simdgroup
+    /// kernel bit for bit at load: `naxSgReg` the one-layer form,
+    /// `naxSgRegShared` the two- and three-layer forms as well.
+    nonisolated(unsafe) private static var naxSgReg = false
+    nonisolated(unsafe) private static var naxSgRegShared = false
+    nonisolated(unsafe) private static var regCheckNote = "not run"
+    nonisolated(unsafe) private static var regFailed = false
+    nonisolated(unsafe) private static var regFailNote = ""
 
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
     /// one activation; every N a multiple of 64, `m` of 64.
     private static func runSg(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool
+        m: Int, k: Int, negative: Bool, register: Bool = false
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
-        return naxSgKernels[layers.count - 1](
+        return (register ? naxSgRegKernels : naxSgKernels)[layers.count - 1](
             inputs, template: [("NEG", negative ? 1 : 0)],
             grid: (ns.reduce(0, +) / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -3455,6 +3575,93 @@ enum PromptInt8Matmul {
         return matched
     }
 
+    /// `DARKBLOOM_BONSAI_PROMPT_REGW=0` keeps the per-simdgroup kernel's
+    /// threadgroup weight staging (the record kernel) everywhere.
+    static let registerAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_REGW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The prompt projections of the pack: inner size K and the output
+    /// widths of the layers sharing one activation (o, GDN out, down, and the
+    /// q|k|v, qkv|z, gate|up groups, with the last-row forms' k|v and z).
+    static let registerShapes: [(k: Int, ns: [Int])] = [
+        (4096, [1024]), (4096, [4096]), (4096, [8192]), (4096, [12288]), (12288, [4096]),
+        (4096, [1024, 1024]), (4096, [8192, 4096]), (4096, [12288, 12288]),
+        (4096, [8192, 1024, 1024]),
+    ]
+
+    /// Runs the register-weight kernel (`naxSgRegBody`) against the
+    /// per-simdgroup kernel on fixed, input-independent operands at every
+    /// shape of `registerShapes` with M = 512, plus M = 192 for the one-layer
+    /// shapes at N = 4096, with the `NEG = 0` form and, where the offset
+    /// skip is on, the `NEG = 1` form, and compares output bits. Sets
+    /// `naxSgReg` when every one-layer comparison matched and
+    /// `naxSgRegShared` when the two- and three-layer ones did too; a
+    /// differing bit, a NaN or an error (compile or dispatch) keeps the
+    /// per-simdgroup kernel.
+    private static func checkRegister() -> String {
+        naxSgReg = false
+        naxSgRegShared = false
+        regFailed = false
+        regFailNote = ""
+        var words = 0
+        func pattern(_ count: Int, _ mul: Int32, _ add: Int32, _ mod: Int32) -> MLXArray {
+            (MLXArray.arange(count, dtype: .int32) * MLXArray(mul) + MLXArray(add)) % MLXArray(mod)
+        }
+        func operands(n: Int, k: Int, seed: Int32) -> (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negatedT: MLXArray) {
+            let kg = k / 128
+            let weight = (MLXArray.arange(n * k / 16, dtype: .int32).asType(.uint32) + MLXArray(UInt32(1 + seed)))
+                * MLXArray(UInt32(2_654_435_761))
+            let scalesT = ((pattern(kg * n, 1, seed, 13) + 1).asType(.float32) / 1024).asType(.float16)
+            let biasesT = (-pattern(kg * n, 1, seed, 7).asType(.float32) / 512).asType(.float16)
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            return (weight.reshaped([n, k / 16]), scalesT.reshaped([kg, n]), biasesT.reshaped([kg, n]), negatedT.reshaped([kg, n]))
+        }
+        let cases: [(k: Int, ns: [Int], m: Int)] = registerShapes.map { (k: $0.k, ns: $0.ns, m: 512) }
+            + registerShapes.filter { $0.ns == [4096] }.map { (k: $0.k, ns: $0.ns, m: 192) }
+        var single = true
+        var shared = true
+        withErrorHandler({ message in
+            if !PromptInt8Matmul.regFailed { PromptInt8Matmul.regFailNote = String(message.prefix(160)) }
+            PromptInt8Matmul.regFailed = true
+        }) {
+            for (index, shape) in cases.enumerated() {
+                let k = shape.k, m = shape.m, kg = k / 128
+                let codes = (pattern(m * k, 37, 11 + Int32(index), 255) - 127).asType(.int8).reshaped([m, k])
+                let ascale = (pattern(m * kg, 1, 1 + Int32(index), 11) + 1).asType(.float32) / 256
+                let rsb = (pattern(m * kg, 1, Int32(index), 17) - 8).asType(.float32) / 64
+                let layers = shape.ns.enumerated().map { operands(n: $1, k: k, seed: Int32(3 * index + $0)) }
+                var forms = [false]
+                if negativeForms { forms.append(true) }
+                var ok = true
+                for negative in forms where ok {
+                    let inputs = layers.map { (weight: $0.weight, scalesT: $0.scalesT, biasesT: negative ? $0.negatedT : $0.biasesT) }
+                    let record = runSg(codes: codes, ascale: ascale, rsb: rsb, layers: inputs, m: m, k: k, negative: negative)
+                    let register = runSg(
+                        codes: codes, ascale: ascale, rsb: rsb, layers: inputs, m: m, k: k, negative: negative, register: true)
+                    for (a, b) in zip(record, register) where ok {
+                        let equal = MLX.all(a.view(dtype: .uint32) .== b.view(dtype: .uint32))
+                        let nan = MLX.any(isNaN(b))
+                        eval(equal, nan)
+                        ok = !regFailed && equal.item(Bool.self) && !nan.item(Bool.self)
+                        if ok { words += b.size }
+                    }
+                }
+                if !ok {
+                    if regFailNote.isEmpty { regFailNote = "K \(k) N \(shape.ns) M \(m) differs" }
+                    if shape.ns.count == 1 { single = false } else { shared = false }
+                }
+                if regFailed { single = false; shared = false; break }
+            }
+        }
+        naxSgReg = single
+        naxSgRegShared = single && shared
+        if !naxSgReg { return "off (\(regFailNote))" }
+        return "on (\(naxSgRegShared ? "1-3 layers" : "1 layer; shared forms: \(regFailNote)"), \(cases.count) shapes, \(words) outputs bit-identical)"
+    }
+
     /// Decided once, at the first packed module's init. A NAX device takes
     /// the tensor kernel only when it compiles and matches the plain kernel
     /// bit for bit; otherwise it keeps the record's float path. Any other
@@ -3476,8 +3683,18 @@ enum PromptInt8Matmul {
         FileHandle.standardError.write(
             "int8 prompt matmul: \(chosen) (\(architecture); nax check: \(checkNote))\n"
                 .data(using: .utf8)!)
+        if chosen == .nax, naxSg {
+            regCheckNote = registerAllowed ? checkRegister() : "off (DARKBLOOM_BONSAI_PROMPT_REGW=0)"
+            FileHandle.standardError.write("int8 prompt register weights: \(regCheckNote)\n".data(using: .utf8)!)
+        }
         return chosen
     }()
+
+    /// The register-weight kernel replaces the per-simdgroup one at an inner
+    /// size and layer count its load check covered.
+    private static func usesRegister(k: Int, layers: Int) -> Bool {
+        (layers == 1 ? naxSgReg : naxSgRegShared) && registerShapes.contains { $0.k == k }
+    }
 
     /// Rows at which the route applies: prompt widths only (a verify window
     /// has at most 7 rows), in whole 64-row tiles.
@@ -3510,7 +3727,7 @@ enum PromptInt8Matmul {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms)[0]
+                negative: negative && negativeForms, register: usesRegister(k: activation.k, layers: 1))[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -3534,7 +3751,8 @@ enum PromptInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative })
+                negative: negativeForms && layers.allSatisfy { $0.negative },
+                register: usesRegister(k: activation.k, layers: layers.count))
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
