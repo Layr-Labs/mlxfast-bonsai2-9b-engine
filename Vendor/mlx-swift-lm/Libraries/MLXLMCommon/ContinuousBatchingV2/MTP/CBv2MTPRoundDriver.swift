@@ -268,6 +268,9 @@ final class CBv2MTPRoundDriver {
     let targetPrefixAcceptance: Bool
     /// Prompt-lookup n-gram length, or nil when lookup drafting is off.
     let lookupNgram: Int?
+    /// A block drafter's lookup: `lookupNgram` is then the shortest unique
+    /// prompt span that may replace its block (`CBv2MTPPromptSpanLookup`).
+    let blockPromptLookup: Bool
     /// Depth of a round whose lookup misses, or nil to keep the declared one.
     let lookupMissDepth: Int?
     /// Deeper drafted depth and the carried-margin threshold that selects it,
@@ -378,13 +381,17 @@ final class CBv2MTPRoundDriver {
                 config.maxSpeculativeBatch = 1
             }
         }
-        // Prompt lookup stands in for a CHAIN drafter at a fixed declared
-        // depth only. The adaptive controller and the marginal policy never
-        // run there, so lookup rounds cannot skew what they learn.
+        // Prompt lookup stands in for a drafter at a fixed declared depth
+        // only. The adaptive controller and the marginal policy never run
+        // there, so lookup rounds cannot skew what they learn. A BLOCK
+        // drafter takes it only for a long unique prompt span
+        // (`CBv2MTPPromptSpanLookup`); its committed rows stay pending
+        // through a lookup round and the next block absorbs them all.
         let lookupNgram =
-            (config.fixedDraftTokens ?? 0) > 0 && !(drafter is any CBv2MTPBlockDrafter)
+            (config.fixedDraftTokens ?? 0) > 0
             ? (drafter as? any CBv2MTPRequestStatefulDrafter)?.lookupDraftNgram : nil
         self.lookupNgram = lookupNgram.flatMap { $0 > 0 ? $0 : nil }
+        self.blockPromptLookup = self.lookupNgram != nil && drafter is any CBv2MTPBlockDrafter
         let missDepth =
             (lookupNgram ?? 0) <= 0
             ? nil
@@ -883,12 +890,19 @@ final class CBv2MTPRoundDriver {
     /// drafter's chain.
     func lookupDraft(for rec: CBv2ScheduledRequest, depth: Int) -> [Int]? {
         guard depth > 0, depth == config.fixedDraftTokens else { return nil }
+        if blockPromptLookup {
+            guard let minimumMatch = lookupNgram else { return nil }
+            return CBv2MTPPromptSpanLookup.continuation(
+                history: rec.tokens, promptLength: rec.request.promptTokens.count,
+                depth: depth, minimumMatch: minimumMatch)
+        }
         return lookupIndex(for: rec)?.draft(rec.tokens)
     }
 
     /// Index the row's committed history while a launched step runs, so the
     /// next round's lookup hashes only the tokens that step commits.
     func indexLookupHistory(for rec: CBv2ScheduledRequest) {
+        guard !blockPromptLookup else { return }
         lookupIndex(for: rec)?.catchUp(rec.tokens)
     }
 

@@ -271,14 +271,26 @@ extension EngineLoopV2 {
                         confirmedInputTokens: 1 + committedDraftCount,
                         committedDraftTokens: committedDraftTokens,
                         committedTargetHidden: committedHidden)
-                    if finishReason == nil, confirmed > 0, mtp.lookupNgram == nil,
-                        verify.rows.count == 1,
-                        rec.request.maxTokens - rec.generatedTokenCount >= k,
-                        let block = mtp.blockDrafter
-                    {
-                        block.prestageBlock(
-                            anchor: kept[confirmed - 1], depth: k, requestState: state)
-                    }
+                }
+                // The next block is built now unless the next round takes
+                // its drafts from prompt lookup: that round runs no block, so
+                // one built here would be work nobody reads. The lookup reads
+                // the committed history only, which is final here, so the
+                // next round's own lookup decides the same way. A chain
+                // drafter with lookup keeps its record behavior (no prestage).
+                if finishReason == nil, confirmed > 0,
+                    mtp.lookupNgram == nil
+                        || (mtp.blockPromptLookup && mtp.lookupDraft(for: rec, depth: k) == nil),
+                    verify.rows.count == 1,
+                    // The planner keeps depth k only while more than k
+                    // output slots remain (`mtpDepthWithinOutputBudget`);
+                    // a block prestaged for a round it then shortens would
+                    // be dropped after absorbing the pending context.
+                    rec.request.maxTokens - rec.generatedTokenCount > k,
+                    let block = mtp.blockDrafter
+                {
+                    block.prestageBlock(
+                        anchor: kept[confirmed - 1], depth: k, requestState: state)
                 }
             }
             if let evaluations = verify.recurrentEvaluations[id] {

@@ -383,6 +383,36 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         append(committedTargetHidden, to: requestState)
     }
 
+    /// Prompt lookup for this block drafter: the shortest unique PROMPT span
+    /// (`CBv2MTPPromptSpanLookup`) whose continuation may replace a block.
+    /// `DARKBLOOM_DFLASH_PROMPT_LOOKUP=0` keeps the drafter's block in every
+    /// round.
+    public var lookupDraftNgram: Int? { Self.promptLookupEnabled ? 16 : nil }
+
+    static let promptLookupEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// A lookup round ran no proposal, so there is nothing of its own to
+    /// retire; its confirmed columns join the pending context exactly as a
+    /// drafted round's do (`finalizeRound`), and the next block absorbs every
+    /// pending row. The seed carry is the chain seam's: the block context's
+    /// confirmed columns already hold this round's rows.
+    public func commitLookupRound(
+        requestState: any CBv2MTPRequestState,
+        seedToken: MLXArray,
+        seedHidden: MLXArray,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray
+    ) {
+        let state = self.state(requestState)
+        state.roots.removeAll(keepingCapacity: true)
+        state.prestaged = nil
+        append(committedTargetHidden, to: requestState)
+    }
+
     /// Nothing to undo: the round wrote no speculative state here. The rows
     /// the proposal absorbed were committed before it ran, and the proposal
     /// itself is discarded with its graph.

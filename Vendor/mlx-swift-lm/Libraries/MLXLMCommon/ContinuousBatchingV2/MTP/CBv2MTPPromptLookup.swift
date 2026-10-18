@@ -74,3 +74,56 @@ final class CBv2MTPPromptLookupIndex {
         return value
     }
 }
+
+/// Prompt-span lookup for a BLOCK drafter.
+///
+/// A block drafter already proposes the whole depth from one forward and
+/// accepts far more than a short n-gram match would, so a short repeat in the
+/// output must not replace its block. This proposes only when the committed
+/// history's suffix matches a span of the PROMPT of at least `minimumMatch`
+/// tokens (up to 64), that longest match is unique (no other prompt span of
+/// the same length has a different continuation), and the `depth` tokens
+/// after it lie inside the prompt: the output is quoting the prompt, and
+/// those tokens are what it quotes next. The target verifies every id and
+/// emits its own greedy tokens; only the draft source changes.
+/// (Matching rule after the Bonsai 2 27B record's prompt lookup: n-gram
+/// matches of 2...4 tokens replaced correct drafter blocks there and added
+/// rounds; a unique 16-token prompt span did not.)
+enum CBv2MTPPromptSpanLookup {
+    static func continuation(
+        history: [Int], promptLength: Int, depth: Int, minimumMatch: Int
+    ) -> [Int]? {
+        let count = history.count
+        let prompt = min(max(promptLength, 0), count)
+        guard depth >= 1, minimumMatch >= 1, prompt >= minimumMatch + depth,
+            count >= minimumMatch
+        else { return nil }
+        let longest = min(64, count - depth, prompt - depth)
+        guard longest >= minimumMatch else { return nil }
+        let last = history[count - 1]
+        var best = minimumMatch - 1
+        var chosenEnd = -1
+        var ambiguous = false
+        for end in minimumMatch ... (prompt - depth) {
+            guard history[end - 1] == last else { continue }
+            var length = 1
+            let limit = min(longest, end)
+            while length < limit, history[end - length - 1] == history[count - length - 1] {
+                length += 1
+            }
+            guard length >= minimumMatch, length >= best else { continue }
+            if length > best {
+                best = length
+                chosenEnd = end
+                ambiguous = false
+            } else if chosenEnd >= 0 {
+                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
+                    ambiguous = true
+                    break
+                }
+            }
+        }
+        guard chosenEnd >= 0, !ambiguous else { return nil }
+        return Array(history[chosenEnd ..< chosenEnd + depth])
+    }
+}
