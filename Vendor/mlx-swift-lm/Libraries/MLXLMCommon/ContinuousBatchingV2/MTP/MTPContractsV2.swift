@@ -516,6 +516,28 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 
     func prestageBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState)
+
+    /// OPTIONAL (defaulted): build the next proposal's acceptance-independent
+    /// work from this round's verify outputs — its context tap over every
+    /// verify column (`[1, 1 + k, taps * hidden]`) and the target's token at
+    /// every column (`[1 + k]` int32, lazy) — and return the arrays the engine
+    /// queues right behind the verify. The next proposal of the same request
+    /// may read the committed prefix of it; nothing else changes. A drafter
+    /// that keeps the default does all of its work after acceptance.
+    func projectRoundContext(
+        blockContext: MLXArray, targetTokens: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray]
+
+    /// OPTIONAL (defaulted): committed-context work the drafter postponed
+    /// while proposing this round (it needs none of it for this round's
+    /// proposal). The engine queues the returned arrays right behind the
+    /// round's verify; `after` is a verify output the work must follow on the
+    /// GPU (it reads it, so it does not compete with the verify). The drafter
+    /// runs anything still postponed itself before its next use of the
+    /// request state.
+    func submitDeferredContext(
+        requestState: any CBv2MTPRequestState, after: MLXArray) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
@@ -532,6 +554,19 @@ extension CBv2MTPBlockDrafter {
     public func prestageBlock(
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) {}
+
+    public func projectRoundContext(
+        blockContext: MLXArray, targetTokens: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray] {
+        []
+    }
+
+    public func submitDeferredContext(
+        requestState: any CBv2MTPRequestState, after: MLXArray
+    ) -> [MLXArray] {
+        []
+    }
 
     /// The chain verbs of the seams this one refines. A block drafter
     /// proposes once per round through `proposeBlock`; the engine's block
