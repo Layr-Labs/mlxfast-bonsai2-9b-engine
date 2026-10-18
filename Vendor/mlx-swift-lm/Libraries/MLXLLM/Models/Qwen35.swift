@@ -230,36 +230,9 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 /// decode and wide prefill keep the stock matmul.
 private enum Qwen35DenseGateProjection {
     static let maximumRows = 16
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_dense_ba_rows",
-        inputNames: ["x", "wb", "wa"], outputNames: ["b", "a"],
-        source: """
-            const uint lane = thread_index_in_simdgroup;
-            const uint n = threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup;
-            const int K = x_shape[1];
-            const uint N = wb_shape[0];
-            const bool is_a = n >= N;
-            const uint col = is_a ? n - N : n;
-            const device float4* wr = (const device float4*)((is_a ? wa : wb) + col * K);
-            float acc[ROWS];
-            for (int v = 0; v < ROWS; v++) acc[v] = 0.0f;
-            for (int k4 = lane; k4 < K / 4; k4 += 32) {
-              const float4 wv = wr[k4];
-              for (int v = 0; v < ROWS; v++) {
-                const float4 xv = ((const device float4*)(x + v * K))[k4];
-                acc[v] = fma(xv.x, wv.x, acc[v]);
-                acc[v] = fma(xv.y, wv.y, acc[v]);
-                acc[v] = fma(xv.z, wv.z, acc[v]);
-                acc[v] = fma(xv.w, wv.w, acc[v]);
-              }
-            }
-            for (int v = 0; v < ROWS; v++) {
-              const float total = simd_sum(acc[v]);
-              if (lane == 0) (is_a ? a : b)[v * N + col] = total;
-            }
-            """)
 
-    static func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
+    /// The eligibility `apply` checks; the rows of `x` when it holds.
+    static func eligibleRows(_ x: MLXArray, b: Linear, a: Linear) -> Int? {
         guard !(b is QuantizedLinear), !(a is QuantizedLinear), b.bias == nil, a.bias == nil,
             x.dtype == .float32, b.weight.dtype == .float32, a.weight.dtype == .float32,
             b.weight.ndim == 2, b.weight.shape == a.weight.shape, x.ndim == 3,
@@ -267,14 +240,16 @@ private enum Qwen35DenseGateProjection {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.dim(0) * x.dim(1)
-        guard (2 ... maximumRows).contains(rows) else { return nil }
+        return (2 ... maximumRows).contains(rows) ? rows : nil
+    }
+
+    static func apply(_ x: MLXArray, b: Linear, a: Linear) -> (MLXArray, MLXArray)? {
+        guard let rows = eligibleRows(x, b: b, a: a) else { return nil }
         let N = b.weight.dim(0)
-        let outputs = kernel(
-            [x.reshaped([rows, x.dim(2)]), b.weight, a.weight], template: [("ROWS", rows)],
-            grid: (32, 2 * N, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, N], [rows, N]], outputDTypes: [.float32, .float32])
+        let outputs = VerifyDenseBA.standalone(
+            x.reshaped([rows, x.dim(2)]), wb: b.weight, wa: a.weight)
         let shape = [x.dim(0), x.dim(1), N]
-        return (outputs[0].reshaped(shape), outputs[1].reshaped(shape))
+        return (outputs.0.reshaped(shape), outputs.1.reshaped(shape))
     }
 }
 
@@ -2031,6 +2006,15 @@ final class Qwen35GatedDeltaNet: Module {
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
+            if prompt == nil, let boundary,
+                Qwen35DenseGateProjection.eligibleRows(inputs, b: inProjB, a: inProjA) != nil,
+                let fused = HadamardQuantizedLinear.boundaryProjectionsWithDenseBA(
+                    boundary, [inProjQKV, inProjZ], x: inputs, wb: inProjB.weight, wa: inProjA.weight)
+            {
+                return (
+                    fused.outputs[0], fused.outputs[1].reshaped(B, S, numVHeads, headVDim),
+                    fused.b, fused.a)
+            }
             let shared = prompt ?? boundary.flatMap {
                 HadamardQuantizedLinear.boundaryProjections($0, [inProjQKV, inProjZ])
             } ?? (S >= 128
