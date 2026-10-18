@@ -4267,6 +4267,29 @@ enum DF2WideLaneSource {
                 const float d1 = l >= 1 ? float(dyn[l * dw + (dw / 2) + (D / 16) + g]) : 0.0f;
                 float v[\(e)];
                 float s4[\(e / 4)];
+                if (sizeof(h[0]) == 4 && sizeof(base[0]) == 4 && sizeof(res[0]) == 4) {
+                  for (int k = 0; k < \(e / 4); k++) {
+                    const int c = c0 + 4 * k;
+                    const float4 b0 = *(const device float4*)(base + 2 * D + c);
+                    const float4 h0 = *(const device float4*)(h + rowBase + 4 * k);
+                    const float4 r0 = *(const device float4*)(res + rowBase + 4 * k);
+                    float4 av = r0 + (b0 + d0) * h0;
+                    if (l >= 1) {
+                      const float4 b1 = *(const device float4*)(base + 3 * D + c);
+                      const float4 h1 = *(const device float4*)(h + rowBase - D + 4 * k);
+                      av += (b1 + d1) * h1;
+                    }
+                    float ak = 0.0f;
+                    for (int i = 0; i < 4; i++) {
+                      const int u = 4 * k + i;
+                      const float acc = av[i];
+                      v[u] = acc;
+                      if (WRITE_RES) { out_res[rowBase + u] = acc; }
+                      ak += acc * acc;
+                    }
+                    s4[k] = ak;
+                  }
+                } else {
                 for (int k = 0; k < \(e / 4); k++) {
                   float ak = 0.0f;
                   for (int i = 0; i < 4; i++) {
@@ -4281,6 +4304,7 @@ enum DF2WideLaneSource {
                     ak += acc * acc;
                   }
                   s4[k] = ak;
+                }
                 }
 
                 """ + rowScale(e: e) + """
