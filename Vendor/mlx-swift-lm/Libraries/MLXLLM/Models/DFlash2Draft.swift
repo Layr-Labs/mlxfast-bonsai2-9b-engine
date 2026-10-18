@@ -2496,12 +2496,15 @@ enum DF2Fast {
             }
             threadgroup float cv[1024]; threadgroup int ci[1024];
             threadgroup float wv[8]; threadgroup int ws[8];
+            threadgroup int selectedSlot;
+            int next = 0;
             for (int k = 0; k < 4; k++) { cv[tid * 4 + k] = tv[k]; ci[tid * 4 + k] = ti[k]; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const size_t outBase = ((size_t)row * 8u + blk) * 16u;
             for (int r = 0; r < 16; r++) {
-              float bv = NEG; int bs = 0x7fffffff;
-              for (int k = 0; k < 4; k++) { const float v = cv[tid * 4 + k]; if (v > bv) { bv = v; bs = int(tid * 4 + k); } }
+              const int slot = int(tid * 4) + next;
+              const float bv = next < 4 ? cv[slot] : NEG;
+              const int bs = bv > NEG ? slot : 0x7fffffff;
               const float m = simd_max(bv);
               int sl = bv == m ? bs : 0x7fffffff;
               sl = simd_min(sl);
@@ -2514,9 +2517,10 @@ enum DF2Fast {
                 const float m2 = simd_max(v2);
                 const int best_id = simd_min(v2 == m2 ? id_in : 0x7fffffff);
                 const int s2 = simd_min((v2 == m2 && id_in == best_id) ? s_in : 0x7fffffff);
-                if (lane == 0) { ids[outBase + r] = ci[s2]; vals[outBase + r] = cv[s2]; cv[s2] = NEG; }
+                if (lane == 0) { ids[outBase + r] = ci[s2]; vals[outBase + r] = cv[s2]; selectedSlot = s2; }
               }
               threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (next < 4 && slot == selectedSlot) { next++; }
             }
             """)
 
