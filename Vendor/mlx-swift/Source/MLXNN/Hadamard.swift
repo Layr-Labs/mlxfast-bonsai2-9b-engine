@@ -938,6 +938,11 @@ enum WideRowSource {
     struct Form: Hashable {
         var swiglu = false, residualNorm = false, normOnly = false, gatedNorm = false
         var attentionGate = false, normalizedOutput = false, rotatedOutput = false
+        /// The norm forms' main-phase loads (x, residual, gate, norm weight,
+        /// signs) issued into registers before the norm reduction's barrier
+        /// (`DARKBLOOM_BONSAI_LOAD_HOIST=0` keeps the parent text). Same
+        /// addresses, same values, same arithmetic text: only the loads move.
+        var hoist = false
     }
 
     static func header(threads: Int) -> String {
@@ -1081,6 +1086,49 @@ enum WideRowSource {
         } else {
             read = "float4 val = in4[w] * s4[w];"
         }
+        let hoist = f.hoist && (f.residualNorm || f.normOnly || f.gatedNorm)
+        let mainDecl = """
+            const uint in_offset = batch_idx + base0;
+            const uint s_offset = sign_offset + base0;
+            const device float4* in4 = (const device float4*)(x + in_offset);
+            const device float4* s4 = (const device float4*)(signs + s_offset);
+            """
+        var hoistDecl = ""
+        var mainRead = read
+        var gatedPrefixRead = gatedPrefix
+        if hoist {
+            let residualLoad = f.residualNorm
+                ? "hr[w] = *((const device float4*)(residual + in_offset) + w);\n" : ""
+            let gateLoad = f.gatedNorm
+                ? "hg[w] = *((const device float4*)(gate + in_offset) + w);\n" : ""
+            let weightAt = f.gatedNorm ? "(base0 & 127u)" : "s_offset"
+            hoistDecl = mainDecl + "\n" + """
+                float4 hx[\(v)], hr[\(v)], hg[\(v)], hw[\(v)], hs[\(v)];
+                #pragma clang loop unroll(full)
+                for (short w = 0; w < \(v); w++) {
+                hx[w] = in4[w];
+                \(residualLoad)\(gateLoad)hw[w] = *((const device float4*)(norm_weight + \(weightAt)) + w);
+                hs[w] = s4[w];
+                }
+
+                """
+            mainRead = read
+                .replacingOccurrences(of: "*((const device float4*)(residual + in_offset) + w)", with: "hr[w]")
+                .replacingOccurrences(of: "*((const device float4*)(gate + in_offset) + w)", with: "hg[w]")
+                .replacingOccurrences(of: "*((const device float4*)(norm_weight + s_offset) + w)", with: "hw[w]")
+                .replacingOccurrences(
+                    of: "*((const device float4*)(norm_weight + (base0 & 127u)) + w)", with: "hw[w]")
+                .replacingOccurrences(of: "in4[w]", with: "hx[w]")
+                .replacingOccurrences(of: "s4[w]", with: "hs[w]")
+            precondition(
+                !mainRead.contains("const device float4*") && !mainRead.contains("in4[")
+                    && !mainRead.contains("s4["), "hoisted read still loads from device")
+            if f.gatedNorm {
+                gatedPrefixRead = gatedPrefix.replacingOccurrences(
+                    of: "const float4 nv = nx4[w];", with: "const float4 nv = hx[w];")
+                precondition(gatedPrefixRead != gatedPrefix, "gated prefix not hoisted")
+            }
+        }
         var passSource = ""
         for k in 1 ..< passes {
             let s = k * b
@@ -1132,17 +1180,14 @@ enum WideRowSource {
               return;
             }
 
-            \(normPrefix)\(gatedPrefix)
+            \(hoistDecl)\(normPrefix)\(gatedPrefixRead)
             threadgroup float buf[4096 + \(4096 / e)];
             float x_reg[\(e)];
 
-            const uint in_offset = batch_idx + base0;
-            const uint s_offset = sign_offset + base0;
-            const device float4* in4 = (const device float4*)(x + in_offset);
-            const device float4* s4 = (const device float4*)(signs + s_offset);
+            \(hoist ? "" : mainDecl)
             #pragma clang loop unroll(full)
             for (short w = 0; w < \(v); w++) {
-              \(read)
+              \(mainRead)
               x_reg[4 * w + 0] = val.x;
               x_reg[4 * w + 1] = val.y;
               x_reg[4 * w + 2] = val.z;
@@ -1292,18 +1337,32 @@ extension SignedBlockHadamard {
         }
     }
 
-    private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] = {
+    /// `DARKBLOOM_BONSAI_LOAD_HOIST=0` keeps the parent text of the norm forms
+    /// (`WideRowSource.Form.hoist`).
+    static let wideRowLoadHoist: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LOAD_HOIST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static func wideRowMakeKernels(hoist: Bool) -> [WideRowKind: MLXFast.MLXFastKernel] {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
         for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
+            var form = kind.form
+            form.hoist = hoist
+            let hoisted = hoist && (form.residualNorm || form.normOnly || form.gatedNorm)
             kernels[kind] = MLXFast.metalKernel(
-                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)",
+                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)\(hoisted ? "_h" : "")",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
                 outputNames: wideRowOutputNames(kind),
-                source: WideRowSource.source(threads: wideRowThreads, form: kind.form),
+                source: WideRowSource.source(threads: wideRowThreads, form: form),
                 header: WideRowSource.header(threads: wideRowThreads), ensureRowContiguous: true)
         }
         return kernels
-    }()
+    }
+
+    private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] =
+        wideRowMakeKernels(hoist: wideRowLoadHoist)
 
     nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Bool] = [:]
     nonisolated(unsafe) private static var wideRowChecked = false
