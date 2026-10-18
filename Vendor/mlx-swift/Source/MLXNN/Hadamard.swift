@@ -3412,6 +3412,126 @@ enum VerifyInt8Matmul {
         return pick
     }
 
+    // `naxFastBody` over 16 columns per threadgroup instead of 32, for one
+    // layer at most `narrowColumns` wide: an N = 4096 call then launches 256
+    // threadgroups (6.4 per core on the M5 Max's 40) instead of 128 (3.2).
+    // The tensor op, its layout guard and the FP32 steps per output, in
+    // order, are `naxFastBody`'s; columns 16-31 of the B tile and their
+    // destination elements (8-15) are dead.
+    static let naxNarrowBody = """
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const int n0 = bx * 16;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+        threadgroup uint32_t bs[4][32 * 32];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, 32));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
+        const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+        const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+        const int cap = int(cT.get_capacity());
+        bool ok = cap == 16;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; i++) {
+          if (i < cap) {
+            auto ids = cT.get_multidimensional_index(i);
+            ok = ok && int(ids[1]) == mrow + 8 * ((i >> 2) & 1) && int(ids[0]) == nb + (i & 3) + 16 * (i >> 3);
+          }
+        }
+        const bool good = simd_all(ok);
+        float acc[8];
+        #pragma clang loop unroll(full)
+        for (int e = 0; e < 8; e++) { acc[e] = 0.0f; }
+        const int mr = min(mrow, ROWS - 1);
+        const int mr1 = min(mrow + 8, ROWS - 1);
+        const device half* scol = scalesT + n0 + nb;
+        const device half* bcol = biasesT + n0 + nb;
+        const int j = int(lane & 7u);
+        const int c = int(lane >> 3);
+        const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
+        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
+        uint32_t wv[4];
+        half4 sA, bA = half4(0.0h);
+        float fa, frb, fa1 = 0.0f, frb1 = 0.0f;
+        {
+          const int gl = int(sg);
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 4; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+          sA = *(const device half4*)(scol + (size_t)gl * N);
+          if (!NEG) { bA = *(const device half4*)(bcol + (size_t)gl * N); }
+          fa = ascale[mr * Kg + gl];
+          frb = rsb[mr * Kg + gl];
+          if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
+        }
+        for (int g = int(sg); g < Kg; g += 4) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 4; t++) {
+            const uint32_t v = wv[t];
+            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+          }
+          const half4 cA = sA;
+          const half4 dA = NEG ? -sA : bA;
+          const float ca = fa, crb = frb, ca1 = fa1, crb1 = frb1;
+          if (g + 4 < Kg) {
+            const int gl = g + 4;
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 4; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
+            sA = *(const device half4*)(scol + (size_t)gl * N);
+            if (!NEG) { bA = *(const device half4*)(bcol + (size_t)gl * N); }
+            fa = ascale[mr * Kg + gl];
+            frb = rsb[mr * Kg + gl];
+            if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          op.run(tA, B, cT);
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) {
+            const float t0 = float(cA[e]) * float(cT[e]);
+            acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));
+            if (ROWS > 8) {
+              const float t2 = float(cA[e]) * float(cT[4 + e]);
+              acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup float* red = (threadgroup float*)bs[sg];
+        if (mrow < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) { red[mrow * 16 + nb + e] = acc[e]; }
+        }
+        if (ROWS > 8 && mrow + 8 < ROWS) {
+          #pragma clang loop unroll(full)
+          for (int e = 0; e < 4; e++) { red[(mrow + 8) * 16 + nb + e] = acc[4 + e]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup float4* r0 = (const threadgroup float4*)bs[0];
+        const threadgroup float4* r1 = (const threadgroup float4*)bs[1];
+        const threadgroup float4* r2 = (const threadgroup float4*)bs[2];
+        const threadgroup float4* r3 = (const threadgroup float4*)bs[3];
+        for (int e = int(tid); e < ROWS * 4; e += 128) {
+          float4 v = r0[e] + r1[e];
+          v = v + r2[e];
+          v = v + r3[e];
+          *(device float4*)(out + (size_t)(e >> 2) * N + n0 + 4 * (e & 3)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
+    static let naxNarrowPick = """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = ksz[0];
+        const int bx = int(threadgroup_position_in_grid.x);
+        const int N = ksz[2];
+
+        """
+
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_verify_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -3478,6 +3598,44 @@ enum VerifyInt8Matmul {
             && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
     }
 
+    private static let naxNarrowKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_narrow",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxNarrowPick + naxNarrowBody,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// The narrow kernel in the compile-time form `naxFormsSource` gives the
+    /// fast one: K from template `KC` and every `size_t` index in 32 bits.
+    /// Its indices are bounded as the fast kernel's (`formsFit`).
+    static var naxNarrowFormsSource: String {
+        naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + naxNarrowBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    private static let naxNarrowFormsKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_narrow_forms",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxNarrowFormsSource,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// The widest one-layer call that takes the narrow kernel, and the
+    /// inner sizes of the model's calls that fit: attention o and GDN out
+    /// (4096) and MLP down (12288).
+    static let narrowColumns = 4096
+    static let narrowDepths = [4096, 12288]
+
+    /// Inner sizes whose narrow kernel matched the fast one at load.
+    /// `DARKBLOOM_BONSAI_VERIFY_NARROW=0` leaves it empty.
+    nonisolated(unsafe) private static var narrowK = Set<Int>()
+    /// Inner sizes in `narrowK` whose compile-time narrow form also matched
+    /// the record fast kernel at load. `DARKBLOOM_BONSAI_VERIFY_FORMS=0`
+    /// leaves it empty (the narrow kernel then runs in its record form).
+    nonisolated(unsafe) private static var narrowFormsK = Set<Int>()
+
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
     /// `naxFast`: the fast kernel matched (it then replaces the vector one);
@@ -3525,6 +3683,87 @@ enum VerifyInt8Matmul {
             inputs, template: template,
             grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    private static func runNarrow(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil
+    ) -> MLXArray {
+        let n = weight.dim(0)
+        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        if forms ?? (formsAllowed && narrowFormsK.contains(k) && formsFit(k: k, n: n)) {
+            return naxNarrowFormsKernel(
+                [codes, weight, scalesT, biasesT, ascale, rsb, dims],
+                template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
+                grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+        }
+        return naxNarrowKernel(
+            [codes, weight, scalesT, biasesT, ascale, rsb, dims],
+            template: [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
+            grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// Compares the narrow kernel's output bits with the fast kernel's at
+    /// each of `narrowDepths`, every verify row count and both offset forms,
+    /// on 128 columns (eight narrow threadgroups) with all 16 code rows
+    /// filled. An inner size joins `narrowK` only when every case matches.
+    /// Both sides are the record forms (`forms: false`), so this check does
+    /// not depend on `checkForms`. Where `formsAllowed`, the compile-time
+    /// narrow form is compared with the same record fast output in each case
+    /// too; an inner size joins `narrowFormsK` only when it is in `narrowK`
+    /// and every such case matches (a compile error fails the form only).
+    private static func checkNarrow() -> (narrow: Set<Int>, forms: Set<Int>) {
+        let n = 128
+        var passed = Set<Int>()
+        var formsPassed = Set<Int>()
+        for k in narrowDepths {
+            let kg = k / 128
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+            let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+            checkFailed = false
+            var matched = true
+            var formsOK = formsAllowed && formsFit(k: k, n: n)
+            withErrorHandler({ _ in VerifyInt8Matmul.checkFailed = true }) {
+                for m in rowRange {
+                    for negative in [false, true] where matched {
+                        let offsets = negative ? negatedT : biasesT
+                        let fast = runFast(
+                            codes: codes, ascale: ascale, rsb: rsb, layers: [(weight, scalesT, offsets)],
+                            m: m, k: k, negative: negative, forms: false)[0]
+                        let narrow = runNarrow(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: false)
+                        let equal = MLX.all(fast.view(dtype: .uint32) .== narrow.view(dtype: .uint32))
+                        eval(equal)
+                        matched = !checkFailed && equal.item(Bool.self)
+                        if matched && formsOK {
+                            let narrowForms = runNarrow(
+                                codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                                scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: true)
+                            let same = MLX.all(fast.view(dtype: .uint32) .== narrowForms.view(dtype: .uint32))
+                            eval(same)
+                            formsOK = !checkFailed && same.item(Bool.self)
+                            checkFailed = false
+                        }
+                    }
+                }
+            }
+            if matched {
+                passed.insert(k)
+                if formsOK { formsPassed.insert(k) }
+            }
+        }
+        checkFailed = false
+        return (passed, formsPassed)
     }
 
     nonisolated(unsafe) private static var checkFailed = false
@@ -3696,6 +3935,14 @@ enum VerifyInt8Matmul {
         FileHandle.standardError.write(
             "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote)\(forms))\n"
                 .data(using: .utf8)!)
+        let narrowValue = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_NARROW"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if chosen == .nax, naxFast, !["0", "false", "no", "off"].contains(narrowValue ?? "") {
+            (narrowK, narrowFormsK) = checkNarrow()
+            FileHandle.standardError.write(
+                "int8 verify narrow: K \(narrowK.sorted()) of \(narrowDepths); compile-time K forms: K \(narrowFormsK.sorted())\n"
+                    .data(using: .utf8)!)
+        }
         return chosen
     }()
 
@@ -3704,6 +3951,12 @@ enum VerifyInt8Matmul {
         negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
+        if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
+            return runNarrow(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
+                scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
+                negative: negative && negativeForms)
+        }
         if route == .nax && naxFast {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
