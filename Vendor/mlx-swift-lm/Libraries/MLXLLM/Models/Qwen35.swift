@@ -1912,11 +1912,7 @@ enum Qwen35RegisterGatedSIMD {
 enum Qwen35FusedGDNVerify {
     static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
-        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+    private static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -2143,8 +2139,164 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
-        header: Qwen35RegisterGatedSIMD.gateHeader)
+        """
+
+    private static let names = (
+        inputs: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputs: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"])
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused",
+        inputNames: names.inputs, outputNames: names.outputs,
+        source: source, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// One step of the software-pipelined scan, for row `t` of `TT` rows.
+    /// Row t's decay and kv dot run first; row t+1's k, q, v and gates are
+    /// read into registers next; then row t's kv reduction; then row t-1's
+    /// output reduction (its partials were kept in `pend`); then row t's
+    /// state update and output partials; row t-1's y store is last. Every
+    /// value goes through the operations of the parent scan in the same
+    /// order, so y and the state are the same bits; only the issue order
+    /// across rows changes, which takes the output reduction and the y
+    /// store off the state recurrence.
+    private static let pipeStep = """
+        {
+          const int tn = t + 1 < TT ? t + 1 : t;
+          float kv[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          float kn[R];
+          float qn[R];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((threadgroup const float4*)(k0_ + tn * Dk))[j];
+            kn[4 * j] = k4.x; kn[4 * j + 1] = k4.y; kn[4 * j + 2] = k4.z; kn[4 * j + 3] = k4.w;
+            const float4 q4 = ((threadgroup const float4*)(q0_ + tn * Dk))[j];
+            qn[4 * j] = q4.x; qn[4 * j + 1] = q4.y; qn[4 * j + 2] = q4.z; qn[4 * j + 3] = q4.w;
+          }
+          const float2 v2n = *((threadgroup const float2*)(v0_ + tn * DVPT));
+          const float gtn = gate_g[tn];
+          const float btn = gate_beta[tn];
+          kv[0] += simd_shuffle_xor(kv[0], 4);
+          kv[1] += simd_shuffle_xor(kv[1], 4);
+          kv[0] += simd_shuffle_xor(kv[0], 2);
+          kv[1] += simd_shuffle_xor(kv[1], 2);
+          kv[0] += simd_shuffle_xor(kv[0], 1);
+          kv[1] += simd_shuffle_xor(kv[1], 1);
+          float prev[DVPL];
+          prev[0] = pend[0]; prev[1] = pend[1];
+          prev[0] += simd_shuffle_xor(prev[0], 4);
+          prev[1] += simd_shuffle_xor(prev[1], 4);
+          prev[0] += simd_shuffle_xor(prev[0], 2);
+          prev[1] += simd_shuffle_xor(prev[1], 2);
+          prev[0] += simd_shuffle_xor(prev[0], 1);
+          prev[1] += simd_shuffle_xor(prev[1], 1);
+          float vt[DVPL];
+          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            pend[d] = (o0 + o1) + (o2 + o3);
+          }
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R; ++j) {
+            kr[j] = kn[j];
+            qr[j] = qn[j];
+          }
+          v2 = v2n; gt = gtn; bt = btn;
+          if (t > 0 && lane % LPD == 0) {
+            *((device float2*)(y_ + (t - 1) * (Hv * Dv))) = float2(prev[0], prev[1]);
+          }
+        }
+        """
+
+    /// The scan of `source` with `pipeStep` in the runtime-T loop.
+    private static func pipeScan() -> String {
+        let loop = "for (int t = 0; t < int(T); ++t) {\n#define TT int(T)\n"
+            + pipeStep + "\n#undef TT\n}\n"
+        return """
+            threadgroup const float* q0_ = qk_raw + dk0;
+            threadgroup const float* k0_ = qk_raw + MAX_T * Dk + dk0;
+            threadgroup const float* v0_ = v_tile + dvlocal;
+            device float* y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase;
+            float kr[R];
+            float qr[R];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              const float4 k4 = ((threadgroup const float4*)k0_)[j];
+              kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+              const float4 q4 = ((threadgroup const float4*)q0_)[j];
+              qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+            }
+            float2 v2 = *((threadgroup const float2*)v0_);
+            float gt = gate_g[0];
+            float bt = gate_beta[0];
+            float pend[DVPL];
+            pend[0] = 0.0f; pend[1] = 0.0f;
+
+            """ + loop + """
+            pend[0] += simd_shuffle_xor(pend[0], 4);
+            pend[1] += simd_shuffle_xor(pend[1], 4);
+            pend[0] += simd_shuffle_xor(pend[0], 2);
+            pend[1] += simd_shuffle_xor(pend[1], 2);
+            pend[0] += simd_shuffle_xor(pend[0], 1);
+            pend[1] += simd_shuffle_xor(pend[1], 1);
+            if (lane % LPD == 0) {
+              *((device float2*)(y_ + (int(T) - 1) * (Hv * Dv))) = float2(pend[0], pend[1]);
+            }
+
+            """
+    }
+
+    /// `source` with its scan replaced by `pipeScan`; everything before the
+    /// scan (conv, SiLU, norm, gates) and the final state store are the
+    /// parent's text.
+    private static func pipeSource() -> String {
+        let start = "threadgroup const float* q_ = qk_raw + dk0;"
+        let end = "  k_ += Dk; v_ += DVPT;\n}\n"
+        guard let lo = source.range(of: start), let hi = source.range(of: end),
+            source.components(separatedBy: start).count == 2,
+            source.components(separatedBy: end).count == 2, lo.lowerBound < hi.lowerBound
+        else { preconditionFailure("qwen35 pipelined verify kernel source") }
+        return String(source[..<lo.lowerBound]) + pipeScan()
+            + String(source[hi.upperBound...])
+    }
+
+    private static let pipeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused_pipe",
+        inputNames: names.inputs, outputNames: names.outputs,
+        source: pipeSource(), header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `DARKBLOOM_BONSAI_GDN_PIPE=0` selects the parent scan (`kernel`).
+    static let pipeEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDN_PIPE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
 
     /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -2166,18 +2318,21 @@ enum Qwen35FusedGDNVerify {
             state.shape == [1, valueHeads, 128, 128],
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let S = qkv.dim(1)
-        let outputs = kernel(
-            [convState, qkv, convWeight, a, b, aLog, dtBias, state],
-            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
-                ("CONV_DIM", C), ("MAX_T", maximumRows),
-                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
-                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
-                ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        func launch(_ k: MLXFast.MLXFastKernel, _ qkv: MLXArray, _ a: MLXArray, _ b: MLXArray) -> [MLXArray] {
+            let S = qkv.dim(1)
+            return k(
+                [convState, qkv, convWeight, a, b, aLog, dtBias, state],
+                template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                    ("CONV_DIM", C), ("MAX_T", maximumRows),
+                    ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                    ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                    ("K_SCALE_BITS", Int(invScale.bitPattern))],
+                grid: (128, 4, valueHeads), threadGroup: (128, 1, 1),
+                outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                    [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+                outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        }
+        let outputs = launch(pipeEnabled ? pipeKernel : kernel, qkv, a, b)
         return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
     }
 }
