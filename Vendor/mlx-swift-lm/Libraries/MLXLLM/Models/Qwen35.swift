@@ -3381,11 +3381,7 @@ final class Qwen35GatedDeltaNet: Module {
 /// l ^ (ROPE_DIMS / 8). Outputs are the bits of `rmsNorm` + `transposed` +
 /// `RoPE` as MLX's compiled kernels form them.
 enum Qwen35VerifyQKNormRoPE {
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_verify_qk_norm_rope",
-        inputNames: ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base"],
-        outputNames: ["q_out", "k_out"],
-        source: """
+    private static let source = """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             constexpr uint D = 256;
@@ -3443,7 +3439,130 @@ enum Qwen35VerifyQKNormRoPE {
             for (uint part = 0; part < 2u; ++part) {
               for (uint j = 0; j < 4u; ++j) dst[part * 128u + lane * 4u + j] = y[part][j];
             }
-            """)
+            """
+
+    private static let inputNames = ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base"]
+    private static let outputNames = ["q_out", "k_out"]
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_verify_qk_norm_rope",
+        inputNames: inputNames, outputNames: outputNames, source: source)
+
+    /// The norm and rotation of `source`: the norm weight is read after the
+    /// row's simdgroup sum, and the RoPE angle (which depends only on the
+    /// position, the offset and the dim) is formed after the norm, so both
+    /// wait behind the row loads and the reduction.
+    private static let normRopeParent = """
+        float x[2][4];
+        float acc[2] = {0.0f, 0.0f};
+        for (uint part = 0; part < 2u; ++part) {
+          for (uint j = 0; j < 4u; ++j) {
+            x[part][j] = src[part * 128u + lane * 4u + j];
+            acc[part] = metal::fma(x[part][j], x[part][j], acc[part]);
+          }
+        }
+        const float total = simd_sum(acc[0]) + simd_sum(acc[1]);
+        const float inv = metal::precise::rsqrt(total / float(D) + epsilon);
+        float y[2][4];
+        for (uint part = 0; part < 2u; ++part) {
+          for (uint j = 0; j < 4u; ++j) {
+            y[part][j] = w[part * 128u + lane * 4u + j] * (x[part][j] * inv);
+          }
+        }
+        const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
+        const float base = rope_base[0];
+        for (uint j = 0; j < 4u; ++j) {
+          const float partner = simd_shuffle_xor(y[0][j], ushort(HALF_ROT / 4u));
+          const uint dim = lane * 4u + j;
+          if (dim < uint(ROPE_DIMS)) {
+            const uint p = dim < HALF_ROT ? dim : dim - HALF_ROT;
+            const float d = static_cast<float>(p) / static_cast<float>(HALF_ROT);
+            const float inv_freq = metal::exp2(-d * base);
+            const float theta = position * inv_freq;
+            const float costheta = metal::fast::cos(theta);
+            const float sintheta = metal::fast::sin(theta);
+            y[0][j] = dim < HALF_ROT
+                ? metal::fma(y[0][j], costheta, -(partner * sintheta))
+                : metal::fma(partner, sintheta, y[0][j] * costheta);
+          }
+        }
+        """
+
+    /// The same norm and rotation with the position-only work first: the
+    /// angle's cos and sin and the norm weight are issued before the row
+    /// loads, so they overlap the loads and the reduction. Every expression
+    /// is the parent's text, so every output bit is the parent's.
+    private static let normRopeHoisted = """
+        const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
+        const float base = rope_base[0];
+        float cos_j[4];
+        float sin_j[4];
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4u; ++j) {
+          const uint dim = lane * 4u + j;
+          if (dim < uint(ROPE_DIMS)) {
+            const uint p = dim < HALF_ROT ? dim : dim - HALF_ROT;
+            const float d = static_cast<float>(p) / static_cast<float>(HALF_ROT);
+            const float inv_freq = metal::exp2(-d * base);
+            const float theta = position * inv_freq;
+            cos_j[j] = metal::fast::cos(theta);
+            sin_j[j] = metal::fast::sin(theta);
+          }
+        }
+        float wv[2][4];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 2u; ++part) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < 4u; ++j) wv[part][j] = w[part * 128u + lane * 4u + j];
+        }
+        float x[2][4];
+        float acc[2] = {0.0f, 0.0f};
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 2u; ++part) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < 4u; ++j) {
+            x[part][j] = src[part * 128u + lane * 4u + j];
+            acc[part] = metal::fma(x[part][j], x[part][j], acc[part]);
+          }
+        }
+        const float total = simd_sum(acc[0]) + simd_sum(acc[1]);
+        const float inv = metal::precise::rsqrt(total / float(D) + epsilon);
+        float y[2][4];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 2u; ++part) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < 4u; ++j) {
+            y[part][j] = wv[part][j] * (x[part][j] * inv);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4u; ++j) {
+          const float partner = simd_shuffle_xor(y[0][j], ushort(HALF_ROT / 4u));
+          const uint dim = lane * 4u + j;
+          if (dim < uint(ROPE_DIMS)) {
+            const float costheta = cos_j[j];
+            const float sintheta = sin_j[j];
+            y[0][j] = dim < HALF_ROT
+                ? metal::fma(y[0][j], costheta, -(partner * sintheta))
+                : metal::fma(partner, sintheta, y[0][j] * costheta);
+          }
+        }
+        """
+
+    private static func replacingOnce(_ text: String, _ old: String, _ new: String) -> String {
+        guard text.components(separatedBy: old).count == 2 else {
+            preconditionFailure("qwen35 verify q/k norm RoPE: hoist anchor not unique")
+        }
+        return text.replacingOccurrences(of: old, with: new)
+    }
+
+    private static let hoistKernel = MLXFast.metalKernel(
+        name: "qwen35_verify_qk_norm_rope_h",
+        inputNames: inputNames, outputNames: outputNames,
+        source: replacingOnce(source, normRopeParent, normRopeHoisted))
+
+    /// `DARKBLOOM_BONSAI_ROPE_HOIST=0` keeps the parent kernel.
+    static let hoisted = Qwen35MTPFusedDraftStep.environmentFlag("DARKBLOOM_BONSAI_ROPE_HOIST")
 
     /// `(queries [1, qHeads, L, 256], keys [1, kvHeads, L, 256])` or nil.
     static func apply(
@@ -3467,7 +3586,7 @@ enum Qwen35VerifyQKNormRoPE {
         else { return nil }
         let L = keyProjection.dim(1)
         let queryRows = lastQueryOnly ? 1 : L
-        let outputs = kernel(
+        let outputs = (hoisted ? hoistKernel : kernel)(
             [queryProjection, keyProjection, queryWeight, keyWeight,
                 MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),

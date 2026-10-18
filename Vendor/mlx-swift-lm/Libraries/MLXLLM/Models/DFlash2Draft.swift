@@ -1664,10 +1664,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
 
         if DF2Fast.on, h.ndim == 3, h.dim(0) == 1, h.size / h.dim(-1) <= 16, !layers.isEmpty {
-            let rSpec = DF2Fast.ropeSpec(self)
+            var rSpec = DF2Fast.ropeSpec(self)
             var normed: MLXArray?
             var normedCodes: DF2Fast.W4Codes?
-            if let group = DF2Fast.w4Group,
+            if let group = DF2Fast.w4Group, let baseSpec = rSpec, let first = cache.first,
+                cache.allSatisfy({ $0.offset == first.offset }),
+                let fused = DF2Fast.rmsQuantPhases(
+                    h, layers[0].inputLayerNorm, group: group, ropeSpec: baseSpec,
+                    C: context.dim(1), offset: first.offset)
+            {
+                normed = fused.0
+                normedCodes = fused.1
+                rSpec = fused.2
+            } else if let group = DF2Fast.w4Group,
                 let rq = DF2Fast.rmsQuant(h, layers[0].inputLayerNorm, group: group)
             {
                 (normed, normedCodes) = rq
@@ -2112,9 +2121,19 @@ enum DF2Fast {
     final class RopeSpec {
         let freqs: MLXArray
         let mscale: Float
-        init(freqs: MLXArray, mscale: Float) {
+        // Request-local immutable coefficients; never installed in ropeCache.
+        let phases: MLXArray?
+        let phaseOffset: Int
+        let phaseRows: Int
+        init(
+            freqs: MLXArray, mscale: Float, phases: MLXArray? = nil,
+            phaseOffset: Int = 0, phaseRows: Int = 0
+        ) {
             self.freqs = freqs
             self.mscale = mscale
+            self.phases = phases
+            self.phaseOffset = phaseOffset
+            self.phaseRows = phaseRows
         }
     }
     struct W4Codes {
@@ -3386,6 +3405,7 @@ enum DF2Fast {
             const device float* w;
             device float* dst;
             float pos;
+            int posRow;
             if (!isK) {
               h = vecIdx / L;
               s = vecIdx % L;
@@ -3396,6 +3416,7 @@ enum DF2Fast {
               w = qw;
               dst = q_out;
               pos = float(offset + C + s);
+              posRow = C + s;
             } else {
               const int kIdx = vecIdx - 32 * L;
               h = kIdx / CL;
@@ -3407,6 +3428,7 @@ enum DF2Fast {
               w = kw;
               dst = k_out;
               pos = float(offset + t);
+              posRow = t;
             }
             const size_t srcBase = ((size_t)s * H + h) * 128;
             const size_t dstBase = ((size_t)h * S_out + t) * 128;
@@ -3424,10 +3446,17 @@ enum DF2Fast {
             const float ny0 = (w[d0 + 64] * (y0 * inv_mean)) * mscale;
             const float nx1 = (w[d1] * (x1 * inv_mean)) * mscale;
             const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
-            const float th0 = pos * (1.0f / freqs[d0]);
-            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
-            const float th1 = pos * (1.0f / freqs[d1]);
-            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+            float c0, s0, c1, s1;
+            if (PHASES) {
+              const size_t phaseBase = ((size_t)posRow * 32 + lane) * 4;
+              c0 = freqs[phaseBase]; s0 = freqs[phaseBase + 1];
+              c1 = freqs[phaseBase + 2]; s1 = freqs[phaseBase + 3];
+            } else {
+              const float th0 = pos * (1.0f / freqs[d0]);
+              c0 = metal::fast::cos(th0); s0 = metal::fast::sin(th0);
+              const float th1 = pos * (1.0f / freqs[d1]);
+              c1 = metal::fast::cos(th1); s1 = metal::fast::sin(th1);
+            }
             dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
@@ -3446,12 +3475,15 @@ enum DF2Fast {
         let CL = C + L
         let totalVecs = 32 * L + 16 * CL
         let tgs = (totalVecs + 3) / 4
+        let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows == C + L
+            ? ropeSpec.phases : nil
         let outs = qkvAllNormRopeKernel(
             [
-                q, k, v, ck, cv, qw, kw, ropeSpec.freqs,
+                q, k, v, ck, cv, qw, kw, phases ?? ropeSpec.freqs,
                 MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
                 MLXArray([qNorm.eps, ropeSpec.mscale]),
             ],
+            template: [("PHASES", phases != nil)],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
             outputDTypes: [.float32, .float32, .float32])
@@ -3545,6 +3577,159 @@ enum DF2Fast {
               xs[l * G + g] = seq_sum;
             }
             """)
+
+    /// First request RMS/quant plus exact rotary coefficients, without an extra dispatch.
+    static let rmsQuantPhasesKernel = MLXFast.metalKernel(
+        name: "df2_rms_q8g_phases",
+        inputNames: ["x", "weight", "dsz", "eps_arr", "freqs", "phase_params"],
+        outputNames: ["out_norm", "xq", "ascale", "xs", "phases"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int l = int(threadgroup_position_in_grid.y);
+            const int L = dsz[1];
+            if (tid < 32u) {
+              for (int phaseRow = l; phaseRow < phase_params[0]; phaseRow += 16) {
+                const float pos = float(phase_params[1] + phaseRow);
+                const float th0 = pos * (1.0f / freqs[lane]);
+                const float th1 = pos * (1.0f / freqs[lane + 32u]);
+                const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
+                phases[phaseBase] = metal::fast::cos(th0);
+                phases[phaseBase + 1] = metal::fast::sin(th0);
+                phases[phaseBase + 2] = metal::fast::cos(th1);
+                phases[phaseBase + 3] = metal::fast::sin(th1);
+              }
+            }
+            const int c0 = int(tid) * 16;
+            const int G = D / KG;
+            const int g = int(tid) / (KG / 16);
+            if (l >= L) {
+              if (l < 16) {
+                const size_t qRowBase = (size_t)l * D + c0;
+                device char4* dst = (device char4*)(xq + qRowBase);
+                for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
+                if ((int(tid) & ((KG / 16) - 1)) == 0) {
+                  ascale[l * G + g] = 0.0f;
+                  xs[l * G + g] = 0.0f;
+                }
+              }
+              return;
+            }
+            const size_t rowBase = (size_t)l * D + c0;
+            float v[16];
+            float s4[4];
+            for (int k = 0; k < 4; k++) {
+              float ak = 0.0f;
+              for (int i = 0; i < 4; i++) {
+                const int u = 4 * k + i;
+                const float a = float(x[rowBase + u]);
+                v[u] = a;
+                ak += a * a;
+              }
+              s4[k] = ak;
+            }
+            float sq = (s4[0] + s4[1]) + (s4[2] + s4[3]);
+            sq += simd_shuffle_xor(sq, 1);
+            sq += simd_shuffle_xor(sq, 2);
+            sq += simd_shuffle_xor(sq, 4);
+            threadgroup float shared_sq[32];
+            if ((lane & 7u) == 0) { shared_sq[(sg << 2) | (lane >> 3)] = sq; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              const float tot = simd_sum(shared_sq[lane]);
+              if (lane == 0) {
+                shared_sq[0] = metal::precise::rsqrt(tot / uint(D) + eps_arr[0]);
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float scale = shared_sq[0];
+            float nv[16];
+            float local_amax = 0.0f;
+            for (int u = 0; u < 16; u++) {
+              const float y = float(weight[c0 + u]) * (v[u] * scale);
+              if (WRITE_NORM) { out_norm[rowBase + u] = y; }
+              nv[u] = y;
+              local_amax = max(local_amax, fabs(y));
+            }
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG == 128) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
+            }
+            float seq_sum = 0.0f;
+            const uint grpBase = lane & ~uint((KG / 16) - 1);
+            for (int step = 0; step < (KG / 16); step++) {
+              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if ((int(lane) & ((KG / 16) - 1)) == step) {
+                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              }
+            }
+            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+            const float ia = 1.0f / a;
+            device char4* dst = (device char4*)(xq + rowBase);
+            for (int u = 0; u < 4; u++) {
+              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+              dst[u] = char4(int4(rint(fv * ia)));
+            }
+            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
+              ascale[l * G + g] = a;
+              xs[l * G + g] = seq_sum;
+            }
+            """
+    )
+
+    static let rmsQuantPhasesWideKernel = MLXFast.metalKernel(
+        name: "df2_rms_q8g_phases_e\(DF2WideLanes.e)",
+        inputNames: ["x", "weight", "dsz", "eps_arr", "freqs", "phase_params"],
+        outputNames: ["out_norm", "xq", "ascale", "xs", "phases"],
+        source: DF2WideLaneSource.source(.rmsQuant, e: DF2WideLanes.e).replacingOccurrences(
+            of: "const int L = dsz[1];",
+            with: """
+                const int L = dsz[1];
+                if (tid < 32u) {
+                  for (int phaseRow = l; phaseRow < phase_params[0]; phaseRow += 16) {
+                    const float pos = float(phase_params[1] + phaseRow);
+                    const float th0 = pos * (1.0f / freqs[lane]);
+                    const float th1 = pos * (1.0f / freqs[lane + 32u]);
+                    const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
+                    phases[phaseBase] = metal::fast::cos(th0);
+                    phases[phaseBase + 1] = metal::fast::sin(th0);
+                    phases[phaseBase + 2] = metal::fast::cos(th1);
+                    phases[phaseBase + 3] = metal::fast::sin(th1);
+                  }
+                }
+                """))
+
+    static func rmsQuantPhases(
+        _ x: MLXArray, _ norm: RMSNorm, group: Int, ropeSpec: RopeSpec,
+        C: Int, offset: Int
+    ) -> (MLXArray, W4Codes, RopeSpec)? {
+        let D = x.dim(-1), L = x.size / D
+        guard on, D == 4096, (1 ... 16).contains(L), (1 ... 16).contains(C),
+            (group == 64 || group == 128), split > 0, D / group >= split,
+            offset >= 0, offset <= Int(Int32.max) - C - L
+        else { return nil }
+        let w = normWeight(norm)
+        // Keep the existing alternate-wide selection and self-check path intact.
+        let wide = DF2WideLanes.serves(
+            .init(kind: .rmsQuant, dtype: x.dtype, dtype2: w.dtype, k: D, group: group, flag: 0))
+        let rows = C + L, G = D / group
+        let lanes = D / (wide ? DF2WideLanes.e : 16)
+        let outs = (wide ? rmsQuantPhasesWideKernel : rmsQuantPhasesKernel)(
+            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps]), ropeSpec.freqs,
+                MLXArray([Int32(rows), Int32(offset)])],
+            template: [("D", D), ("KG", group), ("WRITE_NORM", 1)],
+            grid: (lanes, 16, 1), threadGroup: (lanes, 1, 1),
+            outputShapes: [x.shape, [16 * D], [16 * G], [16 * G], [rows, 32, 4]],
+            outputDTypes: [.float32, .int8, .float32, .float32, .float32])
+        let codes = W4Codes(
+            xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
+        let phases = RopeSpec(
+            freqs: ropeSpec.freqs, mscale: ropeSpec.mscale, phases: outs[4],
+            phaseOffset: offset, phaseRows: rows)
+        return (outs[0], codes, phases)
+    }
 
     static func rmsQuant(
         _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true

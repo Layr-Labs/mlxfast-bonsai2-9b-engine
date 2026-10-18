@@ -3455,86 +3455,34 @@ enum PromptInt8Matmul {
             ensureRowContiguous: true)
     }
 
-    /// `body` with each swap applied; a fragment that is not in the text
-    /// exactly once is a programming error.
-    private static func swapped(_ body: String, _ swaps: [(of: String, with: String)]) -> String {
-        swaps.reduce(body) { text, swap in
-            precondition(text.components(separatedBy: swap.of).count == 2, "fragment not found once: \(swap.of)")
-            return text.replacingOccurrences(of: swap.of, with: swap.with)
-        }
-    }
-
-    // `naxRegBody` on a 32 x 128 tile per threadgroup of four simdgroups, all
-    // on the same 32 rows, so one activation slice serves 128 columns instead
-    // of 64. Simdgroups 2 h and 2 h + 1 take the 64-column unit 2 x + h through
-    // `naxSgSource`'s layer pick, each its own 32-column half, so the pick's
-    // boundaries stay at N / 64: a threadgroup may span two layers, and a unit
-    // past the last layer (an odd unit count) returns before any access. Each
-    // simdgroup runs `naxRegBody`'s guard, operand build, op, epilogue and
-    // stores on its own 32 x 32 tile, so every output is `naxSgBody`'s bits
-    // (checked at load, `checkRegisterCols128`). grid (ceil(sum N / 128) *
-    // 128, M / 32).
-    static func naxRegCols128Source(layers: Int) -> String {
-        swapped(naxSgSource(layers: layers, body: naxRegBody), [
-            (of: "int bx = int(threadgroup_position_in_grid.x);",
-             with: "int bx = 2 * int(threadgroup_position_in_grid.x) + int(simdgroup_index_in_threadgroup >> 1);"),
-            (of: "const int Kg = K / 128;", with: "if (bx >= N / 64) { return; }\nconst int Kg = K / 128;"),
-            (of: "const int ns = bx * 64 + 32 * int(sg);", with: "const int ns = bx * 64 + 32 * int(sg & 1);"),
-        ])
-    }
-
-    /// `naxRegCols128Source` for one, two and three layers (index `layers - 1`).
-    private static let naxRegCols128Kernels = (1 ... 3).map { layers in
-        MLXFast.metalKernel(
-            name: "bonsai_q8_prompt_matmul_nax_reg_cols128_\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: naxRegCols128Source(layers: layers),
-            header: naxHeader,
-            ensureRowContiguous: true)
-    }
-
-    /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its
-    /// register-weight forms `naxRegBody` and `naxRegCols128Source`. Each names its kernels (index `layers - 1`), its
-    /// threads per threadgroup and its rows and columns per threadgroup.
-    enum SgForm {
-        case staged, register, registerCols128
-
-        var launch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
-            switch self {
-            case .staged: return (PromptInt8Matmul.naxSgKernels, 128, 64, 64)
-            case .register: return (PromptInt8Matmul.naxRegKernels, 64, 32, 64)
-            case .registerCols128: return (PromptInt8Matmul.naxRegCols128Kernels, 128, 32, 128)
-            }
-        }
-    }
-
     /// `naxSg`: the per-simdgroup kernel matched at load (it then replaces
     /// the vector one); `naxSgShared`: its two- and three-layer forms did too;
-    /// `sgForm`: the form of it the prompt route runs, the last one that
-    /// matched it on the prompt shapes.
+    /// `naxReg`: its register-weight form matched it on the prompt shapes.
     nonisolated(unsafe) private static var naxSg = false
     nonisolated(unsafe) private static var naxSgShared = false
-    nonisolated(unsafe) private static var sgForm = SgForm.staged
+    nonisolated(unsafe) private static var naxReg = false
 
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
-    /// one activation, in `form`; every N a multiple of 64, `m` of 64. Every
-    /// form has the same outputs.
+    /// one activation; every N a multiple of 64, `m` of 64. `register`: its
+    /// register-weight form (`naxRegBody`), the same outputs.
     private static func runSg(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, form: SgForm
+        m: Int, k: Int, negative: Bool, register: Bool
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
-        let launch = form.launch
-        return launch.kernels[layers.count - 1](
+        if register {
+            return naxRegKernels[layers.count - 1](
+                inputs, template: [("NEG", negative ? 1 : 0)],
+                grid: (ns.reduce(0, +) / 64 * 64, m / 32, 1), threadGroup: (64, 1, 1),
+                outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+        }
+        return naxSgKernels[layers.count - 1](
             inputs, template: [("NEG", negative ? 1 : 0)],
-            grid: ((ns.reduce(0, +) + launch.columns - 1) / launch.columns * launch.threads, m / launch.rows, 1),
-            threadGroup: (launch.threads, 1, 1),
+            grid: (ns.reduce(0, +) / 64 * 128, m / 64, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
     }
 
@@ -3577,13 +3525,17 @@ enum PromptInt8Matmul {
 
     nonisolated(unsafe) private static var registerFailed = false
 
-    /// `form` against `naxSgBody` (the kernel the prompt route runs) at
+    /// `naxRegBody` against `naxSgBody` (the kernel the prompt route runs) at
     /// `registerCheckRows` rows on every `registerCheckShapes` call, on fixed
     /// synthetic operands, `NEG = 0` and, where the offset skip is on,
     /// `NEG = 1`; every output bit compared. A compile or run error counts as
-    /// a mismatch. Returns whether every bit matched, and the detail for the
-    /// stderr line.
-    private static func matchesStaged(_ form: SgForm) -> (same: Bool, detail: String) {
+    /// a mismatch. Sets `naxReg`; returns the verdict for the stderr line.
+    private static func checkRegister() -> String {
+        naxReg = false
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_REG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(value ?? "") { return "off (DARKBLOOM_BONSAI_PROMPT_REG=0)" }
+        guard naxSg, naxSgShared else { return "off (the per-simdgroup shared kernel is not in use)" }
         let m = registerCheckRows
         var same = true
         var compared = 0
@@ -3616,57 +3568,27 @@ enum PromptInt8Matmul {
                 var cases = [(offsets, false)]
                 if negativeForms { cases.append((negated, true)) }
                 for (layers, negative) in cases where same {
-                    func outputs(_ which: SgForm) -> [MLXArray] {
+                    func outputs(_ register: Bool) -> [MLXArray] {
                         runSg(
                             codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
-                            negative: negative, form: which
+                            negative: negative, register: register
                         ).map { $0.view(dtype: .uint32) }
                     }
-                    let checks = zip(outputs(.staged), outputs(form)).map { MLX.all($0 .== $1) }
+                    let checks = zip(outputs(false), outputs(true)).map { MLX.all($0 .== $1) }
                     eval(checks)
                     same = !registerFailed && checks.allSatisfy { $0.item(Bool.self) }
                     compared += m * shape.ns.reduce(0, +)
                 }
             }
         }
-        same = same && !registerFailed
+        naxReg = same && !registerFailed
         registerFailed = false
         let shapes = registerCheckShapes.map { shape in
             "K \(shape.k) N \(shape.ns.map { String($0) }.joined(separator: "+"))"
         }.joined(separator: ", ")
-        return (same, same
-            ? "bitwise equal to the per-simdgroup kernel at rows \(m): \(shapes); NEG 0\(negativeForms ? " and 1" : ""); \(compared) values"
-            : "a check differed or failed to compile")
-    }
-
-    /// `true` when the environment switches `variable` off.
-    private static func switchedOff(_ variable: String) -> Bool {
-        let value = ProcessInfo.processInfo.environment[variable]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["0", "false", "no", "off"].contains(value ?? "")
-    }
-
-    /// `naxRegBody` against `naxSgBody`: `sgForm` becomes `.register` when
-    /// every bit matched. Returns the verdict for the stderr line.
-    private static func checkRegister() -> String {
-        sgForm = .staged
-        if switchedOff("DARKBLOOM_BONSAI_PROMPT_REG") { return "off (DARKBLOOM_BONSAI_PROMPT_REG=0)" }
-        guard naxSg, naxSgShared else { return "off (the per-simdgroup shared kernel is not in use)" }
-        let (same, detail) = matchesStaged(.register)
-        if same { sgForm = .register }
-        return same ? "on (\(detail))" : "off (\(detail); the per-simdgroup kernel is kept)"
-    }
-
-    /// `naxRegCols128Source` against `naxSgBody`, once a register-weight form
-    /// matched: `sgForm` becomes `.registerCols128` when every bit matched, else
-    /// the form selected before it stays. Returns the verdict for the stderr
-    /// line.
-    private static func checkRegisterCols128() -> String {
-        if switchedOff("DARKBLOOM_BONSAI_PROMPT_REG_COLS128") { return "off (DARKBLOOM_BONSAI_PROMPT_REG_COLS128=0)" }
-        guard sgForm != .staged else { return "off (the register-weight kernel is not in use)" }
-        let (same, detail) = matchesStaged(.registerCols128)
-        if same { sgForm = .registerCols128 }
-        return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
+        return naxReg
+            ? "on (bitwise equal to the per-simdgroup kernel at rows \(m): \(shapes); NEG 0\(negativeForms ? " and 1" : ""); \(compared) values)"
+            : "off (a check differed or failed to compile; the per-simdgroup kernel is kept)"
     }
 
     /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
@@ -3718,7 +3640,7 @@ enum PromptInt8Matmul {
             let outputs = runSg(
                 codes: codes, ascale: ascale, rsb: rsb,
                 layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
-                m: m, k: k, negative: negative, form: .staged)
+                m: m, k: k, negative: negative, register: false)
             return concatenated(outputs, axis: 1).view(dtype: .uint32)
         }
         var matched = false
@@ -3793,8 +3715,6 @@ enum PromptInt8Matmul {
         if chosen == .nax {
             FileHandle.standardError.write(
                 "int8 prompt register-weight kernel: \(checkRegister())\n".data(using: .utf8)!)
-            FileHandle.standardError.write(
-                "int8 prompt register-weight 128-column kernel: \(checkRegisterCols128())\n".data(using: .utf8)!)
         }
         return chosen
     }()
@@ -3830,7 +3750,7 @@ enum PromptInt8Matmul {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, form: sgForm)[0]
+                negative: negative && negativeForms, register: naxReg)[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -3854,7 +3774,7 @@ enum PromptInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative }, form: sgForm)
+                negative: negativeForms && layers.allSatisfy { $0.negative }, register: naxReg)
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
