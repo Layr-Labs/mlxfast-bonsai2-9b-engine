@@ -56,7 +56,8 @@ extension EngineLoopV2 {
         // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
             let seedPolicyTopTwo =
-                round.seedPolicyTopTwoValues?.asArray(Float.self)
+                mtp.consumesPolicyTopTwoMargin
+                ? round.seedPolicyTopTwoValues?.asArray(Float.self) : nil
             if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
@@ -106,7 +107,9 @@ extension EngineLoopV2 {
         Self.mtpPollUntilAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        let policyTopTwoHost =
+            mtp.consumesPolicyTopTwoMargin
+            ? verify.policyTopTwoValues?.asArray(Float.self) : nil
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
