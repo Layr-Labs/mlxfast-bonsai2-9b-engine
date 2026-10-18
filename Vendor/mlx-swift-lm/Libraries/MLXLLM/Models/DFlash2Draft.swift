@@ -2023,6 +2023,7 @@ enum DF2Fast {
     nonisolated(unsafe) static var fusedKVCache: [ObjectIdentifier: FusedKVOperands] = [:]
     nonisolated(unsafe) static var baseCache: [ObjectIdentifier: MLXArray] = [:]
     nonisolated(unsafe) static var normCache: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) static var normEpsilonCache: [UInt32: MLXArray] = [:]
     nonisolated(unsafe) static var ropeCache: [ObjectIdentifier: RopeSpec] = [:]
     nonisolated(unsafe) static var maskEmbedCache: [ObjectIdentifier: MLXArray] = [:]
 
@@ -2033,6 +2034,16 @@ enum DF2Fast {
         eval(weight)
         normCache[key] = weight
         return weight
+    }
+
+    /// RMSNorm.eps is immutable; preserve its Float bits while reusing the scalar operand.
+    static func normEpsilon(_ norm: RMSNorm) -> MLXArray {
+        let bits = norm.eps.bitPattern
+        if let value = normEpsilonCache[bits] { return value }
+        let value = MLXArray([norm.eps])
+        eval(value)
+        normEpsilonCache[bits] = value
+        return value
     }
 
     /// `norm(x)` with the norm's weight widened to FP32 once (no per-call cast).
@@ -3430,7 +3441,7 @@ enum DF2Fast {
         let G = D / group
         let gridY = Swift.max(L, 16)
         let outs = rmsQuantKernel(
-            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
+            [x, w, MLXArray([Int32(D), Int32(L)]), normEpsilon(norm)],
             template: [("D", D), ("KG", group)],
             grid: (256, gridY, 1), threadGroup: (256, 1, 1),
             outputShapes: [x.shape, [16 * D], [16 * G], [16 * G]],
@@ -3637,7 +3648,7 @@ enum DF2Fast {
                 [
                     h, dyn, base, residual, w,
                     MLXArray([Int32(D), Int32(L), Int32(qStart)]),
-                    MLXArray([norm.eps]),
+                    normEpsilon(norm),
                 ],
                 template: [("D", D), ("KG", group), ("WRITE_RES", writeRes ? 1 : 0)],
                 grid: (256, gridY, 1), threadGroup: (256, 1, 1),
@@ -3648,7 +3659,7 @@ enum DF2Fast {
             return (outs[0], outs[1], codes)
         }
         let outs = convRms(
-            [h, dyn, base, residual, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
+            [h, dyn, base, residual, w, MLXArray([Int32(D), Int32(L)]), normEpsilon(norm)],
             template: [("D", D)],
             grid: (256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape, h.shape], outputDTypes: [.float32, .float32])
