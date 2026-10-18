@@ -4185,6 +4185,23 @@ enum DF2WideLaneSource {
                 const float d1 = m >= 1 ? float(dyn[m * dw + (K >> 4) + cg]) : 0.0f;
                 float nv[\(e)];
                 float local_amax = 0.0f;
+                if (sizeof(h[0]) == 4 && sizeof(base[0]) == 4) {
+                for (int q = 0; q < \(e / 4); q++) {
+                  const int c = c0 + 4 * q;
+                  const float4 b0 = float4(*(const device float4*)(base + c));
+                  const float4 h0 = float4(*(const device float4*)(h + rowBase + 4 * q));
+                  float4 av = (b0 + d0) * h0;
+                  if (m >= 1) {
+                    const float4 b1 = float4(*(const device float4*)(base + K + c));
+                    const float4 h1 = float4(*(const device float4*)(h + rowBase - K + 4 * q));
+                    av += (b1 + d1) * h1;
+                  }
+                  for (int u = 0; u < 4; u++) {
+                    nv[4 * q + u] = av[u];
+                    local_amax = max(local_amax, fabs(av[u]));
+                  }
+                }
+                } else {
                 for (int u = 0; u < \(e); u++) {
                   const int c = c0 + u;
                   float a = (float(base[c]) + d0) * float(h[rowBase + u]);
@@ -4193,6 +4210,7 @@ enum DF2WideLaneSource {
                   }
                   nv[u] = a;
                   local_amax = max(local_amax, fabs(a));
+                }
                 }
 
                 """ + tail(e: e, row: "m", group: "g", base: "rowBase")
