@@ -951,15 +951,41 @@ private enum Qwen35PromptConvQKNorm {
             );
             """
 
+    private static let vectorSource = source.replacingOccurrences(
+        of: "float acc = 0.0f;",
+        with: "const float4 weights = ((const device float4*)conv_weight)[c]; float acc = 0.0f;")
+        .replacingOccurrences(of: "acc = fma(v, conv_weight[c * 4u + tap], acc);",
+            with: "acc = fma(v, weights[tap], acc);")
+
     private static let kernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prompt_conv_qk",
         inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out", "v_out"],
         source: source, ensureRowContiguous: true)
 
+    private static let vectorKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_vweights",
+        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out", "v_out"],
+        source: vectorSource, ensureRowContiguous: true)
+
     private static let qkOnlyKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_prompt_conv_qk_only",
         inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
         source: source.replacingOccurrences(
+            of: "const uint groups = uint(2 * HK + HV);", with: "const uint groups = uint(2 * HK);")
+            .replacingOccurrences(of: """
+            if (gi >= uint(2 * HK)) {
+              const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
+              ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
+              return;
+            }
+
+            """, with: ""),
+        ensureRowContiguous: true)
+
+    private static let qkOnlyVectorKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_only_vweights",
+        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
+        source: vectorSource.replacingOccurrences(
             of: "const uint groups = uint(2 * HK + HV);", with: "const uint groups = uint(2 * HK);")
             .replacingOccurrences(of: """
             if (gi >= uint(2 * HK)) {
@@ -984,7 +1010,11 @@ private enum Qwen35PromptConvQKNorm {
         else { return nil }
         let S = qkv.dim(1)
         let invScale = pow(Float(128), -0.5)
-        return (materializeValue ? kernel : qkOnlyKernel)(
+        let vectorWeights = (128 ... 512).contains(S)
+        let selected = materializeValue
+            ? (vectorWeights ? vectorKernel : kernel)
+            : (vectorWeights ? qkOnlyVectorKernel : qkOnlyKernel)
+        return selected(
             [state, qkv, weight],
             template: [("HK", keyHeads), ("HV", valueHeads), ("CONV_DIM", C),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
