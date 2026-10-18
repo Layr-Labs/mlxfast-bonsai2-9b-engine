@@ -2707,14 +2707,15 @@ enum DF2Fast {
     /// Fused `rmsNorm(x, weight, eps)` + `W4Codes` int8 group quantization for `D = 4096, L <= 16`.
     static let rmsQuantKernel = MLXFast.metalKernel(
         name: "df2_rms_q8g",
-        inputNames: ["x", "weight", "dsz", "eps_arr"],
+        inputNames: ["x", "weight", "eps_arr"],
         outputNames: ["out_norm", "xq", "ascale", "xs"],
         source: """
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup;
             const uint sg = simdgroup_index_in_threadgroup;
             const int l = int(threadgroup_position_in_grid.y);
-            const int L = dsz[1];
+            int L = 1;
+            for (int dim = 0; dim < x_ndim - 1; ++dim) { L *= x_shape[dim]; }
             const int c0 = int(tid) * 16;
             const int G = D / KG;
             const int g = int(tid) / (KG / 16);
@@ -2803,7 +2804,7 @@ enum DF2Fast {
         let G = D / group
         let gridY = Swift.max(L, 16)
         let outs = rmsQuantKernel(
-            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
+            [x, w, MLXArray([norm.eps])],
             template: [("D", D), ("KG", group)],
             grid: (256, gridY, 1), threadGroup: (256, 1, 1),
             outputShapes: [x.shape, [16 * D], [16 * G], [16 * G]],
