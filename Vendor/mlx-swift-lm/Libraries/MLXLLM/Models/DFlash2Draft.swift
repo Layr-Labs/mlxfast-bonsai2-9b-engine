@@ -319,10 +319,6 @@ public protocol DFlash2Target: AnyObject {
     /// The target's output projection, applied through the target's module. The
     /// drafter applies any config-level logit transform itself.
     func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray
-    /// The same output projection over the vocabulary prefix `0 ..< rows` only:
-    /// the target head's first `rows` output rows, through the same module type
-    /// and transform. Proposals only; the target's verify head stays full.
-    func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray
     /// Build, at load, the per-process state the target's `rows`-row verify head
     /// would otherwise build inside the first measured window. Never changes a token.
     func prepareDFlash2Verify(rows: Int)
@@ -330,97 +326,6 @@ public protocol DFlash2Target: AnyObject {
 
 extension DFlash2Target {
     public func prepareDFlash2Verify(rows: Int) {}
-    public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
-        logitsForDFlash2Hidden(hidden)
-    }
-}
-
-/// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 98304
-/// are the tokenizer's Latin, code and byte-level merges; the rows above are
-/// CJK and other scripts. A draft never reaches the output unverified: the
-/// target's full head checks every drafted token, so a narrower draft
-/// vocabulary changes only which tokens are proposed. `DF2_VOCAB=0` restores
-/// the full head.
-enum DF2Vocab {
-    static let rows: Int = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "") ?? 98304
-}
-
-/// The target head's prefix rows as one module, kept OFF the module tree (see
-/// `DFlash2TapSlot`). Its weight, scales and biases are row slices of the full
-/// head's arrays: views of the same buffers, no copy. Built once per head
-/// instance, at bind (load time), and kept only after a bitwise self-check.
-public final class DFlash2DraftHeadSlot {
-    private var source: ObjectIdentifier?
-    private var rows = 0
-    private var prefix: HadamardQuantizedLinear?
-
-    public init() {}
-
-    public func head(of full: HadamardQuantizedLinear, rows: Int) -> HadamardQuantizedLinear? {
-        if source == ObjectIdentifier(full), self.rows == rows { return prefix }
-        source = ObjectIdentifier(full)
-        self.rows = rows
-        prefix = nil
-        guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
-            rows > 0, rows < full.weight.dim(0)
-        else {
-            Self.report(rows, "off (head packing or row count does not qualify)")
-            return nil
-        }
-        guard
-            let candidate = try? HadamardQuantizedLinear(
-                weight: full.weight[0 ..< rows], scales: full.scales[0 ..< rows],
-                biases: biases[0 ..< rows], groupSize: full.groupSize, bits: full.bits,
-                transform: full.transform, gdnLayout: full.gdnLayout)
-        else {
-            Self.report(rows, "off (prefix module rejected)")
-            return nil
-        }
-        if let mismatch = Self.selfCheck(prefix: candidate, full: full, rows: rows) {
-            Self.report(rows, "off (\(mismatch); full head kept)")
-            return nil
-        }
-        Self.report(rows, "on (bitwise equal to the full head's first \(rows) columns, 15 rows, FP32 and BF16)")
-        prefix = candidate
-        return prefix
-    }
-
-    /// The prefix head against the full head's first `rows` output columns on a
-    /// fixed activation shaped like a proposal's (15 rows, a strided view of a
-    /// 16-row block), in FP32 (the fast drafter's hidden) and BF16 (the plain
-    /// drafter's). Nil when every bit matches, else the first difference found.
-    static func selfCheck(
-        prefix: HadamardQuantizedLinear, full: HadamardQuantizedLinear, rows: Int
-    ) -> String? {
-        let width = full.transform.width
-        let values = (0 ..< 16 * width).map { i -> Float in
-            let t = Double(i)
-            return Float(Foundation.sin(t * 0.7548776) * (1 + 0.5 * Foundation.cos(t * 0.0137)))
-        }
-        let block = MLXArray(values, [1, 16, width])
-        for dtype in [DType.float32, .bfloat16] {
-            let x = block.asType(dtype)[0..., 1..., 0...]
-            let p = prefix(x)
-            let f = full(x)[0..., 0..., 0 ..< rows]
-            guard p.shape == f.shape, p.dtype == f.dtype else {
-                return "\(dtype) shape or dtype differs"
-            }
-            let pf = contiguous(p.asType(.float32)).view(dtype: .uint32)
-            let ff = contiguous(f.asType(.float32)).view(dtype: .uint32)
-            let perRow = (pf .!= ff).asType(.int32).reshaped([-1, rows]).sum(axis: -1)
-            let counts = perRow.asArray(Int32.self)
-            let bad = counts.indices.filter { counts[$0] != 0 }
-            if !bad.isEmpty {
-                return "\(dtype): \(counts.reduce(0) { $0 + Int($1) }) values differ in rows "
-                    + bad.map(String.init).joined(separator: ",")
-            }
-        }
-        return nil
-    }
-
-    private static func report(_ rows: Int, _ state: String) {
-        FileHandle.standardError.write(Data("DF2 vocab prefix \(rows): \(state)\n".utf8))
-    }
 }
 
 /// Where a tower keeps its tap state, deliberately OFF the module tree.
@@ -639,7 +544,19 @@ private final class DFlash2Attention: Module {
         // The block sits immediately after the context, so both the queries and
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
+        var combinedKV: (k: MLXArray, v: MLXArray)? = nil
         if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
+            contextLength > 0, contextLength <= 16,
+            let fastCache = cache as? DFlash2LayerKVCache,
+            let allOut = DF2Fast.qkvAllNormRope(
+                q: queries, k: blockKeys, v: blockValues,
+                ck: contextKeys!, cv: contextValues!,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                L: L, C: contextLength, blockOffset: blockOffset, ctxOffset: fastCache.offset)
+        {
+            queries = allOut.0
+            combinedKV = (allOut.1, allOut.2)
+        } else if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
             let qkvOut = DF2Fast.qkvNormRope(
                 q: queries, k: blockKeys, v: blockValues,
                 qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
@@ -689,12 +606,21 @@ private final class DFlash2Attention: Module {
         let values: MLXArray
         let cachedLength: Int
         if let fastCache = cache as? DFlash2LayerKVCache {
-            let updated = fastCache.updateWithBlock(
-                contextKeys: contextKeys, contextValues: contextValues,
-                blockKeys: blockKeys, blockValues: blockValues)
-            keys = updated.keys
-            values = updated.values
-            cachedLength = updated.cachedLength
+            if let combinedKV {
+                let updated = fastCache.updateWithCombined(
+                    combinedKeys: combinedKV.k, combinedValues: combinedKV.v,
+                    C: contextLength, L: L)
+                keys = updated.keys
+                values = updated.values
+                cachedLength = updated.cachedLength
+            } else {
+                let updated = fastCache.updateWithBlock(
+                    contextKeys: contextKeys, contextValues: contextValues,
+                    blockKeys: blockKeys, blockValues: blockValues)
+                keys = updated.keys
+                values = updated.values
+                cachedLength = updated.cachedLength
+            }
         } else {
             let (cachedKeys, cachedValues) =
                 contextLength > 0
@@ -921,6 +847,37 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         }
         kBuf![.ellipsis, (end + C) ..< (end + C + L), 0...] = blockKeys
         vBuf![.ellipsis, (end + C) ..< (end + C + L), 0...] = blockValues
+        end += C
+        offset += C
+        let cachedLength = end - start
+        return (
+            kBuf![.ellipsis, start ..< (end + L), 0...],
+            vBuf![.ellipsis, start ..< (end + L), 0...],
+            cachedLength
+        )
+    }
+
+    func updateWithCombined(
+        combinedKeys: MLXArray, combinedValues: MLXArray, C: Int, L: Int
+    ) -> (keys: MLXArray, values: MLXArray, cachedLength: Int) {
+        let B = combinedKeys.dim(0)
+        let kvHeads = combinedKeys.dim(1)
+        let kDim = combinedKeys.dim(3)
+        let vDim = combinedValues.dim(3)
+
+        if C > 0, let maxW = maxWindowSize, end > start {
+            let valid = end - start
+            let trimSize = valid - maxW + 1
+            if trimSize > 0 {
+                start = Swift.min(end, start + trimSize)
+            }
+        }
+
+        ensureCapacity(
+            extra: C + L, B: B, kvHeads: kvHeads, kDim: kDim, vDim: vDim,
+            kDType: combinedKeys.dtype, vDType: combinedValues.dtype)
+        kBuf![.ellipsis, end ..< (end + C + L), 0...] = combinedKeys
+        vBuf![.ellipsis, end ..< (end + C + L), 0...] = combinedValues
         end += C
         offset += C
         let cachedLength = end - start
@@ -1272,13 +1229,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 drafter: config.hiddenSize, target: target.dFlash2HiddenSize)
         }
         self.target = target
-        // Build the prefix head (and run its bitwise self-check) at load, on
-        // both drafter paths, so no proposal pays for it.
-        let rows = DF2Vocab.rows
-        if rows >= config.dflash.selectorTopK && rows < config.vocabularySize {
-            let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
-            eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
-        }
         if DF2Fast.on { try prepareFirstRound(target) }
     }
 
@@ -1464,11 +1414,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     func logits(_ hidden: MLXArray) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        let rows = DF2Vocab.rows
-        var logits =
-            rows >= config.dflash.selectorTopK && rows < config.vocabularySize
-            ? target.draftLogitsForDFlash2Hidden(hidden, rows: rows)
-            : target.logitsForDFlash2Hidden(hidden)
+        var logits = target.logitsForDFlash2Hidden(hidden)
         if config.dflash.outputMultiplier != 1 {
             logits = logits * config.dflash.outputMultiplier
         }
@@ -1965,88 +1911,123 @@ enum DF2Fast {
     }
 
     /// x [R, K] (or silu(x) * x2, or head-major [1, 32, R, 128]) -> int8 codes per row and per KG-column group.
+    /// 16 contiguous columns per thread (`c0 = tid * 16`), single-pass register buffering, and SIMD-shuffle group reduction.
     static let quantG = MLXFast.metalKernel(
         name: "df2_act_q8g", inputNames: ["x", "x2", "ksz"], outputNames: ["xq", "ascale", "xs"],
         source: """
             const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
+            const int tid = int(thread_position_in_grid.x);
+            const uint lane = thread_index_in_simdgroup;
+            const int c0 = tid * 16;
+            if (c0 >= K) return;
             const int m = int(threadgroup_position_in_grid.y);
-            for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
-              const size_t dstBase = (size_t)m * K + g * KG;
-              const size_t srcBase = HEAD_MAJOR
-                  ? (((size_t)((g * KG) >> 7) * R + m) * 128 + ((g * KG) & 127))
-                  : dstBase;
-              float amax = 0.0f, sum = 0.0f;
-              if (m < R) {
-                for (int u = 0; u < KG; u++) {
-                  float a = float(x[srcBase + u]);
-                  if (SWIGLU) { const float b = float(x2[srcBase + u]); a = a / (1.0f + metal::exp(-a)) * b; }
-                  amax = max(amax, fabs(a)); sum += a;
-                }
-              }
-              const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
-              const float ia = 1.0f / a;
+            const int g = tid / (KG / 16);
+            const size_t dstBase = (size_t)m * K + c0;
+            if (m >= R) {
               device char4* dst = (device char4*)(xq + dstBase);
-              for (int u = 0; u < KG / 4; u++) {
-                float4 v = float4(0.0f);
-                if (m < R) {
-                  for (int j = 0; j < 4; j++) {
-                    float t = float(x[srcBase + 4 * u + j]);
-                    if (SWIGLU) { const float b = float(x2[srcBase + 4 * u + j]); t = t / (1.0f + metal::exp(-t)) * b; }
-                    v[j] = t;
-                  }
-                }
-                dst[u] = char4(int4(rint(v * ia)));
+              for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
+              if ((tid & ((KG / 16) - 1)) == 0) {
+                ascale[m * G + g] = 0.0f;
+                xs[m * G + g] = 0.0f;
               }
-              ascale[m * G + g] = m < R ? a : 0.0f;
-              xs[m * G + g] = sum;
+              return;
+            }
+            const size_t srcBase = HEAD_MAJOR
+                ? (((size_t)(c0 >> 7) * R + m) * 128 + (c0 & 127))
+                : dstBase;
+            float nv[16];
+            float local_amax = 0.0f;
+            for (int u = 0; u < 16; u++) {
+              float a = float(x[srcBase + u]);
+              if (SWIGLU) { const float b = float(x2[srcBase + u]); a = a / (1.0f + metal::exp(-a)) * b; }
+              nv[u] = a;
+              local_amax = max(local_amax, fabs(a));
+            }
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG == 128) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
+            }
+            float seq_sum = 0.0f;
+            const uint grpBase = lane & ~uint((KG / 16) - 1);
+            for (int step = 0; step < (KG / 16); step++) {
+              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if ((int(lane) & ((KG / 16) - 1)) == step) {
+                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              }
+            }
+            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+            const float ia = 1.0f / a;
+            device char4* dst = (device char4*)(xq + dstBase);
+            for (int u = 0; u < 4; u++) {
+              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+              dst[u] = char4(int4(rint(fv * ia)));
+            }
+            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
+              ascale[m * G + g] = a;
+              xs[m * G + g] = seq_sum;
             }
             """)
 
-    /// Fused `dynConv(part: 0, residual: nil)` + `quantG` in one kernel.
+    /// Fused `dynConv(part: 0, residual: nil)` + `quantG` in one kernel: 16 contiguous columns (= 1 conv group) per thread.
     static let quantGConv0 = MLXFast.metalKernel(
         name: "df2_act_q8g_conv0", inputNames: ["h", "dyn", "base", "ksz"],
         outputNames: ["xq", "ascale", "xs"],
         source: """
             const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
-            const int dw = 4 * (K / 16);
+            const int tid = int(thread_position_in_grid.x);
+            const uint lane = thread_index_in_simdgroup;
+            const int c0 = tid * 16;
+            if (c0 >= K) return;
             const int m = int(threadgroup_position_in_grid.y);
-            for (int g = int(thread_position_in_threadgroup.x); g < G; g += int(threads_per_threadgroup.x)) {
-              const size_t rowBase = (size_t)m * K + g * KG;
-              float amax = 0.0f, sum = 0.0f;
-              if (m < R) {
-                for (int u = 0; u < KG; u++) {
-                  const int c = g * KG + u;
-                  const int cg = c >> 4;
-                  float a = (float(base[c]) + float(dyn[m * dw + cg])) * float(h[rowBase + u]);
-                  if (m >= 1) {
-                    a += (float(base[K + c]) + float(dyn[m * dw + (K >> 4) + cg])) * float(h[rowBase - K + u]);
-                  }
-                  amax = max(amax, fabs(a)); sum += a;
-                }
-              }
-              const float a = amax > 0.0f ? amax / 127.0f : 1.0f;
-              const float ia = 1.0f / a;
+            const int g = tid / (KG / 16);
+            const size_t rowBase = (size_t)m * K + c0;
+            if (m >= R) {
               device char4* dst = (device char4*)(xq + rowBase);
-              for (int u = 0; u < KG / 4; u++) {
-                float4 v = float4(0.0f);
-                if (m < R) {
-                  const int c0 = g * KG + 4 * u;
-                  const int cg = c0 >> 4;
-                  const float d0 = float(dyn[m * dw + cg]);
-                  const float d1 = m >= 1 ? float(dyn[m * dw + (K >> 4) + cg]) : 0.0f;
-                  for (int j = 0; j < 4; j++) {
-                    const int c = c0 + j;
-                    float t = (float(base[c]) + d0) * float(h[rowBase + 4 * u + j]);
-                    if (m >= 1) {
-                      t += (float(base[K + c]) + d1) * float(h[rowBase - K + 4 * u + j]);
-                    }
-                    v[j] = t;
-                  }
-                }
-                dst[u] = char4(int4(rint(v * ia)));
+              for (int u = 0; u < 4; u++) { dst[u] = char4(0); }
+              if ((tid & ((KG / 16) - 1)) == 0) {
+                ascale[m * G + g] = 0.0f;
+                xs[m * G + g] = 0.0f;
               }
-              ascale[m * G + g] = m < R ? a : 0.0f;
-              xs[m * G + g] = sum;
+              return;
+            }
+            const int dw = 4 * (K / 16);
+            const float d0 = float(dyn[m * dw + tid]);
+            const float d1 = m >= 1 ? float(dyn[m * dw + (K >> 4) + tid]) : 0.0f;
+            float nv[16];
+            float local_amax = 0.0f;
+            for (int u = 0; u < 16; u++) {
+              const int c = c0 + u;
+              float a = (float(base[c]) + d0) * float(h[rowBase + u]);
+              if (m >= 1) {
+                a += (float(base[K + c]) + d1) * float(h[rowBase - K + u]);
+              }
+              nv[u] = a;
+              local_amax = max(local_amax, fabs(a));
+            }
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG == 128) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
+            }
+            float seq_sum = 0.0f;
+            const uint grpBase = lane & ~uint((KG / 16) - 1);
+            for (int step = 0; step < (KG / 16); step++) {
+              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if ((int(lane) & ((KG / 16) - 1)) == step) {
+                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              }
+            }
+            const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+            const float ia = 1.0f / a;
+            device char4* dst = (device char4*)(xq + rowBase);
+            for (int u = 0; u < 4; u++) {
+              const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+              dst[u] = char4(int4(rint(fv * ia)));
+            }
+            if ((int(lane) & ((KG / 16) - 1)) == (KG / 16) - 1) {
+              ascale[m * G + g] = a;
+              xs[m * G + g] = seq_sum;
             }
             """)
 
@@ -2159,14 +2140,18 @@ enum DF2Fast {
     ) -> W4Codes? {
         let K = kOverride ?? x.dim(-1)
         let rows = rowsOverride ?? (x.size / K)
-        guard (1 ... 16).contains(rows), K % group == 0, split > 0, K / group >= split else {
+        guard (1 ... 16).contains(rows), (group == 64 || group == 128), K % group == 0,
+            K % 16 == 0, split > 0, K / group >= split
+        else {
             return nil
         }
         let G = K / group
+        let totalThreads = K / 16
+        let tg = Swift.min(256, totalThreads)
         let q = quantG(
             [x, up ?? x, MLXArray([Int32(K), Int32(rows)])],
             template: [("SWIGLU", up == nil ? 0 : 1), ("KG", group), ("HEAD_MAJOR", headMajor ? 1 : 0)],
-            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
             outputDTypes: [.int8, .float32, .float32])
         return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
@@ -2212,10 +2197,12 @@ enum DF2Fast {
         let ops = layers.compactMap { w4Operands($0, group: group) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
         let G = K / group
+        let totalThreads = K / 16
+        let tg = Swift.min(256, totalThreads)
         let q = quantGConv0(
             [h.reshaped([rows, K]), dyn, base, MLXArray([Int32(K), Int32(rows)])],
             template: [("KG", group)],
-            grid: (128, 16, 1), threadGroup: (128, 1, 1),
+            grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
             outputDTypes: [.int8, .float32, .float32])
         let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
@@ -2384,6 +2371,118 @@ enum DF2Fast {
             outputShapes: [[1, 8, C, 128], [1, 8, C, 128]],
             outputDTypes: [.float32, .float32])
         return (outs[0], outs[1])
+    }
+
+    /// Fused `qNorm` + `kNorm` + `YarnRoPE` + `[1, S, H, 128] -> [1, H, S, 128]` transpose for BOTH
+    /// block `(queries, blockKeys, blockValues)` and context `(contextKeys, contextValues)`, producing
+    /// `queries` `[1, 32, L, 128]`, `combinedKeys` `[1, 8, C + L, 128]`, `combinedValues` `[1, 8, C + L, 128]`.
+    static let qkvAllNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_all_norm_rope",
+        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "inv_freqs", "params", "fparams"],
+        outputNames: ["q_out", "k_out", "v_out"],
+        source: """
+            const int L = params[0];
+            const int C = params[1];
+            const int offset = params[2];
+            const int CL = C + L;
+            const float eps = fparams[0];
+            const float mscale = fparams[1];
+            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            if (vecIdx >= 32 * L + 16 * CL) return;
+            const uint lane = thread_index_in_simdgroup;
+            const int d0 = int(lane);
+            const int d1 = d0 + 32;
+            if (vecIdx >= 32 * L + 8 * CL) {
+              const int vIdx = vecIdx - (32 * L + 8 * CL);
+              const int h = vIdx / CL;
+              const int t = vIdx % CL;
+              const device float* vsrc = (t < C) ? cv : bv;
+              const int s = (t < C) ? t : (t - C);
+              const size_t srcBase = ((size_t)s * 8 + h) * 128;
+              const size_t dstBase = ((size_t)h * CL + t) * 128;
+              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
+              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
+              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
+              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
+              return;
+            }
+            const bool isK = vecIdx >= 32 * L;
+            int h, t, s, H, S_out;
+            const device float* src;
+            const device float* w;
+            device float* dst;
+            float pos;
+            if (!isK) {
+              h = vecIdx / L;
+              s = vecIdx % L;
+              t = s;
+              H = 32;
+              S_out = L;
+              src = q;
+              w = qw;
+              dst = q_out;
+              pos = float(offset + C + s);
+            } else {
+              const int kIdx = vecIdx - 32 * L;
+              h = kIdx / CL;
+              t = kIdx % CL;
+              s = (t < C) ? t : (t - C);
+              H = 8;
+              S_out = CL;
+              src = (t < C) ? ck : bk;
+              w = kw;
+              dst = k_out;
+              pos = float(offset + t);
+            }
+            const size_t srcBase = ((size_t)s * H + h) * 128;
+            const size_t dstBase = ((size_t)h * S_out + t) * 128;
+            const float x0 = float(src[srcBase + d0]);
+            const float y0 = float(src[srcBase + d0 + 64]);
+            const float x1 = float(src[srcBase + d1]);
+            const float y1 = float(src[srcBase + d1 + 64]);
+            const float sq = simd_sum(x0 * x0 + y0 * y0 + x1 * x1 + y1 * y1);
+            const float scale = metal::precise::rsqrt(sq * (1.0f / 128.0f) + eps) * mscale;
+            const float nx0 = x0 * w[d0] * scale;
+            const float ny0 = y0 * w[d0 + 64] * scale;
+            const float nx1 = x1 * w[d1] * scale;
+            const float ny1 = y1 * w[d1 + 64] * scale;
+            const float th0 = pos * inv_freqs[d0];
+            const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
+            const float th1 = pos * inv_freqs[d1];
+            const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+            dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
+            dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
+            dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
+            dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            """)
+
+    static func qkvAllNormRope(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
+        L: Int, C: Int, blockOffset: Int, ctxOffset: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard on, L > 0, C > 0, blockOffset == ctxOffset + C,
+            qNorm.eps == kNorm.eps,
+            q.size == L * 32 * 128, k.size == L * 8 * 128, v.size == k.size,
+            ck.size == C * 8 * 128, cv.size == ck.size,
+            [q, k, v, ck, cv].allSatisfy({ $0.dtype == .float32 })
+        else { return nil }
+        let qw = normWeight(qNorm)
+        let kw = normWeight(kNorm)
+        let CL = C + L
+        let totalVecs = 32 * L + 16 * CL
+        let tgs = (totalVecs + 3) / 4
+        let outs = qkvAllNormRopeKernel(
+            [
+                q, k, v, ck, cv, qw, kw, ropeSpec.invFreqs,
+                MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
+                MLXArray([qNorm.eps, ropeSpec.mscale]),
+            ],
+            grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
+            outputDTypes: [.float32, .float32, .float32])
+        return (outs[0], outs[1], outs[2])
     }
 
     /// One part of `DFlash2GroupedDynamicCausalConv` (B = 1) in one kernel, plus an optional residual.

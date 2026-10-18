@@ -4030,9 +4030,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// The fused output-head top-two of the last captured verify forward.
     let verifyHeadTopTwo = Qwen35VerifyHeadTopTwoSlot()
 
-    /// The drafter's prefix head (`DFlash2DraftHeadSlot`), off the module tree.
-    let dFlash2DraftHead = DFlash2DraftHeadSlot()
-
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -4475,13 +4472,6 @@ extension Qwen35TextModel: DFlash2TapTarget {
         lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
     }
 
-    public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
-        guard let full = lmHead as? HadamardQuantizedLinear,
-            let prefix = dFlash2DraftHead.head(of: full, rows: rows)
-        else { return logitsForDFlash2Hidden(hidden) }
-        return prefix(hidden)
-    }
-
     /// One exact top-2 at `rows` rows over a fixed normalized activation: the
     /// head's lazily built constants and its one-time bit-exact self-check at
     /// that row count run here, at load, instead of inside the first round.
@@ -4776,10 +4766,6 @@ extension Qwen35Model: DFlash2TapTarget {
 
     public func logitsForDFlash2Hidden(_ hidden: MLXArray) -> MLXArray {
         languageModel.logitsForDFlash2Hidden(hidden)
-    }
-
-    public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
-        languageModel.draftLogitsForDFlash2Hidden(hidden, rows: rows)
     }
 
     public func prepareDFlash2Verify(rows: Int) {
