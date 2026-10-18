@@ -3823,33 +3823,28 @@ enum DF2Fast {
               }
             }
             threadgroup float ev[2][16];
+            threadgroup float pred_projected[256];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             int pr = anchor[0];
             for (int p = 0; p < P; p++) {
               const int c = tc[p][sg];
               uint predBase = 0u, succBase = 0u;
-              if constexpr (PRED_PACKED) { predBase = predLookup[predLookup_shape[0] == 1 ? 0 : pr]; }
-              if constexpr (SUCC_PACKED) { succBase = succLookup[succLookup_shape[0] == 1 ? 0 : c]; }
-              float acc = 0.0f;
-              for (int r = int(lane); r < 256; r += 64) {
-                const uint pair = uint(r >> 6) * 32u + lane;
-                const uint bit = (pair & 3u) * 24u;
-                const size_t offset = (pair >> 2u) * 3u + (bit >> 5u);
-                const uint shift = bit & 31u;
-                uint predCodes = 0u, succCodes = 0u;
+              if (sg == 0u) {
+                if constexpr (PRED_PACKED) { predBase = predLookup[predLookup_shape[0] == 1 ? 0 : pr]; }
+                for (int r = int(lane); r < 256; r += 64) {
+                  const uint pair = uint(r >> 6) * 32u + lane;
+                  const uint bit = (pair & 3u) * 24u;
+                  const size_t offset = (pair >> 2u) * 3u + (bit >> 5u);
+                  const uint shift = bit & 31u;
+                  uint predCodes = 0u;
                 if constexpr (PRED_PACKED) {
                   const size_t word = (size_t)pr * 96u + offset;
                   predCodes = uint(pred[word]) >> shift;
                   if (shift > 8u) predCodes |= uint(pred[word + 1u]) << (32u - shift);
                 }
-                if constexpr (SUCC_PACKED) {
-                  const size_t word = (size_t)c * 96u + offset;
-                  succCodes = uint(succ[word]) >> shift;
-                  if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
-                }
-                for (int part = 0; part < 2; part++) {
-                  const int component = r + part * 32;
-                  float pv, sv;
+                  for (int part = 0; part < 2; part++) {
+                    const int component = r + part * 32;
+                    float pv;
                   if constexpr (PRED_PACKED) {
                     const uint code = (predCodes >> (part * 12)) & 4095u;
                     const uint exponent = (code >> 7u) & 15u;
@@ -3857,6 +3852,27 @@ enum DF2Fast {
                         | ((exponent == 0u ? 0u : predBase + exponent - 1u) << 7u));
                     pv = cast_to<float>(uint16_to_bfloat16(value));
                   } else { pv = float(pred[(size_t)pr * 256 + component]); }
+                    pred_projected[component] = pv * float(proj[p * 256 + component]);
+                  }
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if constexpr (SUCC_PACKED) { succBase = succLookup[succLookup_shape[0] == 1 ? 0 : c]; }
+              float acc = 0.0f;
+              for (int r = int(lane); r < 256; r += 64) {
+                const uint pair = uint(r >> 6) * 32u + lane;
+                const uint bit = (pair & 3u) * 24u;
+                const size_t offset = (pair >> 2u) * 3u + (bit >> 5u);
+                const uint shift = bit & 31u;
+                uint succCodes = 0u;
+                if constexpr (SUCC_PACKED) {
+                  const size_t word = (size_t)c * 96u + offset;
+                  succCodes = uint(succ[word]) >> shift;
+                  if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
+                }
+                for (int part = 0; part < 2; part++) {
+                  const int component = r + part * 32;
+                  float sv;
                   if constexpr (SUCC_PACKED) {
                     const uint code = (succCodes >> (part * 12)) & 4095u;
                     const uint exponent = (code >> 7u) & 15u;
@@ -3864,7 +3880,7 @@ enum DF2Fast {
                         | ((exponent == 0u ? 0u : succBase + exponent - 1u) << 7u));
                     sv = cast_to<float>(uint16_to_bfloat16(value));
                   } else { sv = float(succ[(size_t)c * 256 + component]); }
-                  acc += pv * float(proj[p * 256 + component]) * sv;
+                  acc += pred_projected[component] * sv;
                 }
               }
               acc = simd_sum(acc);
