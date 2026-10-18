@@ -2019,11 +2019,7 @@ enum Qwen35RegisterGatedSIMD {
 enum Qwen35FusedGDNVerify {
     static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
-        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+    private static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -2250,8 +2246,132 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
+        """
+
+    private static let inputNames = ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"]
+    private static let outputNames = ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"]
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused",
+        inputNames: inputNames, outputNames: outputNames,
+        source: source, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// The value-channel conv of `source`: its copy loop stores before the
+    /// conv loop reads, so every (row, tap) load waits behind a device store.
+    private static let valueConvParent = """
+            for (uint t = tid / uint(DVPT); t < 3u + T; t += 256u / uint(DVPT)) {
+              const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+              conv_in[t * C + c] = xv;
+              if (t >= T) {
+                const uint xb = as_type<uint>(xv);
+                conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+              }
+            }
+            for (uint p = tid / uint(DVPT); p < T; p += 256u / uint(DVPT)) {
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = p + tap;
+                const float v = r < 3u ? conv_state[r * C + c] : qkv[(r - 3u) * C + c];
+                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              const float out = acc * sig;
+              v_tile[p * DVPT + col] = out;
+              v_out[(p * uint(Hv) + hv_idx) * uint(Dv) + dvblock * uint(DVPT) + col] = out;
+            }
+        """
+
+    /// The same conv with the q/k half's load order: the column's rows and
+    /// its four weights are read in one pass before any store, then each
+    /// thread copies and convolves the rows the parent's strided loops gave
+    /// it, from registers. Taps, SiLU and stores are the parent's text.
+    private static let valueConvHoisted = """
+            const uint vrow = tid / uint(DVPT);
+            constexpr uint VSTEP = 256u / uint(DVPT);
+            float xv[3 + MAX_T];
+            #pragma clang loop unroll(full)
+            for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+              if (t < 3u + T) xv[t] = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+            }
+            const float4 wv4 = ((const device float4*)conv_weight)[c];
+            const float wv[4] = {wv4.x, wv4.y, wv4.z, wv4.w};
+            #pragma clang loop unroll(full)
+            for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+              if (t < 3u + T && t % VSTEP == vrow) {
+                conv_in[t * C + c] = xv[t];
+                if (t >= T) {
+                  const uint xb = as_type<uint>(xv[t]);
+                  conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (uint p = 0; p < uint(MAX_T); ++p) {
+              if (p < T && p % VSTEP == vrow) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint tap = 0; tap < 4u; ++tap) {
+                  acc = fma(xv[p + tap], wv[tap], acc);
+                }
+                const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+                const float sig = acc < 0.0f ? e : 1.0f - e;
+                const float out = acc * sig;
+                v_tile[p * DVPT + col] = out;
+                v_out[(p * uint(Hv) + hv_idx) * uint(Dv) + dvblock * uint(DVPT) + col] = out;
+              }
+            }
+        """
+
+    /// The q/k RMSNorm job loop of `source`: each job's load waits behind the
+    /// previous job's stores.
+    private static let qkNormParent = """
+          for (uint job = sg; job < 2u * T; job += 8u) {
+            const uint part = job % 2u;
+            const uint t = job / 2u;
+            threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
+            const float4 x4 = ((threadgroup const float4*)(row + lane * 4u))[0];
+        """
+
+    /// The same jobs with every row of this simdgroup read first. Each
+    /// (part, t) row is read and written by its one simdgroup only, so no
+    /// hoisted load can see another job's store. The reduction, rsqrt,
+    /// scale and stores that follow are the parent's text.
+    private static let qkNormHoisted = """
+          float4 xs[(2 * MAX_T + 7) / 8];
+          #pragma clang loop unroll(full)
+          for (uint i = 0; i < uint((2 * MAX_T + 7) / 8); ++i) {
+            const uint job = sg + 8u * i;
+            if (job < 2u * T) {
+              xs[i] = ((threadgroup const float4*)(qk_raw + ((job % 2u) * MAX_T + job / 2u) * Dk + lane * 4u))[0];
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (uint i = 0; i < uint((2 * MAX_T + 7) / 8); ++i) {
+            const uint job = sg + 8u * i;
+            if (job >= 2u * T) continue;
+            const uint part = job % 2u;
+            const uint t = job / 2u;
+            threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
+            const float4 x4 = xs[i];
+        """
+
+    private static func replacingOnce(_ text: String, _ old: String, _ new: String) -> String {
+        guard text.components(separatedBy: old).count == 2 else {
+            preconditionFailure("qwen35 fused verify: hoist anchor not unique")
+        }
+        return text.replacingOccurrences(of: old, with: new)
+    }
+
+    private static let hoistKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused_vh",
+        inputNames: inputNames, outputNames: outputNames,
+        source: replacingOnce(
+            replacingOnce(source, valueConvParent, valueConvHoisted), qkNormParent, qkNormHoisted),
         header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `DARKBLOOM_BONSAI_VCONV_HOIST=0` keeps the parent kernel.
+    static let hoisted = Qwen35MTPFusedDraftStep.environmentFlag("DARKBLOOM_BONSAI_VCONV_HOIST")
 
     /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -2274,7 +2394,7 @@ enum Qwen35FusedGDNVerify {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let S = qkv.dim(1)
-        let outputs = kernel(
+        let outputs = (hoisted ? hoistKernel : kernel)(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
                 ("CONV_DIM", C), ("MAX_T", maximumRows),
