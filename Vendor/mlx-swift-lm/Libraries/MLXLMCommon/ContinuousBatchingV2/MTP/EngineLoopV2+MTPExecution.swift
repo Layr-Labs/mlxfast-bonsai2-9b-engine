@@ -606,6 +606,10 @@ extension EngineLoopV2 {
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        // The block drafter's `[batch, k]` proposal, when it already is the
+        // stacked draft row: the verify tokens and draft ids then take it
+        // whole instead of re-joining k one-token slices (one copy each).
+        var blockDraftIDs: MLXArray?
         var assistantEvalTargets: [MLXArray] = []
         if let lookupDrafts {
             // Host ids in the drafted chain's [B] int32 per-position shape.
@@ -659,6 +663,11 @@ extension EngineLoopV2 {
             mtp.recordEarlyDraftSubmission()
             for position in 0 ..< k {
                 draftSteps.append(batched[0..., position])
+            }
+            if CBv2MTPBlockTokenRow.enabled, batched.ndim == 2, batched.dim(0) == batch,
+                batched.dim(1) == k
+            {
+                blockDraftIDs = batched
             }
         } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -727,7 +736,7 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        let draftIDs = blockDraftIDs ?? stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -742,7 +751,8 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            tokens: blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) })
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -789,4 +799,11 @@ extension EngineLoopV2 {
         }
     }
 
+}
+
+/// `DARKBLOOM_BONSAI_BLOCK_TOKEN_ROW=0` re-joins the block drafter's verify
+/// tokens and draft ids from one-token slices, as the chain drafters do.
+enum CBv2MTPBlockTokenRow {
+    static let enabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_BLOCK_TOKEN_ROW"] != "0"
 }
