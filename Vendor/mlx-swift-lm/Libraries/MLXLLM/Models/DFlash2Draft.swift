@@ -2326,6 +2326,22 @@ enum DF2Fast {
             source: w4Source(layers: layers, group: group), header: header, ensureRowContiguous: true)
     }
 
+    /// The eligible W4 matrices fit in 32-bit element offsets. Specialize their
+    /// input stride while leaving tensor products and all FP32 reductions unchanged.
+    static let w4FormsKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
+        let group = w4Group ?? 64
+        let source = w4Source(layers: layers, group: group)
+            .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            .replacingOccurrences(of: "const size_t rowU4", with: "const uint rowU4")
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+        return MLXFast.metalKernel(
+            name: "df2_w4g\(group)_forms_\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: source, header: header, ensureRowContiguous: true)
+    }
+
     static func w4Quant(
         _ x: MLXArray, up: MLXArray?, group: Int, headMajor: Bool, rowsOverride: Int? = nil,
         kOverride: Int? = nil
@@ -2362,10 +2378,14 @@ enum DF2Fast {
         inputs += ops.map(\.sT)
         inputs += ops.map(\.bT)
         inputs += [codes.ascale, codes.xs, sizes]
-        let kernel = w4Kernels[layers.count - 1]
+        // Conservative element-count bound covers packed weights, scale/bias arrays,
+        // activation codes and every output. Unknown K or oversized matrices keep the parent.
+        let formsFit = (codes.K == 4096 || codes.K == 12288) && (1 ... 16).contains(codes.rows)
+            && ns.allSatisfy { $0 > 0 && UInt64($0) * UInt64(codes.K) < UInt64(UInt32.max) }
+        let kernel = (formsFit ? w4FormsKernels : w4Kernels)[layers.count - 1]
         let outs = kernel(
             inputs,
-            template: [("SPLIT", split)],
+            template: formsFit ? [("SPLIT", split), ("KC", codes.K)] : [("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [codes.rows, $0] }, outputDTypes: ns.map { _ in .float32 })
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
