@@ -3230,13 +3230,13 @@ enum DF2Fast {
 
     /// Multi-block parallel top-16 per (row, block): 8 blocks of 256 threads per row (120 blocks for P=15).
     static let topk = MLXFast.metalKernel(
-        name: "df2_topk16_mb8", inputNames: ["logits", "vsz"], outputNames: ["ids", "vals"],
+        name: "df2_topk16_mb8", inputNames: ["logits"], outputNames: ["ids", "vals"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint blk = threadgroup_position_in_grid.y;
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-            const int Vn = vsz[0];
+            const int Vn = logits_shape[1];
             const device float* lr = logits + (size_t)row * Vn;
             const float NEG = -INFINITY;
             float tv[4] = {NEG, NEG, NEG, NEG}; int ti[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
@@ -3385,7 +3385,7 @@ enum DF2Fast {
     ) -> MLXArray {
         let V = logits.dim(-1), P = logits.size / V
         let top = topk(
-            [logits.reshaped([P, V]).asType(.float32), MLXArray([Int32(V)])],
+            [logits.reshaped([P, V]).asType(.float32)],
             grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
             outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
         let path = selector(
