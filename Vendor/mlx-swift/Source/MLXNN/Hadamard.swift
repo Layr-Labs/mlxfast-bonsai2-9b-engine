@@ -3397,119 +3397,6 @@ enum VerifyInt8Matmul {
         return pick + naxFastBody
     }
 
-    /// `naxFastBody` with its weight staging read 16 bytes per lane (the
-    /// design of the public, never-measured `454346b9`). The parent kernel's
-    /// lane (c = lane >> 3, j = lane & 7) loads word j of rows c, c + 4, ...,
-    /// c + 28 of a group, one 4-byte load each; here lane l loads words
-    /// 4 (l & 1) ... + 3 of rows l >> 1 and (l >> 1) + 16 as two `uint4`.
-    /// Every (row, word) slot of the staged tile receives the same device word
-    /// through the same expansion, the stores rotated by (l >> 1) & 3 to keep
-    /// the threadgroup banks spread; the multiply, the accumulation order and
-    /// the epilogue are the parent's. Nil when a replaced fragment is missing.
-    static let naxFastWideBody: String? = {
-        var body = naxFastBody
-        let swaps: [(String, String)] = [
-            ("""
-                const int j = int(lane & 7u);
-                const int c = int(lane >> 3);
-                const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
-                threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
-                uint32_t wv[8];
-                """,
-             """
-                const int wr = int(lane >> 1);
-                const int wq = 4 * int(lane & 1u);
-                const int rot = wr & 3;
-                const device uint4* wcol0 = (const device uint4*)(w + (size_t)(n0 + wr) * KW + wq);
-                const device uint4* wcol1 = (const device uint4*)(w + (size_t)(n0 + wr + 16) * KW + wq);
-                threadgroup uint4* dst0 = (threadgroup uint4*)bs[sg] + wr * 8 + wq;
-                threadgroup uint4* dst1 = (threadgroup uint4*)bs[sg] + (wr + 16) * 8 + wq;
-                uint4 wv0, wv1;
-                """),
-            ("""
-                  #pragma clang loop unroll(full)
-                  for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
-                  sA = *(const device half4*)(scol + (size_t)gl * N);
-                  sB = *(const device half4*)(scol + (size_t)gl * N + 16);
-                  if (!NEG) {
-                    bA = *(const device half4*)(bcol + (size_t)gl * N);
-                    bB = *(const device half4*)(bcol + (size_t)gl * N + 16);
-                  }
-                  fa = ascale[mr * Kg + gl];
-                  frb = rsb[mr * Kg + gl];
-                  if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
-                }
-                for
-                """,
-             """
-                  wv0 = wcol0[(size_t)gl * 2]; wv1 = wcol1[(size_t)gl * 2];
-                  sA = *(const device half4*)(scol + (size_t)gl * N);
-                  sB = *(const device half4*)(scol + (size_t)gl * N + 16);
-                  if (!NEG) {
-                    bA = *(const device half4*)(bcol + (size_t)gl * N);
-                    bB = *(const device half4*)(bcol + (size_t)gl * N + 16);
-                  }
-                  fa = ascale[mr * Kg + gl];
-                  frb = rsb[mr * Kg + gl];
-                  if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
-                }
-                for
-                """),
-            ("""
-                  for (int t = 0; t < 8; t++) {
-                    const uint32_t v = wv[t];
-                    dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
-                  }
-                """,
-             """
-                  for (int q = 0; q < 4; q++) {
-                    const int qq = (q + rot) & 3;
-                    const uint32_t v0 = qq == 0 ? wv0.x : qq == 1 ? wv0.y : qq == 2 ? wv0.z : wv0.w;
-                    dst0[qq] = uint4(v0 & 0x03030303u, (v0 >> 2) & 0x03030303u, (v0 >> 4) & 0x03030303u, (v0 >> 6) & 0x03030303u);
-                    const uint32_t v1 = qq == 0 ? wv1.x : qq == 1 ? wv1.y : qq == 2 ? wv1.z : wv1.w;
-                    dst1[qq] = uint4(v1 & 0x03030303u, (v1 >> 2) & 0x03030303u, (v1 >> 4) & 0x03030303u, (v1 >> 6) & 0x03030303u);
-                  }
-                """),
-            ("""
-                    #pragma clang loop unroll(full)
-                    for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }
-                    sA = *(const device half4*)(scol + (size_t)gl * N);
-                """,
-             """
-                    wv0 = wcol0[(size_t)gl * 2]; wv1 = wcol1[(size_t)gl * 2];
-                    sA = *(const device half4*)(scol + (size_t)gl * N);
-                """),
-        ]
-        for (old, new) in swaps {
-            guard body.components(separatedBy: old).count == 2 else { return nil }
-            body = body.replacingOccurrences(of: old, with: new)
-        }
-        return body.contains("wv[") ? nil : body
-    }()
-
-    /// `naxFastSource` over `naxFastWideBody`.
-    static func naxFastWideSource(layers: Int) -> String? {
-        guard let wide = naxFastWideBody else { return nil }
-        let source = naxFastSource(layers: layers)
-        guard source.hasSuffix(naxFastBody) else { return nil }
-        return String(source.dropLast(naxFastBody.count)) + wide
-    }
-
-    private static let naxFastWideKernels: [MLXFast.MLXFastKernel]? = {
-        let sources = (1 ... 3).compactMap { naxFastWideSource(layers: $0) }
-        guard sources.count == 3 else { return nil }
-        return (1 ... 3).map { layers in
-            MLXFast.metalKernel(
-                name: "bonsai_q8_verify_matmul_nax_fast_wide\(layers)",
-                inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                    + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
-                outputNames: (0 ..< layers).map { "out\($0)" },
-                source: sources[layers - 1],
-                header: PromptInt8Matmul.naxHeader,
-                ensureRowContiguous: true)
-        }
-    }()
-
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_verify_matmul_nax",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -3546,11 +3433,6 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
     nonisolated(unsafe) private static var naxShared = false
-    /// The wide-staging forms matched the fast kernel at load (every form in
-    /// use, 4 and 16 rows). `DARKBLOOM_BONSAI_INT8_VERIFY_WIDE=0` keeps them off.
-    nonisolated(unsafe) private static var naxWide = false
-    nonisolated(unsafe) private static var wideNote = "off"
-    nonisolated(unsafe) private static var wideFailed = false
 
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
@@ -3572,15 +3454,14 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, wide: Bool = naxWide
+        m: Int, k: Int, negative: Bool
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
         let template = [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
-        let kernels = wide ? naxFastWideKernels ?? naxFastKernels : naxFastKernels
-        return kernels[layers.count - 1](
+        return naxFastKernels[layers.count - 1](
             inputs, template: template,
             grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -3674,54 +3555,6 @@ enum VerifyInt8Matmul {
         return matched
     }
 
-    /// The wide-staging fast kernel against the fast kernel, bit for bit, on
-    /// a fixed input-independent 64 x 1024 problem at 4 and 16 rows, for the
-    /// one-, two- and three-layer forms and both offset forms in use. Any
-    /// mismatch or compile error keeps the fast kernel.
-    private static func checkWide() -> Bool {
-        guard naxFastWideKernels != nil else { wideNote = "wide forms not built"; return false }
-        let n = 64, k = 1024, kg = k / 128
-        let weight = MLXArray((0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 3) &* 2_654_435_761) }, [n, k / 16])
-        let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
-        let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
-        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
-        wideFailed = false
-        var matched = true
-        withErrorHandler({ message in
-            if !VerifyInt8Matmul.wideFailed { VerifyInt8Matmul.wideNote = "wide error: " + String(message.prefix(120)) }
-            VerifyInt8Matmul.wideFailed = true
-        }) {
-            for m in [4, tileRows] {
-                let codes = MLXArray(
-                    (0 ..< tileRows * k).map { $0 < m * k ? Int8(truncatingIfNeeded: ($0 * 41 + 7) % 255 - 127) : 0 },
-                    [tileRows, k])
-                let ascale = MLXArray((0 ..< m * kg).map { Float(1 + $0 % 11) / 256 }, [m * kg])
-                let rsb = MLXArray((0 ..< m * kg).map { Float($0 % 17 - 8) / 64 }, [m * kg])
-                for negative in negativeForms ? [false, true] : [false] {
-                    let offsets = negative ? negatedT : biasesT
-                    for columns in [[0 ..< n], [0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]] {
-                        let layers = columns.map {
-                            (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0])
-                        }
-                        let fast = runFast(
-                            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
-                            negative: negative, wide: false)
-                        let wide = runFast(
-                            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
-                            negative: negative, wide: true)
-                        let equal = MLX.all(
-                            concatenated(fast, axis: 1).view(dtype: .uint32)
-                                .== concatenated(wide, axis: 1).view(dtype: .uint32))
-                        eval(equal)
-                        if wideFailed || !equal.item(Bool.self) { matched = false }
-                    }
-                }
-            }
-        }
-        if !wideFailed { wideNote = matched ? "wide" : "wide differs" }
-        return matched && !wideFailed
-    }
-
     /// Decided once, at the first packed module's init. A NAX device takes
     /// the tensor kernel only when it compiles and matches the plain kernel
     /// bit for bit; otherwise it keeps the record's float path. Any other
@@ -3737,17 +3570,12 @@ enum VerifyInt8Matmul {
             chosen = .off
         } else if value == "nax" || PromptInt8Matmul.architectureHasNAX(architecture) {
             chosen = checkKernels(nax: true) ? .nax : .off
-            let wideValue = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_WIDE"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if chosen == .nax, naxFast, !["0", "false", "no", "off"].contains(wideValue ?? "") {
-                naxWide = checkWide()
-            }
         } else {
             checkKernels(nax: false)
             chosen = .plain
         }
         FileHandle.standardError.write(
-            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote); \(wideNote))\n"
+            "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote))\n"
                 .data(using: .utf8)!)
         return chosen
     }()
