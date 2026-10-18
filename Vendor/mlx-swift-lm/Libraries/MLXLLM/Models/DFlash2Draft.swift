@@ -645,7 +645,19 @@ private final class DFlash2Attention: Module {
         // the block's own keys rotate at the context's far end.
         let blockOffset = cache.offset + contextLength
         var combinedKV: (k: MLXArray, v: MLXArray)? = nil
+        var placedKV: (MLXArray, MLXArray, Int)? = nil
         if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
+            contextLength > 0, contextLength <= 16,
+            let fastCache = cache as? DFlash2LayerKVCache,
+            let placed = fastCache.normRopeInPlace(
+                q: queries, k: blockKeys, v: blockValues,
+                ck: contextKeys!, cv: contextValues!,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                L: L, C: contextLength, blockOffset: blockOffset)
+        {
+            queries = placed.queries
+            placedKV = (placed.keys, placed.values, placed.cachedLength)
+        } else if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
             contextLength > 0, contextLength <= 16,
             let fastCache = cache as? DFlash2LayerKVCache,
             let allOut = DF2Fast.qkvAllNormRope(
@@ -705,7 +717,9 @@ private final class DFlash2Attention: Module {
         let keys: MLXArray
         let values: MLXArray
         let cachedLength: Int
-        if let fastCache = cache as? DFlash2LayerKVCache {
+        if let placedKV {
+            (keys, values, cachedLength) = placedKV
+        } else if let fastCache = cache as? DFlash2LayerKVCache {
             if let combinedKV {
                 let updated = fastCache.updateWithCombined(
                     combinedKeys: combinedKV.k, combinedValues: combinedKV.v,
@@ -961,6 +975,38 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
             kBuf![.ellipsis, start ..< (end + L), 0...],
             vBuf![.ellipsis, start ..< (end + L), 0...],
             cachedLength
+        )
+    }
+
+    /// `qkvAllNormRope` + `updateWithCombined` in one launch: the kernel writes the C + L rotated
+    /// K rows and V rows at `end`, so no slice update copies them. Same trim, same capacity rule,
+    /// same rows, same returned views.
+    func normRopeInPlace(
+        q: MLXArray, k: MLXArray, v: MLXArray, ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: DF2Fast.RopeSpec, L: Int, C: Int, blockOffset: Int
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray, cachedLength: Int)? {
+        guard DF2Fast.inPlaceKVPassed, L > 0, C > 0, blockOffset == offset + C else { return nil }
+        if let maxW = maxWindowSize, end > start {
+            let valid = end - start
+            let trimSize = valid - maxW + 1
+            if trimSize > 0 {
+                start = Swift.min(end, start + trimSize)
+            }
+        }
+        ensureCapacity(
+            extra: C + L, B: 1, kvHeads: 8, kDim: 128, vDim: 128,
+            kDType: .float32, vDType: .float32)
+        let kc = kBuf!, vc = vBuf!
+        let queries = DF2Fast.qkvAllNormRopeInPlace(
+            q: q, k: k, v: v, ck: ck, cv: cv, qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+            L: L, C: C, ctxOffset: offset, kc: kc, vc: vc, kvBase: end)
+        end += C
+        offset += C
+        return (
+            queries,
+            kc[.ellipsis, start ..< (end + L), 0...],
+            vc[.ellipsis, start ..< (end + L), 0...],
+            end - start
         )
     }
 
@@ -1519,6 +1565,83 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
+        checkInPlaceKV()
+    }
+
+    /// Load-time check: `normRopeInPlace` against `qkvAllNormRope` + `updateWithCombined` on two
+    /// identical synthetic caches with a cached prefix, two rounds each at C = 1, 7 and 16, L = 16:
+    /// every bit of the queries and of the returned K/V cache views, and the cached lengths. Any
+    /// difference or error keeps the slice-update path.
+    private func checkInPlaceKV() {
+        func log(_ s: String) {
+            FileHandle.standardError.write(Data("DF2 in-place kv: \(s)\n".utf8))
+        }
+        DF2Fast.inPlaceKVPassed = false
+        guard DF2Fast.inPlaceKVOffered, let attn = layers.first?.selfAttn,
+            let rSpec = DF2Fast.ropeSpec(self)
+        else { return log("off") }
+        func wave(_ shape: [Int], _ seed: Float) -> MLXArray {
+            let n = shape.reduce(1, *)
+            let i = MLXArray(0 ..< n).asType(.float32)
+            let w = MLX.sin(i * (0.7548776 + seed)) * (1 + 0.5 * MLX.cos(i * 0.0137 + seed))
+            return w.reshaped(shape)
+        }
+        func same(_ x: MLXArray, _ y: MLXArray) -> MLXArray {
+            MLX.all(contiguous(x).view(dtype: .uint32) .== contiguous(y).view(dtype: .uint32))
+        }
+        var verdict = "mismatch"
+        do {
+            let equal = try withError { () -> Bool in
+                let L = 16
+                var eqs: [MLXArray] = []
+                var lengthsMatch = true
+                for C in [1, 7, 16] {
+                    let a = DFlash2LayerKVCache(maxWindowSize: nil)
+                    let b = DFlash2LayerKVCache(maxWindowSize: nil)
+                    let pk = wave([1, 8, 5 + C, 128], 0.01)
+                    let pv = wave([1, 8, 5 + C, 128], 0.02)
+                    a.absorb(contextKeys: pk, contextValues: pv)
+                    b.absorb(contextKeys: pk, contextValues: pv)
+                    for round in 0 ..< 2 {
+                        let r = Float(round) * 0.1
+                        let q = wave([1, L, 32 * 128], 0.03 + r)
+                        let k = wave([1, L, 8 * 128], 0.04 + r)
+                        let v = wave([1, L, 8 * 128], 0.05 + r)
+                        let ck = wave([1, C, 8 * 128], 0.06 + r)
+                        let cv = wave([1, C, 8 * 128], 0.07 + r)
+                        guard let all = DF2Fast.qkvAllNormRope(
+                            q: q, k: k, v: v, ck: ck, cv: cv, qNorm: attn.qNorm, kNorm: attn.kNorm,
+                            ropeSpec: rSpec, L: L, C: C, blockOffset: a.offset + C, ctxOffset: a.offset)
+                        else { return false }
+                        let ua = a.updateWithCombined(
+                            combinedKeys: all.1, combinedValues: all.2, C: C, L: L)
+                        DF2Fast.inPlaceKVPassed = true
+                        let ub = b.normRopeInPlace(
+                            q: q, k: k, v: v, ck: ck, cv: cv, qNorm: attn.qNorm, kNorm: attn.kNorm,
+                            ropeSpec: rSpec, L: L, C: C, blockOffset: b.offset + C)
+                        DF2Fast.inPlaceKVPassed = false
+                        guard let ub else { return false }
+                        // The views are read only after the writing launch (in a proposal the
+                        // attention also takes the queries); here the order is made explicit.
+                        eval(ub.queries)
+                        lengthsMatch = lengthsMatch && ua.cachedLength == ub.cachedLength
+                            && a.offset == b.offset
+                        eqs.append(same(all.0, ub.queries))
+                        eqs.append(same(ua.keys, ub.keys))
+                        eqs.append(same(ua.values, ub.values))
+                        eval(eqs)
+                    }
+                }
+                return lengthsMatch && MLX.all(MLX.stacked(eqs)).item(Bool.self)
+            }
+            if equal {
+                DF2Fast.inPlaceKVPassed = true
+                verdict = "bitwise equal to the slice-update path at C = 1, 7, 16 over two rounds"
+            }
+        } catch {
+            verdict = "error \(error)"
+        }
+        log(verdict)
     }
 
     // MARK: The cache
@@ -3354,7 +3477,9 @@ enum DF2Fast {
         name: "df2_qkv_all_norm_rope",
         inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
         outputNames: ["q_out", "k_out", "v_out"],
-        source: """
+        source: qkvAllNormRopeSource)
+
+    static let qkvAllNormRopeSource = """
             const int L = params[0];
             const int C = params[1];
             const int offset = params[2];
@@ -3432,7 +3557,56 @@ enum DF2Fast {
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
             dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
-            """)
+            """
+
+    /// `DARKBLOOM_BONSAI_DF2_INPLACE_KV=0` keeps the separate cache slice updates.
+    static let inPlaceKVOffered =
+        on && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_INPLACE_KV"] != "0"
+    /// Written once by `checkInPlaceKV` at bind; read-only afterwards.
+    nonisolated(unsafe) static var inPlaceKVPassed = false
+
+    /// `df2_qkv_all_norm_rope` with the rotated K rows and the V rows written straight into the
+    /// layer's cache buffers `kc`/`vc` (`[1, 8, cap, 128]`) at row `kv_base + t` instead of into
+    /// fresh `[1, 8, C + L, 128]` outputs that a slice update then copies there. Same text, same
+    /// values: only the destination index changes.
+    static let qkvAllNormRopeInPlaceKernel: MLXFast.MLXFastKernel = {
+        var src = qkvAllNormRopeSource
+        func swap(_ from: String, _ to: String) {
+            precondition(src.components(separatedBy: from).count == 2, "df2 in-place kv source: \(from)")
+            src = src.replacingOccurrences(of: from, with: to)
+        }
+        swap("const int CL = C + L;", "const int CL = C + L;\nconst int CAP = params[3];\nconst int KVB = params[4];")
+        swap("const size_t dstBase = ((size_t)h * CL + t) * 128;", "const size_t dstBase = ((size_t)h * CAP + KVB + t) * 128;")
+        swap("v_out[dstBase + d0] =", "vc[dstBase + d0] =")
+        swap("v_out[dstBase + d0 + 64] =", "vc[dstBase + d0 + 64] =")
+        swap("v_out[dstBase + d1] =", "vc[dstBase + d1] =")
+        swap("v_out[dstBase + d1 + 64] =", "vc[dstBase + d1 + 64] =")
+        swap("dst = k_out;", "dst = kc;")
+        swap("const size_t dstBase = ((size_t)h * S_out + t) * 128;",
+             "const size_t dstBase = isK ? ((size_t)h * CAP + KVB + t) * 128 : ((size_t)h * S_out + t) * 128;")
+        return MLXFast.metalKernel(
+            name: "df2_qkv_all_norm_rope_kv",
+            inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams", "kc", "vc"],
+            outputNames: ["q_out"], source: src, mutableInputs: ["kc", "vc"])
+    }()
+
+    /// The queries of `qkvAllNormRope`; its K/V rows land in `kc`/`vc` rows `kvBase ..< kvBase + C + L`.
+    static func qkvAllNormRopeInPlace(
+        q: MLXArray, k: MLXArray, v: MLXArray, ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
+        L: Int, C: Int, ctxOffset: Int, kc: MLXArray, vc: MLXArray, kvBase: Int
+    ) -> MLXArray {
+        let CL = C + L
+        let tgs = (32 * L + 16 * CL + 3) / 4
+        let ints = MLXArray([Int32(L), Int32(C), Int32(ctxOffset), Int32(kc.dim(2)), Int32(kvBase)])
+        let floats = MLXArray([qNorm.eps, ropeSpec.mscale])
+        let inputs: [MLXArray] = [
+            q, k, v, ck, cv, normWeight(qNorm), normWeight(kNorm), ropeSpec.freqs, ints, floats, kc, vc,
+        ]
+        return qkvAllNormRopeInPlaceKernel(
+            inputs, grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 32, L, 128]], outputDTypes: [.float32])[0]
+    }
 
     static func qkvAllNormRope(
         q: MLXArray, k: MLXArray, v: MLXArray,
@@ -4068,10 +4242,10 @@ enum DF2WideLanes {
         name: "df2_act_q8g_conv0_e\(e)", inputNames: ["h", "dyn", "base", "ksz"],
         outputNames: ["xq", "ascale", "xs"], source: DF2WideLaneSource.source(.quantGConv0, e: e))
     static let rmsQuant = MLXFast.metalKernel(
-        name: "df2_rms_q8g_e\(e)", inputNames: ["x", "weight", "dsz", "eps_arr"],
+        name: "df2_rms_q8g_e\(e)\(DF2WideLaneSource.hoistWeights ? "_h" : "")", inputNames: ["x", "weight", "dsz", "eps_arr"],
         outputNames: ["out_norm", "xq", "ascale", "xs"], source: DF2WideLaneSource.source(.rmsQuant, e: e))
     static let convRmsQuant = MLXFast.metalKernel(
-        name: "df2_dyn_conv_rms_q8g_e\(e)",
+        name: "df2_dyn_conv_rms_q8g_e\(e)\(DF2WideLaneSource.hoistWeights ? "_h" : "")",
         inputNames: ["h", "dyn", "base", "res", "weight", "dsz", "eps_arr"],
         outputNames: ["out_res", "out_norm", "xq", "ascale", "xs"],
         source: DF2WideLaneSource.source(.convRmsQuant, e: e))
@@ -4214,6 +4388,23 @@ enum DF2WideLanes {
 /// sum stays strictly sequential in column order, chained over KG/e lanes, and the group max is order-free.
 /// So every output bit equals the 16-column kernel's.
 enum DF2WideLaneSource {
+    /// The row-norm kernels' norm-weight loads issued into registers before the RMS reduction's
+    /// barriers (`DARKBLOOM_BONSAI_DF2_WEIGHT_HOIST=0` keeps the parent text). Same addresses, same
+    /// values, same arithmetic: only the loads move ahead of the barrier.
+    static let hoistWeights: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_WEIGHT_HOIST"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// `float wv[e]` = this lane's norm weights, loaded before the reduction (empty when off).
+    static func weightPrefetch(e: Int) -> String {
+        hoistWeights ? "float wv[\(e)];\nfor (int u = 0; u < \(e); u++) { wv[u] = float(weight[c0 + u]); }\n" : ""
+    }
+
+    /// The norm weight of column `u` in the main phase: the register copy, or the parent's device load.
+    static var weightRead: String { hoistWeights ? "wv[u]" : "float(weight[c0 + u])" }
+
     enum Kind: String, CaseIterable {
         case quantG, quantGConv0, rmsQuant, convRmsQuant
         var hasRowNorm: Bool { self == .rmsQuant || self == .convRmsQuant }
@@ -4383,11 +4574,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + weightPrefetch(e: e) + rowScale(e: e) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(weightRead) * (v[u] * scale);
                   if (WRITE_NORM) { out_norm[rowBase + u] = y; }
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
@@ -4438,11 +4629,11 @@ enum DF2WideLaneSource {
                   s4[k] = ak;
                 }
 
-                """ + rowScale(e: e) + """
+                """ + weightPrefetch(e: e) + rowScale(e: e) + """
                 float nv[\(e)];
                 float local_amax = 0.0f;
                 for (int u = 0; u < \(e); u++) {
-                  const float y = float(weight[c0 + u]) * (v[u] * scale);
+                  const float y = \(weightRead) * (v[u] * scale);
                   nv[u] = y;
                   local_amax = max(local_amax, fabs(y));
                 }
