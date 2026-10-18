@@ -1507,25 +1507,20 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             var precomputedKV: [(MLXArray, MLXArray)]? = nil
             if let cCodes, layers.count == 6 {
                 let lead = [1, context.dim(1)]
-                if let kv012 = DF2Fast.w4LinearsFromCodes(
+                // Every context projection reads the same activation codes. Dispatch all twelve
+                // siblings together; each output tile retains its own unchanged K reduction.
+                if let kv = DF2Fast.w4PackedLinearsFromCodes(
                     cCodes, leadShape: lead,
                     [
                         layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
                         layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
                         layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
-                    ]),
-                    let kv345 = DF2Fast.w4LinearsFromCodes(
-                        cCodes, leadShape: lead,
-                        [
-                            layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
-                            layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
-                            layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
-                        ])
+                        layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
+                        layers[4].selfAttn.kProj, layers[4].selfAttn.vProj,
+                        layers[5].selfAttn.kProj, layers[5].selfAttn.vProj,
+                    ])
                 {
-                    precomputedKV = [
-                        (kv012[0], kv012[1]), (kv012[2], kv012[3]), (kv012[4], kv012[5]),
-                        (kv345[0], kv345[1]), (kv345[2], kv345[3]), (kv345[4], kv345[5]),
-                    ]
+                    precomputedKV = (0 ..< 6).map { (kv[2 * $0], kv[2 * $0 + 1]) }
                 }
             }
             let blockLen = h.dim(1)
@@ -2324,6 +2319,66 @@ enum DF2Fast {
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
             source: w4Source(layers: layers, group: group), header: header, ensureRowContiguous: true)
+    }
+
+    /// Twelve independent context projections share one packed operand set. Packing is
+    /// cached once per model; it does not requantize the accepted per-layer W4 codes.
+    final class W4PackedOperands {
+        let ids: [ObjectIdentifier]
+        let group: Int
+        let op: W4Operands
+        let width: Int
+        init(ids: [ObjectIdentifier], group: Int, op: W4Operands, width: Int) {
+            self.ids = ids; self.group = group; self.op = op; self.width = width
+        }
+    }
+    nonisolated(unsafe) static var w4PackedCache: [ObjectIdentifier: W4PackedOperands] = [:]
+
+    /// Same one-projection matmul, but place each projection's output in a contiguous
+    /// [rows, PN] plane, avoiding twelve strided slices/copies after a wide matmul.
+    static let w4PackedKernel: MLXFast.MLXFastKernel = {
+        let group = w4Group ?? 64
+        let source = w4Source(layers: 1, group: group).replacingOccurrences(
+            of: "out[(size_t)(e >> 5) * N + n0 + (e & 31)]",
+            with: "out[(size_t)(n0 / PN) * ksz[1] * PN + (size_t)(e >> 5) * PN + (n0 % PN) + (e & 31)]")
+        return MLXFast.metalKernel(
+            name: "df2_w4g\(group)_packed",
+            inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"],
+            outputNames: ["out0"], source: source, header: header, ensureRowContiguous: true)
+    }()
+
+    static func w4PackedLinearsFromCodes(
+        _ codes: W4Codes, leadShape: [Int], _ layers: [Linear]
+    ) -> [MLXArray]? {
+        guard on, layers.count == 12 else { return nil }
+        let ids = layers.map { ObjectIdentifier($0) }
+        let packed: W4PackedOperands
+        if let cached = w4PackedCache[ids[0]], cached.ids == ids, cached.group == codes.group {
+            packed = cached
+        } else {
+            let ops = layers.compactMap { w4Operands($0, group: codes.group) }
+            guard ops.count == layers.count, let first = ops.first,
+                ops.allSatisfy({ $0.k == codes.K && $0.n == first.n }), first.n % 32 == 0
+            else { return nil }
+            let w = contiguous(concatenated(ops.map(\.w), axis: 0))
+            let sT = contiguous(concatenated(ops.map(\.sT), axis: 1))
+            let bT = contiguous(concatenated(ops.map(\.bT), axis: 1))
+            eval(w, sT, bT)
+            packed = W4PackedOperands(
+                ids: ids, group: codes.group,
+                op: W4Operands(w: w, sT: sT, bT: bT, n: first.n * layers.count, k: codes.K),
+                width: first.n)
+            w4PackedCache[ids[0]] = packed
+        }
+        let op = packed.op
+        guard op.k == codes.K else { return nil }
+        let outs = w4PackedKernel(
+            [codes.xq, op.w, op.sT, op.bT, codes.ascale, codes.xs,
+                MLXArray([Int32(codes.K), Int32(codes.rows), Int32(op.n)])],
+            template: [("SPLIT", split), ("PN", packed.width)],
+            grid: (op.n / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: [[layers.count, codes.rows, packed.width]], outputDTypes: [.float32])
+        return layers.indices.map { outs[0][$0].reshaped(leadShape + [packed.width]) }
     }
 
     static func w4Quant(
