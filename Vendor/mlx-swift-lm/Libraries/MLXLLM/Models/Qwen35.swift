@@ -4283,157 +4283,6 @@ extension Qwen35DecoderLayer {
     }
 }
 
-// MARK: - Layer 0 on an FP32 embedding
-
-extension Qwen35GatedDeltaNet {
-    /// `projectInputs` as the layer-0 check (`Qwen35Layer0FP32`) needs it.
-    fileprivate func layer0CheckInputs(
-        _ x: MLXArray, boundary: HadamardQuantizedLinear.VerifyBoundary?, prompt: [MLXArray]?
-    ) -> [MLXArray] {
-        let (qkv, z, b, a) = projectInputs(
-            x, B: x.dim(0), S: x.dim(1), boundary: boundary, prompt: prompt)
-        return [qkv, z, b, a]
-    }
-}
-
-/// The packed embedding returns F16 rows, so layer 0 misses the fused prompt
-/// and verify boundaries that need an FP32 residual. Its unfused path casts
-/// those rows to FP32 anyway (MLX `rmsNorm` and the residual add promote
-/// them), and F16 to FP32 is exact, so an FP32 copy of the embedding changes
-/// no input value; whether the fused boundaries then return the unfused bits
-/// is checked once per width, at the resident's boot warm, on the real
-/// layer-0 and layer-1 weights. A width switches only after its check
-/// passes. `DARKBLOOM_BONSAI_LAYER0_FP32=0` keeps the F16 input.
-enum Qwen35Layer0FP32 {
-    static let offered =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LAYER0_FP32"] != "0"
-    /// Written once by `prepareIfBoot` before the resident serves; read-only afterwards.
-    nonisolated(unsafe) static var promptPassed = false
-    nonisolated(unsafe) static var verifyPassed = false
-    nonisolated(unsafe) private static var prepared = false
-
-    /// Runs from the first prompt forward of at least 1024 rows: the boot
-    /// warm, which no timed phase reaches (the timed prompts are 512 rows).
-    static func prepareIfBoot(_ model: Qwen35TextModelInner, promptRows: Int) {
-        guard promptRows >= 1024, !prepared else { return }
-        prepared = true
-        guard offered else {
-            FileHandle.standardError.write(Data("qwen35 layer0 fp32: off\n".utf8))
-            return
-        }
-        let prompt = verdict { check(model, rows: [512], prompt: true) }
-        let verify = verdict { check(model, rows: Array(2 ... 16), prompt: false) }
-        promptPassed = prompt.passed
-        verifyPassed = verify.passed
-        FileHandle.standardError.write(Data(
-            "qwen35 layer0 fp32: prompt \(prompt.note) (rows 512), verify \(verify.note) (rows 2-16)\n".utf8))
-    }
-
-    private static func verdict(_ body: () -> Bool) -> (passed: Bool, note: String) {
-        do {
-            return try withError({ body() })
-                ? (true, "bitwise equal") : (false, "mismatch, F16 input kept")
-        } catch {
-            return (false, "error, F16 input kept: \(error)")
-        }
-    }
-
-    private static func bitsEqual(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
-        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
-        let bits: DType? = a.dtype == .float32 ? .uint32
-            : (a.dtype == .float16 || a.dtype == .bfloat16) ? .uint16 : nil
-        guard let bits else { return MLX.all(a .== b) }
-        return MLX.all(contiguous(a).view(dtype: bits) .== contiguous(b).view(dtype: bits))
-    }
-
-    /// Layer 0 (and, at prompt width, layer 1's input) on real embedding rows
-    /// both ways: the unfused path on the F16 rows, as the record serves it,
-    /// against the path `cbv2ForwardSplitFinal` takes on their FP32 copy,
-    /// including its unfused fallbacks. Every array a later kernel reads is
-    /// compared bit for bit.
-    private static func check(_ model: Qwen35TextModelInner, rows: [Int], prompt: Bool) -> Bool {
-        let layers = model.layers
-        guard layers.count > 1, let gdn0 = layers[0].linearAttn,
-            let gdn1 = layers[1].linearAttn, let mlp0 = layers[0].mlp as? Qwen3NextMLP
-        else { return false }
-        let norm0 = layers[0].inputLayerNorm
-        let post0 = layers[0].postAttentionLayerNorm
-        let norm1 = layers[1].inputLayerNorm
-        let vocabulary = model.embedTokens.shape.0
-        var eqs: [MLXArray] = []
-        for count in rows {
-            let ids = MLXArray((0 ..< count).map { Int32((100 + $0 &* 7919) % vocabulary) })
-            let x16 = model.embedTokens(ids.reshaped([1, count]))
-            guard x16.dtype == .float16 else { return false }
-            let x32 = x16.asType(.float32)
-            let r = MLX.sin(MLXArray(0 ..< x16.size).asType(.float32) * 0.37)
-                .reshaped(x16.shape) * 0.05
-
-            let unfused = norm0(x16)
-            let oldInputs = gdn0.layer0CheckInputs(unfused, boundary: nil, prompt: nil)
-            var normalized = norm0(x32)
-            var newInputs: [MLXArray]? = nil
-            if prompt {
-                if let p = HadamardQuantizedLinear.sharedNormPromptProjections(
-                    x32, weight: norm0.weight, eps: norm0.eps,
-                    projections: [gdn0.inProjQKV, gdn0.inProjZ], normalized: true),
-                    let n = p.normalized
-                {
-                    normalized = n
-                    newInputs = gdn0.layer0CheckInputs(n, boundary: nil, prompt: p.projections)
-                }
-            } else if let boundary = HadamardQuantizedLinear.verifyNormBoundary(
-                x32, weight: norm0.weight, eps: norm0.eps,
-                projections: [gdn0.inProjQKV, gdn0.inProjZ])
-            {
-                normalized = boundary.normalized
-                newInputs = gdn0.layer0CheckInputs(
-                    boundary.normalized, boundary: boundary, prompt: nil)
-            }
-            let fusedInputs = newInputs
-                ?? gdn0.layer0CheckInputs(normalized, boundary: nil, prompt: nil)
-            eqs.append(bitsEqual(unfused, normalized))
-            for (o, n) in zip(oldInputs, fusedInputs) { eqs.append(bitsEqual(o, n)) }
-
-            let hOld = x16 + r
-            let ffOld = mlp0.qwen35TargetVerify(post0(hOld), exact: false)
-            let hNew: MLXArray
-            let ffNew: MLXArray
-            if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
-                x32, residual: r, weight: post0.weight, eps: post0.eps,
-                projections: [mlp0.gateProj, mlp0.upProj])
-            {
-                hNew = post.residual
-                ffNew = mlp0.qwen35ProjectedGateUp(post.projections[0], post.projections[1])
-            } else {
-                hNew = x32 + r
-                ffNew = mlp0.qwen35TargetVerify(post0(hNew), exact: false)
-            }
-            eqs.append(bitsEqual(hOld, hNew))
-            eqs.append(bitsEqual(ffOld, ffNew))
-
-            // Prompt width only: layer 1 now receives layer 0's output unadded.
-            // Verify already handed it over unadded on the record path.
-            guard prompt,
-                let fused1 = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
-                    hNew, delta: ffNew, weight: norm1.weight, eps: norm1.eps,
-                    projections: [gdn1.inProjQKV, gdn1.inProjZ], normalized: true)
-            else { continue }
-            let y = hOld + ffOld
-            guard let old1 = HadamardQuantizedLinear.sharedNormPromptProjections(
-                    y, weight: norm1.weight, eps: norm1.eps,
-                    projections: [gdn1.inProjQKV, gdn1.inProjZ], normalized: true),
-                let oldNormalized = old1.normalized, let newNormalized = fused1.normalized,
-                old1.projections.count == fused1.projections.count
-            else { return false }
-            eqs.append(bitsEqual(y, fused1.residual))
-            eqs.append(bitsEqual(oldNormalized, newNormalized))
-            for (o, n) in zip(old1.projections, fused1.projections) { eqs.append(bitsEqual(o, n)) }
-        }
-        return MLX.all(MLX.stacked(eqs)).item(Bool.self)
-    }
-}
-
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
@@ -4638,14 +4487,6 @@ public class Qwen35TextModelInner: Module {
         let fusePromptBoundaries = !captureRecurrentWindow && !exactTargetVerify
             && hiddenStates.ndim == 3 && hiddenStates.dim(0) == 1
             && hiddenStates.dim(1) >= 128 && hiddenStates.dim(1) % 64 == 0
-        let promptRows = fusePromptBoundaries ? hiddenStates.dim(1) : 0
-        if hiddenStates.dtype == .float16,
-            fusePromptBoundaries
-                ? Qwen35Layer0FP32.promptPassed
-                : fuseVerifyBoundaries && Qwen35Layer0FP32.verifyPassed
-        {
-            hiddenStates = hiddenStates.asType(.float32)
-        }
         var pendingDelta: MLXArray? = nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -4749,9 +4590,6 @@ public class Qwen35TextModelInner: Module {
                 asyncEval(hiddenStates)
             }
         }
-        // After the layers are built, so the wide-row load checks this boot
-        // pass triggers have already chosen the verify kernels being checked.
-        Qwen35Layer0FP32.prepareIfBoot(self, promptRows: promptRows)
         if let delta = pendingDelta {
             if let tapLayerIds, let lastSlot = tapLayerIds.firstIndex(of: layers.count - 1) {
                 hiddenStates = hiddenStates + delta
