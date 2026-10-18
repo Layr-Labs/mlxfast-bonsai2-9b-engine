@@ -4479,6 +4479,215 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    // `naxNarrow16Body` with the weight staging moved to loader simdgroups:
+    // six simdgroups over one 16-column tile. Simdgroups 0-3 run the tensor
+    // op and the FP32 epilogue of partial p (groups p, p + 4, ...), as the
+    // N16 form's simdgroup p does, but never touch a weight word; simdgroups
+    // 4 and 5 each stage two partials' tiles into a double-buffered slot
+    // (2 x 4 x 2 KB = 16 KB), one group ahead of the op and with the words
+    // loaded two groups ahead, so the next tile is written while the current
+    // op runs and no op waits on a weight load that was issued less than two
+    // iterations earlier. One threadgroup barrier per group. Loader lane
+    // (c, j) stages word j of columns c + 4 t into the slot position the N16
+    // form's lane (c, j) uses, through the same expansion, so each op
+    // multiplies the same int8 operands; the FP32 steps per output and the
+    // final ((p0 + p1) + p2) + p3 are the N16 form's, in order. Same grid as
+    // the N16 form (one tile per threadgroup), 192 threads. Used only where
+    // `checkPair16` matched the N16 compile-time form bit for bit at that K.
+    static let naxPair16Body = """
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const int n0 = bx * 16;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_position_in_threadgroup.x;
+        const int part = int(sg & 3u);
+        const bool loader = sg >= 4u;
+        const int lp = 2 * int(sg & 1u);
+        const int steps = Kg / 4;
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 16, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+        threadgroup uint32_t bs[2][4][16 * 32];
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0][part], dextents<int, 2>(128, 16));
+        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1][part], dextents<int, 2>(128, 16));
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+        const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+        const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+        const int cap = int(cT.get_capacity());
+        bool ok = cap == 8;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; i++) {
+          if (i < cap) {
+            auto ids = cT.get_multidimensional_index(i);
+            ok = ok && int(ids[1]) == mrow + 8 * ((i >> 2) & 1) && int(ids[0]) == nb + (i & 3) + 16 * (i >> 3);
+          }
+        }
+        const bool good = simd_all(ok);
+        float acc[8];
+        #pragma clang loop unroll(full)
+        for (int e = 0; e < 8; e++) { acc[e] = 0.0f; }
+        const int mr = min(mrow, ROWS - 1);
+        const int mr1 = min(mrow + 8, ROWS - 1);
+        const device half* scol = scalesT + n0 + nb;
+        const device half* bcol = biasesT + n0 + nb;
+        const int j = int(lane & 7u);
+        const int c = int(lane >> 3);
+        const device uint32_t* wcol = w + (uint)(n0 + c) * KW + j;
+        const int ds = c * 8 + j;
+        uint32_t wv[2][4], nv[2][4];
+        half4 sA, bA = half4(0.0h);
+        float fa, frb, fa1 = 0.0f, frb1 = 0.0f;
+        if (loader) {
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 2; q++) {
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 4; t++) { wv[q][t] = wcol[(uint)(4 * t) * KW + (lp + q) * 8]; }
+          }
+          if (steps > 1) {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 4; t++) { nv[q][t] = wcol[(uint)(4 * t) * KW + (lp + q + 4) * 8]; }
+            }
+          }
+          #pragma clang loop unroll(full)
+          for (int q = 0; q < 2; q++) {
+            threadgroup uint4* dst = (threadgroup uint4*)bs[0][lp + q] + ds;
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 4; t++) {
+              const uint32_t v = wv[q][t];
+              dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+            }
+          }
+          if (steps > 1) {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 4; t++) { wv[q][t] = nv[q][t]; }
+            }
+          }
+          if (steps > 2) {
+            #pragma clang loop unroll(full)
+            for (int q = 0; q < 2; q++) {
+              #pragma clang loop unroll(full)
+              for (int t = 0; t < 4; t++) { nv[q][t] = wcol[(uint)(4 * t) * KW + (lp + q + 8) * 8]; }
+            }
+          }
+        } else {
+          const int gl = part;
+          sA = *(const device half4*)(scol + (uint)gl * N);
+          if (!NEG) { bA = *(const device half4*)(bcol + (uint)gl * N); }
+          fa = ascale[mr * Kg + gl];
+          frb = rsb[mr * Kg + gl];
+          if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = 0; i < steps; i++) {
+          if (loader) {
+            if (i + 1 < steps) {
+              #pragma clang loop unroll(full)
+              for (int q = 0; q < 2; q++) {
+                threadgroup uint4* dst = (threadgroup uint4*)bs[(i + 1) & 1][lp + q] + ds;
+                #pragma clang loop unroll(full)
+                for (int t = 0; t < 4; t++) {
+                  const uint32_t v = wv[q][t];
+                  dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+                }
+              }
+              if (i + 2 < steps) {
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < 2; q++) {
+                  #pragma clang loop unroll(full)
+                  for (int t = 0; t < 4; t++) { wv[q][t] = nv[q][t]; }
+                }
+              }
+              if (i + 3 < steps) {
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < 2; q++) {
+                  #pragma clang loop unroll(full)
+                  for (int t = 0; t < 4; t++) { nv[q][t] = wcol[(uint)(4 * t) * KW + (lp + q + 4 * (i + 3)) * 8]; }
+                }
+              }
+            }
+          } else {
+            const int g = part + 4 * i;
+            const half4 cA = sA;
+            const half4 dA = NEG ? -sA : bA;
+            const float ca = fa, crb = frb, ca1 = fa1, crb1 = frb1;
+            if (i + 1 < steps) {
+              const int gl = g + 4;
+              sA = *(const device half4*)(scol + (uint)gl * N);
+              if (!NEG) { bA = *(const device half4*)(bcol + (uint)gl * N); }
+              fa = ascale[mr * Kg + gl];
+              frb = rsb[mr * Kg + gl];
+              if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }
+            }
+            auto tA = A.template slice<128, 16>(g * 128, 0);
+            if (i & 1) { op.run(tA, B1, cT); } else { op.run(tA, B0, cT); }
+            if (good) {
+              #pragma clang loop unroll(full)
+              for (int e = 0; e < 4; e++) {
+                const float t0 = float(cA[e]) * float(cT[e]);
+                acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));
+                if (ROWS > 8) {
+                  const float t2 = float(cA[e]) * float(cT[4 + e]);
+                  acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));
+                }
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup float* red = (threadgroup float*)bs[0][part];
+        if (!loader) {
+          if (mrow < ROWS) {
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 4; e++) { red[mrow * 16 + nb + e] = acc[e]; }
+          }
+          if (ROWS > 8 && mrow + 8 < ROWS) {
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 4; e++) { red[(mrow + 8) * 16 + nb + e] = acc[4 + e]; }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup float4* r0 = (const threadgroup float4*)bs[0][0];
+        const threadgroup float4* r1 = (const threadgroup float4*)bs[0][1];
+        const threadgroup float4* r2 = (const threadgroup float4*)bs[0][2];
+        const threadgroup float4* r3 = (const threadgroup float4*)bs[0][3];
+        for (int e = int(tid); e < ROWS * 4; e += 192) {
+          float4 v = r0[e] + r1[e];
+          v = v + r2[e];
+          v = v + r3[e];
+          *(device float4*)(out + (uint)(e >> 2) * N + n0 + 4 * (e & 3)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
+    /// The loader-pair N16 kernel exists in the compile-time K form only
+    /// (K from template `KC`, 32-bit indices), the form it is checked against.
+    private static let naxPair16FormsKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_pair16_forms",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + naxPair16Body,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// Threads per loader-pair N16 threadgroup: four op simdgroups, two loaders.
+    static let pair16Threads = 192
+
+    /// Inner sizes whose loader-pair N16 kernel matched the N16 compile-time
+    /// form at load (`checkPair16`). `DARKBLOOM_BONSAI_VERIFY_PAIR16=0`
+    /// leaves it empty.
+    nonisolated(unsafe) private static var pair16K = Set<Int>()
+    static let pair16Allowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_PAIR16"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// The widest one-layer call that takes the narrow kernel, and the
     /// inner sizes of the model's calls that fit: attention o and GDN out
     /// (4096) and MLP down (12288).
@@ -4544,13 +4753,24 @@ enum VerifyInt8Matmul {
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
     }
 
+    /// `pair`: the loader-pair N16 kernel in place of the N16 compile-time
+    /// form (nil: where `checkPair16` matched it at `k`); only with `compact`
+    /// and only in the compile-time form.
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false,
+        pair: Bool? = nil
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
+            if compact, pair ?? (pair16Allowed && pair16K.contains(k)) {
+                return naxPair16FormsKernel(
+                    [codes, weight, scalesT, biasesT, ascale, rsb, dims],
+                    template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
+                    grid: (n / 16 * pair16Threads, 1, 1), threadGroup: (pair16Threads, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+            }
             let kernel = compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             return kernel(
                 [codes, weight, scalesT, biasesT, ascale, rsb, dims],
@@ -4625,6 +4845,52 @@ enum VerifyInt8Matmul {
         }
         checkFailed = false
         return (passed, formsPassed)
+    }
+
+    /// Compares the loader-pair N16 kernel's output bits with the N16
+    /// compile-time form's (the kernel in use) at each inner size that form
+    /// serves, every verify row count and both offset forms, on the problem
+    /// `checkNarrow` uses (128 columns, eight tiles, all 16 code rows
+    /// filled). An inner size is returned only when every case matched; a
+    /// compile error or any differing word keeps the N16 form there.
+    private static func checkPair16() -> Set<Int> {
+        var passed = Set<Int>()
+        let n = 128
+        for k in narrowDepths where narrow16FormsK.contains(k) && formsFit(k: k, n: n) {
+            let kg = k / 128
+            let codes = MLXArray(
+                (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
+            let weight = MLXArray(
+                (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+            let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+            let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+            let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+            checkFailed = false
+            var matched = true
+            withErrorHandler({ _ in VerifyInt8Matmul.checkFailed = true }) {
+                for m in 2 ... tileRows {
+                    for negative in [false, true] where matched {
+                        let offsets = negative ? negatedT : biasesT
+                        let reference = runNarrow(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative,
+                            forms: true, compact: true, pair: false)
+                        let candidate = runNarrow(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative,
+                            forms: true, compact: true, pair: true)
+                        let equal = MLX.all(reference.view(dtype: .uint32) .== candidate.view(dtype: .uint32))
+                        eval(equal)
+                        matched = !checkFailed && equal.item(Bool.self)
+                    }
+                }
+            }
+            if matched && !checkFailed { passed.insert(k) }
+        }
+        checkFailed = false
+        return passed
     }
 
     nonisolated(unsafe) private static var checkFailed = false
@@ -4812,6 +5078,10 @@ enum VerifyInt8Matmul {
                     .data(using: .utf8)!)
             FileHandle.standardError.write(
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
+                    .data(using: .utf8)!)
+            if pair16Allowed { pair16K = checkPair16() }
+            FileHandle.standardError.write(
+                "int8 verify narrow N16 loader pairs: \(pair16Allowed ? "K \(pair16K.sorted()) of \(narrow16FormsK.sorted())" : "off (DARKBLOOM_BONSAI_VERIFY_PAIR16=0)")\n"
                     .data(using: .utf8)!)
         }
         return chosen
