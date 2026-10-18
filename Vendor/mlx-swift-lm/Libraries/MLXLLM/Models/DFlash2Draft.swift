@@ -774,10 +774,7 @@ private final class DFlash2Attention: Module {
         return (state[0], state[1])
     }
 
-    func absorbContext(
-        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
-        ropeSpec: DF2Fast.RopeSpec? = nil
-    ) {
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
         var context = context
         var contextLength = context.dim(1)
         if let slidingWindow {
@@ -800,21 +797,11 @@ private final class DFlash2Attention: Module {
         } else {
             (contextKeys, contextValues) = (kProj(context), vProj(context))
         }
-        if let ropeSpec, B == 1, kvHeads == 8,
-            contextKeys.dtype == .float32, contextValues.dtype == .float32,
-            contextKeys.dim(-1) == 1024, contextValues.dim(-1) == 1024,
-            let prepared = DF2Fast.ctxKVNormRope(
-                k: contextKeys, v: contextValues, kNorm: kNorm, ropeSpec: ropeSpec,
-                C: contextLength, offset: cache.offset)
-        {
-            (contextKeys, contextValues) = prepared
-        } else {
-            contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
-                .transposed(0, 2, 1, 3)
-            contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-                .transposed(0, 2, 1, 3)
-            contextKeys = rope(contextKeys, offset: cache.offset)
-        }
+        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
+            .transposed(0, 2, 1, 3)
+        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        contextKeys = rope(contextKeys, offset: cache.offset)
         if let fastCache = cache as? DFlash2LayerKVCache {
             fastCache.absorb(contextKeys: contextKeys, contextValues: contextValues)
         } else {
@@ -1247,11 +1234,8 @@ private final class DFlash2DecoderLayer: Module {
     /// Context-only: nothing of the block runs (no norms, convolutions, MLP
     /// or attention output), only the attention sub-layer's context keys and
     /// values enter the cache.
-    func absorbContext(
-        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
-        ropeSpec: DF2Fast.RopeSpec? = nil
-    ) {
-        selfAttn.absorbContext(context, rope: rope, cache: cache, ropeSpec: ropeSpec)
+    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+        selfAttn.absorbContext(context, rope: rope, cache: cache)
     }
 }
 
@@ -1783,9 +1767,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
         }
         let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
-        let rSpec = DF2Fast.on ? DF2Fast.ropeSpec(self) : nil
         for (index, layer) in layers.enumerated() {
-            layer.absorbContext(context, rope: rope, cache: cache[index], ropeSpec: rSpec)
+            layer.absorbContext(context, rope: rope, cache: cache[index])
         }
     }
 
