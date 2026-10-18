@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -2005,6 +2006,84 @@ enum Qwen35RegisterGatedSIMD {
             outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
+
+    /// `replayKernel` and `hoistedReplayKernel` again (same names, sources,
+    /// header and options, so the same compiled libraries), applied through
+    /// Cmlx because the Swift wrapper cannot target a stream it did not create.
+    private static func makeReplayStreamKernel(name: String, source: String) -> mlx_fast_metal_kernel {
+        let inputNames = mlx_vector_string_new()
+        defer { mlx_vector_string_free(inputNames) }
+        for name in ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in"] {
+            mlx_vector_string_append_value(inputNames, name)
+        }
+        let outputNames = mlx_vector_string_new()
+        defer { mlx_vector_string_free(outputNames) }
+        for name in ["state_out", "conv_tail"] {
+            mlx_vector_string_append_value(outputNames, name)
+        }
+        return mlx_fast_metal_kernel_new(
+            name, inputNames, outputNames, source, gateHeader, false, false)
+    }
+
+    nonisolated(unsafe) private static let replayStreamKernel = makeReplayStreamKernel(
+        name: "qwen35_gdn_register_gate_simd_replay", source: replaySource)
+
+    nonisolated(unsafe) private static let hoistedReplayStreamKernel = makeReplayStreamKernel(
+        name: "qwen35_gdn_register_gate_simd_replay_hg", source: replaySource(hoistedGates: true))
+
+    /// `runReplay(q: q[0..., 0 ..< rows], ...)` on the replay stream: the
+    /// row slice of `q` and the kernel are both placed there, with the same
+    /// template, grid, threadgroup and outputs.
+    static func runReplayOnReplayStream(
+        q: MLXArray, rows: Int, k: MLXArray, v: MLXArray, a: MLXArray,
+        b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        state: MLXArray, convInput: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let stream = CBv2ReplayStream.stream
+        var qShape = q.shape.map { Int32($0) }
+        qShape[1] = Int32(rows)
+        let starts = [Int32](repeating: 0, count: qShape.count)
+        let strides = [Int32](repeating: 1, count: qShape.count)
+        var qSliceCtx = mlx_array_new()
+        mlx_slice(
+            &qSliceCtx, q.ctx, starts, starts.count, qShape, qShape.count,
+            strides, strides.count, stream)
+        let qRows = MLXArray(qSliceCtx)
+
+        let B = k.dim(0), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let config = mlx_fast_metal_kernel_config_new()
+        defer { mlx_fast_metal_kernel_config_free(config) }
+        for (name, value) in [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)] {
+            mlx_fast_metal_kernel_config_add_template_arg_int(config, name, Int32(value))
+        }
+        mlx_fast_metal_kernel_config_set_grid(config, 128, Int32(Dv / 32), Int32(B * Hv))
+        mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1)
+        let outputShapes = [state.shape, [B, 3, convInput.dim(2)]]
+        for shape in outputShapes {
+            mlx_fast_metal_kernel_config_add_output_arg(
+                config, shape.map { Int32($0) }, shape.count, DType.float32.cmlxDtype)
+        }
+        mlx_fast_metal_kernel_config_set_verbose(config, false)
+
+        let inputs = [qRows, k, v, a, b, aLog, dtBias, state, convInput]
+        let inputVector = withExtendedLifetime(inputs) {
+            mlx_vector_array_new_data(inputs.map { $0.ctx }, inputs.count)
+        }
+        defer { mlx_vector_array_free(inputVector) }
+        var result = mlx_vector_array_new()
+        defer { mlx_vector_array_free(result) }
+        // The kernel `runReplay` would pick for the same call: the selection
+        // flag is written once at load and read-only afterwards.
+        let kernel = hoistedReplayPassed ? hoistedReplayStreamKernel : replayStreamKernel
+        mlx_fast_metal_kernel_apply(&result, kernel, inputVector, config, stream)
+        precondition(mlx_vector_array_size(result) == 2, "Qwen35 replay-stream kernel outputs")
+        var stateOut = mlx_array_new()
+        mlx_vector_array_get(&stateOut, result, 0)
+        var convTail = mlx_array_new()
+        mlx_vector_array_get(&convTail, result, 1)
+        return (MLXArray(stateOut), MLXArray(convTail))
+    }
 }
 
 /// Verify-width GDN middle in one kernel: `Qwen35FusedConvSilu`,
@@ -2912,6 +2991,22 @@ final class Qwen35GatedDeltaNet: Module {
             tape.a.dtype == .float32, tape.b.dtype == .float32,
             aLog.dtype == .float32, dtBias.dtype == .float32
         {
+            // Built at finalize (`CBv2ReplayStream`): the same kernel on the
+            // same inputs, on the replay stream. Every input is already
+            // evaluated, so nothing of this eval lands on the main stream.
+            if CBv2ReplayStream.routing, let ssmPre = tape.ssmPre, ssmPre.dtype == .float32 {
+                let (boundarySsm, boundaryConv) = Qwen35RegisterGatedSIMD.runReplayOnReplayStream(
+                    q: tape.q, rows: committedRows,
+                    k: tape.k,
+                    v: tape.v,
+                    a: tape.a,
+                    b: tape.b,
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: ssmPre,
+                    convInput: tape.convInput)
+                return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
+            }
             let initial = tape.ssmPre ?? MLXArray.zeros(
                 [tape.q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)

@@ -4,6 +4,7 @@
 // state is deliberately separate from attention KV: it has fixed per-request
 // residency, model-specific tensor shapes, and transactional step lifecycle.
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -201,6 +202,27 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 }
 
+/// Strict-prefix replays on a second GPU stream. A strict commit's replays
+/// are built at finalize, right after the next round's drafts were submitted,
+/// and submitted on their own command queue so they run beside the drafter
+/// instead of in the next verify's command stream behind it. The next verify
+/// reads them through MLX's cross-stream event wait. The kernels, inputs and
+/// outputs are those of the record schedule. `DARKBLOOM_BONSAI_REPLAY_STREAM=0`
+/// keeps the record schedule (replays built at the next bind).
+public enum CBv2ReplayStream {
+    public static let enabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_REPLAY_STREAM"] != "0"
+    /// True only while `CBv2RecurrentStateEvaluation.submitStrictReplay()`
+    /// builds the replays; a model routes its replay kernel to its second
+    /// stream only then.
+    nonisolated(unsafe) public static var routing = false
+    /// The second GPU stream: its own command queue, created on first use.
+    /// Its encoder is global (usable from any thread), like `Stream.gpu`.
+    nonisolated(unsafe) public static let stream: mlx_stream = mlx_thread_unsafe_gpu_stream_new()
+    /// Wait until every command buffer submitted to `stream` has completed.
+    public static func synchronize() { mlx_synchronize(stream) }
+}
+
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
     public let ssm: MLXArray?
@@ -326,17 +348,38 @@ public final class CBv2RecurrentRequestState {
     /// and the work they describe, are the same either way.
     private var committedStorage: [Int: CBv2RecurrentLayerState] = [:]
     private var deferredCommitted: (() -> [Int: CBv2RecurrentLayerState])?
+    /// The pending `deferredCommitted` is a strict-prefix replay.
+    private var deferredIsStrictReplay = false
+    /// This request submitted replays on `CBv2ReplayStream.stream`. Their
+    /// outputs are owned only by this state until a later verify reads them,
+    /// so `release()` waits for that stream before dropping them.
+    private var submittedOnReplayStream = false
     private var committed: [Int: CBv2RecurrentLayerState] {
         get {
             if let make = deferredCommitted {
                 committedStorage = make()
                 deferredCommitted = nil
+                deferredIsStrictReplay = false
             }
             return committedStorage
         }
         set {
             deferredCommitted = nil
+            deferredIsStrictReplay = false
             committedStorage = newValue
+        }
+    }
+
+    /// Build a pending strict-prefix replay now, with `CBv2ReplayStream.routing`
+    /// set, and return its arrays. Empty when no strict replay is pending.
+    fileprivate func buildStrictReplay() -> [MLXArray] {
+        guard deferredIsStrictReplay, deferredCommitted != nil else { return [] }
+        CBv2ReplayStream.routing = true
+        let layers = committed
+        CBv2ReplayStream.routing = false
+        submittedOnReplayStream = true
+        return layers.keys.sorted().flatMap { index in
+            [layers[index]!.conv, layers[index]!.ssm].compactMap { $0 }
         }
     }
     private var hasCommitted: Bool { deferredCommitted != nil || !committedStorage.isEmpty }
@@ -363,6 +406,11 @@ public final class CBv2RecurrentRequestState {
     public init(spec: CBv2RecurrentStateSpec) throws {
         self.spec = spec
         self.byteCount = try spec.fixedBytesPerRequest()
+    }
+
+    /// A state dropped without `release()` (engine teardown) waits the same way.
+    deinit {
+        if submittedOnReplayStream { CBv2ReplayStream.synchronize() }
     }
 
     public init(
@@ -536,6 +584,7 @@ public final class CBv2RecurrentRequestState {
                 }
             } else {
                 deferredCommitted = { replay.mapValues { $0.replay(keep) } }
+                deferredIsStrictReplay = true
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []
@@ -594,6 +643,14 @@ public final class CBv2RecurrentRequestState {
         guard !bindingOpen, pending.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "release with recurrent work still in flight")
+        }
+        // A cancel, error or retirement can come right after a finalize
+        // submitted replays and before any verify read them: then nothing
+        // else holds their output buffers, and freeing them now would let
+        // the allocator hand them out while the replay queue still writes.
+        if submittedOnReplayStream {
+            CBv2ReplayStream.synchronize()
+            submittedOnReplayStream = false
         }
         committed.removeAll(keepingCapacity: false)
         replacedState.removeAll(keepingCapacity: false)
@@ -793,6 +850,15 @@ public final class CBv2RecurrentStateEvaluation {
         finalized = true
         staged.removeAll(keepingCapacity: false)
         stagedPrefixReplay.removeAll(keepingCapacity: false)
+    }
+
+    /// After `commit(keepPositions:)` of a strict prefix: build the replays
+    /// now and submit them (on the model's replay stream, see
+    /// `CBv2ReplayStream`). No-op for full acceptance, captured windows and
+    /// when no strict replay is pending.
+    public func submitStrictReplay() {
+        let roots = owner.buildStrictReplay()
+        if !roots.isEmpty { asyncEval(roots) }
     }
 
     public func rollback() throws {

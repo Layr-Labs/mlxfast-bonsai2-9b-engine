@@ -329,6 +329,15 @@ extension EngineLoopV2 {
                     do {
                         if confirmed > 0 {
                             try evaluations[0].commit(keepPositions: confirmed)
+                            // The next round's drafts are already submitted;
+                            // a strict prefix's replays go out now, beside them.
+                            // A finishing request has no next verify to read
+                            // them: it keeps the record's lazy replay.
+                            if CBv2ReplayStream.enabled, finishReason == nil,
+                                verify.rows.count == 1
+                            {
+                                evaluations[0].submitStrictReplay()
+                            }
                         } else {
                             try evaluations[0].rollback()
                         }
