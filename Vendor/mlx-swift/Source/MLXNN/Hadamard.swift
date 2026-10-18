@@ -544,8 +544,14 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = attention.dim(2)
-        let outputs = Self.wideRowVerify(
-            .attentionGate, [attention, queryProjection.reshaped([rows, 8192]), signs], rows: rows)
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let outputs = Self.attentionGateQuantized4096Kernel(
+            [attention, queryProjection.reshaped([rows, 8192]), signs],
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+            grid: (256, tile, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups]],
+            outputDTypes: [.int8, .float32, .float32])
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
@@ -826,6 +832,21 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
+    /// Prompt codes for one consumed row; unused metadata lanes are not read.
+    func quantizedForPromptLastRow(_ x: MLXArray) -> PromptInt8Activation? {
+        guard blockSize == 4096, width == 4096, x.dtype == .float32,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) > 0, x.dim(2) == 4096,
+            StreamOrDevice.default == StreamOrDevice.gpu else { return nil }
+        let row = x[0..., (x.dim(1) - 1)..., 0...]
+        let outputs = Self.quantized4096Kernel(
+            [row, signs], template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
+            grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 4096], [64 * 32], [64 * 32]],
+            outputDTypes: [.int8, .float32, .float32])
+        return PromptInt8Activation(
+            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: 1, k: 4096)
+    }
+
     /// `forward(x)` quantized for `VerifyInt8Matmul`, with the codes and
     /// constants of `quantizedForPrompt`: codes `[16, width]` (rows past
     /// `rows` zero) and constants `[rows, width / 128]`. Nil when the shape is
@@ -839,10 +860,15 @@ public struct SignedBlockHadamard {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         if let up, up.shape != x.shape || up.dtype != x.dtype { return nil }
-        let outputs = Self.wideRowVerify(
-            up == nil ? .plain : .swiglu,
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let kernel = up == nil ? Self.quantized4096Kernel : Self.quantizedSwiGLU4096Kernel
+        let outputs = kernel(
             [x.reshaped([rows, width])] + (up.map { [$0.reshaped([rows, width])] } ?? []) + [signs],
-            rows: rows, blocks: width / 4096)
+            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups]],
+            outputDTypes: [.int8, .float32, .float32])
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
@@ -855,9 +881,14 @@ public struct SignedBlockHadamard {
         guard blockSize == 4096, x.dtype == .float32, VerifyInt8Matmul.rowRange.contains(rows),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let outputs = Self.wideRowVerify(
-            .plainRot, [x.reshaped([rows, width]), signs], rows: rows, blocks: width / 4096,
-            sideShape: x.shape)
+        let tile = VerifyInt8Matmul.tileRows
+        let groups = rows * (width / 128)
+        let outputs = Self.quantized4096RotatedKernel(
+            [x.reshaped([rows, width]), signs],
+            template: [("BLOCKS_PER_ROW", width / 4096), ("VERIFY_ROWS", rows)],
+            grid: (256, tile * (width / 4096), 1), threadGroup: (256, 1, 1),
+            outputShapes: [[tile, width], [groups], [groups], x.shape],
+            outputDTypes: [.int8, .float32, .float32, .float32])
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
@@ -1168,16 +1199,12 @@ enum WideRowSource {
 // WIDEROW-GEN END
 
 extension SignedBlockHadamard {
-    /// The verify-width per-row forms: those whose rows carry an RMS
-    /// reduction before the rotation (the residual and input norms, the GDN
-    /// head norm), and the elementwise ones (the plain rotation and its
-    /// rotated-output twin, the SwiGLU down-projection input at three blocks
-    /// per row, the attention output gate). Each one runs `WideRowSource` at
-    /// `wideRowThreads` lanes per row once its load check passed, and the
-    /// record kernel otherwise.
+    /// The verify-width forms whose rows carry an RMS reduction before the
+    /// rotation (the residual and input norms, the GDN head norm): each one
+    /// runs `WideRowSource` at `wideRowThreads` lanes per row once its load
+    /// check passed, and the record kernel otherwise.
     enum WideRowKind: String, CaseIterable {
         case residualNorm, residualNormNormed, residualNormRot, normNormed, gatedNorm
-        case plain, plainRot, swiglu, attentionGate
 
         var form: WideRowSource.Form {
             var f = WideRowSource.Form()
@@ -1187,25 +1214,9 @@ extension SignedBlockHadamard {
             case .residualNormRot: f.residualNorm = true; f.rotatedOutput = true
             case .normNormed: f.normOnly = true; f.normalizedOutput = true
             case .gatedNorm: f.gatedNorm = true
-            case .plain: break
-            case .plainRot: f.rotatedOutput = true
-            case .swiglu: f.swiglu = true
-            case .attentionGate: f.attentionGate = true
             }
             return f
         }
-
-        /// The elementwise forms, switched by `MLXFAST_WIDE_ROWS_ELEMENTWISE`.
-        var elementwise: Bool {
-            switch self {
-            case .plain, .plainRot, .swiglu, .attentionGate: return true
-            default: return false
-            }
-        }
-
-        /// 4096-wide blocks per row in the load check (the SwiGLU input is
-        /// the 12288-wide down-projection input).
-        var checkBlocks: Int { self == .swiglu ? 3 : 1 }
     }
 
     /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel; `MLXFAST_WIDE_ROWS_THREADS`
@@ -1215,17 +1226,6 @@ extension SignedBlockHadamard {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
-    /// `MLXFAST_WIDE_ROWS_ELEMENTWISE=0` keeps the record kernel for the
-    /// elementwise forms only (`WideRowKind.elementwise`).
-    static let wideRowElementwiseEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_ELEMENTWISE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static func wideRowKindEnabled(_ kind: WideRowKind) -> Bool {
-        wideRowEnabled && (!kind.elementwise || wideRowElementwiseEnabled)
-    }
     static let wideRowThreads: Int = {
         ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_THREADS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) == "1024" ? 1024 : 512
@@ -1238,10 +1238,6 @@ extension SignedBlockHadamard {
         case .residualNormRot: return residualNormRotatedQuantized4096Kernel
         case .normNormed: return normNormedQuantized4096Kernel
         case .gatedNorm: return gatedNormQuantized4096Kernel
-        case .plain: return quantized4096Kernel
-        case .plainRot: return quantized4096RotatedKernel
-        case .swiglu: return quantizedSwiGLU4096Kernel
-        case .attentionGate: return attentionGateQuantized4096Kernel
         }
     }
 
@@ -1251,9 +1247,6 @@ extension SignedBlockHadamard {
             return ["x", "residual", "norm_weight", "epsilon", "signs"]
         case .normNormed: return ["x", "norm_weight", "epsilon", "signs"]
         case .gatedNorm: return ["x", "gate", "norm_weight", "epsilon", "signs"]
-        case .plain, .plainRot: return ["x", "signs"]
-        case .swiglu: return ["x", "up", "signs"]
-        case .attentionGate: return ["x", "gate", "signs"]
         }
     }
 
@@ -1263,14 +1256,13 @@ extension SignedBlockHadamard {
         case .residualNormNormed: return ["codes", "ascale", "rsb", "residual_out", "normed_out"]
         case .residualNormRot: return ["codes", "ascale", "rsb", "residual_out", "rotated_out"]
         case .normNormed: return ["codes", "ascale", "rsb", "normed_out"]
-        case .gatedNorm, .plain, .swiglu, .attentionGate: return ["codes", "ascale", "rsb"]
-        case .plainRot: return ["codes", "ascale", "rsb", "rotated_out"]
+        case .gatedNorm: return ["codes", "ascale", "rsb"]
         }
     }
 
     private static let wideRowWideKernels: [WideRowKind: MLXFast.MLXFastKernel] = {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
-        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
+        for kind in WideRowKind.allCases {
             kernels[kind] = MLXFast.metalKernel(
                 name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(wideRowThreads)",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
@@ -1296,7 +1288,7 @@ extension SignedBlockHadamard {
         defer { wideRowLock.unlock() }
         guard !wideRowChecked else { return }
         wideRowChecked = true
-        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
+        for kind in WideRowKind.allCases {
             // An MLX error in the check (a pipeline that cannot run this
             // many threads per threadgroup on this GPU, a compile error)
             // keeps the record kernel instead of stopping the process.
@@ -1315,7 +1307,7 @@ extension SignedBlockHadamard {
     }
 
     private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
-        guard wideRowKindEnabled(kind) else { return false }
+        guard wideRowEnabled else { return false }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         return wideRowVerdict[kind] == true
@@ -1323,20 +1315,16 @@ extension SignedBlockHadamard {
 
     /// The record kernel's outputs bit for bit (`WideRowSource`): codes,
     /// constants and every FP32 side output, on synthetic rows (one all-zero
-    /// row, one at 30x scale) at 3, 11 and 16 verify rows, at each form's
-    /// real shapes (the SwiGLU input 12288 wide, the attention output in its
-    /// `[1, 16, rows, 256]` head-major layout beside the `[rows, 8192]`
-    /// query projection).
+    /// row, one at 30x scale) at 3, 11 and 16 verify rows.
     private static func wideRowCheck(_ kind: WideRowKind) -> Bool {
         var same: [MLXArray] = []
         for rows in [3, 11, 16] {
             let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
             let scale = MLXArray((0 ..< rows).map { Float($0 == 0 ? 0 : ($0 == 1 ? 30 : 1)) })
                 .reshaped([rows, 1])
-            let rowWidth = 4096 * kind.checkBlocks
-            let x = MLXRandom.uniform(low: -3, high: 3, [rows, rowWidth], key: parts[0]) * scale
-            let other = MLXRandom.uniform(low: -4, high: 4, [rows, rowWidth], key: parts[1])
-            let signs = MLX.floor(MLXRandom.uniform(low: 0, high: 2, [rowWidth], key: parts[2])) * 2 - 1
+            let x = MLXRandom.uniform(low: -3, high: 3, [rows, 4096], key: parts[0]) * scale
+            let other = MLXRandom.uniform(low: -4, high: 4, [rows, 4096], key: parts[1])
+            let signs = MLX.floor(MLXRandom.uniform(low: 0, high: 2, [4096], key: parts[2])) * 2 - 1
             let width = kind == .gatedNorm ? 128 : 4096
             let weight = MLXRandom.uniform(low: 0.5, high: 1.5, [width], key: parts[3])
             let eps = MLXArray([Float(1e-6)])
@@ -1346,19 +1334,9 @@ extension SignedBlockHadamard {
                 inputs = [x, other, weight, eps, signs]
             case .normNormed: inputs = [x, weight, eps, signs]
             case .gatedNorm: inputs = [x, other, weight, eps, signs]
-            case .plain, .plainRot: inputs = [x, signs]
-            case .swiglu: inputs = [x, other, signs]
-            case .attentionGate:
-                let attention = x.reshaped([rows, 16, 256]).transposed(1, 0, 2)
-                    .reshaped([1, 16, rows, 256])
-                let gate = MLXRandom.uniform(low: -4, high: 4, [rows, 8192], key: parts[4])
-                    * scale
-                inputs = [attention, gate, signs]
             }
-            let record = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: false)
-            let wide = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, wide: true)
+            let record = wideRowDispatch(kind, inputs, rows: rows, wide: false)
+            let wide = wideRowDispatch(kind, inputs, rows: rows, wide: true)
             same.append(MLX.all(record[0] .== wide[0]))
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
@@ -1368,38 +1346,30 @@ extension SignedBlockHadamard {
     }
 
     /// One verify-width launch of `kind` over `inputs` (`x` first, `[rows,
-    /// 4096 * blocks]` in any leading shape): `[codes [16, 4096 * blocks],
-    /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
+    /// 4096]` in any leading shape): `[codes [16, 4096], ascale, rsb,
+    /// side outputs shaped as x]`.
     private static func wideRowDispatch(
-        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
-        sideShape: [Int]? = nil, wide: Bool
+        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, wide: Bool
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
-        let shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
-            + Array(
-                repeating: sideShape ?? inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
+        let shapes = [[tile, 4096], [rows * 32], [rows * 32]]
+            + Array(repeating: inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         if wide, let kernel = wideRowWideKernels[kind] {
             return kernel(
-                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
-                grid: (wideRowThreads, tile * blocks, 1), threadGroup: (wideRowThreads, 1, 1),
+                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", 1)],
+                grid: (wideRowThreads, tile, 1), threadGroup: (wideRowThreads, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
         }
         return wideRowRecordKernel(kind)(
-            inputs, template: [("BLOCKS_PER_ROW", blocks), ("VERIFY_ROWS", rows)],
-            grid: (256, tile * blocks, 1), threadGroup: (256, 1, 1),
+            inputs, template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", rows)],
+            grid: (256, tile, 1), threadGroup: (256, 1, 1),
             outputShapes: shapes, outputDTypes: dtypes)
     }
 
-    /// `wideRowDispatch` with the wide kernel when its load check passed at
-    /// this many blocks per row.
-    static func wideRowVerify(
-        _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
-        sideShape: [Int]? = nil
-    ) -> [MLXArray] {
-        wideRowDispatch(
-            kind, inputs, rows: rows, blocks: blocks, sideShape: sideShape,
-            wide: blocks == kind.checkBlocks && wideRowUsesWide(kind))
+    /// `wideRowDispatch` with the wide kernel when its load check passed.
+    static func wideRowVerify(_ kind: WideRowKind, _ inputs: [MLXArray], rows: Int) -> [MLXArray] {
+        wideRowDispatch(kind, inputs, rows: rows, wide: wideRowUsesWide(kind))
     }
 }
 
@@ -2882,6 +2852,18 @@ enum PromptInt8Matmul {
         }
         """
 
+    private static let lastRowKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_prompt_matmul_last_row",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: plainSource
+            .replacingOccurrences(of: "(m0 + arow)", with: "ksz[3]")
+            .replacingOccurrences(of: "bonsai_q8_cidx(m0 + sm + 8 * a + fm,", with: "bonsai_q8_cidx(ksz[3],")
+            .replacingOccurrences(of: "out[o] = acc[a][b][0];", with: "if (m0 + sm + 8 * a + fm == 0) { out[o] = acc[a][b][0];")
+            .replacingOccurrences(of: "out[o + 1] = acc[a][b][1];", with: "out[o + 1] = acc[a][b][1]; }"),
+        header: constantIndexSource,
+        ensureRowContiguous: true)
+
     private static let plainKernel = MLXFast.metalKernel(
         name: "bonsai_q8_prompt_matmul_plain",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
@@ -3388,6 +3370,22 @@ enum PromptInt8Matmul {
     /// has at most 7 rows), in whole 64-row tiles.
     static func applies(rows: Int) -> Bool { rows >= 128 && rows % 64 == 0 }
 
+    /// One logical row with the plain Prompt kernel's ordered group fold.
+    static func matmulLastRow(
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray,
+        biasesT: MLXArray, negative: Bool
+    ) -> MLXArray? {
+        guard route != .off, activation.rows == 1 || applies(rows: activation.rows),
+            weight.dim(0) % 32 == 0 else { return nil }
+        let n = weight.dim(0)
+        let dims = MLXArray([Int32(activation.k), 1, Int32(n), Int32(activation.rows - 1)])
+        return lastRowKernel(
+            [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb, dims],
+            template: [("NEG", negative && negativeForms ? 1 : 0)],
+            grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, n]], outputDTypes: [.float32])[0]
+    }
+
     /// `negative`: the module's offsets are its negated scales
     /// (`PromptInt8Constants.negative`).
     static func matmul(
@@ -3455,7 +3453,8 @@ enum PromptInt8Matmul {
 enum VerifyInt8Matmul {
     enum Route { case nax, plain, off }
 
-    static let rowRange = 2 ... 16
+    // The plain kernel maps one row to lane & 7.
+    static var rowRange: ClosedRange<Int> { 2 ... (route == .plain ? 8 : 16) }
     static let tileRows = 16
 
     private static let plainSource = """
@@ -4001,6 +4000,16 @@ enum VerifyInt8Matmul {
         }
         """
 
+    /// The narrow output uses only 16 columns. Keep the accepted N32
+    /// operation as fallback; use this N16 operation only after its check.
+    static let naxNarrow16Body = naxNarrowBody
+        .replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
+        .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];", with: "threadgroup uint32_t bs[4][16 * 32];")
+        .replacingOccurrences(of: "dextents<int, 2>(128, 32));", with: "dextents<int, 2>(128, 16));")
+        .replacingOccurrences(of: "bool ok = cap == 16;", with: "bool ok = cap == 8;")
+        .replacingOccurrences(of: "for (int i = 0; i < 16; i++) {", with: "for (int i = 0; i < 8; i++) {")
+        .replacingOccurrences(of: "  #pragma clang loop unroll(full)\n  for (int e = 0; e < 4; e++) {\n    const float t0 = float(cA[e]) * float(cT[e]);\n    acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n    if (ROWS > 8) {\n      const float t2 = float(cA[e]) * float(cT[4 + e]);\n      acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n    }\n  }\n", with: "  if (good) {\n    #pragma clang loop unroll(full)\n    for (int e = 0; e < 4; e++) {\n      const float t0 = float(cA[e]) * float(cT[e]);\n      acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n      if (ROWS > 8) {\n        const float t2 = float(cA[e]) * float(cT[4 + e]);\n        acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n      }\n    }\n  }\n")
+
     static let naxNarrowPick = """
         #pragma clang fp contract(off)
         #pragma clang fp reassociate(off)
@@ -4100,6 +4109,23 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    private static let naxNarrow16Kernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_narrow16",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxNarrowPick + naxNarrow16Body,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    private static let naxNarrow16FormsKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_narrow16_forms",
+        inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        outputNames: ["out"],
+        source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + naxNarrow16Body.replacingOccurrences(of: "(size_t)", with: "(uint)"),
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
     /// The widest one-layer call that takes the narrow kernel, and the
     /// inner sizes of the model's calls that fit: attention o and GDN out
     /// (4096) and MLP down (12288).
@@ -4113,6 +4139,8 @@ enum VerifyInt8Matmul {
     /// the record fast kernel at load. `DARKBLOOM_BONSAI_VERIFY_FORMS=0`
     /// leaves it empty (the narrow kernel then runs in its record form).
     nonisolated(unsafe) private static var narrowFormsK = Set<Int>()
+    nonisolated(unsafe) private static var narrow16K = Set<Int>()
+    nonisolated(unsafe) private static var narrow16FormsK = Set<Int>()
 
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
@@ -4165,18 +4193,20 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
-        if forms ?? (formsAllowed && narrowFormsK.contains(k) && formsFit(k: k, n: n)) {
-            return naxNarrowFormsKernel(
+        if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
+            let kernel = compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            return kernel(
                 [codes, weight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
                 grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
         }
-        return naxNarrowKernel(
+        let kernel = compact ? naxNarrow16Kernel : naxNarrowKernel
+        return kernel(
             [codes, weight, scalesT, biasesT, ascale, rsb, dims],
             template: [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
             grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4192,11 +4222,11 @@ enum VerifyInt8Matmul {
     /// narrow form is compared with the same record fast output in each case
     /// too; an inner size joins `narrowFormsK` only when it is in `narrowK`
     /// and every such case matches (a compile error fails the form only).
-    private static func checkNarrow() -> (narrow: Set<Int>, forms: Set<Int>) {
+    private static func checkNarrow(compact: Bool = false) -> (narrow: Set<Int>, forms: Set<Int>) {
         let n = 128
         var passed = Set<Int>()
         var formsPassed = Set<Int>()
-        for k in narrowDepths {
+        for k in narrowDepths where !compact || narrowK.contains(k) {
             let kg = k / 128
             let codes = MLXArray(
                 (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [tileRows, k])
@@ -4211,7 +4241,7 @@ enum VerifyInt8Matmul {
             var matched = true
             var formsOK = formsAllowed && formsFit(k: k, n: n)
             withErrorHandler({ _ in VerifyInt8Matmul.checkFailed = true }) {
-                for m in rowRange {
+                for m in 2 ... 16 {
                     for negative in [false, true] where matched {
                         let offsets = negative ? negatedT : biasesT
                         let fast = runFast(
@@ -4219,14 +4249,14 @@ enum VerifyInt8Matmul {
                             m: m, k: k, negative: negative, forms: false)[0]
                         let narrow = runNarrow(
                             codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: false)
+                            scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: false, compact: compact)
                         let equal = MLX.all(fast.view(dtype: .uint32) .== narrow.view(dtype: .uint32))
                         eval(equal)
                         matched = !checkFailed && equal.item(Bool.self)
                         if matched && formsOK {
                             let narrowForms = runNarrow(
                                 codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                                scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: true)
+                                scalesT: scalesT, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: compact)
                             let same = MLX.all(fast.view(dtype: .uint32) .== narrowForms.view(dtype: .uint32))
                             eval(same)
                             formsOK = !checkFailed && same.item(Bool.self)
@@ -4423,8 +4453,12 @@ enum VerifyInt8Matmul {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if chosen == .nax, naxFast, !["0", "false", "no", "off"].contains(narrowValue ?? "") {
             (narrowK, narrowFormsK) = checkNarrow()
+            (narrow16K, narrow16FormsK) = checkNarrow(compact: true)
             FileHandle.standardError.write(
                 "int8 verify narrow: K \(narrowK.sorted()) of \(narrowDepths); compile-time K forms: K \(narrowFormsK.sorted())\n"
+                    .data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
         }
         return chosen
@@ -4434,12 +4468,12 @@ enum VerifyInt8Matmul {
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool
     ) -> MLXArray? {
-        guard route != .off else { return nil }
+        guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
                 scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
-                negative: negative && negativeForms)
+                negative: negative && negativeForms, compact: narrow16K.contains(activation.k))
         }
         if route == .nax && naxFast {
             return runFast(
@@ -4463,7 +4497,7 @@ enum VerifyInt8Matmul {
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
-        guard route != .off else { return nil }
+        guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -4808,6 +4842,29 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
     }
 
+    public func canCallPromptLastRow(_ x: MLXArray) -> Bool {
+        readsFloat16ConstantsInPlace && gdnLayout == nil && transform.blockSize == 4096
+            && transform.width == 4096 && weight.dim(0) % 32 == 0
+            && x.ndim == 3 && x.dim(0) == 1 && x.dim(2) == 4096 && x.dtype == .float32
+            && (x.dim(1) == 1 || PromptInt8Matmul.applies(rows: x.dim(1)))
+            && x.size <= Int(Int32.max) && StreamOrDevice.default == StreamOrDevice.gpu
+            && PromptInt8Matmul.route != .off
+    }
+
+    private func promptLastRow(_ activation: PromptInt8Activation) -> MLXArray {
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        let output = PromptInt8Matmul.matmulLastRow(
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative)!.reshaped([1, 1, weight.dim(0)])
+        return bias.map { output + $0 } ?? output
+    }
+
+    public func callPromptLastRow(_ x: MLXArray) -> MLXArray? {
+        guard canCallPromptLastRow(x), let activation = transform.quantizedForPromptLastRow(x)
+        else { return nil }
+        return promptLastRow(activation)
+    }
+
     /// Form prompt SwiGLU values inside the existing quantizing transform.
     public func callAfterSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
         guard gdnLayout == nil,
@@ -4877,7 +4934,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// and, with `normalized`, the normalized rows as well.
     public static func sharedResidualNormPromptProjections(
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear], normalized: Bool
+        projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false
     ) -> (residual: MLXArray, normalized: MLXArray?, projections: [MLXArray])? {
         guard x.ndim >= 2, x.dtype == .float32, x.dim(-1) == 4096,
             PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
@@ -4889,19 +4946,22 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
                     && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
                     && $0.transform.isIdentical(to: first.transform)
-            }),
+            }), !firstProjectionLastRow || first.canCallPromptLastRow(x),
             let codes = first.transform.residualNormPrompt(
                 x, residual: delta, weight: weight, eps: eps, normalized: normalized)
         else { return nil }
         let rows = x.size / 4096
         let activation = PromptInt8Activation(
             codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
-        guard let outputs = PromptInt8Matmul.matmul(activation, layers: packed.map(\.verifyOperands))
+        let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
+        guard let outputs = PromptInt8Matmul.matmul(activation, layers: full.map(\.verifyOperands))
         else { return nil }
-        return (codes[3], normalized ? codes[4] : nil, zip(packed, outputs).map { layer, output in
+        var projected = zip(full, outputs).map { layer, output in
             let output = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
-        })
+        }
+        if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
+        return (codes[3], normalized ? codes[4] : nil, projected)
     }
 
     /// `sharedPromptProjections(rmsNorm(x, weight), projections)` with the
@@ -4910,7 +4970,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// layer input). Nil when the norm, the shapes, the packing or the route
     /// do not qualify; the caller then normalizes and projects separately.
     public static func sharedNormPromptProjections(
-        _ x: MLXArray, weight: MLXArray, eps: Float, projections: [Linear], normalized: Bool
+        _ x: MLXArray, weight: MLXArray, eps: Float, projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false
     ) -> (normalized: MLXArray?, projections: [MLXArray])? {
         guard x.ndim >= 2, x.dtype == .float32, x.dim(-1) == 4096,
             PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
@@ -4922,18 +4982,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
                     && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 64 == 0
                     && $0.transform.isIdentical(to: first.transform)
-            }),
+            }), !firstProjectionLastRow || first.canCallPromptLastRow(x),
             let codes = first.transform.normPrompt(x, weight: weight, eps: eps, normalized: normalized)
         else { return nil }
         let rows = x.size / 4096
         let activation = PromptInt8Activation(
             codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
-        guard let outputs = PromptInt8Matmul.matmul(activation, layers: packed.map(\.verifyOperands))
+        let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
+        guard let outputs = PromptInt8Matmul.matmul(activation, layers: full.map(\.verifyOperands))
         else { return nil }
-        return (normalized ? codes[3] : nil, zip(packed, outputs).map { layer, output in
+        var projected = zip(full, outputs).map { layer, output in
             let output = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
-        })
+        }
+        if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
+        return (normalized ? codes[3] : nil, projected)
     }
 
     /// Reuse prompt codes within this forward when all input transforms match.

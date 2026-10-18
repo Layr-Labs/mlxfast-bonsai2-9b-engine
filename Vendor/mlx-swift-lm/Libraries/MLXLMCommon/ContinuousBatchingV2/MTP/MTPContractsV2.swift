@@ -489,6 +489,10 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// is still the last one. nil means the tap is off.
     func blockContextHidden() -> MLXArray?
 
+    /// Inspect only this request's committed host history before proposal or prestage.
+    func prepareDraft(
+        history: [Int], depth: Int, requestState: any CBv2MTPRequestState)
+
     /// One round, one proposal: `depth` draft token ids as `[1, depth]`
     /// int32, lazy. Row-local, like every other request-stateful call.
     func proposeBlock(
@@ -515,6 +519,10 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 }
 
 extension CBv2MTPBlockDrafter {
+    public func prepareDraft(
+        history: [Int], depth: Int, requestState: any CBv2MTPRequestState
+    ) {}
+
     /// Lazy absorption is the default: the next `proposeBlock` projects the
     /// pending rows itself, the parent behavior.
     public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {

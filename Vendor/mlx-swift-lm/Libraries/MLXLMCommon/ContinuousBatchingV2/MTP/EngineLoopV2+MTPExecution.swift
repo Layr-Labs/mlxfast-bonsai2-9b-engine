@@ -634,6 +634,8 @@ extension EngineLoopV2 {
                     preconditionFailure(
                         "CBv2 block MTP assistant state missing for \(row.rec.id)")
                 }
+                block.prepareDraft(
+                    history: row.rec.tokens, depth: k, requestState: requestState)
                 let proposal = try block.proposeBlock(
                     anchor: row.carry!.token, depth: k, requestState: requestState)
                 proposals.append(proposal)
