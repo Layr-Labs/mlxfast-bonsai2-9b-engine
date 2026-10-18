@@ -4536,10 +4536,13 @@ public enum VerifyDenseBA {
         let template = [
             ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
         ] as [(String, any KernelTemplateArg)]
+        // The fused Metal body indexes flat row-major storage. Keep native
+        // leading dimensions rather than flattening and restoring each boundary.
+        let lead = Array(x.shape.dropLast())
         return fusedKernel(
             inputs, template: template,
             grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: ns.map { [m, $0] } + [[m, N], [m, N]],
+            outputShapes: ns.map { lead + [$0] } + [lead + [N], lead + [N]],
             outputDTypes: [.float32, .float32, .float32, .float32])
     }
 
@@ -4603,13 +4606,20 @@ public enum VerifyDenseBA {
                     let fusedOut = fused(
                         codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
                         negative: negative, x: x, wb: wb, wa: wa)
+                    let nativeOut = fused(
+                        codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
+                        negative: negative, x: x.reshaped([1, m, k]), wb: wb, wa: wa)
+                    guard nativeOut.map(\.shape) == [[1, m, 32], [1, m, 32], [1, m, N], [1, m, N]] else {
+                        matched = false
+                        break
+                    }
                     let formsOut = VerifyInt8Matmul.denseBAForms(
                         codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative)
                     let ba = standalone(x, wb: wb, wa: wa)
                     let pairs: [(MLXArray, MLXArray)] = [
                         (fusedOut[0], formsOut[0]), (fusedOut[1], formsOut[1]),
                         (fusedOut[2], ba.0), (fusedOut[3], ba.1),
-                    ]
+                    ] + zip(nativeOut, fusedOut).map { native, flat in (native.reshaped(flat.shape), flat) }
                     let checks: [MLXArray] = pairs.map { pair in MLX.all(u(pair.0) .== u(pair.1)) }
                     eval(checks)
                     matched = !failed && checks.allSatisfy { $0.item(Bool.self) }
@@ -4619,7 +4629,7 @@ public enum VerifyDenseBA {
         if failed { matched = false }
         failed = false
         fusedMatched = matched
-        return matched ? "on (rows 2...\(maxRows) bit-identical)" : "off (a check differed or failed to compile)"
+        return matched ? "on (rows 2...\(maxRows), flat/native rank bit-identical)" : "off (a check differed or failed to compile)"
     }
 }
 
@@ -4649,7 +4659,8 @@ extension VerifyInt8Matmul {
         guard layers.count == 2, activation.k == 4096, denseBAEligible(k: activation.k),
             usesForms(k: activation.k, layers: plain),
             (2 ... tileRows).contains(activation.rows),
-            x.ndim == 2, x.dim(0) == activation.rows, x.dim(1) == activation.k, x.dtype == .float32,
+            x.ndim >= 2, x.dim(-1) == activation.k,
+            x.size == activation.rows * activation.k, x.dtype == .float32,
             wb.ndim == 2, wb.shape == wa.shape, wb.dim(1) == activation.k, wb.dim(0) % 2 == 0,
             wb.dtype == .float32, wa.dtype == .float32,
             VerifyDenseBA.fusedMatched
@@ -5022,14 +5033,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             x.shape == boundary.normalized.shape,
             let fused = VerifyInt8Matmul.matmulWithDenseBA(
                 boundary.activation, layers: packed.map(\.verifyOperands),
-                x: x.reshaped([rows, 4096]), wb: wb, wa: wa)
+                x: x, wb: wb, wa: wa)
         else { return nil }
-        let lead = Array(boundary.normalized.shape.dropLast())
-        return (
-            zip(packed, fused.outputs).map { layer, output in
-                output.reshaped(lead + [layer.weight.dim(0)])
-            },
-            fused.b.reshaped(lead + [wb.dim(0)]), fused.a.reshaped(lead + [wb.dim(0)]))
+        return (fused.outputs, fused.b, fused.a)
     }
 
     public static func sharedShortProjections(
