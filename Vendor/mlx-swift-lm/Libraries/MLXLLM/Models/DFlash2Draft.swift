@@ -2342,40 +2342,6 @@ enum DF2Fast {
             source: source, header: header, ensureRowContiguous: true)
     }
 
-    /// Small single-output drafter projections have too few 32-column blocks.
-    /// Use the same tensor op but stage/use its lower 16 columns only. Keep
-    /// the per-group FMA order and SPLIT reduction identical to the full tile.
-    static let w4NarrowOn = ProcessInfo.processInfo.environment["DF2_W4_NARROW"] != "0"
-    static let w4NarrowKernel: MLXFast.MLXFastKernel = {
-        let group = w4Group ?? 64
-        let ru = group / 32
-        let source = w4Source(layers: 1, group: group)
-            .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            .replacingOccurrences(of: "const int n0 = bx * 32;", with: "const int n0 = bx * 16;")
-            .replacingOccurrences(of: "float acc[16], accb[16];", with: "float acc[8], accb[8];")
-            .replacingOccurrences(of: "for (int i = 0; i < 16; i++)", with: "for (int i = 0; i < 8; i++)")
-            .replacingOccurrences(of: "uint4 wv[\(ru)];", with: "uint4 wv[\(ru / 2)];")
-            .replacingOccurrences(of: "p < \(ru);", with: "p < \(ru / 2);")
-            .replacingOccurrences(of: "const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));",
-                with: "const float4 s0v = float4(*(const device half4*)sr);")
-            .replacingOccurrences(of: "const float4 b1v = fma(float4(8.0f), s1v, float4(*(const device half4*)(br + 16)));", with: "")
-            .replacingOccurrences(of: "const float s = (i >> 3) ? s1v[j] : s0v[j];", with: "const float s = s0v[j];")
-            .replacingOccurrences(of: "const float b = (i >> 3) ? b1v[j] : b0v[j];", with: "const float b = b0v[j];")
-            .replacingOccurrences(of: "red[sg * 512 + m * 32 + n]", with: "red[sg * 256 + m * 16 + n]")
-            .replacingOccurrences(of: "e < ksz[1] * 32;", with: "e < ksz[1] * 16;")
-            .replacingOccurrences(of: "red[q * 512 + e]", with: "red[q * 256 + e]")
-            .replacingOccurrences(of: "(e >> 5) * N + n0 + (e & 31)", with: "(e >> 4) * N + n0 + (e & 15)")
-            .replacingOccurrences(of: "const size_t rowU4", with: "const uint rowU4")
-            .replacingOccurrences(of: "(size_t)", with: "(uint)")
-        return MLXFast.metalKernel(
-            name: "df2_w4g\(group)_narrow16",
-            inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"],
-            outputNames: ["out0"], source: source, header: header, ensureRowContiguous: true)
-    }()
-    // A shape is admitted only after its first actual call matches the parent
-    // bit for bit. Warmup populates this off-module-tree table before decode.
-    nonisolated(unsafe) static var w4NarrowChecked: [String: Bool] = [:]
-
     static func w4Quant(
         _ x: MLXArray, up: MLXArray?, group: Int, headMajor: Bool, rowsOverride: Int? = nil,
         kOverride: Int? = nil
@@ -2415,25 +2381,11 @@ enum DF2Fast {
         let formsFit = (codes.K == 4096 || codes.K == 12288) && (1 ... 16).contains(codes.rows)
             && ns.allSatisfy { $0 > 0 && UInt64($0) * UInt64(codes.K) < UInt64(UInt32.max) }
         let kernel = (formsFit ? w4FormsKernels : w4Kernels)[layers.count - 1]
-        let shapeKey = "\(codes.group)/\(codes.K)/\(codes.rows)/\(ns[0])"
-        let narrowFit = formsFit && w4NarrowOn && layers.count == 1 && ns[0] <= 4096
-        let useNarrow = narrowFit && w4NarrowChecked[shapeKey] != false
-        let outs = (useNarrow ? w4NarrowKernel : kernel)(
+        let outs = kernel(
             inputs,
             template: formsFit ? [("SPLIT", split), ("KC", codes.K)] : [("SPLIT", split)],
-            grid: (ns.reduce(0, +) / (useNarrow ? 16 : 32) * split * 32, 1, 1),
-            threadGroup: (split * 32, 1, 1),
+            grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [codes.rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-        if useNarrow && w4NarrowChecked[shapeKey] == nil {
-            let reference = kernel(
-                inputs, template: [("SPLIT", split), ("KC", codes.K)],
-                grid: (ns[0] / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-                outputShapes: [[codes.rows, ns[0]]], outputDTypes: [.float32])
-            let same = (outs[0].view(dtype: .uint32) .== reference[0].view(dtype: .uint32)).all().item(Bool.self)
-            w4NarrowChecked[shapeKey] = same
-            FileHandle.standardError.write(Data("DF2 W4 narrow16 \(shapeKey): \(same ? "bitwise equal" : "mismatch; parent kept")\n".utf8))
-            if !same { return [reference[0].reshaped(leadShape + [ns[0]])] }
-        }
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
     }
 

@@ -3932,6 +3932,12 @@ enum VerifyInt8Matmul {
             chosen = .plain
         }
         let forms = chosen == .nax && naxFast ? "; compile-time K forms: \(checkForms())" : ""
+        if chosen == .nax && naxFast {
+            let eligible = naxShared && formsAllowed && formsMatched.contains("4096 2")
+            FileHandle.standardError.write(
+                "int8 verify dense b/a fold: \(VerifyDenseBA.check(eligible: eligible, negativeForms: negativeForms))\n"
+                    .data(using: .utf8)!)
+        }
         FileHandle.standardError.write(
             "int8 verify matmul: \(chosen) (\(architecture); nax check: \(checkNote)\(forms))\n"
                 .data(using: .utf8)!)
@@ -3991,6 +3997,235 @@ enum VerifyInt8Matmul {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
         }
         return outputs.count == layers.count ? outputs : nil
+    }
+}
+
+// MARK: - The dense GDN b/a projection in the qkv/z verify dispatch
+
+/// The dense FP32 `in_proj_b` / `in_proj_a` of a few-row verify window. Each
+/// simdgroup owns one output column (the b columns, then the a columns),
+/// reads that weight row once for all `ROWS` rows with FP32 FMAs, then
+/// `simd_sum`. The model's standalone kernel (`qwen35_gdn_dense_ba_rows`)
+/// compiles `standaloneSource`; the two-layer verify form below runs the same
+/// `columnBody` in leading threadgroups of the qkv/z dispatch, which saves
+/// one launch per GDN layer per round. The fused form is used only where it
+/// matched both the standalone kernel and the two-layer form bit for bit at
+/// load (`fusedMatched`).
+public enum VerifyDenseBA {
+    /// Needs `lane`, `n`, `K`, `N`, inputs `x`, `wb`, `wa`, outputs `ob`, `oa`.
+    static let columnBody = """
+        const bool is_a = n >= N;
+        const uint col = is_a ? n - N : n;
+        const device float4* wr = (const device float4*)((is_a ? wa : wb) + col * K);
+        float acc[ROWS];
+        for (int v = 0; v < ROWS; v++) acc[v] = 0.0f;
+        for (int k4 = lane; k4 < K / 4; k4 += 32) {
+          const float4 wv = wr[k4];
+          for (int v = 0; v < ROWS; v++) {
+            const float4 xv = ((const device float4*)(x + v * K))[k4];
+            acc[v] = fma(xv.x, wv.x, acc[v]);
+            acc[v] = fma(xv.y, wv.y, acc[v]);
+            acc[v] = fma(xv.z, wv.z, acc[v]);
+            acc[v] = fma(xv.w, wv.w, acc[v]);
+          }
+        }
+        for (int v = 0; v < ROWS; v++) {
+          const float total = simd_sum(acc[v]);
+          if (lane == 0) (is_a ? oa : ob)[v * N + col] = total;
+        }
+
+        """
+
+    /// Grid `(32, 2N, 1)`, threadgroup `(32, 2, 1)`: two columns per threadgroup.
+    public static let standaloneSource = """
+        const uint lane = thread_index_in_simdgroup;
+        const uint n = threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup;
+        const int K = x_shape[1];
+        const uint N = wb_shape[0];
+
+        """ + columnBody
+
+    /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
+    /// that each run four b/a columns and return; every later threadgroup
+    /// runs the two-layer body unchanged, `BAG` threadgroups later.
+    static var fusedSource: String {
+        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2)
+        let anchor = "int bx = int(threadgroup_position_in_grid.x);"
+        guard forms.components(separatedBy: anchor).count == 2 else { return "" }
+        return forms.replacingOccurrences(
+            of: anchor,
+            with: """
+                if (int(threadgroup_position_in_grid.x) < BAG) {
+                const uint lane = thread_index_in_simdgroup;
+                const uint n = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup;
+                const uint N = BAN;
+                \(columnBody)
+                return;
+                }
+                int bx = int(threadgroup_position_in_grid.x) - BAG;
+                """)
+    }
+
+    static let standaloneKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_dense_ba_rows",
+        inputNames: ["x", "wb", "wa"], outputNames: ["ob", "oa"],
+        source: standaloneSource)
+
+    static let fusedKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_forms2_dense_ba",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
+        outputNames: ["out0", "out1", "ob", "oa"],
+        source: fusedSource,
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// The standalone kernel: `x` `[rows, K]` FP32, `wb` and `wa` `[N, K]` FP32.
+    public static func standalone(_ x: MLXArray, wb: MLXArray, wa: MLXArray) -> (MLXArray, MLXArray) {
+        let rows = x.dim(0)
+        let N = wb.dim(0)
+        let outputs = standaloneKernel(
+            [x, wb, wa], template: [("ROWS", rows)],
+            grid: (32, 2 * N, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, N], [rows, N]], outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    static func fused(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
+        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray
+    ) -> [MLXArray] {
+        let ns = layers.map { $0.weight.dim(0) }
+        let N = wb.dim(0)
+        let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
+        let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
+            + [ascale, rsb, dims, x, wb, wa]
+        let template = [
+            ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
+        ] as [(String, any KernelTemplateArg)]
+        return fusedKernel(
+            inputs, template: template,
+            grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] } + [[m, N], [m, N]],
+            outputDTypes: [.float32, .float32, .float32, .float32])
+    }
+
+    /// `DARKBLOOM_BONSAI_VERIFY_DENSE_BA=0` keeps the separate b/a launch.
+    static let allowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_DENSE_BA"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    nonisolated(unsafe) private static var failed = false
+
+    /// Set once by `check`, which `VerifyInt8Matmul.route` runs at load,
+    /// after the compile-time forms check and before any timed work.
+    nonisolated(unsafe) static var fusedMatched = false
+
+    /// Fixed, input-independent problems at K 4096 with N 32 b/a columns and
+    /// 64 matmul columns as two layers, at every verify row count 2 ... 16
+    /// (each its own pipeline, all built here) and both offset forms: every
+    /// output of the fused kernel must equal, bit for bit, the two-layer
+    /// form's outputs and the standalone b/a kernel's outputs.
+    static func check(eligible: Bool, negativeForms: Bool) -> String {
+        fusedMatched = false
+        guard allowed else { return "off (DARKBLOOM_BONSAI_VERIFY_DENSE_BA=0)" }
+        guard eligible else { return "off (two-layer K 4096 form not in use)" }
+        let k = 4096, n = 64, N = 32, kg = k / 128
+        let maxRows = VerifyInt8Matmul.tileRows
+        let codes = MLXArray(
+            (0 ..< maxRows * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [maxRows, k])
+        let weight = MLXArray(
+            (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) }, [n, k / 16])
+        let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+        let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        let ascale = MLXArray((0 ..< maxRows * kg).map { Float(1 + $0 % 11) / 256 }, [maxRows * kg])
+        let rsb = MLXArray((0 ..< maxRows * kg).map { Float($0 % 17 - 8) / 64 }, [maxRows * kg])
+        func pattern(_ count: Int, _ mul: Int, _ add: Int, _ mod: Int, _ center: Int, _ scale: Float) -> [Float] {
+            var values: [Float] = []
+            values.reserveCapacity(count)
+            for i in 0 ..< count {
+                let v: Int = (i * mul + add) % mod - center
+                values.append(Float(v) / scale)
+            }
+            return values
+        }
+        let wb = MLXArray(pattern(N * k, 29, 3, 97, 48, 3072), [N, k])
+        let wa = MLXArray(pattern(N * k, 53, 7, 89, 44, 2048), [N, k])
+        let xAll = MLXArray(pattern(maxRows * k, 41, 5, 211, 105, 64), [maxRows, k])
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        var matched = true
+        withErrorHandler({ _ in VerifyDenseBA.failed = true }) {
+            failed = false
+            for m in (2 ... maxRows).reversed() where matched {
+                let x = xAll[0 ..< m]
+                var cases = [(biasesT, false)]
+                if negativeForms { cases.append((negatedT, true)) }
+                for (offsets, negative) in cases where matched {
+                    let layers = [0 ..< 32, 32 ..< 64].map {
+                        (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0])
+                    }
+                    let fusedOut = fused(
+                        codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
+                        negative: negative, x: x, wb: wb, wa: wa)
+                    let formsOut = VerifyInt8Matmul.denseBAForms(
+                        codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative)
+                    let ba = standalone(x, wb: wb, wa: wa)
+                    let pairs: [(MLXArray, MLXArray)] = [
+                        (fusedOut[0], formsOut[0]), (fusedOut[1], formsOut[1]),
+                        (fusedOut[2], ba.0), (fusedOut[3], ba.1),
+                    ]
+                    let checks: [MLXArray] = pairs.map { pair in MLX.all(u(pair.0) .== u(pair.1)) }
+                    eval(checks)
+                    matched = !failed && checks.allSatisfy { $0.item(Bool.self) }
+                }
+            }
+        }
+        if failed { matched = false }
+        failed = false
+        fusedMatched = matched
+        return matched ? "on (rows 2...\(maxRows) bit-identical)" : "off (a check differed or failed to compile)"
+    }
+}
+
+extension VerifyInt8Matmul {
+    /// The two-layer compile-time form is what the qkv/z pair takes at `k`.
+    static func denseBAEligible(k: Int) -> Bool {
+        route == .nax && naxFast && naxShared && formsAllowed && formsMatched.contains("\(k) 2")
+    }
+
+    static func denseBAForms(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
+        m: Int, k: Int, negative: Bool
+    ) -> [MLXArray] {
+        runFast(codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative, forms: true)
+    }
+
+    /// `matmul(activation, layers:)` for exactly two layers, plus the dense
+    /// b/a of `x` in the same dispatch; nil wherever `matmul` would not take
+    /// the two-layer form, or the fused form did not match at load.
+    static func matmulWithDenseBA(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        x: MLXArray, wb: MLXArray, wa: MLXArray
+    ) -> (outputs: [MLXArray], b: MLXArray, a: MLXArray)? {
+        let plain = layers.map { ($0.weight, $0.scalesT, $0.biasesT) }
+        guard layers.count == 2, activation.k == 4096, denseBAEligible(k: activation.k),
+            usesForms(k: activation.k, layers: plain),
+            (2 ... tileRows).contains(activation.rows),
+            x.ndim == 2, x.dim(0) == activation.rows, x.dim(1) == activation.k, x.dtype == .float32,
+            wb.ndim == 2, wb.shape == wa.shape, wb.dim(1) == activation.k, wb.dim(0) % 2 == 0,
+            wb.dtype == .float32, wa.dtype == .float32,
+            VerifyDenseBA.fusedMatched
+        else { return nil }
+        let outputs = VerifyDenseBA.fused(
+            codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, layers: plain,
+            m: activation.rows, k: activation.k,
+            negative: negativeForms && layers.allSatisfy { $0.negative }, x: x, wb: wb, wa: wa)
+        return ([outputs[0], outputs[1]], outputs[2], outputs[3])
     }
 }
 
@@ -4331,6 +4566,37 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return zip(packed, outputs).map { layer, output in
             output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
         }
+    }
+
+    /// `boundaryProjections(boundary, projections)` for two projections, plus
+    /// `VerifyDenseBA.standalone` of the FP32 `x` (`[..., 4096]`, one row
+    /// per boundary row) over the dense FP32 `wb` and `wa`, in one dispatch,
+    /// each output bit for bit what the separate calls return. Nil when that
+    /// dispatch does not qualify; the caller then makes the separate calls.
+    public static func boundaryProjectionsWithDenseBA(
+        _ boundary: VerifyBoundary, _ projections: [Linear], x: MLXArray, wb: MLXArray, wa: MLXArray
+    ) -> (outputs: [MLXArray], b: MLXArray, a: MLXArray)? {
+        let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
+        guard packed.count == 2, projections.count == 2,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.isIdentical(to: boundary.transform)
+            })
+        else { return nil }
+        let rows = boundary.activation.rows
+        guard boundary.normalized.dim(-1) == 4096, boundary.normalized.size == rows * 4096,
+            x.shape == boundary.normalized.shape,
+            let fused = VerifyInt8Matmul.matmulWithDenseBA(
+                boundary.activation, layers: packed.map(\.verifyOperands),
+                x: x.reshaped([rows, 4096]), wb: wb, wa: wa)
+        else { return nil }
+        let lead = Array(boundary.normalized.shape.dropLast())
+        return (
+            zip(packed, fused.outputs).map { layer, output in
+                output.reshaped(lead + [layer.weight.dim(0)])
+            },
+            fused.b.reshaped(lead + [wb.dim(0)]), fused.a.reshaped(lead + [wb.dim(0)]))
     }
 
     public static func sharedShortProjections(
