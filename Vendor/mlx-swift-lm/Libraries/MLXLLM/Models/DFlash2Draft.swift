@@ -1702,14 +1702,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 h = step.h
                 normed = step.nextNormed
                 normedCodes = step.nextCodes
-                if let normed {
-                    if isLast {
-                        asyncEval(normed)
+                // Enqueue dependent layer pairs together, rather than committing
+                // every small layer separately. The graph and its FP32 order are unchanged.
+                if isLast || index % 2 == 1 {
+                    if let normed {
+                        if isLast {
+                            asyncEval(normed)
+                        } else {
+                            asyncEval(h, normed)
+                        }
                     } else {
-                        asyncEval(h, normed)
+                        asyncEval(h)
                     }
-                } else {
-                    asyncEval(h)
                 }
             }
             if var finalNormed = normed {
