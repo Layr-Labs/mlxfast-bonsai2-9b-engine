@@ -5536,6 +5536,7 @@ enum DF2Fast {
             int pj = -1;
             int pd = -1;
             float pp = 1.0f;
+            float tsc = TREE_SCALE;
             for (int e = 0; e < TREE_NODES; e++) {
               const int p = pd + 1;
               if (p < P) {
@@ -5548,9 +5549,14 @@ enum DF2Fast {
                 if (tid < 16u) {
                   float mx = tev[0];
                   for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
+                  if (TREE_SPLIT && e == 0) {
+                    float z1 = 0.0f;
+                    for (int c = 0; c < 16; c++) { z1 += metal::precise::exp(tev[c] - mx); }
+                    if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }
+                  }
                   float z = 0.0f, mine = 0.0f;
                   for (int c = 0; c < 16; c++) {
-                    const float x = metal::precise::exp(tev[c] - mx);
+                    const float x = metal::precise::exp((tev[c] - mx) * tsc);
                     z += x;
                     if (c == int(tid)) { mine = x; }
                   }
@@ -5622,20 +5628,23 @@ enum DF2Fast {
             """
     }
 
-    /// The tree's child softmax runs at temperature 0.8 (scores times 1.25, exact in float), so a
-    /// block whose chain is confident keeps its full depth instead of spending nodes on side
-    /// branches; `DARKBLOOM_BONSAI_TREE_SHARP=0` keeps temperature 1.
+    /// The tree's child softmax temperature, chosen per block from the anchor's own softmax at
+    /// temperature 1. When the top first-position candidate holds less than 0.8 of it, the block is
+    /// likely to stop early, so the tree keeps temperature 1 and spends nodes on side branches. Otherwise
+    /// it runs at temperature 0.8 (scores times 1.25, exact in float) and keeps a confident chain's full
+    /// depth. `DARKBLOOM_BONSAI_TREE_SPLIT=0` keeps 0.8 on every block;
+    /// `DARKBLOOM_BONSAI_TREE_SHARP=0` keeps 1 on every block.
     static let treeSharp: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SHARP"] != "0"
-    static let treeSoftmaxT1 = "const float x = metal::precise::exp(tev[c] - mx);"
-    static let treeSoftmaxSharp = "const float x = metal::precise::exp((tev[c] - mx) * 1.25f);"
+    static let treeSplit: Bool = treeSharp
+        && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SPLIT"] != "0"
 
     static let treeSelector: MLXFast.MLXFastKernel? = treeSource.map { source in
-        let sharp = treeSharp && source.components(separatedBy: treeSoftmaxT1).count == 2
-        return MLXFast.metalKernel(
-            name: sharp ? "df2_tree_t08_mb8" : "df2_tree_mb8",
+        MLXFast.metalKernel(
+            name: treeSplit ? "df2_tree_split_mb8" : (treeSharp ? "df2_tree_t08_mb8" : "df2_tree_mb8"),
             inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
             outputNames: ["tokens", "desc"],
-            source: sharp ? source.replacingOccurrences(of: treeSoftmaxT1, with: treeSoftmaxSharp) : source)
+            source: source.replacingOccurrences(of: "TREE_SCALE", with: treeSharp ? "1.25f" : "1.0f")
+                .replacingOccurrences(of: "TREE_SPLIT", with: treeSplit ? "true" : "false"))
     }
 
     /// Verify a draft tree instead of the greedy chain; `DARKBLOOM_BONSAI_TREE=0` keeps the chain.
