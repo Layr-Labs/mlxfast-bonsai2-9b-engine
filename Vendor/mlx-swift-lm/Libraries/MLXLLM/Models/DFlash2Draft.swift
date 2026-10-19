@@ -6197,6 +6197,15 @@ enum DF2WideLaneSource {
     }
 
     /// Group max, sequential group sum and int8 codes of `nv[e]`; scale and sum land at `row * G + group`.
+    /// Every lane advances the inherited `simd_shuffle_up` chain on every step, in all four families and
+    /// for the plain, SwiGLU and head-major instantiations alike: no lane predicate remains.
+    ///
+    /// The only lane whose `seq_sum` is written is the last lane of its group, and its surviving recursion
+    /// is the record's left-associative column-order chain `((own_0 + own_1) + ...) + own_{m-1}` for any
+    /// input. A lane's value at step `s` is read only by the lane above it at step `s + 1`, so the
+    /// diagonal that lands in the group's last lane starts at that group's first lane, step 0, where no
+    /// shuffle happens. The unspecified out-of-range `simd_shuffle_up` read at a group's first lane
+    /// therefore can never reach a written value, and the group max stays order-free.
     static func tail(e: Int, row: String, group: String, base: String) -> String {
         """
         for (int s = 1; s < (KG / \(e)); s <<= 1) {
@@ -6207,9 +6216,7 @@ enum DF2WideLaneSource {
           if (step > 0) {
             seq_sum = simd_shuffle_up(seq_sum, 1);
           }
-          if ((int(lane) & ((KG / \(e)) - 1)) == step) {
-            for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
-          }
+          for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
         }
         const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
         const float ia = 1.0f / a;
