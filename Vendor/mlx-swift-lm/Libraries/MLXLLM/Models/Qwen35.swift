@@ -1945,6 +1945,16 @@ enum Qwen35RegisterGatedSIMD {
         }
     }
 
+    nonisolated(unsafe) private static let replayRowTokens: [MLXArray] = (0 ... 16).map { count in
+        let a = MLXArray.zeros([1, max(count, 1)], dtype: .float32)
+        eval(a)
+        return a
+    }
+
+    static func replayRowToken(_ rows: Int) -> MLXArray {
+        replayRowTokens[rows]
+    }
+
     /// `runReplay` along tape rows `rows` (int32 [m]); nil when the twin was not derived.
     static func runTreeReplay(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
                               b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
@@ -1956,7 +1966,7 @@ enum Qwen35RegisterGatedSIMD {
             [q, k, v, a, b, aLog, dtBias, state, convInput, rows],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [state.shape, [B, 3, convInput.dim(2)]],
+            outputShapes: [[B, Hv, Dv, Dk], [B, 3, convInput.dim(2)]],
             outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -1974,6 +1984,7 @@ enum Qwen35RegisterGatedSIMD {
     static func prepareHoistedReplay() {
         guard !hoistedReplayPrepared else { return }
         hoistedReplayPrepared = true
+        _ = replayRowTokens
         guard hoistedReplayOffered else {
             FileHandle.standardError.write(Data("qwen35 replay gate hoist: off\n".utf8))
             return
@@ -2041,7 +2052,7 @@ enum Qwen35RegisterGatedSIMD {
             [q, k, v, a, b, aLog, dtBias, state],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 0)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[B, T, Hv, Dv], state.shape], outputDTypes: [.float32, .float32])
+            outputShapes: [[B, T, Hv, Dv], [B, Hv, Dv, Dk]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
 
@@ -2054,7 +2065,7 @@ enum Qwen35RegisterGatedSIMD {
             [q, k, v, a, b, aLog, dtBias, state],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [[1], state.shape], outputDTypes: [.float32, .float32])
+            outputShapes: [[1], [B, Hv, Dv, Dk]], outputDTypes: [.float32, .float32])
         return result[1]
     }
 
@@ -2070,7 +2081,7 @@ enum Qwen35RegisterGatedSIMD {
             [q, k, v, a, b, aLog, dtBias, state, convInput],
             template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
             grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
-            outputShapes: [state.shape, [B, 3, convInput.dim(2)]],
+            outputShapes: [[B, Hv, Dv, Dk], [B, 3, convInput.dim(2)]],
             outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -2608,20 +2619,23 @@ enum Qwen35FusedGDNVerify {
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, tree: MLXArray,
         keyHeads: Int, valueHeads: Int
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
-        let C = qkv.dim(-1)
         guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
-            convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
-            qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
-            convState.dim(2) == C, C == 2 * keyHeads * 128 + valueHeads * 128,
-            valueHeads % keyHeads == 0, convState.dtype == .float32, qkv.dtype == .float32,
-            convWeight.dtype == .float32, convWeight.shape == [C, 4, 1],
+            convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
+            a.ndim == 3, b.ndim == 3, state.ndim == 4,
+            convState.dtype == .float32, qkv.dtype == .float32, convWeight.dtype == .float32,
             a.dtype == .float32, b.dtype == .float32, aLog.dtype == .float32,
-            dtBias.dtype == .float32, state.dtype == .float32,
-            a.shape == [1, qkv.dim(1), valueHeads], b.shape == a.shape,
-            state.shape == [1, valueHeads, 128, 128],
+            dtBias.dtype == .float32, state.dtype == .float32
+        else { return nil }
+        let qkvShape = qkv.shape3
+        let S = qkvShape.1
+        let C = qkvShape.2
+        guard qkvShape.0 == 1, (3 ... maximumRows).contains(S),
+            convState.shape3 == (1, 3, C), C == 2 * keyHeads * 128 + valueHeads * 128,
+            valueHeads % keyHeads == 0, convWeight.shape3 == (C, 4, 1),
+            a.shape3 == (1, S, valueHeads), b.shape3 == (1, S, valueHeads),
+            state.shape4 == (1, valueHeads, 128, 128),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let S = qkv.dim(1)
         let o = treeKernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
@@ -2631,8 +2645,8 @@ enum Qwen35FusedGDNVerify {
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
-            outputDTypes: Array(repeating: .float32, count: 7))
+                [1, S, valueHeads, 128], [1, valueHeads, 128, 128], [1, 3, C]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
         return (o[0], o[1], o[2], o[3], o[4], o[5], o[6])
     }
 
@@ -2644,19 +2658,22 @@ enum Qwen35FusedGDNVerify {
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
-        let C = qkv.dim(-1)
-        guard convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
-            qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
-            convState.dim(2) == C, C == 2 * keyHeads * 128 + valueHeads * 128,
-            valueHeads % keyHeads == 0, convState.dtype == .float32, qkv.dtype == .float32,
-            convWeight.dtype == .float32, convWeight.shape == [C, 4, 1],
+        guard convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
+            a.ndim == 3, b.ndim == 3, state.ndim == 4,
+            convState.dtype == .float32, qkv.dtype == .float32, convWeight.dtype == .float32,
             a.dtype == .float32, b.dtype == .float32, aLog.dtype == .float32,
-            dtBias.dtype == .float32, state.dtype == .float32,
-            a.shape == [1, qkv.dim(1), valueHeads], b.shape == a.shape,
-            state.shape == [1, valueHeads, 128, 128],
+            dtBias.dtype == .float32, state.dtype == .float32
+        else { return nil }
+        let qkvShape = qkv.shape3
+        let S = qkvShape.1
+        let C = qkvShape.2
+        guard qkvShape.0 == 1, (3 ... maximumRows).contains(S),
+            convState.shape3 == (1, 3, C), C == 2 * keyHeads * 128 + valueHeads * 128,
+            valueHeads % keyHeads == 0, convWeight.shape3 == (C, 4, 1),
+            a.shape3 == (1, S, valueHeads), b.shape3 == (1, S, valueHeads),
+            state.shape4 == (1, valueHeads, 128, 128),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let S = qkv.dim(1)
         let outputs = kernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
@@ -2666,7 +2683,7 @@ enum Qwen35FusedGDNVerify {
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
             outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+                [1, S, valueHeads, 128], [1, valueHeads, 128, 128], [1, 3, C]],
             outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
         return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
     }
@@ -3255,32 +3272,25 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> Bool {
         guard committedRows > 0,
               committedRows < tape.rowCount,
-              tape.convStateRows == convKernelSize - 1,
-              tape.convInput.ndim == 3,
-              tape.q.ndim == 4,
-              tape.k.ndim == 4,
-              tape.v.ndim == 4,
-              tape.a.ndim == 3,
-              tape.b.ndim == 3
+              tape.convStateRows == convKernelSize - 1
         else { return false }
 
         let batch = tape.q.dim(0)
-        guard tape.convInput.shape
-                  == [batch, tape.convStateRows + tape.rowCount, convDim],
-              tape.q.shape == [batch, tape.rowCount, numKHeads, headKDim],
-              tape.k.shape == [batch, tape.rowCount, numKHeads, headKDim],
-              tape.v.shape == [batch, tape.rowCount, numVHeads, headVDim],
-              tape.a.shape == [batch, tape.rowCount, numVHeads],
-              tape.b.shape == [batch, tape.rowCount, numVHeads]
+        guard tape.convInput.shape3 == (batch, tape.convStateRows + tape.rowCount, convDim),
+              tape.q.shape4 == (batch, tape.rowCount, numKHeads, headKDim),
+              tape.k.shape4 == (batch, tape.rowCount, numKHeads, headKDim),
+              tape.v.shape4 == (batch, tape.rowCount, numVHeads, headVDim),
+              tape.a.shape3 == (batch, tape.rowCount, numVHeads),
+              tape.b.shape3 == (batch, tape.rowCount, numVHeads)
         else { return false }
 
         if let ssmPre = tape.ssmPre,
-           ssmPre.shape != [batch, numVHeads, headVDim, headKDim]
+           ssmPre.shape4 != (batch, numVHeads, headVDim, headKDim)
         {
             return false
         }
         if let mask = tape.mask,
-           mask.shape != [batch, tape.rowCount]
+           mask.shape2 != (batch, tape.rowCount)
         {
             return false
         }
@@ -3300,9 +3310,9 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
-        let rows = 0 ..< committedRows
-        if let path = CBv2BranchVerify.committedRows, path.count == committedRows,
-            CBv2BranchVerify.isBranch(path)
+        if CBv2BranchVerify.committedRowsIsBranch,
+            let path = CBv2BranchVerify.committedRows, path.count == committedRows,
+            let pathArray = CBv2BranchVerify.committedRowsArray
         {
             guard tape.mask == nil, headKDim == 128, headVDim == 128, tape.rowCount == 16,
                 tape.convStateRows == 3, tape.convInput.dtype == .float32,
@@ -3312,7 +3322,7 @@ final class Qwen35GatedDeltaNet: Module {
                 let replayed = Qwen35RegisterGatedSIMD.runTreeReplay(
                     q: tape.q, k: tape.k, v: tape.v, a: tape.a, b: tape.b, aLog: aLog, dtBias: dtBias,
                     state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
-                    convInput: tape.convInput, rows: MLXArray(path))
+                    convInput: tape.convInput, rows: pathArray)
             else { preconditionFailure("Qwen35 tree commit: path replay unavailable") }
             return CBv2RecurrentLayerState(conv: replayed.1, ssm: replayed.0)
         }
@@ -3328,7 +3338,7 @@ final class Qwen35GatedDeltaNet: Module {
                 [tape.q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
             let (boundarySsm, boundaryConv) = Qwen35RegisterGatedSIMD.runReplay(
-                q: tape.q[0..., rows, 0...],
+                q: Qwen35RegisterGatedSIMD.replayRowToken(committedRows),
                 k: tape.k,
                 v: tape.v,
                 a: tape.a,
@@ -3339,6 +3349,7 @@ final class Qwen35GatedDeltaNet: Module {
                 convInput: tape.convInput)
             return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
         }
+        let rows = 0 ..< committedRows
         let boundarySsm = updateRecurrenceStateOnly(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
@@ -3517,15 +3528,27 @@ final class Qwen35GatedDeltaNet: Module {
                 b: promptGates == nil ? b : inProjB(inputs),
                 convState: convState, ssmState: ssmState, mask: nil)
 
-        for (row, evaluation) in recurrentState.enumerated() {
+        if B == 1 {
             do {
-                try evaluation.stage(
+                try recurrentState[0].stage(
                     modelLayerIndex: modelLayerIndex,
-                    conv: newConvState[row ..< row + 1],
-                    ssm: newSsmState[row ..< row + 1])
+                    conv: newConvState,
+                    ssm: newSsmState)
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
+            }
+        } else {
+            for (row, evaluation) in recurrentState.enumerated() {
+                do {
+                    try evaluation.stage(
+                        modelLayerIndex: modelLayerIndex,
+                        conv: newConvState[row ..< row + 1],
+                        ssm: newSsmState[row ..< row + 1])
+                } catch {
+                    preconditionFailure(
+                        "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
+                }
             }
         }
 
@@ -3653,27 +3676,42 @@ final class Qwen35GatedDeltaNet: Module {
             // The fused path has one row; capture only its tail buffer.
             let fusedTail = fusedMiddle?.6
             for (row, evaluation) in recurrentState.enumerated() {
-                let rowRange = row ..< (row + 1)
-                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
-                let finalSSM = finalSsmState[rowRange]
-                let tape = ArraysCache.PrefixReplayTape(
-                    convInput: convInput[rowRange],
-                    q: qNormed[rowRange],
-                    k: kNormed[rowRange],
-                    v: v[rowRange],
-                    a: a[rowRange],
-                    b: b[rowRange],
-                    ssmPre: ssmState[rowRange],
-                    mask: nil,
-                    rowCount: S,
-                    convStateRows: nKeep)
-                // Count unique additional buffers retained by this stage.
-                // `finalConv` aliases `convInput` until full acceptance detaches
-                // its exact tail at commit. A one-row `ssmPre` aliases the
-                // already-accounted committed generation when it existed before
-                // this verify. The fused path retains packed V; the fallback
-                // retains the whole conv output backing through its V view.
-                let convOutBacking = convOut[rowRange]
+                let finalConv: MLXArray
+                let finalSSM: MLXArray
+                let tape: ArraysCache.PrefixReplayTape
+                let convOutBacking: MLXArray
+                if B == 1 {
+                    finalConv = fusedTail ?? convInput[0..., S ..< (S + nKeep), 0...]
+                    finalSSM = finalSsmState
+                    tape = ArraysCache.PrefixReplayTape(
+                        convInput: convInput,
+                        q: qNormed,
+                        k: kNormed,
+                        v: v,
+                        a: a,
+                        b: b,
+                        ssmPre: ssmState,
+                        mask: nil,
+                        rowCount: S,
+                        convStateRows: nKeep)
+                    convOutBacking = convOut
+                } else {
+                    let rowRange = row ..< (row + 1)
+                    finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
+                    finalSSM = finalSsmState[rowRange]
+                    tape = ArraysCache.PrefixReplayTape(
+                        convInput: convInput[rowRange],
+                        q: qNormed[rowRange],
+                        k: kNormed[rowRange],
+                        v: v[rowRange],
+                        a: a[rowRange],
+                        b: b[rowRange],
+                        ssmPre: ssmState[rowRange],
+                        mask: nil,
+                        rowCount: S,
+                        convStateRows: nKeep)
+                    convOutBacking = convOut[rowRange]
+                }
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
@@ -3841,7 +3879,7 @@ enum Qwen35VerifyQKNormRoPE {
               }
             }
             const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
-            const float base = rope_base[0];
+            const float base = eps[2];
             for (uint j = 0; j < 4u; ++j) {
               const float partner = simd_shuffle_xor(y[0][j], ushort(HALF_ROT / 4u));
               const uint dim = lane * 4u + j;
@@ -3867,7 +3905,7 @@ enum Qwen35VerifyQKNormRoPE {
             }
             """
 
-    private static let inputNames = ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base"]
+    private static let inputNames = ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset"]
     private static let outputNames = ["q_out", "k_out"]
 
     private static let kernel = MLXFast.metalKernel(
@@ -3896,7 +3934,7 @@ enum Qwen35VerifyQKNormRoPE {
           }
         }
         const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
-        const float base = rope_base[0];
+        const float base = eps[2];
         for (uint j = 0; j < 4u; ++j) {
           const float partner = simd_shuffle_xor(y[0][j], ushort(HALF_ROT / 4u));
           const uint dim = lane * 4u + j;
@@ -3920,7 +3958,7 @@ enum Qwen35VerifyQKNormRoPE {
     /// is the parent's text, so every output bit is the parent's.
     private static let normRopeHoisted = """
         const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
-        const float base = rope_base[0];
+        const float base = eps[2];
         float cos_j[4];
         float sin_j[4];
         if (lane * 4u < uint(ROPE_DIMS)) {
@@ -4008,9 +4046,23 @@ enum Qwen35VerifyQKNormRoPE {
     ).map {
         MLXFast.metalKernel(
             name: "qwen35_verify_qk_norm_rope_tree",
-            inputNames: ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base", "tree"],
+            inputNames: ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "tree"],
             outputNames: ["q_out", "k_out"],
             source: $0)
+    }
+
+    nonisolated(unsafe) private static let defaultEpsRopeBase: MLXArray = {
+        let a = MLXArray([Float(1e-6), Float(1e-6), log2(Float(10_000_000.0))])
+        eval(a)
+        return a
+    }()
+
+    @inline(__always)
+    private static func epsRopeBaseArray(queryEps: Float, keyEps: Float, ropeBase: Float) -> MLXArray {
+        if queryEps == Float(1e-6) && keyEps == Float(1e-6) && ropeBase == Float(10_000_000.0) {
+            return defaultEpsRopeBase
+        }
+        return MLXArray([queryEps, keyEps, log2(ropeBase)])
     }
 
     /// `apply` (all query rows) for a draft tree window.
@@ -4019,22 +4071,25 @@ enum Qwen35VerifyQKNormRoPE {
         keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
         queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, tree: MLXArray
     ) -> (MLXArray, MLXArray)? {
-        guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
-            queryProjection.ndim == 3, queryProjection.dim(0) == 1, keyProjection.ndim == 3,
-            (2 ... 16).contains(queryProjection.dim(1)),
-            queryProjection.dim(2) == queryHeads * 512,
-            keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
+        let qShape = queryProjection.shape3
+        guard qShape.0 == 1,
+            (2 ... 16).contains(qShape.1),
+            qShape.2 == queryHeads * 512,
+            keyProjection.shape3 == (1, qShape.1, keyHeads * 256),
+            let treeKernel, tree.dtype == .int32, tree.size >= 288,
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
-            queryWeight.shape == [256], keyWeight.shape == [256],
+            queryWeight.ndim == 1, queryWeight.dim(0) == 256,
+            keyWeight.ndim == 1, keyWeight.dim(0) == 256,
             offsets.size == 1, offsets.dtype == .int32,
             ropeDims % 8 == 0, (8 ... 128).contains(ropeDims),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let L = keyProjection.dim(1)
+        let L = qShape.1
+        let epsArray = epsRopeBaseArray(queryEps: queryEps, keyEps: keyEps, ropeBase: ropeBase)
         let outputs = treeKernel(
             [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)]), tree],
+                epsArray, offsets, tree],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", false)],
             grid: (32, queryHeads + keyHeads, L),
@@ -4050,25 +4105,30 @@ enum Qwen35VerifyQKNormRoPE {
         keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
         queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, lastQueryOnly: Bool = false
     ) -> (MLXArray, MLXArray)? {
-        guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
-            keyProjection.ndim == 3,
+        let qShape = queryProjection.shape3
+        let kShape = keyProjection.shape3
+        guard qShape.0 == 1,
+            kShape.0 == 1,
             lastQueryOnly
-                ? (queryProjection.dim(1) == 1 && keyProjection.dim(1) >= 128 && keyProjection.dim(1) % 64 == 0)
-                : ((2 ... 16).contains(queryProjection.dim(1)) || (64 ... 4096).contains(queryProjection.dim(1))),
-            queryProjection.dim(2) == queryHeads * 512,
-            keyProjection.shape == [1, lastQueryOnly ? keyProjection.dim(1) : queryProjection.dim(1), keyHeads * 256],
+                ? (qShape.1 == 1 && kShape.1 >= 128 && kShape.1 % 64 == 0)
+                : ((2 ... 16).contains(qShape.1) || (64 ... 4096).contains(qShape.1)),
+            qShape.2 == queryHeads * 512,
+            kShape.1 == (lastQueryOnly ? kShape.1 : qShape.1),
+            kShape.2 == keyHeads * 256,
             queryProjection.dtype == .float32, keyProjection.dtype == .float32,
             queryWeight.dtype == .float32, keyWeight.dtype == .float32,
-            queryWeight.shape == [256], keyWeight.shape == [256],
+            queryWeight.ndim == 1, queryWeight.dim(0) == 256,
+            keyWeight.ndim == 1, keyWeight.dim(0) == 256,
             offsets.size == 1, offsets.dtype == .int32,
             ropeDims % 8 == 0, (8 ... 128).contains(ropeDims),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let L = keyProjection.dim(1)
+        let L = kShape.1
         let queryRows = lastQueryOnly ? 1 : L
+        let epsArray = epsRopeBaseArray(queryEps: queryEps, keyEps: keyEps, ropeBase: ropeBase)
         let outputs = (hoisted ? hoistKernel : kernel)(
             [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
+                epsArray, offsets],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", lastQueryOnly)],
             grid: lastQueryOnly ? (32, 1, queryHeads + keyHeads * L) : (32, queryHeads + keyHeads, L),
@@ -5074,6 +5134,7 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
     let exactTargetVerify: Bool
+    let fullAttentionLayerCount: Int
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -5083,8 +5144,12 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        let constructedLayers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
+        }
+        self.layers = constructedLayers
+        self.fullAttentionLayerCount = constructedLayers.reduce(into: 0) { count, layer in
+            if !layer.isLinear { count += 1 }
         }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -5234,7 +5299,7 @@ public class Qwen35TextModelInner: Module {
         deferFinalDelta: Bool = false
     ) -> (hiddenStates: MLXArray, pendingDelta: MLXArray?) {
         precondition(
-            caches.count == layers.filter({ !$0.isLinear }).count,
+            caches.count == fullAttentionLayerCount,
             "Qwen35 CBv2 requires only full-attention caches")
         let shapeCall = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
