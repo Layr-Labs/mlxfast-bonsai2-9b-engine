@@ -1291,6 +1291,28 @@ extension SignedBlockHadamard {
         /// 4096-wide blocks per row in the load check (the SwiGLU input is
         /// the 12288-wide down-projection input).
         var checkBlocks: Int { self == .swiglu ? 3 : 1 }
+
+        var index: Int {
+            switch self {
+            case .residualNorm: return 0
+            case .residualNormNormed: return 1
+            case .residualNormRot: return 2
+            case .normNormed: return 3
+            case .gatedNorm: return 4
+            case .plain: return 5
+            case .plainRot: return 6
+            case .swiglu: return 7
+            case .attentionGate: return 8
+            }
+        }
+
+        var sideOutputCount: Int {
+            switch self {
+            case .residualNorm, .normNormed, .plainRot: return 1
+            case .residualNormNormed, .residualNormRot: return 2
+            case .gatedNorm, .plain, .swiglu, .attentionGate: return 0
+            }
+        }
     }
 
     /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel.
@@ -1408,7 +1430,9 @@ extension SignedBlockHadamard {
 
     /// The lane count each form serves (absent: the record kernel).
     nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Int] = [:]
+    nonisolated(unsafe) private static var wideRowResolvedLanes: [Int] = [Int](repeating: 0, count: 9)
     nonisolated(unsafe) private static var wideRowChecked = false
+    nonisolated(unsafe) private static var wideRowReady = false
     private static let wideRowLock = NSLock()
 
     /// Runs the load check once, from the first prompt-width call of at
@@ -1417,7 +1441,7 @@ extension SignedBlockHadamard {
     /// 512 tokens). Until then, and without it, every form keeps the record
     /// kernel.
     static func wideRowPrepareIfBoot(rows: Int) {
-        guard rows >= 1024, wideRowEnabled else { return }
+        guard rows >= 1024, wideRowEnabled, !wideRowReady else { return }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         guard !wideRowChecked else { return }
@@ -1433,6 +1457,7 @@ extension SignedBlockHadamard {
                 do {
                     if try withError({ wideRowCheck(kind, threads: threads) }) {
                         wideRowVerdict[kind] = threads
+                        wideRowResolvedLanes[kind.index] = threads
                         note = "passed"
                     }
                 } catch {
@@ -1444,6 +1469,7 @@ extension SignedBlockHadamard {
                 if wideRowVerdict[kind] != nil { break }
             }
         }
+        wideRowReady = true
     }
 
     private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
@@ -1452,6 +1478,7 @@ extension SignedBlockHadamard {
 
     private static func wideRowLanes(_ kind: WideRowKind) -> Int {
         guard wideRowKindEnabled(kind) else { return 0 }
+        if wideRowReady { return wideRowResolvedLanes[kind.index] }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         return wideRowVerdict[kind] ?? 0
@@ -1513,7 +1540,7 @@ extension SignedBlockHadamard {
         let tile = VerifyInt8Matmul.tileRows
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
             + Array(
-                repeating: sideShape ?? inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
+                repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
         if headError2 { shapes.append([rows * 32 * blocks]) }
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         if lanes > 0, let kernel = (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind] {
@@ -3731,9 +3758,10 @@ enum PromptInt8Matmul {
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto aT = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         auto tA0 = A.template slice<128, 32>(0, ms);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(aT)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
         const int nb = ns + fn;
         const int mb = ms + fm;
         // The operand words are written straight into bT's storage, so the
@@ -3743,7 +3771,7 @@ enum PromptInt8Matmul {
         // NaN (failing the load check) and touches no tensor.
         thread int8_t* b0p = &bT[0];
         bool ok = int(bT.get_capacity()) == 128 && int(cT.get_capacity()) == 32
-            && (reinterpret_cast<ulong>(b0p) & 3ul) == 0;
+            && ((uintptr_t)(b0p) & 3ul) == 0;
         if (ok) {
           for (int i = 1; i < 128; i++) { ok = ok && &bT[i] == b0p + i; }
           #pragma clang loop unroll(full)
@@ -3848,9 +3876,9 @@ enum PromptInt8Matmul {
     // stores on its own 32 x 32 tile, so every output is `naxSgBody`'s bits
     // (checked at load, `checkRegisterCols128`). grid (ceil(sum N / 128) *
     // 128, M / 32).
-    static func naxRegCols128Source(layers: Int) -> String {
+    static func naxRegCols128Source(layers: Int, operandBody: String = naxRegBody) -> String {
         let body = "using elem_index = metal::conditional_t<INDEX32, uint, size_t>;\n"
-            + naxRegBody.replacingOccurrences(of: "(size_t)", with: "(elem_index)")
+            + operandBody.replacingOccurrences(of: "(size_t)", with: "(elem_index)")
                 .replacingOccurrences(of: "const size_t ", with: "const elem_index ")
         return swapped(naxSgSource(layers: layers, body: body), [
             (of: "int bx = int(threadgroup_position_in_grid.x);",
@@ -3878,24 +3906,24 @@ enum PromptInt8Matmul {
     // Read the same immutable C16 copies as verify. Each uint4 still expands
     // into exactly the canonical staged B bytes. Independent allocations keep
     // MLX's command-buffer grouping by input buffer unchanged.
-    private static let streamedSgBody: String = {
-        let first = naxSgBody.range(of: "        const int sc =")
-        // Multiline-string indentation is stripped by Swift.
-        let start = first ?? naxSgBody.range(of: "const int sc =")!
-        let end = naxSgBody.range(of: "const int nb =", range: start.lowerBound ..< naxSgBody.endIndex)!
+    private static let streamedSgBody: String? = {
+        guard naxSgBody.components(separatedBy: "const int sc =").count == 2,
+            naxSgBody.components(separatedBy: "const int nb =").count == 2,
+            let start = naxSgBody.range(of: "const int sc ="),
+            let end = naxSgBody.range(of: "const int nb =",
+                range: start.lowerBound ..< naxSgBody.endIndex) else { return nil }
         let stage = """
             const uint pl = tid & 31u;
             const uint tile = tid >> 5;
-            const uint kj = pl & 7u;
-            const uint nc = pl >> 3;
             auto stage = [&](int g, int buf) {
               const elem_index at = ((elem_index)(n0 / 16 + int(tile)) * Kg + g) * 128
                   + pl * 4u;
               const uint4 v = *(const device uint4*)(w + at);
               #pragma clang loop unroll(full)
               for (int j = 0; j < 4; j++) {
-                const uint col = tile * 16u + uint(j) * 4u + nc;
-                threadgroup uint32_t* dst = bs[buf] + col * 32u + kj * 4u;
+                const uint col = tile * 16u + (pl >> 1);
+                const uint word = (pl & 1u) * 4u + uint(j);
+                threadgroup uint32_t* dst = bs[buf] + col * 32u + word * 4u;
                 const uint wv = v[j];
                 *(threadgroup uint4*)dst = uint4(wv & 0x03030303u,
                     (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
@@ -3912,8 +3940,80 @@ enum PromptInt8Matmul {
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
-            source: naxSgSource(layers: layers, body: streamedSgBody),
+            source: naxSgSource(layers: layers, body: streamedSgBody ?? naxSgBody),
             header: naxHeader, ensureRowContiguous: true)
+    }
+
+    /// Source drift disables the shared route before any copied weights are used.
+    /// The native register sources and their qualification remain unchanged.
+    private static func replacingStreamFragments(
+        _ body: String, _ swaps: [(of: String, with: String)]
+    ) -> String? {
+        var result = body
+        for swap in swaps {
+            guard result.components(separatedBy: swap.of).count == 2 else { return nil }
+            result = result.replacingOccurrences(of: swap.of, with: swap.with)
+        }
+        return result
+    }
+
+    // Only the word loads differ; the cooperative operand and all math stay native.
+    private static let streamedRegBody: String? = replacingStreamFragments(naxRegBody, [
+        (of: "const size_t cs = (size_t)(K / 8);\nconst device uint4* wcol = (const device uint4*)(w + (size_t)(ns + nl) * (size_t)(K / 16));\nuint4 wv[8];", with: "const device uint4* wcol = (const device uint4*)(w + (size_t)(ns / 16) * Kg * 128 + (size_t)nl * 8);\nuint4 wv[8];"),
+        (of: "  const device uint4* src = wcol + (size_t)g * 2;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * cs]; wv[2 * c + 1] = src[c * cs + 1]; }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }", with: "  const device uint4* src = wcol + (size_t)g * 32;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const size_t off = (size_t)(c >> 1) * Kg * 32 + (c & 1) * 16;\n    wv[2*c] = src[off]; wv[2*c+1] = src[off+1];\n  }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }"),
+    ])
+
+    private static let streamedRegKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_c16col_reg_\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxSgSource(layers: layers, body: streamedRegBody ?? naxRegBody),
+            header: naxHeader, ensureRowContiguous: true)
+    }
+
+    private static let streamedRegCols128Kernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_c16col_reg_cols128_\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxRegCols128Source(layers: layers, operandBody: streamedRegBody ?? naxRegBody),
+            header: naxHeader, ensureRowContiguous: true)
+    }
+
+    // No tensor operation: compare the 32 packed operand words in each lane.
+    private static let registerOperandProofSource = "const uint lane = thread_index_in_simdgroup;\nconst uint3 pos = threadgroup_position_in_grid;\nconst int Kg = K / 128;\nconst int ns = int(pos.x) * 32;\nconst int g = int(pos.y);\nconst int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));\nconst uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));\nuint32_t reference[32], candidate[32];\n{\n  const device uint32_t* w = canonical;\n  thread uint32_t* bw = reference;\n  const size_t cs = (size_t)(K / 8);\n  const device uint4* wcol = (const device uint4*)(w + (size_t)(ns + nl) * (size_t)(K / 16));\n  uint4 wv[8];\n  const device uint4* src = wcol + (size_t)g * 2;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * cs]; wv[2 * c + 1] = src[c * cs + 1]; }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }\n}\n{\n  const device uint32_t* w = packed;\n  thread uint32_t* bw = candidate;\n  const device uint4* wcol = (const device uint4*)(w + (size_t)(ns / 16) * Kg * 128 + (size_t)nl * 8);\n  uint4 wv[8];\n  const device uint4* src = wcol + (size_t)g * 32;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const size_t off = (size_t)(c >> 1) * Kg * 32 + (c & 1) * 16;\n    wv[2*c] = src[off]; wv[2*c+1] = src[off+1];\n  }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }\n}\nuint diff = 0;\nfor (int i = 0; i < 32; ++i) diff |= reference[i] ^ candidate[i];\nbad[(size_t(pos.x) * Kg + pos.y) * 32 + lane] = diff != 0 ? 1 : 0;\n"
+    private static let registerOperandProofKernels = [false, true].map { index32 in
+        let source = index32 ? registerOperandProofSource
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+            .replacingOccurrences(of: "const size_t ", with: "const uint ") : registerOperandProofSource
+        return MLXFast.metalKernel(
+            name: "bonsai_c16_register_operand_proof_\(index32 ? 32 : 64)",
+            inputNames: ["canonical", "packed"], outputNames: ["bad"], source: source,
+            ensureRowContiguous: true)
+    }
+
+    static func checkRegisterStreamOperands(weight: MLXArray, packed: MLXArray, k: Int) -> Bool {
+        let n = weight.dim(0), kg = k / 128
+        var matched = true
+        let failed = OSAllocatedUnfairLock(initialState: false)
+        withErrorHandler({ _ in failed.withLock { $0 = true } }) {
+            for kernel in registerOperandProofKernels where matched {
+                let bad = kernel([weight, packed], template: [("K", k)],
+                    grid: (n, kg, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[n / 32, kg, 32]], outputDTypes: [.uint8])[0]
+                let equal = MLX.all(bad .== MLXArray(UInt8(0)))
+                eval(equal)
+                let didFail = failed.withLock { $0 }
+                matched = !didFail && equal.item(Bool.self)
+            }
+        }
+        let didFail = failed.withLock { $0 }
+        let passed = matched && !didFail
+        FileHandle.standardError.write(Data("C16 register operand: \(passed ? "passed" : "FAILED") K\(k) N\(n); all tiles/groups/lanes/32 words; index32/index64\n".utf8))
+        return passed
     }
 
     private final class StreamPair {
@@ -3929,12 +4029,11 @@ enum PromptInt8Matmul {
         var pairs: [ObjectIdentifier: StreamPair] = [:]
     }
     private static let streamTable = StreamTable()
-    // Opt-in: the prompt route keeps its own matched sg form and the stored
-    // words unless DARKBLOOM_BONSAI_PREFILL_STREAM=1.
     private static let streamPromptAllowed = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_PREFILL_STREAM"] == "1"
+        "DARKBLOOM_BONSAI_PREFILL_STREAM"] != "0"
     private static let checkStreamActual = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_PREFILL_STREAM_CHECK"] == "1"
+    nonisolated(unsafe) private static var streamedForm = SgForm.staged
     nonisolated(unsafe) private static var streamPromptReady = false
     nonisolated(unsafe) private static var streamPromptPrepared = false
     nonisolated(unsafe) private static var streamPromptError = false
@@ -3980,6 +4079,11 @@ enum PromptInt8Matmul {
         guard !streamPromptPrepared else { return }
         streamPromptPrepared = true
         guard streamPromptAllowed, VerifyInt8Matmul.streamReady, route == .nax, naxSg else { return }
+        guard streamedRegBody != nil, streamedSgBody != nil else {
+            VerifyInt8Matmul.streamReady = false
+            FileHandle.standardError.write(Data("prompt C16 source drift: canonical route kept\n".utf8))
+            return
+        }
         var allMatched = true
         for k in [4096, 12288] where allMatched {
             let n = 128, kg = k / 128
@@ -3997,7 +4101,7 @@ enum PromptInt8Matmul {
             let ranges: [[Range<Int>]] = [[0 ..< 128], [0 ..< 64, 64 ..< 128], [0 ..< 64, 64 ..< 128, 0 ..< 64]]
             let copied: [[MLXArray]] = ranges.map { rs in rs.map { VerifyInt8Matmul.streamPack(weight[$0], k: k, columns: 16) } }
             eval(copied.flatMap { $0 })
-            var matched = true
+            var matched = checkRegisterStreamOperands(weight: weight, packed: copied[0][0], k: k)
             streamPromptError = false
             withErrorHandler({ _ in PromptInt8Matmul.streamPromptError = true }) {
                 for m in [64, 128] where matched {
@@ -4017,7 +4121,7 @@ enum PromptInt8Matmul {
                                 (copied[count - 1][i], entry.scalesT, entry.biasesT)
                             }
                             let a = runSg(codes: codes, ascale: ascale, rsb: rsb, layers: canonical,
-                                m: m, k: k, negative: negative, form: sgForm)
+                                m: m, k: k, negative: negative, form: .staged)
                             let b = runSg(codes: codes, ascale: ascale, rsb: rsb, layers: packed,
                                 m: m, k: k, negative: negative, form: .staged, streamed: true)
                             let checks: [MLXArray] = zip(a, b).map { x, y in MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32)) }
@@ -4029,7 +4133,17 @@ enum PromptInt8Matmul {
             }
             allMatched = matched && !streamPromptError
         }
+        streamedForm = .staged
+        if allMatched, sgForm != .staged {
+            // Keep the canonical prompt form's performance contract. A C16
+            // register failure disables both streams instead of downgrading.
+            let qualified = matchesStaged(sgForm, streamed: true)
+            allMatched = qualified.same
+            if allMatched { streamedForm = sgForm }
+            FileHandle.standardError.write(Data("prompt C16 register qualification: \(qualified.same ? "passed" : "FAILED; canonical buffers kept") \(sgForm)\n".utf8))
+        }
         streamPromptReady = allMatched
+        FileHandle.standardError.write(Data("prompt C16 selected form: \(streamedForm); canonical form: \(sgForm)\n".utf8))
         // A failed prefill qualification keeps the canonical layout on both
         // paths, rather than enabling copies with an unqualified consumer.
         if !allMatched { VerifyInt8Matmul.streamReady = false }
@@ -4038,6 +4152,14 @@ enum PromptInt8Matmul {
 
     enum SgForm {
         case staged, register, registerCols128
+
+        var streamedLaunch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
+            switch self {
+            case .staged: return (PromptInt8Matmul.streamedSgKernels, 128, 64, 64)
+            case .register: return (PromptInt8Matmul.streamedRegKernels, 64, 32, 64)
+            case .registerCols128: return (PromptInt8Matmul.streamedRegCols128Kernels, 128, 32, 128)
+            }
+        }
 
         var launch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
             switch self {
@@ -4075,8 +4197,8 @@ enum PromptInt8Matmul {
             }
         var template: [(String, any KernelTemplateArg)] = [("NEG", negative ? 1 : 0)]
         if form == .staged || form == .registerCols128 { template.append(("INDEX32", index32)) }
-        let launch = form.launch
-        let kernels = streamed ? streamedSgKernels : launch.kernels
+        let launch = streamed ? form.streamedLaunch : form.launch
+        let kernels = launch.kernels
         return kernels[layers.count - 1](
             inputs, template: template,
             grid: ((ns.reduce(0, +) + launch.columns - 1) / launch.columns * launch.threads, m / launch.rows, 1),
@@ -4129,7 +4251,7 @@ enum PromptInt8Matmul {
     /// `NEG = 1`; every output bit compared. A compile or run error counts as
     /// a mismatch. Returns whether every bit matched, and the detail for the
     /// stderr line.
-    private static func matchesStaged(_ form: SgForm) -> (same: Bool, detail: String) {
+    private static func matchesStaged(_ form: SgForm, streamed: Bool = false) -> (same: Bool, detail: String) {
         let m = registerCheckRows
         var same = true
         var compared = 0
@@ -4162,10 +4284,15 @@ enum PromptInt8Matmul {
                 var cases = [(offsets, false)]
                 if negativeForms { cases.append((negated, true)) }
                 for (layers, negative) in cases where same {
+                    let copies = streamed ? layers.map { VerifyInt8Matmul.streamPack($0.weight, k: k, columns: 16) } : []
+                    if streamed { eval(copies) }
+                    let packed: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] = streamed
+                        ? layers.enumerated().map { i, layer in (copies[i], layer.scalesT, layer.biasesT) } : layers
                     func outputs(_ which: SgForm) -> [MLXArray] {
-                        runSg(
-                            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
-                            negative: negative, form: which
+                        let useCopies = streamed && which == form
+                        return runSg(
+                            codes: codes, ascale: ascale, rsb: rsb, layers: useCopies ? packed : layers,
+                            m: m, k: k, negative: negative, form: which, streamed: useCopies
                         ).map { $0.view(dtype: .uint32) }
                     }
                     let checks = zip(outputs(.staged), outputs(form)).map { MLX.all($0 .== $1) }
@@ -4396,7 +4523,7 @@ enum PromptInt8Matmul {
         if let copied = promptStream(weight, m: activation.rows, k: activation.k) {
             let output = runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(copied, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, form: .staged, streamed: true)
+                negative: negative && negativeForms, form: streamedForm, streamed: true)
             return streamOutputs(output) {
                 runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                     layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
@@ -4435,7 +4562,7 @@ enum PromptInt8Matmul {
                 let negative = negativeForms && layers.allSatisfy { $0.negative }
                 let output = runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                     layers: packed, m: activation.rows, k: activation.k, negative: negative,
-                    form: .staged, streamed: true)
+                    form: streamedForm, streamed: true)
                 return streamOutputs(output) {
                     runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                         layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
@@ -4491,12 +4618,11 @@ enum VerifyInt8Matmul {
         name: "bonsai_verify_stream_repack", inputNames: ["w"], outputNames: ["packed"],
         source: """
             const uint i = thread_position_in_grid.x;
-            const uint Kg = K / 128, W = C / 4;
+            const uint Kg = K / 128;
             if (i >= N * K / 16) return;
             const uint bx = i / (Kg * C * 8), local = i % (Kg * C * 8);
             const uint g = local / (C * 8), v = local % (C * 8);
-            const uint lane = v / W, t = v % W;
-            const uint col = bx * C + lane / 8 + 4 * t, j = lane % 8;
+            const uint col = bx * C + v / 8, j = v % 8;
             packed[i] = w[col * (K / 16) + g * 8 + j];
             """, ensureRowContiguous: true)
 
@@ -4510,21 +4636,43 @@ enum VerifyInt8Matmul {
 
     /// Same staged B tile, int32 tensor result and FP32 epilogue. Only the
     /// word addresses/load width and the position of next-group loads change.
-    static func streamedBody(_ body: String, columns: Int) -> String {
+    private static func makeStreamedBody(_ body: String, columns: Int) -> String? {
         let words = columns / 4
         let oldPointer = "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
-        let pointer = "const device uint32_t* wcol = w + (size_t)bx * Kg * \(columns * 8);"
+        let pointer = "const device uint32_t* wcol = w + (size_t)bx * (\(columns / 16)) * Kg * 128;"
         let oldLoad = "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
         let load = "for (int t = 0; t < \(words); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
-        precondition(body.components(separatedBy: oldPointer).count == 2)
-        precondition(body.components(separatedBy: oldLoad).count == 3)
+        let oldStore = "dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
+        let store = "const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4); threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + col * 32u + word * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
+        guard body.components(separatedBy: oldPointer).count == 2,
+            body.components(separatedBy: oldLoad).count == 3,
+            body.components(separatedBy: oldStore).count == 2 else { return nil }
         var result = body.replacingOccurrences(of: oldPointer, with: pointer)
             .replacingOccurrences(of: oldLoad, with: load)
-        let start = result.range(of: "  if (g + 4 < Kg) {")!
-        let end = result.range(of: "  simdgroup_barrier(mem_flags::mem_threadgroup);", range: start.lowerBound ..< result.endIndex)!
+            .replacingOccurrences(of: oldStore, with: store)
+        let prefetchStart = "  if (g + 4 < Kg) {"
+        let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);"
+        let prefetchEnd = barrier + "\n  auto tA ="
+        // Two native barriers, but exactly one prefetch boundary. Reject
+        // duplicated bare markers as well as duplicated boundary context.
+        guard result.components(separatedBy: prefetchStart).count == 2,
+            result.components(separatedBy: prefetchEnd).count == 2,
+            result.components(separatedBy: barrier).count == 3,
+            let start = result.range(of: prefetchStart),
+            let end = result.range(of: prefetchEnd,
+                range: start.lowerBound ..< result.endIndex) else { return nil }
         let prefetch = String(result[start.lowerBound ..< end.lowerBound])
         result.removeSubrange(start.lowerBound ..< end.lowerBound)
-        return result.replacingOccurrences(of: "  op.run(tA, B, cT);", with: "  op.run(tA, B, cT);\n" + prefetch)
+        let issue = "  op.run(tA, B, cT);"
+        guard result.components(separatedBy: issue).count == 2 else { return nil }
+        return result.replacingOccurrences(of: issue, with: issue + "\n" + prefetch)
+    }
+
+    private static let streamedSourcesReady = makeStreamedBody(naxFastBody, columns: 32) != nil
+        && makeStreamedBody(naxNarrow16Body, columns: 16) != nil
+
+    static func streamedBody(_ body: String, columns: Int) -> String {
+        makeStreamedBody(body, columns: columns) ?? body
     }
 
     static func streamedFormsSource(layers: Int) -> String {
@@ -4535,7 +4683,7 @@ enum VerifyInt8Matmul {
 
     private static let streamedKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
-            name: "bonsai_q8_verify_streamed\(layers)",
+            name: "bonsai_q8_verify_streamed_col\(layers)",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
@@ -4543,7 +4691,7 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
     private static let streamedNarrowKernel = MLXFast.metalKernel(
-        name: "bonsai_q8_verify_streamed_n16", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+        name: "bonsai_q8_verify_streamed_col_n16", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
         source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
             + streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)"),
@@ -4554,7 +4702,7 @@ enum VerifyInt8Matmul {
     /// Input-independent guard at load, before any request. Compare new
     /// pipelines with the unchanged canonical forms, including dense b/a.
     private static func checkStreamed() -> Bool {
-        guard streamAllowed, naxShared, formsAllowed else { return false }
+        guard streamAllowed, naxShared, formsAllowed, streamedSourcesReady else { return false }
         var matched = true
         streamFailed = false
         withErrorHandler({ _ in VerifyInt8Matmul.streamFailed = true }) {
@@ -4646,6 +4794,8 @@ enum VerifyInt8Matmul {
         let shape = "K\(k) N\(n)"
         let first = checkedStreamShapes.withLock { $0.insert(shape).inserted }
         guard first else { return true }
+        guard PromptInt8Matmul.checkRegisterStreamOperands(weight: weight, packed: copied, k: k)
+        else { return false }
         let q: [Int8] = (0 ..< tileRows * k).map { (i: Int) -> Int8 in
             let v: Int = (i * 37 + 11) % 255 - 127
             return Int8(truncatingIfNeeded: v)
@@ -5168,7 +5318,7 @@ enum VerifyInt8Matmul {
 
     static func compactHeadAvailable(rows: Int, k: Int, n: Int) -> Bool {
         route == .nax && naxFast && rows == 16 && k == 4096 && n % 64 == 0
-            && formsAllowed && formsMatched.contains("\(k) 1") && formsFit(k: k, n: n)
+            && formsAllowed && hasMatchedForm(k: k, layers: 1) && formsFit(k: k, n: n)
     }
 
     static func compactHead(
@@ -5404,6 +5554,22 @@ enum VerifyInt8Matmul {
     /// `"\(k) \(layers)"` for each form that matched the record kernel at
     /// load, both offset forms included.
     nonisolated(unsafe) private static var formsMatched: Set<String> = []
+    /// Bitmask for fast hot-path lookup without string formatting:
+    /// bit `(layers - 1)` for `k == 4096`, bit `(layers + 3)` for `k == 12288`.
+    nonisolated(unsafe) private static var formsMatchedMask: UInt32 = 0
+    @inline(__always)
+    private static func formBit(k: Int, layers: Int) -> UInt32 {
+        guard (1 ... 3).contains(layers) else { return 0 }
+        if k == 4096 { return 1 << UInt32(layers - 1) }
+        if k == 12288 { return 1 << UInt32(layers + 3) }
+        return 0
+    }
+    @inline(__always)
+    private static func hasMatchedForm(k: Int, layers: Int) -> Bool {
+        let bit = formBit(k: k, layers: layers)
+        if bit != 0 { return (formsMatchedMask & bit) != 0 }
+        return formsMatched.contains("\(k) \(layers)")
+    }
     /// `DARKBLOOM_BONSAI_VERIFY_FORMS=0` keeps the record kernel everywhere.
     static let formsAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_FORMS"]?
@@ -5419,7 +5585,7 @@ enum VerifyInt8Matmul {
     }
 
     private static func usesForms(k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]) -> Bool {
-        formsAllowed && formsMatched.contains("\(k) \(layers.count)")
+        formsAllowed && hasMatchedForm(k: k, layers: layers.count)
             && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
     }
 
@@ -5763,6 +5929,7 @@ enum VerifyInt8Matmul {
     /// or any differing bit keeps the record kernel there.
     private static func checkForms() -> String {
         formsMatched = []
+        formsMatchedMask = 0
         guard formsAllowed else { return "off (DARKBLOOM_BONSAI_VERIFY_FORMS=0)" }
         let m = tileRows, n = 64
         for k in formsK {
@@ -5817,14 +5984,23 @@ enum VerifyInt8Matmul {
                 return !formsFailed
             }
             withErrorHandler({ _ in VerifyInt8Matmul.formsFailed = true }) {
-                if matches([0 ..< n]) { formsMatched.insert("\(k) 1") }
-                if naxShared, matches([0 ..< 32, 32 ..< 64]) { formsMatched.insert("\(k) 2") }
-                if naxShared, matches([0 ..< 32, 32 ..< 64, 0 ..< 32]) { formsMatched.insert("\(k) 3") }
+                if matches([0 ..< n]) {
+                    formsMatched.insert("\(k) 1")
+                    formsMatchedMask |= formBit(k: k, layers: 1)
+                }
+                if naxShared, matches([0 ..< 32, 32 ..< 64]) {
+                    formsMatched.insert("\(k) 2")
+                    formsMatchedMask |= formBit(k: k, layers: 2)
+                }
+                if naxShared, matches([0 ..< 32, 32 ..< 64, 0 ..< 32]) {
+                    formsMatched.insert("\(k) 3")
+                    formsMatchedMask |= formBit(k: k, layers: 3)
+                }
             }
         }
         formsFailed = false
         return "matched " + formsK.map { k in
-            let layers = (1 ... 3).filter { formsMatched.contains("\(k) \($0)") }.map { String($0) }
+            let layers = (1 ... 3).filter { hasMatchedForm(k: k, layers: $0) }.map { String($0) }
             return "K \(k): layers " + (layers.isEmpty ? "none" : layers.joined(separator: ","))
         }.joined(separator: "; ")
     }
@@ -5850,7 +6026,7 @@ enum VerifyInt8Matmul {
         }
         let forms = chosen == .nax && naxFast ? "; compile-time K forms: \(checkForms())" : ""
         if chosen == .nax && naxFast {
-            let eligible = naxShared && formsAllowed && formsMatched.contains("4096 2")
+            let eligible = naxShared && formsAllowed && hasMatchedForm(k: 4096, layers: 2)
             FileHandle.standardError.write(
                 "int8 verify dense b/a fold: \(VerifyDenseBA.check(eligible: eligible, negativeForms: negativeForms))\n"
                     .data(using: .utf8)!)
@@ -6133,7 +6309,7 @@ public enum VerifyDenseBA {
         ensureRowContiguous: true)
 
     static let streamedKernel = MLXFast.metalKernel(
-        name: "bonsai_q8_verify_streamed_dense_ba",
+        name: "bonsai_q8_verify_streamed_col_dense_ba",
         inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
         outputNames: ["out0", "out1", "ob", "oa"], source: fusedSource(streamed: true),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
@@ -6278,7 +6454,7 @@ public enum VerifyDenseBA {
 extension VerifyInt8Matmul {
     /// The two-layer compile-time form is what the qkv/z pair takes at `k`.
     static func denseBAEligible(k: Int) -> Bool {
-        route == .nax && naxFast && naxShared && formsAllowed && formsMatched.contains("\(k) 2")
+        route == .nax && naxFast && naxShared && formsAllowed && hasMatchedForm(k: k, layers: 2)
     }
 
     static func denseBAForms(
@@ -6361,11 +6537,9 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
-    /// Qualify the prompt route's use of the verify weight copies before
-    /// serving requests. Off by default (`DARKBLOOM_BONSAI_PREFILL_STREAM=1`
-    /// opts in), so prefill reads the stored words; verify reads the copies
-    /// whenever its own load check passed. No allocator policy or request
-    /// scratch is changed, and no request work is moved into begin.
+    /// Qualify the shared immutable weight layout before serving requests.
+    /// Prefill and verify then consume the same copies; no allocator policy or
+    /// request scratch is changed, and no request work is moved into begin.
     public static func prepareSharedVerifyWeights() {
         PromptInt8Matmul.prepareStreaming()
     }
