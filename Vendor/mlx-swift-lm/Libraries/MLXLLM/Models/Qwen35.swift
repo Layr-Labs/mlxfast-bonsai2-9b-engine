@@ -2515,14 +2515,87 @@ enum Qwen35FusedGDNVerify {
         return ok ? s : nil
     }
 
+    /// `fastTreeSource(source)` with one saved state: the prologue (during the conv) picks the row
+    /// whose state, reused by the restarts below it, saves the most ancestor re-runs (each
+    /// restart row t with that row s at depth d on its path skips d + 1 re-runs). The scan
+    /// writes that row's state to the thread's own `state_out` words when it reaches it (the
+    /// final state overwrites them at the end), and such a restart reloads it and re-runs only
+    /// the ancestors below s. A re-run is the same update on the same values, so the bits are
+    /// those of a restart from `state_in`. `DARKBLOOM_BONSAI_TREE_SNAPSHOT=0` keeps `fastTreeSource`.
+    static func snapshotTreeSource(_ fast: String) -> String? {
+        var s = fast
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let pick = """
+            {
+              const uint sn_s = tid >> 4, sn_t = tid & 15u;
+              uint sn_v = 0u;
+              if (sn_t > sn_s && sn_t < T) {
+                const int sn_ds = tb_desc[16 + sn_s];
+                if (tb_desc[sn_t] != int(sn_t) - 1 && tb_desc[16 + sn_t] > sn_ds
+                    && tb_desc[32 + 16 * sn_t + sn_ds] == int(sn_s)) {
+                  sn_v = uint(sn_ds) + 1u;
+                }
+              }
+              sn_v += simd_shuffle_xor(sn_v, 8u);
+              sn_v += simd_shuffle_xor(sn_v, 4u);
+              sn_v += simd_shuffle_xor(sn_v, 2u);
+              sn_v += simd_shuffle_xor(sn_v, 1u);
+              if (sn_t == 0u) {
+                sn_score[sn_s] = sn_v != 0u ? (sn_v << 4) | sn_s : 0u;
+              }
+            }
+            """
+        let save = """
+            if (t == sn_row) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                device float4* sn_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  sn_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+                }
+              }
+            }
+            """
+        let ok = swap("threadgroup uint tb_tab[MAX_T * 4];", "threadgroup uint tb_tab[MAX_T * 4];\nthreadgroup uint sn_score[16];")
+            && swap(
+                "// Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.",
+                pick + "\n// Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.")
+            && swap(
+                "float qr[R];",
+                "float qr[R];\nconst uint sn_k = simd_max(lane < 16u ? sn_score[lane] : 0u);\n"
+                    + "const int sn_row = sn_k != 0u ? int(sn_k & 15u) : -1;\nconst int sn_d = sn_row >= 0 ? tb_desc[16 + sn_row] : 0;")
+            && swap("q_ += Dk;", save + "\nq_ += Dk;")
+            && swap(
+                "const int sp_d = tb_desc[16 + t];",
+                "const int sp_d = tb_desc[16 + t];\n"
+                    + "const bool sn_use = sn_row >= 0 && sp_d > sn_d && tb_desc[32 + 16 * t + sn_d] == sn_row;\n"
+                    + "const device float* sn_src = sn_use ? (const device float*)state_out : state_in;")
+            && swap(
+                "const device float4* s_re4 = (const device float4*)(state_in + ",
+                "const device float4* s_re4 = (const device float4*)(sn_src + ")
+            && swap("for (int sp_i = 0; sp_i < sp_d; ++sp_i) {", "for (int sp_i = sn_use ? sn_d + 1 : 0; sp_i < sp_d; ++sp_i) {")
+        return ok ? s : nil
+    }
+
     static let fastTreeOffered =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_FAST"] != "0"
+    static let snapshotOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SNAPSHOT"] != "0"
 
     private static let treeKernel: MLXFast.MLXFastKernel? = {
-        let fast = fastTreeOffered ? fastTreeSource(source) : nil
+        let plainFast = fastTreeOffered ? fastTreeSource(source) : nil
+        let snapshot = snapshotOffered ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
+        let fast = snapshot ?? plainFast
         guard let text = fast ?? treeSource(source) else { return nil }
+        let name = snapshot != nil ? "qwen35_gdn_verify_fused_tree_fast_snapshot"
+            : fast != nil ? "qwen35_gdn_verify_fused_tree_fast" : "qwen35_gdn_verify_fused_tree"
         return MLXFast.metalKernel(
-            name: fast != nil ? "qwen35_gdn_verify_fused_tree_fast" : "qwen35_gdn_verify_fused_tree",
+            name: name,
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
             outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
             source: text,
