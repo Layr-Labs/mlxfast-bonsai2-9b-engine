@@ -2156,7 +2156,8 @@ enum DF2Fast {
         let key = ObjectIdentifier(norm)
         if let w = normCache[key] { return w }
         let weight = contiguous(norm.weight.asType(.float32))
-        eval(weight)
+        // Cache the same immutable tensor without waiting for prior GPU work.
+        asyncEval(weight)
         normCache[key] = weight
         return weight
     }
