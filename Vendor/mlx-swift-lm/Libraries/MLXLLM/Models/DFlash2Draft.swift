@@ -3380,7 +3380,7 @@ enum DF2Fast {
             const int CL = C + L;
             const float eps = fparams[0];
             const float mscale = fparams[1];
-            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            const int vecIdx = int(threadgroup_position_in_grid.x) * 8 + int(simdgroup_index_in_threadgroup);
             if (vecIdx >= 32 * L + 16 * CL) return;
             const uint lane = thread_index_in_simdgroup;
             const int d0 = int(lane);
@@ -3474,7 +3474,7 @@ enum DF2Fast {
         let kw = normWeight(kNorm)
         let CL = C + L
         let totalVecs = 32 * L + 16 * CL
-        let tgs = (totalVecs + 3) / 4
+        let tgs = (totalVecs + 7) / 8
         let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows == C + L
             ? ropeSpec.phases : nil
         let outs = qkvAllNormRopeKernel(
@@ -3484,7 +3484,7 @@ enum DF2Fast {
                 MLXArray([qNorm.eps, ropeSpec.mscale]),
             ],
             template: [("PHASES", phases != nil)],
-            grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+            grid: (tgs * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
             outputDTypes: [.float32, .float32, .float32])
         return (outs[0], outs[1], outs[2])
