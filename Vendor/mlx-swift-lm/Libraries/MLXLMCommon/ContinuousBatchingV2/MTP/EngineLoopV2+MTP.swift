@@ -127,8 +127,9 @@ extension EngineLoopV2 {
     /// arrives. Two kinds: context work the drafter postponed while proposing
     /// this round, and the next proposal's projection of this round's context
     /// columns. The projection is queued only for a single row that cannot
-    /// finish by length this round, so another round of the same request
-    /// inside the same decode window always follows it.
+    /// finish by length this round, so another round of the same request can
+    /// follow it; a stop token or the end of the caller's drain can still
+    /// leave it unused.
     private func mtpQueueRoundContextProjection(
         _ verify: CBv2MTPRoundInFlight.Verify, driver mtp: CBv2MTPRoundDriver
     ) {
@@ -139,6 +140,7 @@ extension EngineLoopV2 {
         else { return }
         // Packet layout for one row: k draft ids, then the 1 + k target ids.
         let k = verify.k
+        let draftTokens = verify.acceptancePacket[0 ..< k]
         let targetTokens = verify.acceptancePacket[k ..< (2 * k + 1)]
         var arrays = block.submitDeferredContext(requestState: state, after: targetTokens)
         let row = verify.rows[0]
@@ -148,7 +150,7 @@ extension EngineLoopV2 {
             arrays.append(
                 contentsOf: block.projectRoundContext(
                     blockContext: blockContext, targetTokens: targetTokens,
-                    requestState: state))
+                    draftTokens: draftTokens, requestState: state))
         }
         if !arrays.isEmpty {
             asyncEval(arrays)
