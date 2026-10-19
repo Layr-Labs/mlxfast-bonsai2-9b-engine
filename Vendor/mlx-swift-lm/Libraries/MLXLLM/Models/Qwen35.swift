@@ -916,38 +916,38 @@ private enum Qwen35PromptConvQKNorm {
             const uint lane = thread_index_in_simdgroup;
             const uint C = uint(CONV_DIM);
             const uint c0 = gi * 128u + lane * 4u;
-            float val[4];
-            for (int i = 0; i < 4; ++i) {
-              const uint c = c0 + uint(i);
-              float acc = 0.0f;
-              for (uint tap = 0; tap < 4u; ++tap) {
-                const uint r = t + tap;
-                const float v = r < 3u ? state[r * C + c] : qkv[(r - 3u) * C + c];
-                acc = fma(v, conv_weight[c * 4u + tap], acc);
-              }
-              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
-              const float sig = acc < 0.0f ? e : 1.0f - e;
-              val[i] = acc * sig;
+            const device float4* cw4 = (const device float4*)(conv_weight + c0 * 4u);
+            const float4 w0 = cw4[0];
+            const float4 w1 = cw4[1];
+            const float4 w2 = cw4[2];
+            const float4 w3 = cw4[3];
+            float4 acc = float4(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint tap = 0; tap < 4u; ++tap) {
+              const uint r = t + tap;
+              const float4 v4 = *(const device float4*)((r < 3u ? state + r * C : qkv + (r - 3u) * C) + c0);
+              const float4 wt = float4(w0[tap], w1[tap], w2[tap], w3[tap]);
+              acc = fma(v4, wt, acc);
             }
+            const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+            const float4 sig = select(1.0f - e, e, acc < 0.0f);
+            const float4 val = acc * sig;
             if (gi >= uint(2 * HK)) {
               const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
-              ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
+              ((device float4*)(v_out + o))[0] = val;
               return;
             }
-            float sum = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-              sum += val[i] * val[i];
-            }
+            const float sum = ((val.x * val.x + val.y * val.y) + val.z * val.z) + val.w * val.w;
             const float eps = as_type<float>(uint(EPS_BITS));
             const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
             const bool is_q = gi < uint(HK);
             const float scale = as_type<float>(uint(is_q ? Q_SCALE_BITS : K_SCALE_BITS));
             const uint o = (t * uint(HK) + (is_q ? gi : gi - uint(HK))) * 128u + lane * 4u;
             ((device float4*)((is_q ? q_out : k_out) + o))[0] = float4(
-              scale * (val[0] * inv),
-              scale * (val[1] * inv),
-              scale * (val[2] * inv),
-              scale * (val[3] * inv)
+              scale * (val.x * inv),
+              scale * (val.y * inv),
+              scale * (val.z * inv),
+              scale * (val.w * inv)
             );
             """
 
@@ -964,7 +964,7 @@ private enum Qwen35PromptConvQKNorm {
             .replacingOccurrences(of: """
             if (gi >= uint(2 * HK)) {
               const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
-              ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
+              ((device float4*)(v_out + o))[0] = val;
               return;
             }
 
@@ -1408,23 +1408,24 @@ private enum Qwen35Fresh8PromptGDN {
             const uint vcol0 = 2 * Hk * Dk + hv * Dv + r0 + fn;
             const float4 vw0 = *(const device float4*)(w + vcol0 * 4u);
             const float4 vw1 = *(const device float4*)(w + (vcol0 + 1u) * 4u);
-            auto vconv = [&](int t, uint col, float4 wt) -> float {
+            auto vconv2 = [&](int t) -> float2 {
               #pragma clang fp reassociate(off)
-              float acc = 0.0f;
+              float2 acc = float2(0.0f);
+              #pragma clang loop unroll(full)
               for (uint tap = 0; tap < 4u; ++tap) {
                 const uint r = uint(t) + tap;
-                const float xv = r < 3u ? conv_state[r * CD + col] : qkv[(r - 3u) * CD + col];
-                acc = fma(xv, wt[tap], acc);
+                const float2 xv = *(const device float2*)((r < 3u ? conv_state + r * CD : qkv + (r - 3u) * CD) + vcol0);
+                acc = fma(xv, float2(vw0[tap], vw1[tap]), acc);
               }
-              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
-              const float sig = acc < 0.0f ? e : 1.0f - e;
+              const float2 e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float2 sig = select(1.0f - e, e, acc < 0.0f);
               return acc * sig;
             };
             """)
         .replacingOccurrences(of: "const device float* v_ = vbase + (uint)t0 * vs;", with: "")
         .replacingOccurrences(
             of: "const float2 vv = *(const device float2*)(v_ + row * vs + fn);",
-            with: "const float2 vv = float2(vconv(t0 + row, vcol0, vw0), vconv(t0 + row, vcol0 + 1u, vw1));")
+            with: "const float2 vv = vconv2(t0 + row);")
 }
 
 /// Prompt-width register recurrence: `qwen35_gdn_register_v3` (same per-lane
@@ -2077,10 +2078,12 @@ enum Qwen35FusedGDNVerify {
         }
         {
           #pragma clang fp reassociate(off)
-          // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
-          #pragma clang loop unroll(full)
-          for (uint part = 0; part < (tid < 128u ? 2u : 0u); ++part) {
-            const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + tid;
+          // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk:
+          // all 256 threads run in parallel (tid 0..127 -> Q, tid 128..255 -> K).
+          {
+            const uint part = tid >> 7;
+            const uint qk_col = tid & 127u;
+            const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + qk_col;
             // All loads first; the taps then run in Qwen35FusedConvSilu's order.
             float xin[3 + MAX_T];
             #pragma clang loop unroll(full)
@@ -2113,7 +2116,7 @@ enum Qwen35FusedGDNVerify {
                 const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
                 const float sig = acc < 0.0f ? e : 1.0f - e;
                 const float out = acc * sig;
-                qk_raw[(part * MAX_T + p) * Dk + tid] = out;
+                qk_raw[(part * MAX_T + p) * Dk + qk_col] = out;
               }
             }
           }
@@ -2121,6 +2124,8 @@ enum Qwen35FusedGDNVerify {
           {
             const uint col = tid % uint(DVPT);
             const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
+            const float4 vw4 = ((const device float4*)conv_weight)[c];
+            const float vw[4] = {vw4.x, vw4.y, vw4.z, vw4.w};
             for (uint t = tid / uint(DVPT); t < 3u + T; t += 256u / uint(DVPT)) {
               const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
               conv_in[t * C + c] = xv;
@@ -2131,10 +2136,11 @@ enum Qwen35FusedGDNVerify {
             }
             for (uint p = tid / uint(DVPT); p < T; p += 256u / uint(DVPT)) {
               float acc = 0.0f;
+              #pragma clang loop unroll(full)
               for (uint tap = 0; tap < 4u; ++tap) {
                 const uint r = p + tap;
                 const float v = r < 3u ? conv_state[r * C + c] : qkv[(r - 3u) * C + c];
-                acc = fma(v, conv_weight[c * 4u + tap], acc);
+                acc = fma(v, vw[tap], acc);
               }
               const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
               const float sig = acc < 0.0f ? e : 1.0f - e;
@@ -3457,8 +3463,10 @@ enum Qwen35VerifyQKNormRoPE {
             const uint outL = LAST_QUERY && is_q ? 1u : L;
             const uint outT = LAST_QUERY && is_q ? 0u : t;
             device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;
+            #pragma clang loop unroll(full)
             for (uint part = 0; part < 2u; ++part) {
-              for (uint j = 0; j < 4u; ++j) dst[part * 128u + lane * 4u + j] = y[part][j];
+              *((device float4*)(dst + part * 128u + lane * 4u)) =
+                  float4(y[part][0], y[part][1], y[part][2], y[part][3]);
             }
             """
 
@@ -3518,10 +3526,10 @@ enum Qwen35VerifyQKNormRoPE {
         const float base = rope_base[0];
         float cos_j[4];
         float sin_j[4];
-        #pragma clang loop unroll(full)
-        for (uint j = 0; j < 4u; ++j) {
-          const uint dim = lane * 4u + j;
-          if (dim < uint(ROPE_DIMS)) {
+        if (lane * 4u < uint(ROPE_DIMS)) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < 4u; ++j) {
+            const uint dim = lane * 4u + j;
             const uint p = dim < HALF_ROT ? dim : dim - HALF_ROT;
             const float d = static_cast<float>(p) / static_cast<float>(HALF_ROT);
             const float inv_freq = metal::exp2(-d * base);
@@ -3758,8 +3766,6 @@ final class Qwen35Attention: Module {
             qProjOutput = exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         }
-        let qSplit = qProjOutput.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)
-        let gate = qSplit[1].reshaped(B, queryRows, -1)
         let keyIndex = narrowsToLastQuery && promptProjections == nil ? 0 : 1
         let valueIndex = narrowsToLastQuery && promptProjections == nil ? 1 : 2
         let kProjection = exactTargetVerify
@@ -3768,6 +3774,14 @@ final class Qwen35Attention: Module {
             ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[valueIndex] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
+
+        var cachedQSplit: [MLXArray]? = nil
+        func qSplitParts() -> [MLXArray] {
+            if let cachedQSplit { return cachedQSplit }
+            let parts = qProjOutput.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)
+            cachedQSplit = parts
+            return parts
+        }
 
         var queries: MLXArray
         var keys: MLXArray
@@ -3782,7 +3796,7 @@ final class Qwen35Attention: Module {
             // Verify window: q/k RMSNorm and RoPE in one kernel, same bits.
             (queries, keys) = fused
         } else {
-            queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            queries = qNorm(qSplitParts()[0]).transposed(0, 2, 1, 3)
             keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
                 .transposed(0, 2, 1, 3)
 
@@ -3817,6 +3831,7 @@ final class Qwen35Attention: Module {
         {
             return gated
         }
+        let gate = qSplitParts()[1].reshaped(B, queryRows, -1)
         let output = attended
             .transposed(0, 2, 1, 3)
             .reshaped(B, queryRows, -1)

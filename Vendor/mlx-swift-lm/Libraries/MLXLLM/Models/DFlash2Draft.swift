@@ -2874,7 +2874,17 @@ enum DF2Fast {
         let narrow: Bool
         let split: Int
     }
+    struct W4Pair24ShapeKey: Hashable {
+        let K: Int
+        let ns: [Int]
+        let group: Int
+        let form: Int
+        let narrow: Bool
+        let split: Int
+    }
     final class W4Pair24SelectionCache {
+        private static let shapeLock = NSLock()
+        nonisolated(unsafe) private static var shapeCache: [W4Pair24ShapeKey: W4Pair24Choice] = [:]
         private let lock = NSLock()
         private var cached: (key: W4Pair24SelectionKey, choice: W4Pair24Choice)?
         func resolve(
@@ -2897,7 +2907,20 @@ enum DF2Fast {
             }
             let key = W4Pair24SelectionKey(operands: ops.map { ObjectIdentifier($0) }, K: K, ns: ns,
                 group: group, form: form, narrow: narrow, split: split)
+            let shapeKey = W4Pair24ShapeKey(K: K, ns: ns, group: group, form: form, narrow: narrow, split: split)
+            Self.shapeLock.lock()
+            let existingShapeChoice = Self.shapeCache[shapeKey]
+            Self.shapeLock.unlock()
+            if let existingShapeChoice {
+                cached = (key, existingShapeChoice)
+                return existingShapeChoice
+            }
             let choice = build()
+            Self.shapeLock.lock()
+            if Self.shapeCache[shapeKey] == nil {
+                Self.shapeCache[shapeKey] = choice
+            }
+            Self.shapeLock.unlock()
             cached = (key, choice)
             return choice
         }
@@ -2932,9 +2955,12 @@ enum DF2Fast {
     static func w4Pair24Choose(valid: [Bool], samples: [[UInt64]]) -> W4Pair24Choice {
         func wins(_ candidate: W4Pair24Method, _ control: W4Pair24Method) -> Bool {
             let a = candidate.rawValue, b = control.rawValue
-            guard valid[a], valid[b], samples[a].count == 3, samples[b].count == 3 else { return false }
+            guard valid[a], valid[b], samples[a].count == 3, samples[b].count == 3,
+                let minA = samples[a].min(), let minB = samples[b].min(), minA > 0,
+                Double(minB) / Double(minA) >= 1.50
+            else { return false }
             return zip(samples[a], samples[b]).allSatisfy {
-                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.50
             }
         }
         let ordinary: W4Pair24Method = wins(.compact, .raw) ? .compact : .raw
@@ -2959,7 +2985,7 @@ enum DF2Fast {
             let index = control.rawValue
             guard valid[3], valid[index], samples[3].count == 3, samples[index].count == 3 else { return false }
             return zip(samples[3], samples[index]).allSatisfy {
-                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.50
             }
         }
         if beats(.raw) && (current.full16 == .raw || beats(current.full16)) {

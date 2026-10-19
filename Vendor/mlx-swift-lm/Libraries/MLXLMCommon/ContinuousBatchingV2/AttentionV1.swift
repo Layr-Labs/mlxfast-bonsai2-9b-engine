@@ -1010,9 +1010,18 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const device float* qp = queries + (h0 + h) * queries_strides[1]
                   + t * queries_strides[2] + simd_lid * 8;
+              const packed_float4 q0 = *((const device packed_float4*)(qp + 0));
+              const packed_float4 q1 = *((const device packed_float4*)(qp + 4));
+              q[h][0] = static_cast<float>(scale) * q0.x;
+              q[h][1] = static_cast<float>(scale) * q0.y;
+              q[h][2] = static_cast<float>(scale) * q0.z;
+              q[h][3] = static_cast<float>(scale) * q0.w;
+              q[h][4] = static_cast<float>(scale) * q1.x;
+              q[h][5] = static_cast<float>(scale) * q1.y;
+              q[h][6] = static_cast<float>(scale) * q1.z;
+              q[h][7] = static_cast<float>(scale) * q1.w;
               #pragma clang loop unroll(full)
               for (int j = 0; j < 8; j++) {
-                q[h][j] = static_cast<float>(scale) * qp[j];
                 o[h][j] = 0;
               }
               max_score[h] = -metal::numeric_limits<float>::max();
@@ -1023,13 +1032,12 @@ enum CBv2VerifyVectorAttention {
             const int64_t ks = keys_strides[2];
             const int64_t vs = values_strides[2];
             for (int i = c; i <= limit; i += 32) {
-              float k[8];
-              float v[8];
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 8; j++) {
-                k[j] = kp[i * ks + j];
-                v[j] = vp[i * vs + j];
-              }
+              const packed_float4 k0 = *((const device packed_float4*)(kp + i * ks + 0));
+              const packed_float4 k1 = *((const device packed_float4*)(kp + i * ks + 4));
+              const packed_float4 v0 = *((const device packed_float4*)(vp + i * vs + 0));
+              const packed_float4 v1 = *((const device packed_float4*)(vp + i * vs + 4));
+              const float k[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+              const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
               #pragma clang loop unroll(full)
               for (int h = 0; h < G; h++) {
                 float score = 0;
@@ -1053,8 +1061,8 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
               device float* op = part_o + slot * D + simd_lid * 8;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 8; j++) op[j] = o[h][j];
+              *((device packed_float4*)(op + 0)) = packed_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+              *((device packed_float4*)(op + 4)) = packed_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
               if (simd_lid == 0) {
                 part_m[slot] = max_score[h];
                 part_s[slot] = sum_exp_score[h];
@@ -1082,6 +1090,7 @@ enum CBv2VerifyVectorAttention {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint base = (head * L + t) * 32u;
+            #pragma clang loop unroll(full)
             for (uint idx = tid; idx < 32u * 32u; idx += 256u) {
               const uint c = idx / 32u, x = (idx % 32u) * 4u;
               const packed_float4 packet = *((const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x));
@@ -1093,6 +1102,7 @@ enum CBv2VerifyVectorAttention {
             float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             float o[v_per_thread];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < v_per_thread; i++) {
               o[i] = simd_sum(staged[simd_lid * 129u + simd_gid * v_per_thread + i] * factor);
               o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
@@ -1100,7 +1110,10 @@ enum CBv2VerifyVectorAttention {
             if (simd_lid == 0) {
               device float* op = out + (head * L + t) * 256u + half_ * 128u
                   + simd_gid * v_per_thread;
-              for (int i = 0; i < v_per_thread; i++) op[i] = o[i];
+              *((device packed_float4*)(op + 0)) = packed_float4(o[0], o[1], o[2], o[3]);
+              *((device packed_float4*)(op + 4)) = packed_float4(o[4], o[5], o[6], o[7]);
+              *((device packed_float4*)(op + 8)) = packed_float4(o[8], o[9], o[10], o[11]);
+              *((device packed_float4*)(op + 12)) = packed_float4(o[12], o[13], o[14], o[15]);
             }
             """)
 
@@ -1132,9 +1145,18 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const device float* qp = queries + (h0 + h) * queries_strides[1]
                   + t * queries_strides[2] + simd_lid * 8;
+              const packed_float4 q0 = *((const device packed_float4*)(qp + 0));
+              const packed_float4 q1 = *((const device packed_float4*)(qp + 4));
+              q[h][0] = static_cast<float>(scale) * q0.x;
+              q[h][1] = static_cast<float>(scale) * q0.y;
+              q[h][2] = static_cast<float>(scale) * q0.z;
+              q[h][3] = static_cast<float>(scale) * q0.w;
+              q[h][4] = static_cast<float>(scale) * q1.x;
+              q[h][5] = static_cast<float>(scale) * q1.y;
+              q[h][6] = static_cast<float>(scale) * q1.z;
+              q[h][7] = static_cast<float>(scale) * q1.w;
               #pragma clang loop unroll(full)
               for (int j = 0; j < 8; j++) {
-                q[h][j] = static_cast<float>(scale) * qp[j];
                 o[h][j] = 0;
               }
               max_score[h] = -metal::numeric_limits<float>::max();
@@ -1145,13 +1167,12 @@ enum CBv2VerifyVectorAttention {
             const int64_t ks = keys_strides[2];
             const int64_t vs = values_strides[2];
             for (int i = c; i <= limit; i += 32) {
-              float k[8];
-              float v[8];
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 8; j++) {
-                k[j] = kp[i * ks + j];
-                v[j] = vp[i * vs + j];
-              }
+              const packed_float4 k0 = *((const device packed_float4*)(kp + i * ks + 0));
+              const packed_float4 k1 = *((const device packed_float4*)(kp + i * ks + 4));
+              const packed_float4 v0 = *((const device packed_float4*)(vp + i * vs + 0));
+              const packed_float4 v1 = *((const device packed_float4*)(vp + i * vs + 4));
+              const float k[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+              const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
               #pragma clang loop unroll(full)
               for (int h = 0; h < G; h++) {
                 float score = 0;
@@ -1175,8 +1196,8 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
               device float* op = part_o + slot * D + simd_lid * 8;
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 8; j++) op[j] = o[h][j];
+              *((device packed_float4*)(op + 0)) = packed_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+              *((device packed_float4*)(op + 4)) = packed_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
               if (simd_lid == 0) {
                 part_m[slot] = max_score[h];
                 part_s[slot] = sum_exp_score[h];
@@ -1199,9 +1220,10 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
+        let nKeys = keys.dim(2)
 
         if L > 8 && classesPerGroup == 2 {
-            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])]
+            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])]
             let states = pairedPartial(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
@@ -1212,7 +1234,7 @@ enum CBv2VerifyVectorAttention {
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
         let parts = partial(
-            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
+            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])],
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
