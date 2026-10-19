@@ -28,8 +28,13 @@ extension EngineLoopV2 {
     static func mtpPollUntilAvailable(_ array: MLXArray) {
         var available = false
         let start = DispatchTime.now().uptimeNanoseconds
+        var pollsUntilClock = 64
         while _mlx_array_is_available(&available, array.ctx) == 0, !available {
-            if DispatchTime.now().uptimeNanoseconds &- start > 1_000_000_000 { return }
+            pollsUntilClock -= 1
+            if pollsUntilClock == 0 {
+                if DispatchTime.now().uptimeNanoseconds &- start > 1_000_000_000 { return }
+                pollsUntilClock = 64
+            }
         }
     }
 
