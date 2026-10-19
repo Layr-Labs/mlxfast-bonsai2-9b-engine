@@ -1082,9 +1082,10 @@ enum CBv2VerifyVectorAttention {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint base = (head * L + t) * 32u;
-            for (uint idx = tid; idx < 32u * 128u; idx += 512u) {
-              const uint c = idx / 128u, x = idx % 128u;
-              staged[c * 129u + x] = part_o[(base + c) * 256u + half_ * 128u + x];
+            for (uint idx = tid; idx < 32u * 32u; idx += 512u) {
+              const uint c = idx / 32u, x = (idx % 32u) * 4u;
+              const packed_float4 packet = *((const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x));
+              *((threadgroup packed_float4*)(staged + c * 129u + x)) = packet;
             }
             float max_score = part_m[base + simd_lid];
             float new_max = simd_max(max_score);
