@@ -1993,7 +1993,12 @@ enum Qwen35RegisterGatedSIMD {
     private static func checkRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
         let i = MLXArray(0 ..< n).asType(.float32)
-        let w = MLX.sin(i * (0.7548776 + seed)) * (1 + 0.5 * MLX.cos(i * 0.0137 + seed))
+        let firstAngle = i * (0.7548776 + seed)
+        let first = MLX.sin(firstAngle)
+        let secondAngle = i * 0.0137 + seed
+        let second = MLX.cos(secondAngle)
+        let amplitude = 1 + 0.5 * second
+        let w = first * amplitude
         return (w * scale).reshaped(shape)
     }
 
@@ -2329,6 +2334,88 @@ enum Qwen35FusedGDNVerify {
         source: source,
         header: Qwen35RegisterGatedSIMD.gateHeader)
 
+    private static let deltaKernel: MLXFast.MLXFastKernel? = {
+        guard let text = capturingDelta(source) else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_fused_delta",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail", "delta_out"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    private static func tunedSourceFor(_ record: String) -> String? {
+        var s = record
+        func change(_ from: String, _ to: String, count: Int = 1) -> Bool {
+            guard s.components(separatedBy: from).count == count + 1 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        guard change("const uint T = qkv_shape[1];", "constexpr uint T = 16u;") else { return nil }
+        guard change("// all 256 threads run in parallel (tid 0..127 -> Q, tid 128..255 -> K).\n  {",
+            "// The first 256 threads form Q/K; the remaining threads form V.\n  if (tid < 256u) {") else { return nil }
+        guard change("constexpr int DVPT = DVPS * 8;", "constexpr int DVPT = DVPS * 16;") else { return nil }
+        guard change("256u / uint(DVPT)", "512u / uint(DVPT)", count: 2) else { return nil }
+        guard change("job += 8u", "job += 16u") else { return nil }
+        guard let beginRange = s.range(of: "// The scan state loads first, so they overlap the conv and norm below.")
+        else { return nil }
+        let begin = beginRange.lowerBound
+        guard let finishRange = s.range(of: "\n{\n  #pragma clang fp reassociate(off)", range: begin..<s.endIndex)
+        else { return nil }
+        let finish = finishRange.lowerBound
+        var load = String(s[begin..<finish])
+        load = load.replacingOccurrences(
+            of: "// The scan state loads first, so they overlap the conv and norm below.",
+            with: "// Keep state registers out of the convolution frontend.")
+        s.removeSubrange(begin..<finish)
+        let scan = "// Qwen35RegisterGatedSIMD with q/k/v read from threadgroup memory."
+        guard s.components(separatedBy: scan).count == 2 else { return nil }
+        return s.replacingOccurrences(of: scan, with: load + "\n" + scan)
+    }
+
+    private static let tunedSource = tunedSourceFor(source)
+
+    private static func capturingDelta(_ s: String) -> String? {
+        let from = "const float delta = (vt[d] - kv[d]) * bt;"
+        guard s.components(separatedBy: from).count == 2 else { return nil }
+        return s.replacingOccurrences(of: from, with: """
+            const float delta = (vt[d] - kv[d]) * bt;
+            if (lane % LPD == 0) {
+              delta_out[(t * Hv + hv_idx) * (Dv + 1) + dvbase + d] = delta;
+            }
+            if (dvbase == 0 && lane % LPD == 0 && d == 0) {
+              delta_out[(t * Hv + hv_idx) * (Dv + 1) + Dv] = gt;
+            }
+            """)
+    }
+
+    private static let tunedKernel: MLXFast.MLXFastKernel? = {
+        guard let text = tunedSource else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_fused_sg16",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    private static let tunedDeltaKernel: MLXFast.MLXFastKernel? = {
+        guard let record = tunedSource, let text = capturingDelta(record) else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_fused_sg16_delta",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail", "delta_out"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    private static let tuneOffered = ProcessInfo.processInfo.environment["GDN_VERIFY_TUNE"] != "0"
+    private static let deltaOffered = ProcessInfo.processInfo.environment["GDN_DELTA_REPLAY"] != "0"
+    nonisolated(unsafe) private static var tunePassed = false
+    nonisolated(unsafe) private static var deltaPassed = false
+    nonisolated(unsafe) private static var prepared = false
+
+    typealias VerifyResult = (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray?)
+
+
+
     /// Tree twin of `source`. `tree` is the draft tree descriptor (int32, at least 288):
     /// parent row [16], depth [16] (row 0 = anchor, depth 0), ancestor row by depth [16][16].
     /// Each row's conv window reads its own path (taps past the anchor read `conv_state`), and a
@@ -2602,12 +2689,50 @@ enum Qwen35FusedGDNVerify {
             header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
 
+    private static func treeVariant(tuned: Bool, delta: Bool) -> MLXFast.MLXFastKernel? {
+        let record: String
+        if tuned {
+            guard let text = tunedSource else { return nil }
+            record = text
+        } else { record = source }
+        let plainFast = fastTreeOffered ? fastTreeSource(record) : nil
+        let snapshot = snapshotOffered ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
+        guard var text = snapshot ?? plainFast ?? treeSource(record) else { return nil }
+        if tuned && plainFast != nil {
+            // The descriptor covers 288 words; SG16 has 512 threads rather than 256.
+            guard text.components(separatedBy: "tb_i += 256u").count == 2 else { return nil }
+            text = text.replacingOccurrences(of: "tb_i += 256u", with: "tb_i += 512u")
+        }
+        if tuned && snapshot != nil {
+            // Only the first 256 threads score the 16 by 16 snapshot candidates.
+            guard text.components(separatedBy: "{\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;").count == 2
+            else { return nil }
+            text = text.replacingOccurrences(
+                of: "{\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;",
+                with: "if (tid < 256u) {\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;")
+        }
+        if delta {
+            guard let captured = capturingDelta(text) else { return nil }
+            text = captured
+        }
+        let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : ""),
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"] + (delta ? ["delta_out"] : []),
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }
+
+    private static let deltaTreeKernel = treeVariant(tuned: false, delta: true)
+    private static let tunedTreeKernel = treeVariant(tuned: true, delta: false)
+    private static let tunedDeltaTreeKernel = treeVariant(tuned: true, delta: true)
+
     /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
     static func applyTree(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, tree: MLXArray,
         keyHeads: Int, valueHeads: Int
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+    ) -> VerifyResult? {
         guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
             convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
             a.ndim == 3, b.ndim == 3, state.ndim == 4,
@@ -2625,28 +2750,40 @@ enum Qwen35FusedGDNVerify {
             state.shape4 == (1, valueHeads, 128, 128),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let o = treeKernel(
+        let eligible = keyHeads == 16 && valueHeads == 32
+        let wantsDelta = eligible && deltaPassed
+        let wantsTuned = eligible && S == 16 && tunePassed
+        let tuned = wantsTuned && (wantsDelta ? tunedDeltaTreeKernel : tunedTreeKernel) != nil
+        let captureDelta = wantsDelta && (tuned ? tunedDeltaTreeKernel : deltaTreeKernel) != nil
+        let selected: MLXFast.MLXFastKernel?
+        if tuned { selected = captureDelta ? tunedDeltaTreeKernel : tunedTreeKernel }
+        else { selected = captureDelta ? deltaTreeKernel : treeKernel }
+        guard let selected else { return nil }
+        let qShape = [1, S, keyHeads, 128]
+        let vShape = [1, S, valueHeads, 128]
+        var shapes = [[1, S + 3, C], vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C]]
+        if captureDelta { shapes.append([1, S, valueHeads, 129]) }
+        let o = selected(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
                 ("CONV_DIM", C), ("MAX_T", maximumRows),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], [1, valueHeads, 128, 128], [1, 3, C]],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
-        return (o[0], o[1], o[2], o[3], o[4], o[5], o[6])
+            grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads), threadGroup: (tuned ? 512 : 256, 1, 1),
+            outputShapes: shapes,
+            outputDTypes: captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        return (o[0], o[1], o[2], o[3], o[4], o[5], o[6], captureDelta ? o[7] : nil)
     }
 
-    /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
+    /// `(convIn, v, q, k, y, finalState, convTail, deltaTape)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
     /// is `convIn[:, S...] + 0` (the full-acceptance conv state) in its own
     /// buffer.
     static func apply(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+    ) -> VerifyResult? {
         guard convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
             a.ndim == 3, b.ndim == 3, state.ndim == 4,
             convState.dtype == .float32, qkv.dtype == .float32, convWeight.dtype == .float32,
@@ -2663,18 +2800,287 @@ enum Qwen35FusedGDNVerify {
             state.shape4 == (1, valueHeads, 128, 128),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let outputs = kernel(
+        let eligible = keyHeads == 16 && valueHeads == 32
+        let wantsDelta = eligible && deltaPassed
+        let wantsTuned = eligible && S == 16 && tunePassed
+        let tuned = wantsTuned && (wantsDelta ? tunedDeltaKernel : tunedKernel) != nil
+        let captureDelta = wantsDelta && (tuned ? tunedDeltaKernel : deltaKernel) != nil
+        let selectedKernel: MLXFast.MLXFastKernel
+        if tuned {
+            let selected = captureDelta ? tunedDeltaKernel : tunedKernel
+            selectedKernel = selected ?? kernel
+        } else {
+            selectedKernel = captureDelta ? (deltaKernel ?? kernel) : kernel
+        }
+        let qShape = [1, S, keyHeads, 128]
+        let vShape = [1, S, valueHeads, 128]
+        let convShape = [1, S + 3, C]
+        let tailShape = [1, 3, C]
+        var shapes = [convShape, vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape]
+        if captureDelta { shapes.append([1, S, valueHeads, 129]) }
+        let outputs = selectedKernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
                 ("CONV_DIM", C), ("MAX_T", maximumRows),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
-            outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
-                [1, S, valueHeads, 128], [1, valueHeads, 128, 128], [1, 3, C]],
-            outputDTypes: [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
-        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6])
+            grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads),
+            threadGroup: (tuned ? 512 : 256, 1, 1),
+            outputShapes: shapes,
+            outputDTypes: captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        let delta = captureDelta ? outputs[7] : nil
+        return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5], outputs[6], delta)
+    }
+    /// Compile/check fixed synthetic tensors at model load, before request data exists.
+    static func prepare() {
+        guard !prepared, StreamOrDevice.default == StreamOrDevice.gpu else { return }
+        prepared = true
+        guard tuneOffered || deltaOffered else { return }
+        Qwen35RegisterGatedSIMD.prepareHoistedReplay()
+        var verdict = (false, false)
+        do {
+            verdict = try withError { checkPreparedKernels() }
+        } catch {
+            FileHandle.standardError.write(Data("gdn16 check error: \(error)\n".utf8))
+        }
+        tunePassed = tuneOffered && verdict.0
+        deltaPassed = deltaOffered && verdict.1
+        let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)\n"
+        FileHandle.standardError.write(Data(message.utf8))
+    }
+
+    private static func probeRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
+        let n = shape.reduce(1, *)
+        let i = MLXArray(0..<n).asType(.float32)
+        let firstAngle = i * (0.7548776 + seed)
+        let first = MLX.sin(firstAngle)
+        let secondAngle = i * 0.0137 + seed
+        let second = MLX.cos(secondAngle)
+        let amplitude = 1 + 0.5 * second
+        let values = first * amplitude
+        return (values * scale).reshaped(shape)
+    }
+
+    private static func probeWords(_ shape: [Int]) -> MLXArray {
+        let pattern: [UInt32] = [0x7fc00001, 0x7fc12345, 0xffc00042, 0x7f800001,
+            0x7f800000, 0xff800000, 0, 0x80000000]
+        let n = shape.reduce(1, *)
+        let words = (0..<n).map { pattern[$0 % pattern.count] }
+        return MLXArray(words).view(dtype: .float32).reshaped(shape)
+    }
+
+    private static func sameBits(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+        guard a.count == b.count else { return false }
+        for j in a.indices {
+            guard a[j].shape == b[j].shape else { return false }
+            let lhs = a[j].view(dtype: .uint32)
+            let rhs = b[j].view(dtype: .uint32)
+            let equal = lhs .== rhs
+            if !equal.all().item(Bool.self) { return false }
+        }
+        return true
+    }
+
+    private static func seven(_ a: VerifyResult) -> [MLXArray] {
+        [a.0, a.1, a.2, a.3, a.4, a.5, a.6]
+    }
+
+    private static func probeForward(_ inputs: [MLXArray], tuned: Bool, delta: Bool, tree: MLXArray? = nil) -> VerifyResult? {
+        tunePassed = tuned
+        deltaPassed = delta
+        if let tree {
+            return applyTree(convState: inputs[0], qkv: inputs[1], convWeight: inputs[2],
+                a: inputs[3], b: inputs[4], aLog: inputs[5], dtBias: inputs[6],
+                state: inputs[7], tree: tree, keyHeads: 16, valueHeads: 32)
+        }
+        return apply(convState: inputs[0], qkv: inputs[1], convWeight: inputs[2],
+            a: inputs[3], b: inputs[4], aLog: inputs[5], dtBias: inputs[6],
+            state: inputs[7], keyHeads: 16, valueHeads: 32)
+    }
+
+    private static func probeTree(_ parents: [Int]) -> (MLXArray, [[Int]]) {
+        var paths = [[Int]]()
+        for row in parents.indices {
+            var path = parents[row] < 0 ? [] : paths[parents[row]]
+            path.append(row)
+            paths.append(path)
+        }
+        var descriptor = parents.map { Int32($0) }
+        descriptor += paths.map { Int32($0.count - 1) }
+        for path in paths {
+            descriptor += path.map { Int32($0) }
+            descriptor += Array(repeating: Int32(0), count: 16 - path.count)
+        }
+        return (MLXArray(descriptor), paths)
+    }
+
+    private static func checkPreparedKernels() -> (Bool, Bool) {
+        defer { tunePassed = false; deltaPassed = false }
+        guard tunedKernel != nil, tunedDeltaKernel != nil, deltaKernel != nil,
+            deltaTreeKernel != nil, tunedTreeKernel != nil, tunedDeltaTreeKernel != nil
+        else { return (false, false) }
+        var tuneOK = true
+        var deltaOK = true
+        for kind in 0..<3 {
+            let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
+            let qkv = kind == 2 ? probeWords([1, 16, 8192])
+                : probeRows([1, 16, 8192], seed: 0.02, scale: 0.5)
+            let weight = probeRows([8192, 4, 1], seed: 0.03, scale: 0.1)
+            let a = probeRows([1, 16, 32], seed: 0.04, scale: 30)
+            let b = probeRows([1, 16, 32], seed: 0.05, scale: 8)
+            let aLog = probeRows([32], seed: 0.06, scale: 2)
+            let bias = probeRows([32], seed: 0.07, scale: 3)
+            let state = kind == 1 ? probeWords([1, 32, 128, 128])
+                : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)
+            let inputs = [convState, qkv, weight, a, b, aLog, bias, state]
+            let parents: [[Int]?] = [nil,
+                [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
+                [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+            for parent in parents {
+            let descriptor = parent.map { probeTree($0) }
+            let tree = descriptor.map { $0.0 }
+            guard let record = probeForward(inputs, tuned: false, delta: false, tree: tree),
+                let tuned = probeForward(inputs, tuned: true, delta: false, tree: tree),
+                let plainCapture = probeForward(inputs, tuned: false, delta: true, tree: tree),
+                let tunedCapture = probeForward(inputs, tuned: true, delta: true, tree: tree)
+            else { return (false, false) }
+            tuneOK = sameBits(seven(record), seven(tuned)) && tuneOK
+            deltaOK = sameBits(seven(record), seven(plainCapture)) && deltaOK
+            deltaOK = sameBits(seven(record), seven(tunedCapture)) && deltaOK
+            for capture in [plainCapture, tunedCapture] {
+                guard let tape = capture.7 else { return (false, false) }
+                let paths = descriptor.map { $0.1 }
+                    ?? [1, 2, 4, 8, 15, 16].map { Array(0..<$0) }
+                for path in paths {
+                    let q = record.2[0..., 0..<path.count, 0...]
+                    let treeRows = tree == nil ? nil : MLXArray(path)
+                    let old: (MLXArray, MLXArray)
+                    if let treeRows {
+                        guard let replay = Qwen35RegisterGatedSIMD.runTreeReplay(q: record.2,
+                            k: record.3, v: record.1, a: a, b: b, aLog: aLog, dtBias: bias,
+                            state: state, convInput: record.0, rows: treeRows)
+                        else { return (false, false) }
+                        old = replay
+                    } else {
+                        old = Qwen35RegisterGatedSIMD.runReplay(q: q, k: record.3, v: record.1,
+                            a: a, b: b, aLog: aLog, dtBias: bias, state: state, convInput: record.0)
+                    }
+                    guard let new = Qwen35DeltaReplay.run(q: q, k: capture.3, delta: tape,
+                        state: state, convInput: capture.0, treeRows: treeRows)
+                    else { return (false, false) }
+                    deltaOK = sameBits([old.0, old.1], [new.0, new.1]) && deltaOK
+                }
+            }
+        }
+        }
+        return (tuneOK, deltaOK)
+    }
+
+}
+
+/// Accepted-prefix state reconstruction from the exact delta captured by verify.
+/// The multiply and FMA remain separate, in the original recurrence order.
+private enum Qwen35DeltaReplay {
+    private static let source = """
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(off)
+        const uint T = q_shape[1];
+        const uint tid = thread_position_in_grid.x;
+        const uint hv = threadgroup_position_in_grid.z;
+        const uint dv = tid / 8u;
+        const uint dk = (tid % 8u) * 16u;
+        float s[16];
+        const uint si = hv * state_in_strides[1] + dv * state_in_strides[2] + dk;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+          const float4 sv = ((const device float4*)(state_in + si))[j];
+          s[j * 4] = sv.x; s[j * 4 + 1] = sv.y;
+          s[j * 4 + 2] = sv.z; s[j * 4 + 3] = sv.w;
+        }
+        for (uint t = 0; t < T; ++t) {
+          const float g = delta[t * delta_strides[1] + hv * delta_strides[2] + Dv];
+          const float d = delta[t * delta_strides[1] + hv * delta_strides[2] + dv];
+          const uint ki = t * k_strides[1] + (hv / (Hv / Hk)) * k_strides[2] + dk;
+          const device float4* kp = (const device float4*)(k + ki);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; ++j) {
+            const float4 kv = kp[j];
+            s[j * 4] *= g; s[j * 4 + 1] *= g;
+            s[j * 4 + 2] *= g; s[j * 4 + 3] *= g;
+            s[j * 4] = fma(kv.x, d, s[j * 4]);
+            s[j * 4 + 1] = fma(kv.y, d, s[j * 4 + 1]);
+            s[j * 4 + 2] = fma(kv.z, d, s[j * 4 + 2]);
+            s[j * 4 + 3] = fma(kv.w, d, s[j * 4 + 3]);
+          }
+        }
+        const uint so = (hv * Dv + dv) * Dk + dk;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+          ((device float4*)(state_out + so))[j] =
+              float4(s[j * 4], s[j * 4 + 1], s[j * 4 + 2], s[j * 4 + 3]);
+        }
+        // Match the old replay's raw-bit conv tail, including signed zero.
+        const uint cdim = uint(conv_in_shape[2]);
+        const uint gid = hv * threads_per_grid.x + tid;
+        const uint nthreads = uint(Hv) * threads_per_grid.x;
+        const device uint* src = (const device uint*)conv_in;
+        device uint* dst = (device uint*)conv_tail;
+        for (uint i = gid; i < 3u * cdim; i += nthreads) {
+          const uint r = i / cdim;
+          const uint c = i - r * cdim;
+          dst[i] = src[(T + r) * conv_in_strides[1] + c * conv_in_strides[2]];
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_replay",
+        inputNames: ["q", "k", "delta", "state_in", "conv_in"],
+        outputNames: ["state_out", "conv_tail"], source: source, ensureRowContiguous: false)
+
+    private static let treeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_tree_replay",
+        inputNames: ["q", "k", "delta", "state_in", "conv_in", "tree_rows"],
+        outputNames: ["state_out", "conv_tail"],
+        source: source
+            .replacingOccurrences(of: "const uint T = q_shape[1];", with: "const uint T = uint(tree_rows_shape[0]);")
+            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+            .replacingOccurrences(of: "t * delta_strides[1]", with: "step * delta_strides[1]")
+            .replacingOccurrences(of: "t * k_strides[1]", with: "step * k_strides[1]")
+            .replacingOccurrences(of: "(T + r) * conv_in_strides[1]", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * conv_in_strides[1]"),
+        ensureRowContiguous: false)
+
+    static func run(
+        q: MLXArray, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
+        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false
+    ) -> (MLXArray, MLXArray)? {
+        guard q.ndim == 4, q.dim(0) == 1, (1...16).contains(q.dim(1)),
+            q.dim(3) == 128, k.ndim == 4, k.dim(0) == 1, k.dim(3) == 128,
+            state.ndim == 4, state.dim(0) == 1, state.dim(2) == 128,
+            delta.shape == [1, k.dim(1), state.dim(1), 129],
+            delta.dtype == .float32, k.dtype == .float32,
+            state.dim(3) == 128, state.dtype == .float32
+        else { return nil }
+        // D2: producer layout metadata is valid before GPU completion.
+        // Unknown views still need observed row-contiguous backing, or decline.
+        if !stateIsRowContiguous {
+            guard let stateInfo = try? state.evaluatedBufferInfo(), stateInfo.isRowContiguous
+            else { return nil }
+        }
+        if let treeRows {
+            guard treeRows.dtype == .int32, treeRows.ndim == 1,
+                (1...16).contains(treeRows.size) else { return nil }
+        }
+        var inputs = [q, k, delta, state, convInput]
+        if let treeRows { inputs.append(treeRows) }
+        let selected = treeRows == nil ? kernel : treeKernel
+        let result = selected(
+            inputs,
+            template: [("Dk", 128), ("Dv", 128), ("Hk", k.dim(2)), ("Hv", state.dim(1))],
+            grid: (1024, 1, state.dim(1)), threadGroup: (128, 1, 1),
+            outputShapes: [state.shape, [1, 3, convInput.dim(2)]],
+            outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
     }
 }
 
@@ -3079,17 +3485,20 @@ final class Qwen35GatedDeltaNet: Module {
     private func canUsePromptMiddle(_ inputs: MLXArray, ssmState: MLXArray) -> Bool {
         guard inputs.ndim == 3 else { return false }
         let S = inputs.dim(1)
-        guard inputs.dim(0) == 1 && (64 ... 1365).contains(S) &&
-            S <= Qwen35PromptGatedGDN.maximumSteps && inputs.dtype == .float32 &&
-            headKDim == 128 && headVDim == 128 && convKernelSize == 4
+        guard inputs.dim(0) == 1, (64 ... 1365).contains(S),
+            S <= Qwen35PromptGatedGDN.maximumSteps, inputs.dtype == .float32
         else { return false }
-        guard !(inProjB is QuantizedLinear) && !(inProjA is QuantizedLinear) &&
-            inProjB.bias == nil && inProjA.bias == nil &&
-            inProjB.weight.dtype == .float32 && inProjA.weight.dtype == .float32
+        guard headKDim == 128, headVDim == 128, convKernelSize == 4 else { return false }
+        guard !(inProjB is QuantizedLinear), !(inProjA is QuantizedLinear),
+            inProjB.bias == nil, inProjA.bias == nil
         else { return false }
-        guard inProjB.weight.shape == [numVHeads, inputs.dim(2)] && inProjA.weight.shape == inProjB.weight.shape &&
-            conv1d.bias == nil && conv1d.weight.dtype == .float32 &&
-            aLog.dtype == .float32 && dtBias.dtype == .float32 && aLog.size == numVHeads && dtBias.size == numVHeads
+        guard inProjB.weight.dtype == .float32, inProjA.weight.dtype == .float32 else { return false }
+        guard inProjB.weight.shape == [numVHeads, inputs.dim(2)],
+            inProjA.weight.shape == inProjB.weight.shape
+        else { return false }
+        guard conv1d.bias == nil, conv1d.weight.dtype == .float32 else { return false }
+        guard aLog.dtype == .float32, dtBias.dtype == .float32,
+            aLog.size == numVHeads, dtBias.size == numVHeads
         else { return false }
         return ssmState.dtype == .float32 && ssmState.shape == [1, numVHeads, headVDim, headKDim]
     }
@@ -3177,10 +3586,12 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let foldValue = mask == nil && S >= 64 && headKDim == 128 && headVDim == 128
-            && convKernelSize == 4 && convInput.dtype == .float32
-            && conv1d.weight.dtype == .float32 && conv1d.weight.shape == [convDim, 4, 1]
-            && conv1d.bias == nil && aLog.dtype == .float32 && dtBias.dtype == .float32
+        let foldShape = mask == nil && S >= 64 && headKDim == 128 && headVDim == 128
+        let foldInput = foldShape && convKernelSize == 4 && convInput.dtype == .float32
+        let foldWeight = foldInput && conv1d.weight.dtype == .float32
+            && conv1d.weight.shape == [convDim, 4, 1]
+        let foldValue = foldWeight && conv1d.bias == nil
+            && aLog.dtype == .float32 && dtBias.dtype == .float32
         let convOut = foldValue
             ? silu(MLX.conv1d(
                 convInput[0..., 0..., 0 ..< (2 * keyDim)],
@@ -3307,13 +3718,22 @@ final class Qwen35GatedDeltaNet: Module {
                 tape.convStateRows == 3, tape.convInput.dtype == .float32,
                 tape.q.dtype == .float32, tape.k.dtype == .float32, tape.v.dtype == .float32,
                 tape.a.dtype == .float32, tape.b.dtype == .float32,
-                aLog.dtype == .float32, dtBias.dtype == .float32, let ssmPre = tape.ssmPre,
-                let replayed = Qwen35RegisterGatedSIMD.runTreeReplay(
+                aLog.dtype == .float32, dtBias.dtype == .float32, let ssmPre = tape.ssmPre
+            else { preconditionFailure("Qwen35 tree commit: path replay unavailable") }
+            if let delta = tape.delta,
+                let replay = Qwen35DeltaReplay.run(q: tape.q, k: tape.k, delta: delta,
+                    state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
+                    convInput: tape.convInput, treeRows: pathArray,
+                    stateIsRowContiguous: tape.ssmPreIsRowContiguous)
+            { return CBv2RecurrentLayerState(
+                conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true) }
+            guard let replayed = Qwen35RegisterGatedSIMD.runTreeReplay(
                     q: tape.q, k: tape.k, v: tape.v, a: tape.a, b: tape.b, aLog: aLog, dtBias: dtBias,
                     state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
                     convInput: tape.convInput, rows: pathArray)
             else { preconditionFailure("Qwen35 tree commit: path replay unavailable") }
-            return CBv2RecurrentLayerState(conv: replayed.1, ssm: replayed.0)
+            return CBv2RecurrentLayerState(
+                conv: replayed.1, ssm: replayed.0, ssmIsRowContiguous: true)
         }
         let rows = 0 ..< committedRows
         // One kernel reads the tape in place (no copy of the strided value
@@ -3327,6 +3747,13 @@ final class Qwen35GatedDeltaNet: Module {
             let initial = tape.ssmPre ?? MLXArray.zeros(
                 [tape.q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
+            if let delta = tape.delta,
+                let replay = Qwen35DeltaReplay.run(
+                    q: tape.q[0..., rows, 0...], k: tape.k, delta: delta,
+                    state: floatState, convInput: tape.convInput,
+                    stateIsRowContiguous: tape.ssmPreIsRowContiguous)
+            { return CBv2RecurrentLayerState(
+                conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true) }
             let (boundarySsm, boundaryConv) = Qwen35RegisterGatedSIMD.runReplay(
                 q: tape.q[0..., rows, 0...],
                 k: tape.k,
@@ -3337,7 +3764,8 @@ final class Qwen35GatedDeltaNet: Module {
                 dtBias: dtBias,
                 state: floatState,
                 convInput: tape.convInput)
-            return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
+            return CBv2RecurrentLayerState(
+                conv: boundaryConv, ssm: boundarySsm, ssmIsRowContiguous: true)
         }
         let boundarySsm = updateRecurrenceStateOnly(
             q: tape.q[0..., rows, 0...],
@@ -3508,11 +3936,11 @@ final class Qwen35GatedDeltaNet: Module {
             : nil
         let (qkv, z, b, a) = projectInputs(
             inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
-        let (out, newConvState, newSsmState) = promptMiddle(
+        let middle = promptMiddle(
             inputs, qkv: qkv, a: a, b: b, convState: convState, ssmState: ssmState,
             freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil,
             promptGates: promptGates)
-            ?? processChunk(
+        let (out, newConvState, newSsmState) = middle ?? processChunk(
                 qkv: qkv, a: promptGates == nil ? a : inProjA(inputs),
                 b: promptGates == nil ? b : inProjB(inputs),
                 convState: convState, ssmState: ssmState, mask: nil)
@@ -3522,7 +3950,7 @@ final class Qwen35GatedDeltaNet: Module {
                 try recurrentState[0].stage(
                     modelLayerIndex: modelLayerIndex,
                     conv: newConvState,
-                    ssm: newSsmState)
+                    ssm: newSsmState, ssmIsRowContiguous: middle != nil)
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
@@ -3533,7 +3961,7 @@ final class Qwen35GatedDeltaNet: Module {
                     try evaluation.stage(
                         modelLayerIndex: modelLayerIndex,
                         conv: newConvState[row ..< row + 1],
-                        ssm: newSsmState[row ..< row + 1])
+                        ssm: newSsmState[row ..< row + 1], ssmIsRowContiguous: middle != nil)
                 } catch {
                     preconditionFailure(
                         "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
@@ -3664,6 +4092,8 @@ final class Qwen35GatedDeltaNet: Module {
 
             // The fused path has one row; capture only its tail buffer.
             let fusedTail = fusedMiddle?.6
+            let finalSSMIsRowContiguous = fusedMiddle != nil
+            let capturedDelta = fusedMiddle.flatMap { $0.7 }
             for (row, evaluation) in recurrentState.enumerated() {
                 let finalConv: MLXArray
                 let finalSSM: MLXArray
@@ -3682,7 +4112,10 @@ final class Qwen35GatedDeltaNet: Module {
                         ssmPre: ssmState,
                         mask: nil,
                         rowCount: S,
-                        convStateRows: nKeep)
+                        convStateRows: nKeep,
+                        delta: capturedDelta,
+                        ssmPreIsRowContiguous: evaluation.inputState(
+                            modelLayerIndex: modelLayerIndex)?.ssmIsRowContiguous == true)
                     convOutBacking = convOut
                 } else {
                     let rowRange = row ..< (row + 1)
@@ -3698,12 +4131,14 @@ final class Qwen35GatedDeltaNet: Module {
                         ssmPre: ssmState[rowRange],
                         mask: nil,
                         rowCount: S,
-                        convStateRows: nKeep)
+                        convStateRows: nKeep,
+                        delta: capturedDelta.map { $0[rowRange] })
                     convOutBacking = convOut[rowRange]
                 }
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
+                if let delta = tape.delta { roots.append(delta) }
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
                 if B > 1 || inputSSM == nil {
@@ -3739,6 +4174,7 @@ final class Qwen35GatedDeltaNet: Module {
                         positions: S,
                         finalConv: finalConv,
                         finalSSM: finalSSM,
+                        ssmIsRowContiguous: finalSSMIsRowContiguous,
                         materializedByteCount: materializedBytes,
                         evaluationRoots: strictReplayRoots,
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
@@ -3751,7 +4187,8 @@ final class Qwen35GatedDeltaNet: Module {
                             let detachedConv = fusedTail ?? finalConv + MLXArray.zeros(
                                 finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
-                                conv: detachedConv, ssm: finalSSM)
+                                conv: detachedConv, ssm: finalSSM,
+                                ssmIsRowContiguous: finalSSMIsRowContiguous)
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
@@ -5956,6 +6393,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
+        if rows == 16 { Qwen35FusedGDNVerify.prepare() }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }

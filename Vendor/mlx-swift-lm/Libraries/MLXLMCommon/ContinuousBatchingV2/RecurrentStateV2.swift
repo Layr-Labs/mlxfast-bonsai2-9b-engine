@@ -204,10 +204,14 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
     public let ssm: MLXArray?
+    /// Set only for a known row-contiguous producer (or its outer-row slice).
+    /// Unknown views default to false. This metadata never evaluates or copies.
+    public let ssmIsRowContiguous: Bool
 
-    public init(conv: MLXArray?, ssm: MLXArray?) {
+    public init(conv: MLXArray?, ssm: MLXArray?, ssmIsRowContiguous: Bool = false) {
         self.conv = conv
         self.ssm = ssm
+        self.ssmIsRowContiguous = ssmIsRowContiguous && ssm != nil
     }
 }
 
@@ -238,6 +242,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         positions: Int,
         finalConv: MLXArray,
         finalSSM: MLXArray,
+        ssmIsRowContiguous: Bool = false,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -259,7 +264,8 @@ public struct CBv2RecurrentPrefixReplayStage {
                 "prefix replay materialized bytes must be nonnegative")
         }
         self.positions = positions
-        self.finalState = CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
+        self.finalState = CBv2RecurrentLayerState(
+            conv: finalConv, ssm: finalSSM, ssmIsRowContiguous: ssmIsRowContiguous)
         self.materializedByteCount = materializedByteCount
         self.evaluationRoots = evaluationRoots
         self.strictReplayRetainedByteCount = strictReplayRetainedByteCount
@@ -505,7 +511,8 @@ public final class CBv2RecurrentRequestState {
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
-                    ssm: layer.ssm.map { $0[(keep - 1) ..< keep] })
+                    ssm: layer.ssm.map { $0[(keep - 1) ..< keep] },
+                    ssmIsRowContiguous: layer.ssmIsRowContiguous)
             }
             // MLX slices share their allocation: selecting one prefix does
             // not release the other positions in the captured backing stack.
@@ -652,15 +659,22 @@ public final class CBv2RecurrentStateEvaluation {
         input[modelLayerIndex]
     }
 
-    public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+    public func stage(
+        modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray,
+        ssmIsRowContiguous: Bool = false
+    ) throws {
         guard stagedCapturedPositions == nil, stagedPrefixReplay.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "cannot mix captured, compact replay, and plain recurrent stages")
         }
-        try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
+        try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm,
+            ssmIsRowContiguous: ssmIsRowContiguous)
     }
 
-    private func stageRaw(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+    private func stageRaw(
+        modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray,
+        ssmIsRowContiguous: Bool = false
+    ) throws {
         guard !evaluated, requiredLayers.contains(modelLayerIndex) else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "stage for undeclared or already-evaluated recurrent layer \(modelLayerIndex)")
@@ -669,7 +683,8 @@ public final class CBv2RecurrentStateEvaluation {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "duplicate recurrent stage for layer \(modelLayerIndex)")
         }
-        staged[modelLayerIndex] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+        staged[modelLayerIndex] = CBv2RecurrentLayerState(
+            conv: conv, ssm: ssm, ssmIsRowContiguous: ssmIsRowContiguous)
     }
 
     /// Stage one layer's CAPTURED per-position states for an MTP verify
@@ -712,6 +727,7 @@ public final class CBv2RecurrentStateEvaluation {
         positions: Int,
         finalConv: MLXArray,
         finalSSM: MLXArray,
+        ssmIsRowContiguous: Bool = false,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -741,6 +757,7 @@ public final class CBv2RecurrentStateEvaluation {
             positions: positions,
             finalConv: finalConv,
             finalSSM: finalSSM,
+            ssmIsRowContiguous: ssmIsRowContiguous,
             materializedByteCount: materializedByteCount,
             evaluationRoots: evaluationRoots,
             strictReplayRetainedByteCount: strictReplayRetainedByteCount,

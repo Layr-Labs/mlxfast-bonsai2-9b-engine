@@ -1195,9 +1195,11 @@ open class ArraysCache: BaseKVCache {
         public let a: MLXArray
         public let b: MLXArray
         public let ssmPre: MLXArray?
+        public let ssmPreIsRowContiguous: Bool
         public let mask: MLXArray?
         public let rowCount: Int
         public let convStateRows: Int
+        public let delta: MLXArray?
 
         public init(
             convInput: MLXArray,
@@ -1209,7 +1211,9 @@ open class ArraysCache: BaseKVCache {
             ssmPre: MLXArray?,
             mask: MLXArray?,
             rowCount: Int,
-            convStateRows: Int
+            convStateRows: Int,
+            delta: MLXArray? = nil,
+            ssmPreIsRowContiguous: Bool = false
         ) {
             self.convInput = convInput
             self.q = q
@@ -1218,9 +1222,11 @@ open class ArraysCache: BaseKVCache {
             self.a = a
             self.b = b
             self.ssmPre = ssmPre
+            self.ssmPreIsRowContiguous = ssmPreIsRowContiguous && ssmPre != nil
             self.mask = mask
             self.rowCount = rowCount
             self.convStateRows = convStateRows
+            self.delta = delta
         }
     }
 
