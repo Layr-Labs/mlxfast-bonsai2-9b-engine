@@ -774,15 +774,20 @@ private final class DFlash2Attention: Module {
         return (state[0], state[1])
     }
 
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
+    func absorbContext(
+        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
+        contextCodes: DF2Fast.W4Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
+    ) {
         var context = context
         var contextLength = context.dim(1)
+        var activeContextCodes = contextCodes
         if let slidingWindow {
             let skip = DFlash2SlidingMask.contextSkip(
                 contextLength: contextLength, slidingWindow: slidingWindow)
             if skip > 0 {
                 context = context[0..., skip..., 0...]
                 contextLength = context.dim(1)
+                activeContextCodes = nil
                 if let base = cache as? BaseKVCache {
                     base.offset += skip
                 }
@@ -790,18 +795,33 @@ private final class DFlash2Attention: Module {
         }
         let B = context.dim(0)
         var contextKeys: MLXArray, contextValues: MLXArray
-        if let kv = DF2Fast.linears(context, [kProj, vProj]) {
+        if let activeContextCodes,
+            let kv = DF2Fast.w4LinearsFromCodes(
+                activeContextCodes, leadShape: [B, contextLength], [kProj, vProj])
+        {
+            (contextKeys, contextValues) = (kv[0], kv[1])
+        } else if let kv = DF2Fast.linears(context, [kProj, vProj]) {
             (contextKeys, contextValues) = (kv[0], kv[1])
         } else if let kv = DF2Fast.fusedKVLinear(context, kProj: kProj, vProj: vProj) {
             (contextKeys, contextValues) = (kv.0, kv.1)
         } else {
             (contextKeys, contextValues) = (kProj(context), vProj(context))
         }
-        contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
-            .transposed(0, 2, 1, 3)
-        contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        contextKeys = rope(contextKeys, offset: cache.offset)
+        if let ropeSpec, B == 1, heads == 32, kvHeads == 8,
+            (1 ... 16).contains(contextLength), contextKeys.dtype == .float32,
+            contextValues.dtype == .float32,
+            let ctxOut = DF2Fast.ctxKVNormRope(
+                k: contextKeys, v: contextValues, kNorm: kNorm, ropeSpec: ropeSpec,
+                C: contextLength, offset: cache.offset)
+        {
+            (contextKeys, contextValues) = (ctxOut.0, ctxOut.1)
+        } else {
+            contextKeys = DF2Fast.rms(contextKeys.reshaped(B, contextLength, kvHeads, -1), kNorm)
+                .transposed(0, 2, 1, 3)
+            contextValues = contextValues.reshaped(B, contextLength, kvHeads, -1)
+                .transposed(0, 2, 1, 3)
+            contextKeys = rope(contextKeys, offset: cache.offset)
+        }
         if let fastCache = cache as? DFlash2LayerKVCache {
             fastCache.absorb(contextKeys: contextKeys, contextValues: contextValues)
         } else {
@@ -1104,6 +1124,9 @@ private final class DFlash2MLP: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil
     ) -> MLXArray {
+        if let codes = DF2Fast.w4SwiGLUCodes(x, gate: gate, up: up, conv0: conv0),
+            let y = DF2Fast.w4LinearsFromCodes(codes, leadShape: Array(x.shape.dropLast()), [down])
+        { return y[0] }
         if let conv0,
             let gu = DF2Fast.linearsConv0(conv0.n, dyn: conv0.dyn, base: conv0.base, [gate, up]),
             let y = DF2Fast.linears(gu[0], [down], up: gu[1])
@@ -1234,8 +1257,12 @@ private final class DFlash2DecoderLayer: Module {
     /// Context-only: nothing of the block runs (no norms, convolutions, MLP
     /// or attention output), only the attention sub-layer's context keys and
     /// values enter the cache.
-    func absorbContext(_ context: MLXArray, rope: RoPELayer, cache: KVCache) {
-        selfAttn.absorbContext(context, rope: rope, cache: cache)
+    func absorbContext(
+        _ context: MLXArray, rope: RoPELayer, cache: KVCache,
+        contextCodes: DF2Fast.W4Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
+    ) {
+        selfAttn.absorbContext(
+            context, rope: rope, cache: cache, contextCodes: contextCodes, ropeSpec: ropeSpec)
     }
 }
 
@@ -1768,6 +1795,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// a later `propose` continues these caches exactly as a steady-state
     /// round's incremental absorption does.
     public func absorbContext(targetHidden: MLXArray, cache: [KVCache]) throws {
+        try absorbContext(targetHidden: targetHidden, cache: cache, lookupFC: nil)
+    }
+
+    func absorbContext(targetHidden: MLXArray, cache: [KVCache], lookupFC: MLXArray?) throws {
         guard cache.count == layers.count else {
             throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
         }
@@ -1775,9 +1806,80 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             throw DFlash2Error.targetHiddenSizeMismatch(
                 expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
         }
-        let context = DF2Fast.rms(DF2Fast.linear(targetHidden.asType(dtype), fc), hiddenNorm)
+        let fcOutput: MLXArray
+        if let lookupFC, dtype == .bfloat16, targetHidden.dtype == .bfloat16,
+            targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            (1 ... 16).contains(targetHidden.dim(1)), targetHidden.dim(2) == 32768,
+            config.hiddenSize == 4096, lookupFC.dtype == .float32,
+            lookupFC.ndim == 3, lookupFC.dim(0) == 1,
+            lookupFC.dim(1) == targetHidden.dim(1), lookupFC.dim(2) == config.hiddenSize
+        {
+            fcOutput = lookupFC
+        } else {
+            fcOutput = DF2Fast.linear(targetHidden.asType(dtype), fc)
+        }
+        let context = DF2Fast.rms(fcOutput, hiddenNorm)
+        let contextCodes: DF2Fast.W4Codes?
+        if DF2Fast.on, layers.count == 6, context.ndim == 3, context.dtype == .float32,
+            context.dim(0) == 1, context.dim(2) == 4096, let group = DF2Fast.w4Group
+        {
+            contextCodes = DF2Fast.w4Quant(context, up: nil, group: group, headMajor: false)
+        } else {
+            contextCodes = nil
+        }
+        let ropeSpec = DF2Fast.on ? DF2Fast.ropeSpec(self) : nil
+        let contextRows = context.dim(1)
+        if let contextCodes, let ropeSpec, layers.count == 6,
+            (1 ... 16).contains(contextRows),
+            cache.allSatisfy({ $0 is DFlash2LayerKVCache && $0.offset == cache[0].offset }),
+            layers.allSatisfy({
+                let attention = $0.selfAttn
+                return attention.heads == 32 && attention.kvHeads == 8
+                    && (attention.slidingWindow.map { contextRows < $0 } ?? true)
+            })
+        {
+            // Every layer keeps the same rows and offset; any context skip
+            // keeps the original per-layer path below.
+            // Two layers keep the 4096-column narrow dispatch eligible.
+            var contextKV: [(MLXArray, MLXArray)] = []
+            for index in stride(from: 0, to: layers.count, by: 2) {
+                guard let kv = DF2Fast.w4LinearsFromCodes(
+                    contextCodes, leadShape: [1, contextRows],
+                    [
+                        layers[index].selfAttn.kProj, layers[index].selfAttn.vProj,
+                        layers[index + 1].selfAttn.kProj, layers[index + 1].selfAttn.vProj,
+                    ])
+                else { break }
+                contextKV.append((kv[0], kv[1]))
+                contextKV.append((kv[2], kv[3]))
+            }
+            if contextKV.count != 6 {
+                contextKV = []
+                for layer in layers {
+                    guard let kv = DF2Fast.w4LinearsFromCodes(
+                        contextCodes, leadShape: [1, contextRows],
+                        [layer.selfAttn.kProj, layer.selfAttn.vProj])
+                    else { break }
+                    contextKV.append((kv[0], kv[1]))
+                }
+            }
+            if contextKV.count == 6, contextKV.allSatisfy({ $0.1.dtype == .float32 }),
+                let keys = DF2Fast.ctxKGroupNormRope(
+                    keys: contextKV.map { $0.0 }, norms: layers.map { $0.selfAttn.kNorm },
+                    ropeSpec: ropeSpec, C: contextRows, offset: cache[0].offset)
+            {
+                for index in layers.indices {
+                    let values = contextKV[index].1.reshaped(1, contextRows, 8, 128)
+                        .transposed(0, 2, 1, 3)
+                    (cache[index] as! DFlash2LayerKVCache).absorb(
+                        contextKeys: keys[index], contextValues: values)
+                }
+                return
+            }
+        }
         for (index, layer) in layers.enumerated() {
-            layer.absorbContext(context, rope: rope, cache: cache[index])
+            layer.absorbContext(
+                context, rope: rope, cache: cache[index], contextCodes: contextCodes, ropeSpec: ropeSpec)
         }
     }
 
@@ -1814,12 +1916,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             targetHidden.dim(-1) == config.targetHiddenSize,
             anchors.size == targetHidden.dim(1)
         else { return nil }
-        let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
+        let fcInput = targetHidden.asType(dtype)
+        let fcOut = DF2Fast.linear(fcInput, fc)
         guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
         let context = normed.0
         guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
-        return DFlash2ContextProjection(anchorEmbeddings: embeddings, context: context, contextKV: kv)
+        let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
+        return DFlash2ContextProjection(
+            anchorEmbeddings: embeddings, context: context, contextKV: kv, lookupFCOutput: lookupFC)
     }
 
     /// Every layer's context keys and values from the context codes, in the
@@ -2121,6 +2226,8 @@ enum DF2Fast {
     final class RopeSpec {
         let freqs: MLXArray
         let mscale: Float
+        private let floatLock = NSLock()
+        private var cachedFloats: (epsBits: UInt32, mscaleBits: UInt32, array: MLXArray)?
         // Request-local immutable coefficients; never installed in ropeCache.
         let phases: MLXArray?
         let phaseOffset: Int
@@ -2134,6 +2241,21 @@ enum DF2Fast {
             self.phases = phases
             self.phaseOffset = phaseOffset
             self.phaseRows = phaseRows
+        }
+
+        func floatParameters(eps: Float) -> MLXArray {
+            let epsBits = eps.bitPattern
+            let mscaleBits = mscale.bitPattern
+            floatLock.lock()
+            defer { floatLock.unlock() }
+            if let cachedFloats, cachedFloats.epsBits == epsBits,
+                cachedFloats.mscaleBits == mscaleBits
+            {
+                return cachedFloats.array
+            }
+            let array = MLXArray([eps, mscale])
+            cachedFloats = (epsBits, mscaleBits, array)
+            return array
         }
     }
     struct W4Codes {
@@ -2312,8 +2434,45 @@ enum DF2Fast {
 
     final class W4Operands {
         let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        var pair24: W4Pair24? = nil
+        private let swigluLock = NSLock()
+        private var cachedSwiGLU: (up: ObjectIdentifier, admitted: Bool)?
+        func admitsSwiGLU(up: W4Operands, build: () -> Bool) -> Bool {
+            swigluLock.lock()
+            defer { swigluLock.unlock() }
+            if let cachedSwiGLU { return cachedSwiGLU.up == ObjectIdentifier(up) && cachedSwiGLU.admitted }
+            let admitted = build()
+            cachedSwiGLU = (ObjectIdentifier(up), admitted)
+            return admitted
+        }
+        private var cachedPair24SwiGLU: (up: ObjectIdentifier, method: W4Pair24Method, admitted: Bool)?
+        func admitsPair24SwiGLU(up: W4Operands, method: W4Pair24Method, build: () -> Bool) -> Bool {
+            swigluLock.lock()
+            defer { swigluLock.unlock() }
+            if let cachedPair24SwiGLU {
+                return cachedPair24SwiGLU.up == ObjectIdentifier(up)
+                    && cachedPair24SwiGLU.method == method && cachedPair24SwiGLU.admitted
+            }
+            let admitted = build()
+            cachedPair24SwiGLU = (ObjectIdentifier(up), method, admitted)
+            return admitted
+        }
+        private let sizeLock = NSLock()
+        private var cachedSizes: (words: [Int32], array: MLXArray)?
         init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
+        }
+
+        func dispatchSizes(K: Int, rows: Int, ns: [Int]) -> MLXArray {
+            let words = [Int32(K), Int32(rows)] + ns.map { Int32($0) }
+            sizeLock.lock()
+            defer { sizeLock.unlock() }
+            if let cachedSizes, cachedSizes.words == words {
+                return cachedSizes.array
+            }
+            let array = MLXArray(words)
+            cachedSizes = (words, array)
+            return array
         }
     }
     nonisolated(unsafe) static var w4Cache: [ObjectIdentifier: W4Operands] = [:]
@@ -2368,6 +2527,11 @@ enum DF2Fast {
         let bT = contiguous(b.asType(.float16).transposed())
         eval(packed, sT, bT)
         let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
+        if group == 64 && ((N == 4096 && K == 32768)
+            || (N == 12288 && K == 4096) || (N == 4096 && K == 12288))
+        {
+            o.pair24 = W4Pair24(sT, bT)
+        }
         w4Cache[ObjectIdentifier(layer)] = o
         return o
     }
@@ -2492,6 +2656,603 @@ enum DF2Fast {
               xs[m * G + g] = seq_sum;
             }
             """)
+
+    /// Optional FC metadata. Original half arrays remain available for the accepted fallback.
+    final class W4Pair24 {
+        let words: MLXArray, bases: MLXArray
+        let shape: [Int]
+        let count: Int
+        let selection = W4Pair24SelectionCache()
+
+        init?(_ scales: MLXArray, _ offsets: MLXArray) {
+            guard scales.dtype == .float16, offsets.dtype == .float16,
+                scales.ndim == 2, scales.shape == offsets.shape, scales.dim(1) % 4 == 0,
+                scales.strides == [scales.dim(1), 1], offsets.strides == scales.strides,
+                scales.size > 0, scales.size % 4 == 0, scales.size / 4 <= Int.max / 3
+            else { return nil }
+            let s = scales.view(dtype: .uint16).asArray(UInt16.self)
+            let b = offsets.view(dtype: .uint16).asArray(UInt16.self)
+            let sb = UInt32(s.min()!), bb = UInt32(b.min()!)
+            guard UInt32(s.max()!) - sb <= 4095, UInt32(b.max()!) - bb <= 4095 else { return nil }
+            func pair(_ i: Int) -> UInt32 {
+                (UInt32(s[i]) - sb) | ((UInt32(b[i]) - bb) << 12)
+            }
+            var packed = [UInt32](repeating: 0, count: s.count / 4 * 3)
+            for i in stride(from: 0, to: s.count, by: 4) {
+                let a = pair(i), c = pair(i + 1), d = pair(i + 2), e = pair(i + 3)
+                let j = i / 4 * 3
+                packed[j] = a | (c << 24)
+                packed[j + 1] = (c >> 8) | (d << 16)
+                packed[j + 2] = (d >> 16) | (e << 8)
+            }
+            // Check every inverse before admitting this representation.
+            for i in s.indices {
+                let bit = (i & 3) * 24, j = i / 4 * 3 + bit / 32, shift = bit & 31
+                var value = packed[j] >> shift
+                if shift > 8 { value |= packed[j + 1] << (32 - shift) }
+                guard sb + (value & 4095) == UInt32(s[i]),
+                    bb + ((value >> 12) & 4095) == UInt32(b[i])
+                else { return nil }
+            }
+            shape = scales.shape
+            count = s.count
+            words = MLXArray(packed)
+            bases = MLXArray([sb | (bb << 16)])
+        }
+    }
+
+    /// Three scalar loads; uint3 would add padding between these12-byte tiles.
+    static let pair24Header = """
+        inline void df2_pair24_load(const device uint* words, uint bases, size_t tile,
+                                   thread half4& scales, thread half4& offsets) {
+            const uint a = words[3 * tile], b = words[3 * tile + 1], c = words[3 * tile + 2];
+            const uint4 pairs(a & 0x00ffffffu, ((a >> 24) | (b << 8)) & 0x00ffffffu,
+                              ((b >> 16) | (c << 16)) & 0x00ffffffu, c >> 8);
+            const ushort4 s = ushort4(pairs & uint4(4095u)) + ushort(bases & 65535u);
+            const ushort4 o = ushort4((pairs >> 12) & uint4(4095u)) + ushort(bases >> 16);
+            scales = as_type<half4>(s);
+            offsets = as_type<half4>(o);
+        }
+
+        """
+
+    /// Only metadata loads change. The original raw generator and FP32 arithmetic stay intact.
+    static func w4Pair24Source(form: Int, narrow: Bool) -> String {
+        var source = w4Source(layers: 1, group: 64, form: form, narrow: narrow)
+        func change(_ before: String, _ after: String) {
+            precondition(source.contains(before))
+            source = source.replacingOccurrences(of: before, with: after)
+        }
+        change("const device half* sT = s0; const device half* bT = b0;",
+               "const device uint* metadata = s0; const uint metadataBases = b0[0];")
+        if form == 0 {
+            change("const device half* sr = sT + (size_t)g * N + n0 + nb;", """
+                half4 sm0, sm1, om0, om1;
+                const size_t tile = ((size_t)g * N + n0 + nb) / 4;
+                df2_pair24_load(metadata, metadataBases, tile, sm0, om0);
+                df2_pair24_load(metadata, metadataBases, tile + 4, sm1, om1);
+                """)
+            change("const device half* br = bT + (size_t)g * N + n0 + nb;", "")
+            change("const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));",
+                   "const float4 s0v = float4(sm0), s1v = float4(sm1);")
+            change("float4(*(const device half4*)br)", "float4(om0)")
+            change("float4(*(const device half4*)(br + 16))", "float4(om1)")
+        } else {
+            change("const device half* sc = sT + n0 + nb;", "const size_t tile = (n0 + nb) / 4;")
+            change("const device half* oc = bT + n0 + nb;", "")
+            if narrow {
+                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);", """
+                    half4 ps0, po0;
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
+                    """)
+                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N);", "")
+                change("ps0 = *(const device half4*)(sc + r);",
+                       "df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);")
+                change("po0 = *(const device half4*)(oc + r);", "")
+            } else {
+                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);", """
+                    half4 ps0, ps1, po0, po1;
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
+                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile + 4, ps1, po1);
+                    """)
+                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);", "")
+                change("ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);", """
+                    df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);
+                    df2_pair24_load(metadata, metadataBases, r / 4 + tile + 4, ps1, po1);
+                    """)
+                change("po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);", "")
+            }
+        }
+        precondition(!source.contains("sT") && !source.contains("bT") && !source.contains("const device half4*"))
+        return source
+    }
+
+    static let w4Pair24Kernels: [Int: MLXFast.MLXFastKernel] = {
+        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+        for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)] {
+            kernels[form * 2 + (narrow ? 1 : 0)] = MLXFast.metalKernel(
+                name: "df2_w4g64_pair24f\(form)_n\(narrow ? 16 : 32)",
+                inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+                source: w4Pair24Source(form: form, narrow: narrow), header: header + pair24Header,
+                ensureRowContiguous: true)
+        }
+        return kernels
+    }()
+
+    static func w4Pair24Run(
+        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        op: W4Operands, metadata: W4Pair24, sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        let columns = narrow ? 16 : 32
+        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(rows), Int32(4096)])
+        return w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!(
+            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+            template: [("SPLIT", split)], grid: (4096 / columns * split * 32, 1, 1),
+            threadGroup: (split * 32, 1, 1), outputShapes: [[rows, 4096]], outputDTypes: [.float32])
+    }
+
+    /// Shared by the compact MLP consumer and its metadata-only proof.
+    static func w4Pair24MLPSelection(layers: Int) -> String {
+        precondition(layers == 1 || layers == 2)
+        var source = """
+            const device uint* metadata = s0;
+            uint metadataBases = b0[0];
+
+            """
+        if layers == 2 {
+            source += "if (li == 1) { metadata = s1; metadataBases = b1[0]; }\n"
+        }
+        return source
+    }
+
+    /// Keep the FC bodies exact; the MLP adds sibling selection and the accepted static-K form.
+    static func w4Pair24MLPSource(layers: Int, form: Int, narrow: Bool) -> String {
+        precondition(layers == 1 || (layers == 2 && !narrow))
+        var source = w4Pair24Source(form: form, narrow: narrow)
+        let pointer = "const device uint* metadata = s0; const uint metadataBases = b0[0];"
+        precondition(source.contains(pointer))
+        source = source.replacingOccurrences(of: pointer, with: "int li = 0;")
+        if layers == 2 {
+            let pick = "device float* out = out0; int N = ksz[2];"
+            precondition(source.contains(pick))
+            source = source.replacingOccurrences(of: pick, with: pick + """
+
+                if (bx >= N / 32) { bx -= N / 32; w = w1; li = 1; out = out1; N = ksz[3]; }
+                """)
+        }
+        precondition(source.contains("#define LO(v)"))
+        source = source.replacingOccurrences(of: "#define LO(v)",
+            with: w4Pair24MLPSelection(layers: layers) + "#define LO(v)")
+        return w4Specialize(source)
+    }
+
+    static let w4Pair24MLPKernels: [Int: MLXFast.MLXFastKernel] = {
+        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+        for layers in 1 ... 2 {
+            for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)]
+                where layers == 1 || !narrow
+            {
+                let key = (layers - 1) * 6 + form * 2 + (narrow ? 1 : 0)
+                kernels[key] = MLXFast.metalKernel(
+                    name: "df2_w4g64_pair24_mlp_f\(form)_n\(narrow ? 16 : 32)_forms_\(layers)",
+                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+                    outputNames: (0 ..< layers).map { "out\($0)" },
+                    source: w4Pair24MLPSource(layers: layers, form: form, narrow: narrow),
+                    header: header + pair24Header, ensureRowContiguous: true)
+            }
+        }
+        return kernels
+    }()
+
+    static func w4Pair24MLPMetadata(_ ops: [W4Operands]) -> [W4Pair24]? {
+        let gateUp = ops.count == 2 && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 }
+        let down = ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
+        guard gateUp || down else { return nil }
+        let metadata = ops.compactMap(\.pair24)
+        return metadata.count == ops.count ? metadata : nil
+    }
+
+    /// These ordered inputs are also used by the proof; each payload keeps its own data header.
+    static func w4Pair24MLPMetadataInputs(_ metadata: [W4Pair24]) -> [MLXArray] {
+        metadata.map(\.words) + metadata.map(\.bases)
+    }
+
+    static func w4Pair24MLPRun(
+        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        ops: [W4Operands], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        let K = ops[0].k, ns = ops.map(\.n)
+        precondition(w4FormsFit(K: K, rows: rows, ns: ns) && ops.count == metadata.count)
+        let key = (ops.count - 1) * 6 + form * 2 + (narrow ? 1 : 0)
+        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        return w4Pair24MLPKernels[key]!(
+            [xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata)
+                + [ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", K)],
+            grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
+            threadGroup: (split * 32, 1, 1),
+            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    enum W4Pair24Method: Int {
+        case raw, compact, quartet, rawWide, fcStatic
+    }
+    struct W4Pair24Choice: Equatable {
+        let ordinary: W4Pair24Method
+        let full16: W4Pair24Method
+        func method(rows: Int) -> W4Pair24Method { rows == 16 ? full16 : ordinary }
+    }
+    struct W4Pair24SelectionKey: Equatable {
+        let operands: [ObjectIdentifier]
+        let K: Int
+        let ns: [Int]
+        let group: Int
+        let form: Int
+        let narrow: Bool
+        let split: Int
+    }
+    final class W4Pair24SelectionCache {
+        private let lock = NSLock()
+        private var cached: (key: W4Pair24SelectionKey, choice: W4Pair24Choice)?
+        func resolve(
+            _ ops: [W4Operands], K: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int,
+            build: () -> W4Pair24Choice
+        ) -> W4Pair24Choice {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached {
+                let key = cached.key
+                guard key.K == K, key.ns == ns, key.group == group, key.form == form,
+                    key.narrow == narrow, key.split == split, key.operands.count == ops.count
+                else { return W4Pair24Choice(ordinary: .raw, full16: .raw) }
+                for index in ops.indices {
+                    if key.operands[index] != ObjectIdentifier(ops[index]) {
+                        return W4Pair24Choice(ordinary: .raw, full16: .raw)
+                    }
+                }
+                return cached.choice
+            }
+            let key = W4Pair24SelectionKey(operands: ops.map { ObjectIdentifier($0) }, K: K, ns: ns,
+                group: group, form: form, narrow: narrow, split: split)
+            let choice = build()
+            cached = (key, choice)
+            return choice
+        }
+
+        func fcLookupPrefixCompatible(_ op: W4Operands) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let cached else { return false }
+            let key = cached.key
+            guard key.operands.count == 1, key.operands[0] == ObjectIdentifier(op),
+                key.K == 32768, key.ns.count == 1, key.ns[0] == 4096,
+                key.group == 64, key.form == 2, key.narrow, key.split == 8,
+                (cached.choice.ordinary == cached.choice.full16 || cached.choice.full16 == .fcStatic)
+            else { return false }
+            return cached.choice.ordinary == .raw || cached.choice.ordinary == .compact
+        }
+    }
+
+    static func fcLookupPrefixReuseEligible(_ layer: Linear, input: MLXArray) -> Bool {
+        guard on, w4Group == 64, split == 8, input.dtype == .bfloat16,
+            input.ndim == 3, input.dim(0) == 1, input.dim(1) == 16, input.dim(2) == 32768,
+            w4SelectedForm == 2, w4Narrow, w4Form2Narrow,
+            let op = w4Cache[ObjectIdentifier(layer)], op.k == 32768, op.n == 4096,
+            let metadata = op.pair24
+        else { return false }
+        let wide = DF2WideLanes.serves(
+            .init(kind: .quantG, dtype: input.dtype, dtype2: input.dtype, k: 32768, group: 64, flag: 0))
+        return !wide && metadata.selection.fcLookupPrefixCompatible(op)
+    }
+
+    /// Raw is the incumbent.3% in all3 rounds is a conservative initial policy.
+    static func w4Pair24Choose(valid: [Bool], samples: [[UInt64]]) -> W4Pair24Choice {
+        func wins(_ candidate: W4Pair24Method, _ control: W4Pair24Method) -> Bool {
+            let a = candidate.rawValue, b = control.rawValue
+            guard valid[a], valid[b], samples[a].count == 3, samples[b].count == 3 else { return false }
+            return zip(samples[a], samples[b]).allSatisfy {
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+            }
+        }
+        let ordinary: W4Pair24Method = wins(.compact, .raw) ? .compact : .raw
+        let full16: W4Pair24Method =
+            wins(.quartet, .raw) && (ordinary == .raw || wins(.quartet, .compact)) ? .quartet : ordinary
+        return W4Pair24Choice(ordinary: ordinary, full16: full16)
+    }
+
+    static func w4Pair24DownWideEligible(
+        _ ops: [W4Operands], rows: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int
+    ) -> Bool {
+        rows == 16 && group == 64 && split == 8 && form == 2 && narrow && ops.count == 1
+            && ops[0].k == 12288 && ops[0].n == 4096 && ns == [4096]
+    }
+
+    static func w4Pair24ChooseWithWide(
+        valid: [Bool], samples: [[UInt64]], eligible: Bool
+    ) -> W4Pair24Choice {
+        let current = w4Pair24Choose(valid: valid, samples: samples)
+        guard eligible, valid.count == 4, samples.count == 4 else { return current }
+        func beats(_ control: W4Pair24Method) -> Bool {
+            let index = control.rawValue
+            guard valid[3], valid[index], samples[3].count == 3, samples[index].count == 3 else { return false }
+            return zip(samples[3], samples[index]).allSatisfy {
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+            }
+        }
+        if beats(.raw) && (current.full16 == .raw || beats(current.full16)) {
+            return W4Pair24Choice(ordinary: current.ordinary, full16: .rawWide)
+        }
+        return current
+    }
+
+    static func w4FCStaticEligible(
+        _ ops: [W4Operands], rows: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int
+    ) -> Bool {
+        guard rows == 16, group == 64, form == 2, narrow, split == 8, ops.count == 1,
+            ops[0].k == 32768, ops[0].n == 4096, ns == [4096] else { return false }
+        let span = ops[0].n.multipliedReportingOverflow(by: ops[0].k)
+        return !span.overflow && span.partialValue > 0 && span.partialValue < Int(UInt32.max)
+    }
+
+    static func w4Pair24ChooseWithFCStatic(
+        valid: [Bool], samples: [[UInt64]], wideEligible: Bool, eligible: Bool
+    ) -> W4Pair24Choice {
+        let current = w4Pair24ChooseWithWide(valid: valid, samples: samples, eligible: wideEligible)
+        guard eligible, valid.count == 5, samples.count == 5 else { return current }
+        func beats(_ control: W4Pair24Method) -> Bool {
+            let index = control.rawValue
+            guard valid[4], valid[index], samples[4].count == 3, samples[index].count == 3 else { return false }
+            return zip(samples[4], samples[index]).allSatisfy {
+                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
+            }
+        }
+        if beats(.raw) && (current.full16 == .raw || beats(current.full16)) {
+            return W4Pair24Choice(ordinary: current.ordinary, full16: .fcStatic)
+        }
+        return current
+    }
+
+    static func w4FCStaticRun(
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(16), Int32(4096)])
+        return w4Form2NarrowFormsKernels[0](
+            [xq, op.w, op.sT, op.bT, ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", 32768)],
+            grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: [[16, 4096]], outputDTypes: [.float32])
+    }
+
+    /// Build plus eval/encoding/default-stream completion; output roots live past the stop clock.
+    static func w4Pair24Time(_ build: () -> [MLXArray]) -> UInt64? {
+        do {
+            return try withError {
+                Stream.gpu.synchronize()
+                let start = DispatchTime.now().uptimeNanoseconds
+                let outputs = build()
+                eval(outputs)
+                Stream.gpu.synchronize()
+                let end = DispatchTime.now().uptimeNanoseconds
+                withExtendedLifetime(outputs) {}
+                return end > start ? end - start : nil
+            }
+        } catch { return nil }
+    }
+
+    static func w4Pair24Exact(_ build: () -> [MLXArray], reference: MLXArray) -> Bool {
+        (try? withError {
+            let output = concatenated(build(), axis: 1)
+            let finite = isFinite(output).all()
+            eval(finite)
+            guard finite.item(Bool.self) else { return false }
+            let exact = (reference.view(dtype: .uint32) .== output.view(dtype: .uint32)).all()
+            eval(exact)
+            return exact.item(Bool.self)
+        }) ?? false
+    }
+
+    static func w4Pair24Output(
+        _ method: W4Pair24Method, form: Int, narrow: Bool,
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
+        ops: [W4Operands], ns: [Int], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        switch method {
+        case .raw:
+            return w4Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs, rows: rows,
+                K: ops[0].k, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                ns: ns, sizeDescriptor: sizeDescriptor)
+        case .compact:
+            if ops[0].k == 32768 {
+                return w4Pair24Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
+                    rows: rows, op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
+            }
+            return w4Pair24MLPRun(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
+                rows: rows, ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
+        case .quartet:
+            if rows == 16 && ops.count == 2 && ops.allSatisfy({ $0.k == 4096 && $0.n == 12288 })
+                && form == 2 && !narrow
+            {
+                return w4Pair24QuartetWideRun(xq: xq, ascale: ascale, xs: xs,
+                    ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
+            }
+            precondition(rows == 16 && ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
+                && form == 2 && narrow)
+            return w4Pair24QuartetRun(xq: xq, ascale: ascale, xs: xs,
+                op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
+        case .rawWide:
+            precondition(w4Pair24DownWideEligible(ops, rows: rows, ns: ns, group: 64,
+                form: form, narrow: narrow, split: split))
+            return w4Run(form: form, narrow: false, xq: xq, ascale: ascale, xs: xs, rows: rows,
+                K: ops[0].k, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                ns: ns, sizeDescriptor: sizeDescriptor)
+        case .fcStatic:
+            precondition(w4FCStaticEligible(ops, rows: rows, ns: ns, group: 64,
+                form: form, narrow: narrow, split: split))
+            return w4FCStaticRun(xq: xq, ascale: ascale, xs: xs,
+                op: ops[0], sizeDescriptor: sizeDescriptor)
+        }
+    }
+
+    /// The existing bind preparation reaches this R16 key; runtime row changes do not retune it.
+    static func w4Pair24Selected(
+        _ ops: [W4Operands], ns: [Int], metadata: [W4Pair24], form: Int, narrow: Bool
+    ) -> W4Pair24Choice {
+        let K = ops[0].k, G = K / 64
+        return metadata[0].selection.resolve(ops, K: K, ns: ns, group: 64,
+            form: form, narrow: narrow, split: split) {
+            let coldStart = DispatchTime.now().uptimeNanoseconds
+            let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
+            let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
+            let x = MLXArray((0 ..< 16 * G).map { Float($0 % 17 - 8) / 64 }, [16 * G])
+            let sizes = MLXArray([Int32(K), Int32(16)] + ns.map { Int32($0) })
+            func build(_ index: Int) -> [MLXArray] {
+                w4Pair24Output(W4Pair24Method(rawValue: index)!, form: form, narrow: narrow,
+                    xq: xq, ascale: a, xs: x, rows: 16, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizes)
+            }
+            let quartet = ops.count == 1 && K == 12288 && ns == [4096] && form == 2 && narrow
+            let wideQuartet = ops.count == 2 && K == 4096 && ns == [12288, 12288] && form == 2 && !narrow
+            let rawWide = w4Pair24DownWideEligible(ops, rows: 16, ns: ns, group: 64,
+                form: form, narrow: narrow, split: split)
+            let fcStatic = w4FCStaticEligible(ops, rows: 16, ns: ns, group: 64,
+                form: form, narrow: narrow, split: split)
+            let methods = fcStatic ? [0, 1, 4] : (rawWide ? [0, 1, 2, 3] : (quartet || wideQuartet ? [0, 1, 2] : [0, 1]))
+            let candidateCount = fcStatic ? 5 : (rawWide ? 4 : 3)
+            var valid = [Bool](repeating: false, count: candidateCount)
+            var reference: MLXArray?
+            valid[0] = (try? withError {
+                let output = concatenated(build(0), axis: 1)
+                let finite = isFinite(output).all()
+                eval(finite)
+                reference = output
+                return finite.item(Bool.self)
+            }) ?? false
+            if valid[0], let reference {
+                for index in methods.dropFirst() {
+                    valid[index] = w4Pair24Exact({ build(index) }, reference: reference)
+                }
+            }
+            reference = nil
+            var warm = [UInt64](repeating: 0, count: candidateCount)
+            var samples = [[UInt64]](repeating: [], count: candidateCount)
+            var legs = [[[UInt64]]](repeating: [], count: candidateCount)
+            if valid[0] {
+                for index in methods where valid[index] {
+                    if let elapsed = w4Pair24Time({ build(index) }) { warm[index] = elapsed }
+                    else { valid[index] = false }
+                }
+                if valid[0] {
+                    let orders = fcStatic
+                        ? [[0, 1, 4], [1, 4, 0], [4, 0, 1]]
+                        : (rawWide
+                            ? [[0, 1, 2, 3], [1, 2, 3, 0], [2, 3, 0, 1]]
+                            : [[0, 1, 2], [1, 2, 0], [2, 0, 1]])
+                    for order in orders {
+                        if !valid[0] { break }
+                        var round = [[UInt64]](repeating: [], count: candidateCount)
+                        for mirrored in [order, Array(order.reversed())] {
+                            if !valid[0] { break }
+                            for index in mirrored where methods.contains(index) && valid[index] {
+                                if let elapsed = w4Pair24Time({ build(index) }) { round[index].append(elapsed) }
+                                else { valid[index] = false; samples[index] = [] }
+                            }
+                        }
+                        for index in methods {
+                            legs[index].append(round[index])
+                            if valid[index] && round[index].count == 2 {
+                                samples[index].append(round[index][0] + round[index][1])
+                            }
+                        }
+                    }
+                }
+            }
+            let choice = w4Pair24ChooseWithFCStatic(valid: valid, samples: samples, wideEligible: rawWide, eligible: fcStatic)
+            withExtendedLifetime((xq, a, x, sizes)) {}
+            let cold = DispatchTime.now().uptimeNanoseconds - coldStart
+            FileHandle.standardError.write(Data(
+                "DF2 pair24 select K\(K) N\(ns) form\(form) narrow=\(narrow) R16 policy=all3>=1.03 valid=\(valid) warm_ns=\(warm) legs_ns=\(legs) round_sums_ns=\(samples) ordinary=\(choice.ordinary) full16=\(choice.full16) calibration_ns=\(cold)\n".utf8))
+            return choice
+        }
+    }
+
+    /// All32 lanes reach each gather; bits4,3,0 identify one four-lane quartet.
+    static let pair24QuartetHeader = """
+        inline void df2_pair24_quartet_load(const device uint* words, uint bases, uint lane, size_t tile,
+                                           thread half4& scales, thread half4& offsets) {
+            const uint component = (lane >> 1) & 3u;
+            const uint bit = 24u * component, shift = bit & 31u;
+            const size_t word = 3 * tile + bit / 32u;
+            uint value = words[word] >> shift;
+            if (shift > 8u) value |= words[word + 1] << (32u - shift);
+            const ushort s = ushort(bases & 65535u) + ushort(value & 4095u);
+            const ushort o = ushort(bases >> 16) + ushort((value >> 12) & 4095u);
+            const uint pair = uint(s) | (uint(o) << 16);
+            uint4 pairs(pair, simd_shuffle_xor(pair, 2), simd_shuffle_xor(pair, 4),
+                        simd_shuffle_xor(pair, 6));
+            pairs = (component & 1u) != 0u ? pairs.yxwz : pairs;
+            pairs = (component & 2u) != 0u ? pairs.zwxy : pairs;
+            scales = as_type<half4>(ushort4(pairs & uint4(65535u)));
+            offsets = as_type<half4>(ushort4(pairs >> 16));
+        }
+        
+        """
+
+    static func w4Pair24QuartetSource() -> String {
+        let source = w4Pair24MLPSource(layers: 1, form: 2, narrow: true)
+        let call = "df2_pair24_load(metadata, metadataBases, "
+        precondition(source.components(separatedBy: call).count == 3)
+        return source.replacingOccurrences(of: call,
+            with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
+    }
+
+    static let w4Pair24QuartetKernel = MLXFast.metalKernel(
+        name: "df2_w4g64_pair24_quartet_xor_mlp_f2_n16_forms_1",
+        inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+        source: w4Pair24QuartetSource(), header: header + pair24Header + pair24QuartetHeader,
+        ensureRowContiguous: true)
+
+    static func w4Pair24QuartetRun(
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, metadata: W4Pair24,
+        sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        precondition(op.k == 12288 && op.n == 4096)
+        let sizes = sizeDescriptor ?? MLXArray([Int32(12288), Int32(16), Int32(4096)])
+        return w4Pair24QuartetKernel(
+            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", 12288)],
+            grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: [[16, 4096]], outputDTypes: [.float32])
+    }
+
+    /// Form2 wide gate/up only. The existing selector checks and measures this alternative.
+    static func w4Pair24QuartetWideSource() -> String {
+        let source = w4Pair24MLPSource(layers: 2, form: 2, narrow: false)
+        let call = "df2_pair24_load(metadata, metadataBases, "
+        precondition(source.components(separatedBy: call).count == 5)
+        return source.replacingOccurrences(of: call,
+            with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
+    }
+
+    static let w4Pair24QuartetWideKernel = MLXFast.metalKernel(
+        name: "df2_w4g64_pair24_quartet_xor_mlp_f2_n32_forms_2",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs", "ksz"],
+        outputNames: ["out0", "out1"],
+        source: w4Pair24QuartetWideSource(), header: header + pair24Header + pair24QuartetHeader,
+        ensureRowContiguous: true)
+
+    static func w4Pair24QuartetWideRun(
+        xq: MLXArray, ascale: MLXArray, xs: MLXArray, ops: [W4Operands], metadata: [W4Pair24],
+        sizeDescriptor: MLXArray? = nil
+    ) -> [MLXArray] {
+        precondition(ops.count == 2 && metadata.count == 2
+            && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 })
+        let sizes = sizeDescriptor ?? MLXArray([Int32(4096), Int32(16), Int32(12288), Int32(12288)])
+        return w4Pair24QuartetWideKernel(
+            [xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata) + [ascale, xs, sizes],
+            template: [("SPLIT", split), ("KC", 4096)],
+            grid: (24576 / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+            outputShapes: [[16, 12288], [16, 12288]], outputDTypes: [.float32, .float32])
+    }
 
     /// int8 activations x the 4-bit codes on the NAX tensor units, one 16 x 32 x `group` op per group,
     /// SPLIT simdgroups over K, 32 output columns per threadgroup, the codes of the next group
@@ -2785,9 +3546,10 @@ enum DF2Fast {
 
     static func w4Run(
         form: Int, narrow: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int]
+        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
+        sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
-        let sizes = MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
         let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
         let kernels =
             narrow
@@ -3161,11 +3923,339 @@ enum DF2Fast {
         let preferredForm = w4SelectedForm
         let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
         let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
-        let outs = w4Run(
-            form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
-            rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-            ns: ns)
+        let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
+        let metadata: [W4Pair24]?
+        if codes.group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
+            metadata = ops[0].pair24.map { [$0] }
+        } else if codes.group == 64, w4FormsFit(K: codes.K, rows: codes.rows, ns: ns) {
+            metadata = w4Pair24MLPMetadata(ops)
+        } else {
+            metadata = nil
+        }
+        let outs: [MLXArray]
+        if let metadata {
+            let method = w4Pair24Selected(ops, ns: ns, metadata: metadata, form: form, narrow: narrow).method(rows: codes.rows)
+            outs = w4Pair24Output(method, form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale,
+                xs: codes.xs, rows: codes.rows, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizeDescriptor)
+        } else {
+            outs = w4Run(
+                form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                ns: ns, sizeDescriptor: sizeDescriptor)
+        }
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
+    }
+
+    /// The existing split fold, followed by the current quantG SwiGLU arithmetic.
+    static let w4SwiGLUStore = """
+        for (int e = int(tid); e < 16 * 32; e += SPLIT * 32) {
+          float v = 0.0f;
+          for (int q = 0; q < SPLIT; q++) { v += red[q * (16 * 32) + e]; }
+          const float value = ok ? v : as_type<float>(0x7fc00000u);
+          if (li == 0) { gateValue[e / (SPLIT * 32)] = value; }
+          else {
+            const float a = gateValue[e / (SPLIT * 32)];
+            activationValue[2 * halfTile + e / (SPLIT * 32)] = a / (1.0f + metal::exp(-a)) * value;
+          }
+        }
+        """
+
+    /// All reduction reads end at the last existing projection barrier. Publish only after it.
+    static let w4SwiGLUPublish = """
+        threadgroup float* activated = (threadgroup float*)tiles;
+        const uint publishTid = thread_position_in_threadgroup.x;
+        for (int halfTile = 0; halfTile < 2; halfTile++) {
+          for (int e = int(publishTid); e < 16 * 32; e += SPLIT * 32) {
+            activated[(e >> 5) * 64 + halfTile * 32 + (e & 31)] = activationValue[2 * halfTile + e / (SPLIT * 32)];
+          }
+        }
+        """
+
+    /// The original group64 quantizer reads the locally completed SwiGLU values.
+    static let w4SwiGLUQuant = """
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        if (tid < 64u) {
+          const int m = int(tid) / 4, chunk = int(tid) & 3;
+          const int g = int(threadgroup_position_in_grid.x);
+          const int K = 12288, G = K / 64;
+          const int c0 = g * 64 + chunk * 16;
+          const size_t dstBase = (size_t)m * K + c0;
+          float nv[16];
+          float local_amax = 0.0f;
+          for (int u = 0; u < 16; u++) {
+            const float a = activated[m * 64 + chunk * 16 + u];
+            nv[u] = a;
+            local_amax = max(local_amax, fabs(a));
+          }
+          local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+          local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+          float seq_sum = 0.0f;
+          const uint grpBase = lane & ~uint(3);
+          for (int step = 0; step < 4; step++) {
+            seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+            if ((int(lane) & 3) == step) {
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+            }
+          }
+          const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+          const float ia = 1.0f / a;
+          device char4* dst = (device char4*)(xq_out + dstBase);
+          for (int u = 0; u < 4; u++) {
+            const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+            dst[u] = char4(int4(rint(fv * ia)));
+          }
+          if ((int(lane) & 3) == 3) {
+            ascale_out[m * G + g] = a;
+            xs_out[m * G + g] = seq_sum;
+          }
+        }
+        """
+
+    static func w4SwiGLUIndexSource(_ source: String) -> String {
+        source
+            .replacingOccurrences(of: "const size_t r =", with: "const uint r =")
+            .replacingOccurrences(of: "const size_t tile =", with: "const uint tile =")
+            .replacingOccurrences(of: "const size_t dstBase =", with: "const uint dstBase =")
+            .replacingOccurrences(of: "size_t tile,", with: "uint tile,")
+            .replacingOccurrences(of: "const size_t word =", with: "const uint word =")
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    static func w4SwiGLUSource() -> String {
+        var body = w4Specialize(w4Source(layers: 1, group: 64, form: 2, narrow: false))
+        let pick = """
+            const int K = KC;
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
+            device float* out = out0; int N = ksz[2];
+            """
+        let selected = """
+            const int K = KC;
+            const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+            const device uint32_t* w = li == 0 ? w0 : w1;
+            const device half* sT = li == 0 ? s0 : s1;
+            const device half* bT = li == 0 ? b0 : b1;
+            const int N = 12288;
+            """
+        let store = """
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(uint)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+        precondition(body.contains(pick) && body.contains(store))
+        body = body.replacingOccurrences(of: pick, with: selected)
+            .replacingOccurrences(of: store, with: w4SwiGLUStore)
+            .replacingOccurrences(of: "threadgroup uint4 tiles[SPLIT * 32 * 4];", with: "")
+        return w4SwiGLUIndexSource("""
+            threadgroup uint4 tiles[SPLIT * 32 * 4];
+            float gateValue[2];
+            float activationValue[4];
+            for (int halfTile = 0; halfTile < 2; halfTile++) {
+              for (int li = 0; li < 2; li++) {
+            \(body)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+              }
+            }
+            \(w4SwiGLUPublish)
+            \(w4SwiGLUQuant)
+            """)
+    }
+
+    static let w4SwiGLUKernel = MLXFast.metalKernel(
+        name: "df2_w4g64_f2_gate_up_swiglu_q8_scratch_alias_index32_v1",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+        outputNames: ["xq_out", "ascale_out", "xs_out"],
+        source: w4SwiGLUSource(), header: header, ensureRowContiguous: true)
+
+    static func w4SwiGLURun(_ codes: W4Codes, _ ops: [W4Operands]) -> W4Codes {
+        let q = w4SwiGLUKernel(
+            [codes.xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT) + [codes.ascale, codes.xs],
+            template: [("SPLIT", 8), ("KC", 4096)],
+            grid: (12288 / 64 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[16 * 12288], [16 * 192], [16 * 192]],
+            outputDTypes: [.int8, .float32, .float32])
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 12288, group: 64)
+    }
+
+    static func w4SwiGLUAdmitted(_ ops: [W4Operands]) -> Bool {
+        ops[0].admitsSwiGLU(up: ops[1]) {
+            (try? withError {
+                let codes = W4Codes(
+                    xq: MLXArray((0 ..< 16 * 4096).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }),
+                    ascale: MLXArray((0 ..< 16 * 64).map { Float(1 + $0 % 11) / 256 }),
+                    xs: MLXArray((0 ..< 16 * 64).map { Float($0 % 17 - 8) / 64 }),
+                    rows: 16, K: 4096, group: 64)
+                let gu = w4Run(form: 2, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                    rows: 16, K: 4096, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT), ns: [12288, 12288])
+                let finite = isFinite(concatenated(gu, axis: 1)).all()
+                eval(finite)
+                guard finite.item(Bool.self) else { return false }
+                let ref = quantGRun(gu[0], gu[1], K: 12288, rows: 16, group: 64,
+                    headMajor: false, swiglu: true, wide: false)
+                let result = w4SwiGLURun(codes, ops)
+                let candidate = [result.xq, result.ascale, result.xs]
+                let valid = isFinite(result.ascale).all() .&& isFinite(result.xs).all()
+                eval(valid)
+                guard valid.item(Bool.self) else { return false }
+                for i in 0 ..< 3 {
+                    let bits = i == 0 ? DType.uint8 : .uint32
+                    let exact = (ref[i].view(dtype: bits) .== candidate[i].view(dtype: bits)).all()
+                    eval(exact)
+                    if !exact.item(Bool.self) { return false }
+                }
+                return true
+            }) ?? false
+        }
+    }
+
+    /// The existing compact form2 body shares the raw SwiGLU store, alias and quantizer.
+    static func w4SwiGLUPair24Source(quartet: Bool) -> String {
+        var body = w4Pair24MLPSource(layers: 1, form: 2, narrow: false)
+        let pick = """
+            const int K = KC;
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; int li = 0;
+            device float* out = out0; int N = ksz[2];
+            """
+        let selected = """
+            const int K = KC;
+            const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+            const device uint32_t* w = li == 0 ? w0 : w1;
+            const int N = 12288;
+            """
+        let store = """
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(uint)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+        precondition(body.contains(pick) && body.contains(store))
+        body = body.replacingOccurrences(of: pick, with: selected)
+            .replacingOccurrences(of: w4Pair24MLPSelection(layers: 1), with: w4Pair24MLPSelection(layers: 2))
+            .replacingOccurrences(of: store, with: w4SwiGLUStore)
+            .replacingOccurrences(of: "threadgroup uint4 tiles[SPLIT * 32 * 4];", with: "")
+        if quartet {
+            let call = "df2_pair24_load(metadata, metadataBases, "
+            precondition(body.components(separatedBy: call).count == 5)
+            body = body.replacingOccurrences(of: call,
+                with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
+        }
+        return w4SwiGLUIndexSource("""
+            threadgroup uint4 tiles[SPLIT * 32 * 4];
+            float gateValue[2];
+            float activationValue[4];
+            for (int halfTile = 0; halfTile < 2; halfTile++) {
+              for (int li = 0; li < 2; li++) {
+            \(body)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+              }
+            }
+            \(w4SwiGLUPublish)
+            \(w4SwiGLUQuant)
+            """)
+    }
+
+    static let w4SwiGLUPair24Kernels: [MLXFast.MLXFastKernel] = [false, true].map { quartet in
+        MLXFast.metalKernel(
+            name: "df2_w4g64_pair24_\(quartet ? "xor" : "scalar")_f2_gate_up_swiglu_q8_scratch_alias_index32_v1",
+            inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+            outputNames: ["xq_out", "ascale_out", "xs_out"],
+            source: w4SwiGLUPair24Source(quartet: quartet),
+            header: header + w4SwiGLUIndexSource(pair24Header + pair24QuartetHeader), ensureRowContiguous: true)
+    }
+
+    static func w4SwiGLUPair24Run(
+        _ codes: W4Codes, _ ops: [W4Operands], metadata: [W4Pair24], method: W4Pair24Method
+    ) -> W4Codes {
+        precondition(method == .compact || method == .quartet)
+        let q = w4SwiGLUPair24Kernels[method == .quartet ? 1 : 0](
+            [codes.xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata) + [codes.ascale, codes.xs],
+            template: [("SPLIT", 8), ("KC", 4096)],
+            grid: (12288 / 64 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[16 * 12288], [16 * 192], [16 * 192]],
+            outputDTypes: [.int8, .float32, .float32])
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 12288, group: 64)
+    }
+
+    static func w4SwiGLUPair24Admitted(
+        _ ops: [W4Operands], metadata: [W4Pair24], method: W4Pair24Method
+    ) -> Bool {
+        ops[0].admitsPair24SwiGLU(up: ops[1], method: method) {
+            (try? withError {
+                let codes = W4Codes(
+                    xq: MLXArray((0 ..< 16 * 4096).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }),
+                    ascale: MLXArray((0 ..< 16 * 64).map { Float(1 + $0 % 11) / 256 }),
+                    xs: MLXArray((0 ..< 16 * 64).map { Float($0 % 17 - 8) / 64 }),
+                    rows: 16, K: 4096, group: 64)
+                let gu = w4Pair24Output(method, form: 2, narrow: false,
+                    xq: codes.xq, ascale: codes.ascale, xs: codes.xs, rows: 16,
+                    ops: ops, ns: [12288, 12288], metadata: metadata)
+                let finite = isFinite(concatenated(gu, axis: 1)).all()
+                eval(finite)
+                guard finite.item(Bool.self) else { return false }
+                let ref = quantGRun(gu[0], gu[1], K: 12288, rows: 16, group: 64,
+                    headMajor: false, swiglu: true, wide: false)
+                let result = w4SwiGLUPair24Run(codes, ops, metadata: metadata, method: method)
+                let candidate = [result.xq, result.ascale, result.xs]
+                let valid = isFinite(result.ascale).all() .&& isFinite(result.xs).all()
+                eval(valid)
+                guard valid.item(Bool.self) else { return false }
+                for i in 0 ..< 3 {
+                    let bits = i == 0 ? DType.uint8 : .uint32
+                    let exact = (ref[i].view(dtype: bits) .== candidate[i].view(dtype: bits)).all()
+                    eval(exact)
+                    if !exact.item(Bool.self) { return false }
+                }
+                return true
+            }) ?? false
+        }
+    }
+
+    /// Exact normal form2 gate/up; retain the chosen metadata decoder and original fallback.
+    static func w4SwiGLUCodes(
+        _ x: MLXArray, gate: Linear, up: Linear,
+        conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)?
+    ) -> W4Codes? {
+        guard on, w4Group == 64, split == 8, x.dim(-1) == 4096, x.size / 4096 == 16,
+            w4SelectedForm == 2,
+            !DF2WideLanes.serves(.init(kind: .quantG, dtype: .float32, dtype2: .float32,
+                k: 12288, group: 64, flag: 1)),
+            let g = w4Operands(gate, group: 64), let u = w4Operands(up, group: 64),
+            g.k == 4096, u.k == 4096, g.n == 12288, u.n == 12288
+        else { return nil }
+        let ops = [g, u], ns = [12288, 12288]
+        guard w4FormsFit(K: g.k, rows: 16, ns: ns) else { return nil }
+        let metadata = w4Pair24MLPMetadata(ops)
+        let method = metadata.map {
+            w4Pair24Selected(ops, ns: ns, metadata: $0, form: 2, narrow: false).full16
+        } ?? .raw
+        if method == .raw {
+            guard w4SwiGLUAdmitted(ops) else { return nil }
+        } else {
+            guard let metadata, method == .compact || method == .quartet,
+                w4SwiGLUPair24Admitted(ops, metadata: metadata, method: method)
+            else { return nil }
+        }
+        let codes: W4Codes
+        if let conv0 {
+            let wide = DF2WideLanes.serves(.init(kind: .quantGConv0, dtype: conv0.n.dtype,
+                dtype2: conv0.dyn.dtype, k: 4096, group: 64, flag: conv0.base.dtype == .float32 ? 0 : 1))
+            let q = conv0Run(conv0.n.reshaped([16, 4096]), dyn: conv0.dyn, base: conv0.base,
+                K: 4096, rows: 16, group: 64, wide: wide)
+            codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 4096, group: 64)
+        } else {
+            guard let q = w4Quant(x, up: nil, group: 64, headMajor: false) else { return nil }
+            codes = q
+        }
+        if let metadata, method != .raw {
+            return w4SwiGLUPair24Run(codes, ops, metadata: metadata, method: method)
+        }
+        return w4SwiGLURun(codes, ops)
     }
 
     /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
@@ -3325,6 +4415,81 @@ enum DF2Fast {
             k_out[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
             """)
 
+    /// Six independent context-key projections share factors within each
+    /// two-layer, four-head group. Values remain transpose views for the cache.
+    static let ctxKGroupNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_ctx_k_group_norm_rope",
+        inputNames: (0 ..< 6).map { "k\($0)" } + (0 ..< 6).map { "w\($0)" }
+            + ["freqs", "params", "fparams"],
+        outputNames: (0 ..< 6).map { "k_out\($0)" },
+        source: """
+            const int C = params[0];
+            const int offset = params[1];
+            const float eps = fparams[0];
+            const float mscale = fparams[1];
+            const int s = int(threadgroup_position_in_grid.x);
+            const int group = int(threadgroup_position_in_grid.y);
+            const int pair = group / 2;
+            const uint lane = thread_index_in_simdgroup;
+            const int h = 4 * (group % 2) + int(simdgroup_index_in_threadgroup);
+            const int d0 = int(lane), d1 = d0 + 32;
+            threadgroup float4 factors[32];
+            if (simdgroup_index_in_threadgroup == 0) {
+              const float pos = float(offset + s);
+              const float th0 = pos * (1.0f / freqs[d0]);
+              const float c0 = metal::fast::cos(th0), s0 = metal::fast::sin(th0);
+              const float th1 = pos * (1.0f / freqs[d1]);
+              const float c1 = metal::fast::cos(th1), s1 = metal::fast::sin(th1);
+              factors[lane] = float4(c0, s0, c1, s1);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float4 cs = factors[lane];
+            const float c0 = cs.x, s0 = cs.y, c1 = cs.z, s1 = cs.w;
+            const size_t srcBase = ((size_t)s * 8 + h) * 128;
+            const size_t dstBase = ((size_t)h * C + s) * 128;
+            for (int local = 0; local < 2; local++) {
+              const int layer = pair * 2 + local;
+              const device float* k = layer == 0 ? k0 : layer == 1 ? k1 : layer == 2 ? k2 : layer == 3 ? k3 : layer == 4 ? k4 : k5;
+              const device float* kw = layer == 0 ? w0 : layer == 1 ? w1 : layer == 2 ? w2 : layer == 3 ? w3 : layer == 4 ? w4 : w5;
+              device float* dst = layer == 0 ? k_out0 : layer == 1 ? k_out1 : layer == 2 ? k_out2 : layer == 3 ? k_out3 : layer == 4 ? k_out4 : k_out5;
+              float acc = 0.0f;
+              for (int i = 0; i < 4; i++) {
+                const float xi = float(k[srcBase + 4 * int(lane) + i]);
+                acc += xi * xi;
+              }
+              const float inv_mean = metal::precise::rsqrt(simd_sum(acc) / 128u + eps);
+              const float x0 = float(k[srcBase + d0]);
+              const float y0 = float(k[srcBase + d0 + 64]);
+              const float x1 = float(k[srcBase + d1]);
+              const float y1 = float(k[srcBase + d1 + 64]);
+              const float nx0 = (kw[d0] * (x0 * inv_mean)) * mscale;
+              const float ny0 = (kw[d0 + 64] * (y0 * inv_mean)) * mscale;
+              const float nx1 = (kw[d1] * (x1 * inv_mean)) * mscale;
+              const float ny1 = (kw[d1 + 64] * (y1 * inv_mean)) * mscale;
+              dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
+              dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
+              dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
+              dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            }
+            """)
+
+    static func ctxKGroupNormRope(
+        keys: [MLXArray], norms: [RMSNorm], ropeSpec: RopeSpec, C: Int, offset: Int
+    ) -> [MLXArray]? {
+        guard on, (1 ... 16).contains(C), keys.count == 6, norms.count == 6,
+            keys.allSatisfy({ $0.dtype == .float32 && $0.shape == [1, C, 1024] }),
+            norms.allSatisfy({ $0.eps == norms[0].eps })
+        else { return nil }
+        let inputs = keys + norms.map { normWeight($0) } + [
+            ropeSpec.freqs, MLXArray([Int32(C), Int32(offset)]),
+            ropeSpec.floatParameters(eps: norms[0].eps),
+        ]
+        return ctxKGroupNormRopeKernel(
+            inputs, grid: (C * 128, 6, 1), threadGroup: (128, 1, 1),
+            outputShapes: Array(repeating: [1, 8, C, 128], count: 6),
+            outputDTypes: Array(repeating: .float32, count: 6))
+    }
+
     static func qkvNormRope(
         q: MLXArray, k: MLXArray, v: MLXArray,
         qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec, L: Int, offset: Int
@@ -3338,7 +4503,7 @@ enum DF2Fast {
             [
                 q, k, v, qw, kw, ropeSpec.freqs,
                 MLXArray([Int32(L), Int32(offset)]),
-                MLXArray([qNorm.eps, ropeSpec.mscale]),
+                ropeSpec.floatParameters(eps: qNorm.eps),
             ],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[1, 32, L, 128], [1, 8, L, 128], [1, 8, L, 128]],
@@ -3358,7 +4523,7 @@ enum DF2Fast {
             [
                 k, v, kw, ropeSpec.freqs,
                 MLXArray([Int32(C), Int32(offset)]),
-                MLXArray([kNorm.eps, ropeSpec.mscale]),
+                ropeSpec.floatParameters(eps: kNorm.eps),
             ],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[1, 8, C, 128], [1, 8, C, 128]],
@@ -3481,7 +4646,7 @@ enum DF2Fast {
             [
                 q, k, v, ck, cv, qw, kw, phases ?? ropeSpec.freqs,
                 MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
-                MLXArray([qNorm.eps, ropeSpec.mscale]),
+                ropeSpec.floatParameters(eps: qNorm.eps),
             ],
             template: [("PHASES", phases != nil)],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -4178,11 +5343,16 @@ public final class DFlash2ContextProjection {
     let anchorEmbeddings: MLXArray
     let context: MLXArray
     let contextKV: [(MLXArray, MLXArray)]
+    let lookupFCOutput: MLXArray?
 
-    init(anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)]) {
+    init(
+        anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)],
+        lookupFCOutput: MLXArray?
+    ) {
         self.anchorEmbeddings = anchorEmbeddings
         self.context = context
         self.contextKV = contextKV
+        self.lookupFCOutput = lookupFCOutput
     }
 
     /// The columns the projection covers.
@@ -4190,6 +5360,7 @@ public final class DFlash2ContextProjection {
 
     public var evaluationTargets: [MLXArray] {
         var arrays = [anchorEmbeddings, context]
+        if let lookupFCOutput { arrays.append(lookupFCOutput) }
         for (keys, values) in contextKV {
             arrays.append(keys)
             arrays.append(values)
