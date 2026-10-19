@@ -584,7 +584,9 @@ private final class DFlash2Attention: Module {
         conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil,
         ropeSpec: DF2Fast.RopeSpec? = nil,
         contextCodes: DF2Fast.W4Codes? = nil,
-        precomputedContextKV: (MLXArray, MLXArray)? = nil
+        precomputedContextKV: (MLXArray, MLXArray)? = nil,
+        precomputedQKV: (MLXArray, MLXArray, MLXArray)? = nil,
+        submitProjections: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -612,11 +614,16 @@ private final class DFlash2Attention: Module {
         var queries: MLXArray
         var contextKeys: MLXArray? = nil, contextValues: MLXArray? = nil
         var blockKeys: MLXArray, blockValues: MLXArray
-        if let conv0,
+        if let precomputedQKV {
+            (queries, blockKeys, blockValues) = precomputedQKV
+        } else if let conv0,
             let qkv = DF2Fast.linearsConv0(
                 conv0.n, dyn: conv0.dyn, base: conv0.base, [qProj, kProj, vProj])
         {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
+            // The block's projections need nothing built after them: start
+            // them on the GPU while the host builds the attention.
+            if submitProjections { asyncEval(queries, blockKeys, blockValues) }
         } else if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
         } else {
@@ -1181,22 +1188,31 @@ private final class DFlash2DecoderLayer: Module {
         context: MLXArray, rope: RoPELayer, cache: KVCache,
         ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.W4Codes?,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
-        submitAttention: Bool = false
+        submitAttention: Bool = false,
+        front: DFlash2LayerZeroFront? = nil
     ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
         let n1 = normedInput ?? DF2Fast.rms(x, inputLayerNorm)
         let leadShape = Array(n1.shape.dropLast())
-        let p1 =
-            (normedCodes.flatMap {
-                DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [attentionConv.kernelProjection])
-            }?[0]) ?? DF2Fast.linear(n1, attentionConv.kernelProjection)
+        let p1: MLXArray
+        if let front {
+            p1 = front.p1
+        } else {
+            p1 =
+                (normedCodes.flatMap {
+                    DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [attentionConv.kernelProjection])
+                }?[0]) ?? DF2Fast.linear(n1, attentionConv.kernelProjection)
+        }
         let base1 = attentionConv.fastBase
         let attnOut: MLXArray
         if DF2Fast.w4Group != nil {
+            let frontQKV: (MLXArray, MLXArray, MLXArray)? = front.map { ($0.queries, $0.keys, $0.values) }
             attnOut = selfAttn(
                 n1, context: context, rope: rope, cache: cache,
                 conv0: (n: n1, dyn: p1, base: base1),
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
+                precomputedContextKV: precomputedContextKV,
+                precomputedQKV: frontQKV,
+                submitProjections: submitAttention && DF2Fast.earlyFront)
         } else {
             let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
             attnOut = selfAttn(
@@ -1533,7 +1549,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
             eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
         }
-        if DF2Fast.on { try prepareFirstRound(target) }
+        if DF2Fast.on {
+            try prepareFirstRound(target)
+            checkLayerZeroFront()
+        }
     }
 
     /// Prepare at load what the first round of the first request would otherwise
@@ -1634,10 +1653,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 expected: config.targetHiddenSize, actual: targetHidden.dim(-1))
         }
 
+        // Decided once, before anything it replaces is built.
+        let front: DFlash2LayerZeroFront? = projected.flatMap {
+            usableFront($0, inputs: inputs, cache: cache, logitsStart: logitsStart)
+        }
         // Both crossings from the target cast here. The target's embedding is a
         // MODULE call, never a raw weight read.
         var h: MLXArray
-        if DF2Fast.on, inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == config.dflash.blockSize,
+        if let front {
+            h = front.h
+        } else if DF2Fast.on, inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == config.dflash.blockSize,
             logitsStart == 1, fc is QuantizedLinear
         {
             let anchorEmbed =
@@ -1698,7 +1723,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             var rSpec = DF2Fast.ropeSpec(self)
             var normed: MLXArray?
             var normedCodes: DF2Fast.W4Codes?
-            if let group = DF2Fast.w4Group, let baseSpec = rSpec, let first = cache.first,
+            if let front {
+                normed = front.normed
+                rSpec = front.ropeSpec
+            } else if let group = DF2Fast.w4Group, let baseSpec = rSpec, let first = cache.first,
                 cache.allSatisfy({ $0.offset == first.offset }),
                 let fused = DF2Fast.rmsQuantPhases(
                     h, layers[0].inputLayerNorm, group: group, ropeSpec: baseSpec,
@@ -1755,7 +1783,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     context: context, rope: rope, cache: cache[index],
                     ropeSpec: rSpec, contextCodes: cCodes,
                     precomputedContextKV: precomputedKV?[index],
-                    submitAttention: index == 0 && projected != nil)
+                    submitAttention: index == 0 && projected != nil,
+                    front: index == 0 ? front : nil)
                 h = step.h
                 normed = step.nextNormed
                 normedCodes = step.nextCodes
@@ -1790,6 +1819,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h[0..., logitsStart..., 0...]
         }
         return (DF2Fast.rms(h, norm), nil)
+    }
+
+    /// The projection's layer-0 front when this block is the one it was built
+    /// for: the record fast path's block shape, every cache at the front's
+    /// offset, and a phase table covering the context and the block.
+    private func usableFront(
+        _ projected: DFlash2ContextProjection.Use, inputs: MLXArray, cache: [KVCache], logitsStart: Int
+    ) -> DFlash2LayerZeroFront? {
+        guard let front = projected.front, DF2Fast.on, layers.count == 6, logitsStart == 1,
+            config.dflash.inputEmbeddingScale == 1, fc is QuantizedLinear,
+            inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == front.h.dim(1),
+            cache.count == layers.count,
+            cache.allSatisfy({ $0.offset == front.cacheOffset })
+        else { return nil }
+        let phaseRowsNeeded: Int = projected.context.dim(1) + inputs.dim(1)
+        guard phaseRowsNeeded <= front.ropeSpec.phaseRows else { return nil }
+        return front
     }
 
     /// Absorb committed context rows into the drafter's caches without
@@ -1969,6 +2015,51 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return projection.use(rows: contextRows)
     }
 
+    /// Layer 0's front of the next proposal from this round's verify, queued
+    /// with the context projection: the anchor row is `targetTokens[accepted]`'s
+    /// embedding, gathered on the GPU by the leading-match count of
+    /// `draftTokens` against `targetTokens`, so the host's acceptance is not
+    /// waited for. The phase table covers every context width up to `1 + k`,
+    /// each row a function of `cacheOffset + row` only. nil when the record
+    /// fast path the front mirrors would not run.
+    func projectLayerZeroFront(
+        _ projection: DFlash2ContextProjection, draftTokens: MLXArray, targetTokens: MLXArray,
+        cacheOffset: Int, retainCodes: Bool = false
+    ) -> DFlash2LayerZeroFront? {
+        let blockSize: Int = config.dflash.blockSize
+        let k: Int = blockSize - 1
+        let key = ObjectIdentifier(self)
+        guard DF2Fast.on, blockSize == 16, layers.count == 6, fc is QuantizedLinear,
+            config.dflash.inputEmbeddingScale == 1,
+            let group = DF2Fast.w4Group, let baseSpec = DF2Fast.ropeSpec(self),
+            draftTokens.size == k, targetTokens.size == blockSize, projection.rows == blockSize,
+            let maskEmbed = DF2Fast.maskEmbedCache[key], maskEmbed.ndim == 3,
+            maskEmbed.dim(0) == 1, maskEmbed.dim(1) == k, maskEmbed.dim(2) == config.hiddenSize,
+            maskEmbed.dtype == projection.anchorEmbeddings.dtype
+        else { return nil }
+        let drafts: MLXArray = draftTokens.reshaped([k])
+        let targets: MLXArray = targetTokens.reshaped([blockSize])[0 ..< k]
+        let matches: MLXArray = (drafts .== targets).asType(.int32)
+        let accepted: MLXArray = cumprod(matches, axis: 0).sum().asType(.int32)
+        let anchor: MLXArray = take(projection.anchorEmbeddings, accepted.reshaped([1]), axis: 1)
+        let h: MLXArray = concatenated([anchor, maskEmbed], axis: 1)
+        let layer = layers[0]
+        let attention = layer.selfAttn
+        let projections: [Linear] = [attention.qProj, attention.kProj, attention.vProj]
+        guard
+            let fused = DF2Fast.rmsQuantPhases(
+                h, layer.inputLayerNorm, group: group, ropeSpec: baseSpec,
+                C: blockSize, offset: cacheOffset),
+            let p1 = DF2Fast.w4LinearsFromCodes(
+                fused.1, leadShape: [1, blockSize], [layer.attentionConv.kernelProjection])?.first,
+            let qkv = DF2Fast.linearsConv0(
+                fused.0, dyn: p1, base: layer.attentionConv.fastBase, projections)
+        else { return nil }
+        return DFlash2LayerZeroFront(
+            cacheOffset: cacheOffset, h: h, normed: fused.0, codes: retainCodes ? fused.1 : nil, ropeSpec: fused.2,
+            p1: p1, queries: qkv[0], keys: qkv[1], values: qkv[2])
+    }
+
     // MARK: Proposing
 
     /// Draft `blockSize - 1` tokens in one forward.
@@ -1989,6 +2080,20 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         blockSize: Int,
         projection: DFlash2ContextProjection? = nil
     ) throws -> MLXArray {
+        try proposeWithHidden(
+            anchor: anchor, targetHidden: targetHidden, cache: cache, blockSize: blockSize,
+            projection: projection
+        ).tokens
+    }
+
+    /// `propose`, with the final normed hidden state and its codes.
+    private func proposeWithHidden(
+        anchor: [Int],
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        blockSize: Int,
+        projection: DFlash2ContextProjection?
+    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?) {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let rows = anchor.flatMap { [Int32($0)] + masks }
@@ -2006,16 +2111,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
-            return DF2Fast.select(
+            let tokens = DF2Fast.select(
                 logits: try logits(hidden), projected: projected,
                 anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                 succ: sel.successorCodebook,
                 predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
+            return (tokens, hidden, finalCodes)
         }
-        return candidateSelector.selectGreedy(
+        let tokens = candidateSelector.selectGreedy(
             hidden: hidden,
             logits: try logits(hidden),
             anchor: MLXArray(anchor.map { Int32($0) }))
+        return (tokens, hidden, finalCodes)
     }
 
     // MARK: Loading
@@ -2094,6 +2201,14 @@ enum DF2Fast {
     /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
     static let tokenMajorOProj =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_FRONT=0` keeps layer 0's projections in the attention-half submit.
+    static let earlyFront =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_FRONT"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_FRONT2=0` builds layer 0's front after acceptance, in the proposal.
+    static let frontEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_FRONT2"] != "0"
+    /// Written once by `checkLayerZeroFront` at bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var frontMatched = false
     static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
     static let header = """
         #include <metal_tensor>
@@ -4331,7 +4446,7 @@ enum DF2Fast {
         let CL = C + L
         let totalVecs = 32 * L + 16 * CL
         let tgs = (totalVecs + 3) / 4
-        let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows == C + L
+        let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows >= C + L
             ? ropeSpec.phases : nil
         let outs = qkvAllNormRopeKernel(
             [
@@ -5035,6 +5150,7 @@ public final class DFlash2ContextProjection {
     let context: MLXArray
     let contextKV: [(MLXArray, MLXArray)]
     let lookupFCOutput: MLXArray?
+    var front: DFlash2LayerZeroFront?
 
     init(
         anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)],
@@ -5064,6 +5180,7 @@ public final class DFlash2ContextProjection {
         let anchorEmbedding: MLXArray
         let context: MLXArray
         let contextKV: [(MLXArray, MLXArray)]
+        let front: DFlash2LayerZeroFront?
     }
 
     func use(rows: Int) -> Use {
@@ -5073,7 +5190,205 @@ public final class DFlash2ContextProjection {
         return Use(
             anchorEmbedding: anchorEmbeddings[0..., (rows - 1) ..< rows, 0...],
             context: context[0..., 0 ..< rows, 0...],
-            contextKV: kv)
+            contextKV: kv,
+            front: front)
+    }
+}
+
+/// Layer 0's front of the next proposal, built on the GPU behind the verify
+/// (`DFlash2DraftModel.projectLayerZeroFront`): the block input with its anchor
+/// gathered by the device acceptance count, layer 0's input norm and codes, a
+/// rotation table for every context width up to 16, the attention conv kernel
+/// projection and q, k, v before their norm and rotation. Valid for a proposal
+/// whose caches all sit at `cacheOffset`.
+final class DFlash2LayerZeroFront {
+    let cacheOffset: Int
+    let h: MLXArray
+    let normed: MLXArray
+    /// Layer 0's input codes, kept only for the load check (p1 replaces them at runtime).
+    let codes: DF2Fast.W4Codes?
+    let ropeSpec: DF2Fast.RopeSpec
+    let p1: MLXArray
+    let queries: MLXArray
+    let keys: MLXArray
+    let values: MLXArray
+
+    init(
+        cacheOffset: Int, h: MLXArray, normed: MLXArray, codes: DF2Fast.W4Codes?,
+        ropeSpec: DF2Fast.RopeSpec, p1: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray
+    ) {
+        self.cacheOffset = cacheOffset
+        self.h = h
+        self.normed = normed
+        self.codes = codes
+        self.ropeSpec = ropeSpec
+        self.p1 = p1
+        self.queries = queries
+        self.keys = keys
+        self.values = values
+    }
+
+    var evaluationTargets: [MLXArray] {
+        var arrays: [MLXArray] = [h, normed, p1, queries, keys, values]
+        if let phases = ropeSpec.phases { arrays.append(phases) }
+        return arrays
+    }
+}
+
+extension DFlash2DraftModel {
+    /// Resolve `DF2Fast.frontMatched` once at bind, after the warmup filled the
+    /// mask embedding cache. On synthetic rounds (accepted 0, 7 and 15, a
+    /// mismatching draft followed by matching ones where one exists; cache
+    /// offsets 0 and 37) the front must equal the record path bit for bit: its
+    /// pieces, layer 0's normed and rotated q|k|v under both phase tables, and
+    /// a whole proposal's draft ids, final hidden state and codes.
+    func checkLayerZeroFront() {
+        var note = "off"
+        if DF2Fast.frontEnabled {
+            do {
+                note = try layerZeroFrontMismatch().map { "failed (\($0))" } ?? "matched"
+            } catch {
+                note = "failed (\(error))"
+            }
+        }
+        DF2Fast.frontMatched = note == "matched"
+        FileHandle.standardError.write(Data("DF2 front2 check: \(note)\n".utf8))
+    }
+
+    private func layerZeroFrontMismatch() throws -> String? {
+        let blockSize: Int = config.dflash.blockSize
+        guard blockSize == 16 else { return "block size \(blockSize)" }
+        let k: Int = blockSize - 1
+        let width: Int = config.targetHiddenSize
+        let tokens: [Int32] = (0 ..< blockSize).map { Int32(1000 + 37 * $0) }
+        let ramp: MLXArray = MLXArray(0 ..< (blockSize * width)).asType(.float32)
+        let wave: MLXArray = MLX.sin(ramp * 0.7548776) * 2
+        let hidden: MLXArray = wave.reshaped([1, blockSize, width]).asType(dtype)
+        for accepted in [0, 7, 15] {
+            var drafts: [Int32] = Array(tokens[0 ..< k])
+            if accepted < k { drafts[accepted] += 1 }
+            for offset in [0, 37] {
+                if let note = try frontMismatch(
+                    hidden: hidden, tokens: tokens, drafts: drafts, accepted: accepted, offset: offset)
+                {
+                    return "accepted \(accepted), offset \(offset): \(note)"
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The first output that differs, or nil.
+    private func frontMismatch(
+        hidden: MLXArray, tokens: [Int32], drafts: [Int32], accepted: Int, offset: Int
+    ) throws -> String? {
+        let targets = MLXArray(tokens)
+        guard let projection = projectContext(targetHidden: hidden, anchors: targets) else {
+            return "no projection"
+        }
+        guard
+            let front = projectLayerZeroFront(
+                projection, draftTokens: MLXArray(drafts), targetTokens: targets, cacheOffset: offset,
+                retainCodes: true),
+            let frontCodes = front.codes
+        else { return "no front" }
+        let rows: Int = accepted + 1
+        let L: Int = config.dflash.blockSize
+        let use = projection.use(rows: rows)
+        let layer = layers[0]
+        let attention = layer.selfAttn
+        let projections: [Linear] = [attention.qProj, attention.kProj, attention.vProj]
+        guard let group = DF2Fast.w4Group, let baseSpec = DF2Fast.ropeSpec(self),
+            let mask = DF2Fast.maskEmbedCache[ObjectIdentifier(self)]
+        else { return "no record operands" }
+        let h: MLXArray = concatenated([use.anchorEmbedding, mask], axis: 1)
+        guard
+            let record = DF2Fast.rmsQuantPhases(
+                h, layer.inputLayerNorm, group: group, ropeSpec: baseSpec, C: rows, offset: offset),
+            let p1 = DF2Fast.w4LinearsFromCodes(
+                record.1, leadShape: [1, L], [layer.attentionConv.kernelProjection])?.first,
+            let qkv = DF2Fast.linearsConv0(
+                record.0, dyn: p1, base: layer.attentionConv.fastBase, projections),
+            let recordPhases = record.2.phases, let frontPhases = front.ropeSpec.phases
+        else { return "no record pieces" }
+        let contextKV = use.contextKV[0]
+        guard
+            let recordRotated = DF2Fast.qkvAllNormRope(
+                q: qkv[0], k: qkv[1], v: qkv[2], ck: contextKV.0, cv: contextKV.1,
+                qNorm: attention.qNorm, kNorm: attention.kNorm, ropeSpec: record.2,
+                L: L, C: rows, blockOffset: offset + rows, ctxOffset: offset),
+            let frontRotated = DF2Fast.qkvAllNormRope(
+                q: front.queries, k: front.keys, v: front.values, ck: contextKV.0, cv: contextKV.1,
+                qNorm: attention.qNorm, kNorm: attention.kNorm, ropeSpec: front.ropeSpec,
+                L: L, C: rows, blockOffset: offset + rows, ctxOffset: offset)
+        else { return "no rotation" }
+
+        let anchor = Int(tokens[accepted])
+        let frontRun = try proposalOutputs(
+            projection, front: front, rows: rows, anchor: anchor, hidden: hidden, offset: offset)
+        guard frontRun.used else { return "front not consumed" }
+        let recordRun = try proposalOutputs(
+            projection, front: nil, rows: rows, anchor: anchor, hidden: hidden, offset: offset)
+
+        var pairs: [(String, MLXArray, MLXArray)] = [
+            ("h", front.h, h), ("normed", front.normed, record.0),
+            ("xq", frontCodes.xq, record.1.xq), ("ascale", frontCodes.ascale, record.1.ascale),
+            ("xs", frontCodes.xs, record.1.xs),
+            ("phases", frontPhases[0 ..< (rows + L)], recordPhases),
+            ("p1", front.p1, p1), ("q", front.queries, qkv[0]), ("k", front.keys, qkv[1]),
+            ("v", front.values, qkv[2]),
+        ]
+        pairs.append(("rotated q", frontRotated.0, recordRotated.0))
+        pairs.append(("rotated k", frontRotated.1, recordRotated.1))
+        pairs.append(("rotated v", frontRotated.2, recordRotated.2))
+        pairs.append(("draft ids", frontRun.tokens, recordRun.tokens))
+        pairs.append(("final hidden", frontRun.hidden, recordRun.hidden))
+        switch (frontRun.codes, recordRun.codes) {
+        case (.some(let a), .some(let b)):
+            pairs.append(("final xq", a.xq, b.xq))
+            pairs.append(("final ascale", a.ascale, b.ascale))
+            pairs.append(("final xs", a.xs, b.xs))
+        case (.none, .none):
+            break
+        default:
+            return "final codes"
+        }
+        let checks: [MLXArray] = pairs.map { Self.bitsEqual($0.1, $0.2) }
+        eval(checks)
+        for (pair, check) in zip(pairs, checks) where !check.item(Bool.self) {
+            return pair.0
+        }
+        return nil
+    }
+
+    /// One proposal over the projection's first `rows` columns on fresh caches
+    /// at `offset`, with or without the front, and whether the front was taken.
+    private func proposalOutputs(
+        _ projection: DFlash2ContextProjection, front: DFlash2LayerZeroFront?, rows: Int,
+        anchor: Int, hidden: MLXArray, offset: Int
+    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?, used: Bool) {
+        let blockSize: Int = config.dflash.blockSize
+        let cache = try makeCache()
+        for layerCache in cache {
+            (layerCache as? BaseKVCache)?.offset = offset
+        }
+        projection.front = front
+        defer { projection.front = nil }
+        let block = MLXArray.zeros([1, blockSize], dtype: .int32)
+        let used = usableFront(projection.use(rows: rows), inputs: block, cache: cache, logitsStart: 1) != nil
+        let context: MLXArray = hidden[0..., 0 ..< rows, 0...]
+        let run = try proposeWithHidden(
+            anchor: [anchor], targetHidden: context, cache: cache, blockSize: blockSize,
+            projection: projection)
+        return (run.tokens, run.hidden, run.codes, used)
+    }
+
+    /// Every bit equal. BF16, FP32, int8 and token ids all widen to FP32 exactly.
+    private static func bitsEqual(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+        let x: MLXArray = contiguous(a.asType(.float32)).view(dtype: .uint32)
+        let y: MLXArray = contiguous(b.asType(.float32)).view(dtype: .uint32)
+        return MLX.all(x .== y)
     }
 }
 

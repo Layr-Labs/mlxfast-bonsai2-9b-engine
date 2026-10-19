@@ -519,15 +519,21 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 
     /// OPTIONAL (defaulted): build the next proposal's acceptance-independent
     /// work from this round's verify outputs — its context tap over every
-    /// verify column (`[1, 1 + k, taps * hidden]`) and the target's token at
-    /// every column (`[1 + k]` int32, lazy) — and return the arrays the engine
-    /// queues right behind the verify. The next proposal of the same request
-    /// may read the committed prefix of it; nothing else changes. A drafter
-    /// that keeps the default does all of its work after acceptance.
+    /// verify column (`[1, 1 + k, taps * hidden]`), the target's token at
+    /// every column (`[1 + k]` int32, lazy) and the round's draft ids (`[k]`
+    /// int32, lazy) — and return the arrays the engine queues right behind
+    /// the verify. The next proposal of the same request may read the
+    /// committed prefix of it; nothing else changes. A drafter that keeps the
+    /// default does all of its work after acceptance.
     func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray,
+        blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray]
+
+    /// OPTIONAL (defaulted): the round's raw accepted draft count (its leading
+    /// drafts the target matched), reported after `finalizeRound` only when
+    /// the round confirmed exactly `accepted + 1` columns.
+    func recordValidatedAcceptance(_ accepted: Int, requestState: any CBv2MTPRequestState)
 
     /// OPTIONAL (defaulted): committed-context work the drafter postponed
     /// while proposing this round (it needs none of it for this round's
@@ -556,11 +562,15 @@ extension CBv2MTPBlockDrafter {
     ) {}
 
     public func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray,
+        blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         []
     }
+
+    public func recordValidatedAcceptance(
+        _ accepted: Int, requestState: any CBv2MTPRequestState
+    ) {}
 
     public func submitDeferredContext(
         requestState: any CBv2MTPRequestState, after: MLXArray
