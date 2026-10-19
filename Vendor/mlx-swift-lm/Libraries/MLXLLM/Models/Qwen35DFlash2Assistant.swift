@@ -632,33 +632,86 @@ enum DFlash2PromptLookup {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// The shortest committed suffix match that may seed a lookup block. It is
+    /// evidence, not a length limit: the block copied out of the match is still
+    /// exactly `depth` tokens, and the block still needs `depth` committed
+    /// tokens after the match to exist. A repeat of `minimumMatch` tokens is
+    /// already an unambiguous continuation of the same text, so this is the
+    /// only term that decides how often the lookup may speak instead of the
+    /// neural drafter. `DARKBLOOM_DFLASH_PROMPT_LOOKUP_MIN` overrides it for a
+    /// same-box A/B; out of range values keep the shipped 8.
+    ///
+    /// Shipped 8, not 16. On the public capture the round count is exactly the
+    /// number of lookup misses plus the number of accepted blocks, and every
+    /// miss accepts one token because the drafted rows are rejected: at a
+    /// minimum of 16 the run spends 14 of 23 rounds on a miss, at 12 it spends
+    /// 10, at 8 it spends 6, and all three commit the same 128 tokens
+    /// (token sha256 d6ad211e…, reports/loop49/lookup-min-evidence). Lowering
+    /// the minimum cannot cost tokens: the target model still decides every
+    /// committed token, so a wrong short match is rejected exactly like a
+    /// rejected drafted row, while a right one commits a whole block.
+    static let minimumMatch: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP_MIN"],
+            let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            value >= 2, value <= 64
+        else { return 8 }
+        return value
+    }()
+
+    /// Require the committed suffix to have ONE continuation anywhere in the
+    /// history, not merely among the equal-longest matches. Set
+    /// `DARKBLOOM_DFLASH_PROMPT_LOOKUP_STRICT=1` to measure it: it is the
+    /// difference between "the longest match wins" and "the only match survives".
+    static let requireUniqueContinuation: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP_STRICT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["1", "true", "yes", "on"].contains(value ?? "")
+    }()
+
+    /// How many committed tokens before `end` agree with the tail of the
+    /// history, capped at `limit` so the block always fits.
+    private static func matchLength(_ history: [Int], end: Int, count: Int, limit: Int) -> Int {
+        var length = 1
+        let bound = min(limit, end)
+        while length < bound && history[end - length - 1] == history[count - length - 1] {
+            length += 1
+        }
+        return length
+    }
+
+    private static func sameBlock(_ history: [Int], _ a: Int, _ b: Int, _ depth: Int) -> Bool {
+        for offset in 0 ..< depth where history[a + offset] != history[b + offset] { return false }
+        return true
+    }
+
     static func continuation(history: [Int], depth: Int) -> [Int32]? {
         let count = history.count
-        guard enabled, depth >= 1, count >= 16 + depth else { return nil }
+        let need = minimumMatch
+        guard enabled, depth >= 1, count >= need + depth else { return nil }
         let longest = min(64, count - depth)
-        var best = 15
+        var best = need - 1
         var chosenEnd: Int?
         var ambiguous = false
-        for end in 16 ... (count - depth) {
+        for end in need ... (count - depth) {
             guard history[end - 1] == history[count - 1] else { continue }
-            var length = 1
-            let limit = min(longest, end)
-            while length < limit && history[end - length - 1] == history[count - length - 1] {
-                length += 1
-            }
-            guard length >= 16, length >= best else { continue }
+            let length = matchLength(history, end: end, count: count, limit: longest)
+            guard length >= need, length >= best else { continue }
             if length > best {
                 best = length
                 chosenEnd = end
                 ambiguous = false
-            } else if let chosenEnd {
-                for offset in 0 ..< depth where history[chosenEnd + offset] != history[end + offset] {
-                    ambiguous = true
-                    break
-                }
+            } else if let chosenEnd, !ambiguous, !sameBlock(history, chosenEnd, end, depth) {
+                ambiguous = true
             }
         }
         guard let chosenEnd, !ambiguous else { return nil }
+        if requireUniqueContinuation {
+            for end in need ... (count - depth) where end != chosenEnd {
+                guard history[end - 1] == history[count - 1] else { continue }
+                guard matchLength(history, end: end, count: count, limit: longest) >= need else { continue }
+                guard sameBlock(history, chosenEnd, end, depth) else { return nil }
+            }
+        }
         return history[chosenEnd ..< chosenEnd + depth].map(Int32.init)
     }
 }
