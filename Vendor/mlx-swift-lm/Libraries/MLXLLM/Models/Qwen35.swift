@@ -2587,26 +2587,194 @@ enum Qwen35FusedGDNVerify {
     static let snapshotOffered =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SNAPSHOT"] != "0"
 
-    private static let treeKernel: MLXFast.MLXFastKernel? = {
-        let plainFast = fastTreeOffered ? fastTreeSource(source) : nil
-        let snapshot = snapshotOffered ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
+    /// The tree kernel's text and name: the snapshot text, else the fast one, else `treeSource`.
+    /// Both the tree launch and its prefetch variant are built from it.
+    static func treeText(fast fastOn: Bool, snapshot snapshotOn: Bool) -> (text: String, name: String)? {
+        let plainFast = fastOn ? fastTreeSource(source) : nil
+        let snapshot = snapshotOn ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
         let fast = snapshot ?? plainFast
         guard let text = fast ?? treeSource(source) else { return nil }
         let name = snapshot != nil ? "qwen35_gdn_verify_fused_tree_fast_snapshot"
             : fast != nil ? "qwen35_gdn_verify_fused_tree_fast" : "qwen35_gdn_verify_fused_tree"
+        return (text, name)
+    }
+
+    private static let treeKernel: MLXFast.MLXFastKernel? = {
+        guard let tree = treeText(fast: fastTreeOffered, snapshot: snapshotOffered) else { return nil }
         return MLXFast.metalKernel(
-            name: name,
+            name: tree.name,
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
             outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-            source: text,
+            source: tree.text,
             header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
+
+    /// Extra threadgroups appended to the launch (`grid.z` past the value heads, two per z).
+    static let prefetchZ = 8
+
+    /// `text` with `2 * prefetchZ` extra threadgroups that read one element per 64-byte line
+    /// of `pf_w`, `pf_s` and `pf_b` (the next projection's weight-side buffers) and return.
+    /// They write no output the model reads, share no barrier with the scan threadgroups, and
+    /// those threadgroups (z below `Hv`) run the unchanged text.
+    static func prefetchSource(_ text: String) -> String {
+        let prologue = """
+            if (threadgroup_position_in_grid.z >= uint(Hv)) {
+              const uint pf_g = (threadgroup_position_in_grid.z - uint(Hv)) * 2u + threadgroup_position_in_grid.y;
+              const uint pf_t = pf_g * 256u + thread_index_in_threadgroup;
+              const uint pf_all = \(prefetchZ * 2 * 256)u;
+              uint pf_hits = 0u;
+              const uint pf_we = 64u / uint(sizeof(pf_w[0]));
+              const uint pf_wl = uint(pf_w_shape[0]) * uint(pf_w_shape[1]) / pf_we;
+              for (uint l = pf_t; l < pf_wl; l += pf_all) { pf_hits += uint(pf_w[l * pf_we] != 0); }
+              const uint pf_se = 64u / uint(sizeof(pf_s[0]));
+              const uint pf_sl = uint(pf_s_shape[0]) * uint(pf_s_shape[1]) / pf_se;
+              for (uint l = pf_t; l < pf_sl; l += pf_all) { pf_hits += uint(pf_s[l * pf_se] != 0); }
+              const uint pf_be = 64u / uint(sizeof(pf_b[0]));
+              const uint pf_bl = uint(pf_b_shape[0]) * uint(pf_b_shape[1]) / pf_be;
+              for (uint l = pf_t; l < pf_bl; l += pf_all) { pf_hits += uint(pf_b[l * pf_be] != 0); }
+              if (pf_hits == 0x7FFFFFFFu) { pf_sink[0] = pf_hits; }
+              return;
+            }
+
+            """
+        return prologue + text
+    }
+
+    static let prefetchOffered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDN_PREFETCH"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let prefetchKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused_pf",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in",
+            "pf_w", "pf_s", "pf_b"],
+        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail", "pf_sink"],
+        source: prefetchSource(source),
+        header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `treeKernel`'s text (the same selection) with the prefetch threadgroups.
+    private static let prefetchTreeKernel: MLXFast.MLXFastKernel? = {
+        guard let tree = treeText(fast: fastTreeOffered, snapshot: snapshotOffered) else { return nil }
+        return MLXFast.metalKernel(
+            name: tree.name + "_pf",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree",
+                "pf_w", "pf_s", "pf_b"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail", "pf_sink"],
+            source: prefetchSource(tree.text),
+            header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    /// Load-time result per conv width: the prefetch launches gave every output of the
+    /// record launches bit for bit on synthetic windows (chain and restart trees).
+    nonisolated(unsafe) private static var prefetchMatched: [Int: Bool] = [:]
+
+    /// The prefetch operands for this launch, or nil (switch off, check failed or not run,
+    /// or buffers not three 2-D arrays).
+    private static func prefetchOperands(_ buffers: [MLXArray]?, conv: Int) -> [MLXArray]? {
+        guard let buffers, prefetchMatched[conv] == true, buffers.count == 3,
+            buffers.allSatisfy({ $0.ndim == 2 })
+        else { return nil }
+        return buffers
+    }
+
+    /// Runs once per conv width at model construction, before any request: compares every
+    /// output of the prefetch launches with the record launches on fixed synthetic inputs.
+    static func checkPrefetch(keyHeads: Int, valueHeads: Int) {
+        let C = 2 * keyHeads * 128 + valueHeads * 128
+        guard prefetchMatched[C] == nil else { return }
+        prefetchMatched[C] = false
+        guard prefetchOffered else {
+            FileHandle.standardError.write(Data("gdn verify prefetch: off\n".utf8))
+            return
+        }
+        let S = maximumRows
+        let keys = MLXRandom.split(key: MLXRandom.key(0x9d5), into: 8)
+        let convState = MLXRandom.normal([1, 3, C], key: keys[0])
+        let qkv = MLXRandom.normal([1, S, C], key: keys[1])
+        let convWeight = MLXRandom.normal([C, 4, 1], key: keys[2]) * 0.5
+        let a = MLXRandom.normal([1, S, valueHeads], key: keys[3])
+        let b = MLXRandom.normal([1, S, valueHeads], key: keys[4])
+        let aLog = MLXRandom.normal([valueHeads], key: keys[5]) * 0.5
+        let dtBias = MLXRandom.normal([valueHeads], key: keys[6]) * 0.5
+        let state = MLXRandom.normal([1, valueHeads, 128, 128], key: keys[7]) * 0.1
+        let buffers = [
+            MLXArray.zeros([4096, 256], dtype: .uint32),
+            MLXArray.ones([32, 4096], dtype: .float16),
+            MLXArray.ones([32, 4096], dtype: .float16),
+        ]
+        var trees: [MLXArray] = []
+        for restartRow in [0, 9] {
+            var parent = [Int32](repeating: 0, count: 16)
+            var depth = [Int32](repeating: 0, count: 16)
+            var path = [[Int32]](repeating: [], count: 16)
+            path[0] = [0]
+            for t in 1 ..< 16 {
+                let p = t == restartRow ? 4 : t - 1
+                parent[t] = Int32(p)
+                depth[t] = depth[p] + 1
+                path[t] = path[p] + [Int32(t)]
+            }
+            var desc = [Int32](repeating: 0, count: 333)
+            for t in 0 ..< 16 {
+                desc[t] = parent[t]
+                desc[16 + t] = depth[t]
+                for (d, row) in path[t].enumerated() { desc[32 + 16 * t + d] = row }
+            }
+            trees.append(MLXArray(desc))
+        }
+        func same(_ x: [MLXArray], _ y: [MLXArray]) -> MLXArray {
+            let flags: [MLXArray] = zip(x, y).map { pair in
+                MLX.all(pair.0.view(dtype: .uint32) .== pair.1.view(dtype: .uint32))
+            }
+            return MLX.all(stacked(flags))
+        }
+        var checks: [MLXArray] = []
+        func outputs(_ o: (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)?) -> [MLXArray] {
+            guard let o else { return [] }
+            return [o.0, o.1, o.2, o.3, o.4, o.5, o.6]
+        }
+        prefetchMatched[C] = true
+        var shapesOK = true
+        let plain = outputs(apply(
+            convState: convState, qkv: qkv, convWeight: convWeight, a: a, b: b, aLog: aLog,
+            dtBias: dtBias, state: state, keyHeads: keyHeads, valueHeads: valueHeads))
+        let fetched = outputs(apply(
+            convState: convState, qkv: qkv, convWeight: convWeight, a: a, b: b, aLog: aLog,
+            dtBias: dtBias, state: state, keyHeads: keyHeads, valueHeads: valueHeads, prefetch: buffers))
+        shapesOK = shapesOK && plain.count == 7 && fetched.count == 7
+        if shapesOK { checks.append(same(plain, fetched)) }
+        for tree in trees {
+            let plainTree = outputs(applyTree(
+                convState: convState, qkv: qkv, convWeight: convWeight, a: a, b: b, aLog: aLog,
+                dtBias: dtBias, state: state, tree: tree, keyHeads: keyHeads, valueHeads: valueHeads))
+            let fetchedTree = outputs(applyTree(
+                convState: convState, qkv: qkv, convWeight: convWeight, a: a, b: b, aLog: aLog,
+                dtBias: dtBias, state: state, tree: tree, keyHeads: keyHeads, valueHeads: valueHeads,
+                prefetch: buffers))
+            shapesOK = shapesOK && plainTree.count == 7 && fetchedTree.count == 7
+            if shapesOK { checks.append(same(plainTree, fetchedTree)) }
+        }
+        var verdict = "mismatch"
+        var matched = false
+        do {
+            matched = try withError {
+                shapesOK && checks.count == 3 && MLX.all(stacked(checks)).item(Bool.self)
+            }
+            if matched { verdict = "passed (every output bit, chain and restart trees)" }
+        } catch {
+            matched = false
+            verdict = "error \(error)"
+        }
+        prefetchMatched[C] = matched
+        FileHandle.standardError.write(Data("gdn verify prefetch loadcheck: \(verdict)\n".utf8))
+    }
 
     /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
     static func applyTree(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, tree: MLXArray,
-        keyHeads: Int, valueHeads: Int
+        keyHeads: Int, valueHeads: Int, prefetch: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
         let C = qkv.dim(-1)
         guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
@@ -2622,6 +2790,20 @@ enum Qwen35FusedGDNVerify {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let S = qkv.dim(1)
+        if let pf = prefetchOperands(prefetch, conv: C), let prefetchTreeKernel {
+            let o = prefetchTreeKernel(
+                [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree] + pf,
+                template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                    ("CONV_DIM", C), ("MAX_T", maximumRows),
+                    ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                    ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                    ("K_SCALE_BITS", Int(invScale.bitPattern))],
+                grid: (256, 2, valueHeads + prefetchZ), threadGroup: (256, 1, 1),
+                outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                    [1, S, valueHeads, 128], state.shape, [1, 3, C], [1]],
+                outputDTypes: Array(repeating: .float32, count: 7) + [.uint32])
+            return (o[0], o[1], o[2], o[3], o[4], o[5], o[6])
+        }
         let o = treeKernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
@@ -2642,7 +2824,8 @@ enum Qwen35FusedGDNVerify {
     /// buffer.
     static func apply(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int,
+        prefetch: [MLXArray]? = nil
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
         let C = qkv.dim(-1)
         guard convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
@@ -2657,6 +2840,20 @@ enum Qwen35FusedGDNVerify {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let S = qkv.dim(1)
+        if let pf = prefetchOperands(prefetch, conv: C) {
+            let o = prefetchKernel(
+                [convState, qkv, convWeight, a, b, aLog, dtBias, state] + pf,
+                template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                    ("CONV_DIM", C), ("MAX_T", maximumRows),
+                    ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                    ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                    ("K_SCALE_BITS", Int(invScale.bitPattern))],
+                grid: (256, 2, valueHeads + prefetchZ), threadGroup: (256, 1, 1),
+                outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                    [1, S, valueHeads, 128], state.shape, [1, 3, C], [1]],
+                outputDTypes: Array(repeating: .float32, count: 7) + [.uint32])
+            return (o[0], o[1], o[2], o[3], o[4], o[5], o[6])
+        }
         let outputs = kernel(
             [convState, qkv, convWeight, a, b, aLog, dtBias, state],
             template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
@@ -3599,17 +3796,19 @@ final class Qwen35GatedDeltaNet: Module {
         // Verify windows of 3 ... 8 rows: conv, SiLU, q/k norm and the scan
         // in one kernel (`Qwen35FusedGDNVerify`), the same bits.
         let tree = S == 16 && B == 1 ? CBv2BranchVerify.tree : nil
+        // The out projection's weight-side buffers, read ahead by idle threadgroups of the scan.
+        let nextReads = (outProj as? HadamardQuantizedLinear)?.verifyReadBuffers(rows: B * S)
         let fusedMiddle = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
             || headKDim != 128 || headVDim != 128
             ? nil : (tree.map {
                 Qwen35FusedGDNVerify.applyTree(
                     convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                     aLog: aLog, dtBias: dtBias, state: ssmState, tree: $0,
-                    keyHeads: numKHeads, valueHeads: numVHeads)
+                    keyHeads: numKHeads, valueHeads: numVHeads, prefetch: nextReads)
             } ?? Qwen35FusedGDNVerify.apply(
                 convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState,
-                keyHeads: numKHeads, valueHeads: numVHeads))
+                keyHeads: numKHeads, valueHeads: numVHeads, prefetch: nextReads))
         precondition(tree == nil || fusedMiddle != nil, "Qwen35 tree verify: fused GDN tree kernel unavailable")
         let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
             || convKernelSize != 4
@@ -5904,6 +6103,12 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
+        if configuration.linearKeyHeadDim == 128, configuration.linearValueHeadDim == 128,
+            configuration.linearNumValueHeads % configuration.linearNumKeyHeads == 0
+        {
+            Qwen35FusedGDNVerify.checkPrefetch(
+                keyHeads: configuration.linearNumKeyHeads, valueHeads: configuration.linearNumValueHeads)
+        }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }

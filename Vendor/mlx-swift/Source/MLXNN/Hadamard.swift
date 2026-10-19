@@ -5900,6 +5900,23 @@ enum VerifyInt8Matmul {
             vector: naxVector, negative: negative && negativeForms)
     }
 
+    /// The weight buffer `matmul(_:weight:...)` binds for one layer of inner size `k` at `rows`
+    /// rows, by the same branch conditions; nil when that call would return nil.
+    static func boundWeight(rows: Int, k: Int, weight: MLXArray, streamedWeight: MLXArray?) -> MLXArray? {
+        guard route != .off, route != .plain || rows <= 8 else { return nil }
+        let n = weight.dim(0)
+        if route == .nax, naxFast, n <= narrowColumns, narrowK.contains(k) {
+            let compact = narrow16K.contains(k)
+            let forms = formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)
+            return forms && compact && streamedWeight != nil ? streamedWeight! : weight
+        }
+        if route == .nax && naxFast {
+            let forms = formsAllowed && formsMatched.contains("\(k) 1") && formsFit(k: k, n: n)
+            return forms ? (streamedWeight ?? weight) : weight
+        }
+        return weight
+    }
+
     /// `matmul` for sibling projections of one activation: two or three
     /// layers in one dispatch when the fast kernel's shared forms matched at
     /// load, else one `matmul` per layer. Either way each output is that
@@ -6810,6 +6827,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             weights.append(weight)
         }
         return weights
+    }
+
+    /// The weight-side buffers a verify-width forward of `rows` rows reads (the bound codes,
+    /// then the scales and offsets in the layout that route reads), for a reader that only
+    /// touches them ahead of the call. Reading them changes no value.
+    public func verifyReadBuffers(rows: Int) -> [MLXArray] {
+        if readsFloat16ConstantsInPlace, transform.blockSize == 4096, let biases,
+            weight.dim(0) % 32 == 0, transform.width % 512 == 0,
+            let bound = VerifyInt8Matmul.boundWeight(
+                rows: rows, k: transform.width, weight: weight, streamedWeight: streamedVerifyWeight)
+        {
+            let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases)
+            return [bound, scalesT, biasesT]
+        }
+        return [weight, scales] + (biases.map { [$0] } ?? [])
     }
 
     /// This layer's operands for `VerifyInt8Matmul.matmul(_:layers:)` and
