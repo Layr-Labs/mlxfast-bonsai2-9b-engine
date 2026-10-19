@@ -609,7 +609,7 @@ private final class DFlash2Attention: Module {
         _ x: MLXArray, context: MLXArray, rope: RoPELayer, cache: KVCache,
         conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil,
         ropeSpec: DF2Fast.RopeSpec? = nil,
-        contextCodes: DF2Fast.W4Codes? = nil,
+        contextCodes: DF2Fast.Group32Codes? = nil,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
         precomputedQKV: (MLXArray, MLXArray, MLXArray)? = nil,
         submitProjections: Bool = false
@@ -642,14 +642,21 @@ private final class DFlash2Attention: Module {
         var blockKeys: MLXArray, blockValues: MLXArray
         if let precomputedQKV {
             (queries, blockKeys, blockValues) = precomputedQKV
-        } else if let conv0,
-            let qkv = DF2Fast.linearsConv0(
+        } else if let conv0 {
+            if let qkv = DF2Fast.linearsConv0(
                 conv0.n, dyn: conv0.dyn, base: conv0.base, [qProj, kProj, vProj])
-        {
-            (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
-            // The block's projections need nothing built after them: start
-            // them on the GPU while the host builds the attention.
-            if submitProjections { asyncEval(queries, blockKeys, blockValues) }
+            {
+                (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
+                if submitProjections { asyncEval(queries, blockKeys, blockValues) }
+            } else {
+                let m = DF2Fast.dynConv(conv0.n, dyn: conv0.dyn, base: conv0.base, part: 0, residual: nil)
+                if let qkv = DF2Fast.linears(m, [qProj, kProj, vProj]) {
+                    (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
+                    if submitProjections { asyncEval(queries, blockKeys, blockValues) }
+                } else {
+                    (queries, blockKeys, blockValues) = (qProj(m), kProj(m), vProj(m))
+                }
+            }
         } else if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
         } else {
@@ -661,7 +668,7 @@ private final class DFlash2Attention: Module {
             if let activePrecomputedKV {
                 (contextKeys, contextValues) = (activePrecomputedKV.0, activePrecomputedKV.1)
             } else if let activeContextCodes,
-                let kv = DF2Fast.w4LinearsFromCodes(
+                let kv = DF2Fast.linearsFromCodes(
                     activeContextCodes, leadShape: [B, contextLength], [kProj, vProj])
             {
                 (contextKeys, contextValues) = (kv[0], kv[1])
@@ -816,7 +823,7 @@ private final class DFlash2Attention: Module {
 
     func absorbContext(
         _ context: MLXArray, rope: RoPELayer, cache: KVCache,
-        contextCodes: DF2Fast.W4Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
+        contextCodes: DF2Fast.Group32Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
     ) {
         var context = context
         var contextLength = context.dim(1)
@@ -836,7 +843,7 @@ private final class DFlash2Attention: Module {
         let B = context.dim(0)
         var contextKeys: MLXArray, contextValues: MLXArray
         if let activeContextCodes,
-            let kv = DF2Fast.w4LinearsFromCodes(
+            let kv = DF2Fast.linearsFromCodes(
                 activeContextCodes, leadShape: [B, contextLength], [kProj, vProj])
         {
             (contextKeys, contextValues) = (kv[0], kv[1])
@@ -1164,16 +1171,38 @@ private final class DFlash2MLP: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil
     ) -> MLXArray {
-        if let conv0,
-            let gu = DF2Fast.linearsConv0(conv0.n, dyn: conv0.dyn, base: conv0.base, [gate, up]),
-            let y = DF2Fast.linears(gu[0], [down], up: gu[1])
-        {
+        let act: MLXArray
+        if let conv0 {
+            if let gu = DF2Fast.linearsConv0(conv0.n, dyn: conv0.dyn, base: conv0.base, [gate, up]) {
+                if let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
+                    return y[0]
+                }
+                act = silu(gu[0]) * gu[1]
+            } else {
+                let m = DF2Fast.dynConv(conv0.n, dyn: conv0.dyn, base: conv0.base, part: 0, residual: nil)
+                if let gu = DF2Fast.linears(m, [gate, up]) {
+                    if let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
+                        return y[0]
+                    }
+                    act = silu(gu[0]) * gu[1]
+                } else {
+                    act = silu(gate(m)) * up(m)
+                }
+            }
+        } else {
+            if let gu = DF2Fast.linears(x, [gate, up]) {
+                if let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
+                    return y[0]
+                }
+                act = silu(gu[0]) * gu[1]
+            } else {
+                act = silu(gate(x)) * up(x)
+            }
+        }
+        if let y = DF2Fast.linears(act, [down]) {
             return y[0]
         }
-        if let gu = DF2Fast.linears(x, [gate, up]), let y = DF2Fast.linears(gu[0], [down], up: gu[1]) {
-            return y[0]
-        }
-        return down(silu(gate(x)) * up(x))
+        return down(act)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -1209,14 +1238,14 @@ private final class DFlash2DecoderLayer: Module {
     }
 
     func forwardFast(
-        _ x: MLXArray, normedInput: MLXArray?, normedCodes: DF2Fast.W4Codes?,
+        _ x: MLXArray, normedInput: MLXArray?, normedCodes: DF2Fast.Group32Codes?,
         nextNorm: RMSNorm?, nextQStart: Int = 0,
         context: MLXArray, rope: RoPELayer, cache: KVCache,
-        ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.W4Codes?,
+        ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.Group32Codes?,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
         submitAttention: Bool = false,
         front: DFlash2LayerZeroFront? = nil
-    ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
+    ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.Group32Codes?) {
         let n1 = normedInput ?? DF2Fast.rms(x, inputLayerNorm)
         let leadShape = Array(n1.shape.dropLast())
         let p1: MLXArray
@@ -1225,12 +1254,12 @@ private final class DFlash2DecoderLayer: Module {
         } else {
             p1 =
                 (normedCodes.flatMap {
-                    DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [attentionConv.kernelProjection])
+                    DF2Fast.linearsFromCodes($0, leadShape: leadShape, [attentionConv.kernelProjection])
                 }?[0]) ?? DF2Fast.linear(n1, attentionConv.kernelProjection)
         }
         let base1 = attentionConv.fastBase
         let attnOut: MLXArray
-        if DF2Fast.w4Group != nil {
+        if DF2Fast.on {
             let frontQKV: (MLXArray, MLXArray, MLXArray)? = front.map { ($0.queries, $0.keys, $0.values) }
             attnOut = selfAttn(
                 n1, context: context, rope: rope, cache: cache,
@@ -1250,7 +1279,7 @@ private final class DFlash2DecoderLayer: Module {
         if submitAttention { asyncEval(attnOut) }
         let attended: MLXArray
         let n2: MLXArray
-        let n2Codes: DF2Fast.W4Codes?
+        let n2Codes: DF2Fast.Group32Codes?
         if let fused = DF2Fast.dynConvRms(
             attnOut, dyn: p1, base: base1, residual: x, norm: postAttentionLayerNorm, qStart: 0)
         {
@@ -1262,11 +1291,11 @@ private final class DFlash2DecoderLayer: Module {
         }
         let p2 =
             (n2Codes.flatMap {
-                DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [mlpConv.kernelProjection])
+                DF2Fast.linearsFromCodes($0, leadShape: leadShape, [mlpConv.kernelProjection])
             }?[0]) ?? DF2Fast.linear(n2, mlpConv.kernelProjection)
         let base2 = mlpConv.fastBase
         let mlpOut: MLXArray
-        if DF2Fast.w4Group != nil {
+        if DF2Fast.on {
             mlpOut = mlp(n2, conv0: (n: n2, dyn: p2, base: base2))
         } else {
             let m = DF2Fast.dynConv(n2, dyn: p2, base: base2, part: 0, residual: nil)
@@ -1305,7 +1334,7 @@ private final class DFlash2DecoderLayer: Module {
     /// values enter the cache.
     func absorbContext(
         _ context: MLXArray, rope: RoPELayer, cache: KVCache,
-        contextCodes: DF2Fast.W4Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
+        contextCodes: DF2Fast.Group32Codes? = nil, ropeSpec: DF2Fast.RopeSpec? = nil
     ) {
         selfAttn.absorbContext(
             context, rope: rope, cache: cache, contextCodes: contextCodes, ropeSpec: ropeSpec)
@@ -1558,7 +1587,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     public func bind(target: any DFlash2Target) throws {
         // The per-row kernels' wide-form bit check (load time, before any proposal).
-        if DF2Fast.on, let group = DF2Fast.w4Group { DF2WideLanes.prepare(group: group) }
+        if DF2Fast.on { DF2WideLanes.prepare(group: 32) }
         guard target.dFlash2VocabularySize == config.vocabularySize else {
             throw DFlash2Error.vocabularyMismatch(
                 drafter: config.vocabularySize, target: target.dFlash2VocabularySize)
@@ -1590,22 +1619,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
         let cache = try makeCache()
-        DF2Fast.w4Recording = !DF2Fast.w4TilesOn
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
-        }
-        if DF2Fast.w4Recording {
-            DF2Fast.w4Recording = false
-            DF2Fast.w4AdoptTiles()
-            if DF2Fast.w4TilesOn {
-                // Compile the tiled kernels here, not in the first measured round.
-                let warm = try makeCache()
-                for rows in [32, 16] {
-                    let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
-                    eval(try propose(anchor: [0], targetHidden: context, cache: warm, blockSize: config.dflash.blockSize))
-                }
-            }
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
     }
@@ -1682,7 +1698,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         logitsStart: Int,
         projected: DFlash2ContextProjection.Use? = nil
-    ) throws -> (hidden: MLXArray, codes: DF2Fast.W4Codes?) {
+    ) throws -> (hidden: MLXArray, codes: DF2Fast.Group32Codes?) {
         guard let target else { throw DFlash2Error.notBound }
         guard cache.count == layers.count else {
             throw DFlash2Error.invalidCacheCount(expected: layers.count, actual: cache.count)
@@ -1725,7 +1741,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             h = h * config.dflash.inputEmbeddingScale
         }
         var context: MLXArray
-        let cCodes: DF2Fast.W4Codes?
+        let cCodes: DF2Fast.Group32Codes?
         var deferredContextNorm: (input: MLXArray, group: Int)? = nil
         if let projected {
             context = projected.context
@@ -1735,10 +1751,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             cCodes = nil
         } else {
             let fcOut = DF2Fast.linear(targetHidden.asType(dtype), fc)
-            if let group = DF2Fast.w4Group, fcOut.dim(0) == 1,
+            if DF2Fast.on, fcOut.dim(0) == 1,
                 (1 ... 16).contains(fcOut.dim(1)),
                 let rq = DF2Fast.rmsQuant(
-                    fcOut, hiddenNorm, group: group,
+                    fcOut, hiddenNorm, group: 32,
                     writeNorm: !(DF2Fast.on && h.ndim == 3 && h.dim(0) == 1
                         && h.size / h.dim(-1) <= 16 && layers.count == 6
                         && (config.slidingWindow.map { fcOut.dim(1) < $0 } ?? true)))
@@ -1748,7 +1764,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     // A failed projection below materializes the original normalized output.
                     context = fcOut
                     cCodes = rq.1
-                    deferredContextNorm = (fcOut, group)
+                    deferredContextNorm = (fcOut, 32)
                 } else {
                     (context, cCodes) = rq
                 }
@@ -1761,21 +1777,21 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if DF2Fast.on, h.ndim == 3, h.dim(0) == 1, h.size / h.dim(-1) <= 16, !layers.isEmpty {
             var rSpec = DF2Fast.ropeSpec(self)
             var normed: MLXArray?
-            var normedCodes: DF2Fast.W4Codes?
+            var normedCodes: DF2Fast.Group32Codes?
             if let front {
                 normed = front.normed
                 rSpec = front.ropeSpec
-            } else if let group = DF2Fast.w4Group, let baseSpec = rSpec, let first = cache.first,
+            } else if DF2Fast.on, let baseSpec = rSpec, let first = cache.first,
                 cache.allSatisfy({ $0.offset == first.offset }),
                 let fused = DF2Fast.rmsQuantPhases(
-                    h, layers[0].inputLayerNorm, group: group, ropeSpec: baseSpec,
+                    h, layers[0].inputLayerNorm, group: 32, ropeSpec: baseSpec,
                     C: context.dim(1), offset: first.offset)
             {
                 normed = fused.0
                 normedCodes = fused.1
                 rSpec = fused.2
-            } else if let group = DF2Fast.w4Group,
-                let rq = DF2Fast.rmsQuant(h, layers[0].inputLayerNorm, group: group)
+            } else if DF2Fast.on,
+                let rq = DF2Fast.rmsQuant(h, layers[0].inputLayerNorm, group: 32)
             {
                 (normed, normedCodes) = rq
             } else {
@@ -1785,14 +1801,14 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             var precomputedKV: [(MLXArray, MLXArray)]? = projected?.contextKV
             if let cCodes, layers.count == 6 {
                 let lead = [1, context.dim(1)]
-                if let kv012 = DF2Fast.w4LinearsFromCodes(
+                if let kv012 = DF2Fast.linearsFromCodes(
                     cCodes, leadShape: lead,
                     [
                         layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
                         layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
                         layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
                     ]),
-                    let kv345 = DF2Fast.w4LinearsFromCodes(
+                    let kv345 = DF2Fast.linearsFromCodes(
                         cCodes, leadShape: lead,
                         [
                             layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
@@ -1908,11 +1924,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             fcOutput = DF2Fast.linear(targetHidden.asType(dtype), fc)
         }
         let context = DF2Fast.rms(fcOutput, hiddenNorm)
-        let contextCodes: DF2Fast.W4Codes?
+        let contextCodes: DF2Fast.Group32Codes?
         if DF2Fast.on, layers.count == 6, context.ndim == 3, context.dtype == .float32,
-            context.dim(0) == 1, context.dim(2) == 4096, let group = DF2Fast.w4Group
+            context.dim(0) == 1, context.dim(2) == 4096
         {
-            contextCodes = DF2Fast.w4Quant(context, up: nil, group: group, headMajor: false)
+            contextCodes = DF2Fast.quantCodes(context, up: nil, group: 32, headMajor: false)
         } else {
             contextCodes = nil
         }
@@ -1929,10 +1945,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         {
             // Every layer keeps the same rows and offset; any context skip
             // keeps the original per-layer path below.
-            // Two layers keep the 4096-column narrow dispatch eligible.
             var contextKV: [(MLXArray, MLXArray)] = []
             for index in stride(from: 0, to: layers.count, by: 2) {
-                guard let kv = DF2Fast.w4LinearsFromCodes(
+                guard let kv = DF2Fast.linearsFromCodes(
                     contextCodes, leadShape: [1, contextRows],
                     [
                         layers[index].selfAttn.kProj, layers[index].selfAttn.vProj,
@@ -1945,7 +1960,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             if contextKV.count != 6 {
                 contextKV = []
                 for layer in layers {
-                    guard let kv = DF2Fast.w4LinearsFromCodes(
+                    guard let kv = DF2Fast.linearsFromCodes(
                         contextCodes, leadShape: [1, contextRows],
                         [layer.selfAttn.kProj, layer.selfAttn.vProj])
                     else { break }
@@ -2017,35 +2032,34 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// does not apply.
     public func projectContext(targetHidden: MLXArray, anchors: MLXArray) -> DFlash2ContextProjection? {
         guard let target, DF2Fast.on, fc is QuantizedLinear, layers.count == 6,
-            let group = DF2Fast.w4Group, targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            targetHidden.ndim == 3, targetHidden.dim(0) == 1,
             (1 ... 16).contains(targetHidden.dim(1)),
             targetHidden.dim(-1) == config.targetHiddenSize,
             anchors.size == targetHidden.dim(1)
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
+        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: 32) else { return nil }
         let context = normed.0
         guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
-        let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
-            anchorEmbeddings: embeddings, context: context, contextKV: kv, lookupFCOutput: lookupFC)
+            anchorEmbeddings: embeddings, context: context, contextKV: kv, lookupFCOutput: nil)
     }
 
     /// Every layer's context keys and values from the context codes, in the
     /// two six-output launches `hiddenStatesWithCodes` uses.
-    private func contextKeysValues(_ codes: DF2Fast.W4Codes, rows: Int) -> [(MLXArray, MLXArray)]? {
+    private func contextKeysValues(_ codes: DF2Fast.Group32Codes, rows: Int) -> [(MLXArray, MLXArray)]? {
         let lead = [1, rows]
         guard
-            let kv012 = DF2Fast.w4LinearsFromCodes(
+            let kv012 = DF2Fast.linearsFromCodes(
                 codes, leadShape: lead,
                 [
                     layers[0].selfAttn.kProj, layers[0].selfAttn.vProj,
                     layers[1].selfAttn.kProj, layers[1].selfAttn.vProj,
                     layers[2].selfAttn.kProj, layers[2].selfAttn.vProj,
                 ]),
-            let kv345 = DF2Fast.w4LinearsFromCodes(
+            let kv345 = DF2Fast.linearsFromCodes(
                 codes, leadShape: lead,
                 [
                     layers[3].selfAttn.kProj, layers[3].selfAttn.vProj,
@@ -2065,7 +2079,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         _ projection: DFlash2ContextProjection, anchors: Int, blockSize: Int, contextRows: Int
     ) -> DFlash2ContextProjection.Use? {
         guard DF2Fast.on, anchors == 1, blockSize == config.dflash.blockSize, blockSize <= 16,
-            fc is QuantizedLinear, layers.count == 6, DF2Fast.w4Group != nil,
+            fc is QuantizedLinear, layers.count == 6,
             contextRows >= 1, contextRows <= projection.rows
         else { return nil }
         return projection.use(rows: contextRows)
@@ -2087,7 +2101,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let key = ObjectIdentifier(self)
         guard DF2Fast.on, blockSize == 16, layers.count == 6, fc is QuantizedLinear,
             config.dflash.inputEmbeddingScale == 1,
-            let group = DF2Fast.w4Group, let baseSpec = DF2Fast.ropeSpec(self),
+            let baseSpec = DF2Fast.ropeSpec(self),
             draftTokens.size == k, targetTokens.size == blockSize, projection.rows == blockSize,
             let maskEmbed = DF2Fast.maskEmbedCache[key], maskEmbed.ndim == 3,
             maskEmbed.dim(0) == 1, maskEmbed.dim(1) == k, maskEmbed.dim(2) == config.hiddenSize,
@@ -2104,9 +2118,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let projections: [Linear] = [attention.qProj, attention.kProj, attention.vProj]
         guard
             let fused = DF2Fast.rmsQuantPhases(
-                h, layer.inputLayerNorm, group: group, ropeSpec: baseSpec,
+                h, layer.inputLayerNorm, group: 32, ropeSpec: baseSpec,
                 C: blockSize, offset: cacheOffset),
-            let p1 = DF2Fast.w4LinearsFromCodes(
+            let p1 = DF2Fast.linearsFromCodes(
                 fused.1, leadShape: [1, blockSize], [layer.attentionConv.kernelProjection])?.first,
             let qkv = DF2Fast.linearsConv0(
                 fused.0, dyn: p1, base: layer.attentionConv.fastBase, projections)
@@ -2149,7 +2163,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         blockSize: Int,
         projection: DFlash2ContextProjection?
-    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?) {
+    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.Group32Codes?) {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let rows = anchor.flatMap { [Int32($0)] + masks }
@@ -2164,7 +2178,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let sel = candidateSelector
             let projected =
                 (finalCodes.flatMap {
-                    DF2Fast.w4LinearsFromCodes(
+                    DF2Fast.linearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
             let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize)
@@ -2313,80 +2327,168 @@ enum DF2Fast {
             }
             """)
 
-    static func matmulSource(layers: Int) -> String {
+    static func matmulSource(layers: Int, columns: Int) -> String {
+        precondition(columns == 16 || columns == 32)
         var pick = """
-            const int K = ksz[0];
+            const int K = KC;
             int bx = int(threadgroup_position_in_grid.x);
             const device uint32_t* w = w0; const device float* sT = s0; const device float* bT = b0;
             device float* out = out0; int N = ksz[2];
 
             """
         for l in 1 ..< layers {
-            pick += "if (bx >= N / 32) { bx -= N / 32; w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+            pick += "if (bx >= N / \(columns)) { bx -= N / \(columns); w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
-        return pick + """
-            const int G = K / 32;
-            const int n0 = bx * 32;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const uint tid = thread_position_in_threadgroup.x;
-            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-            threadgroup uint32_t bs[SPLIT][32 * 8];
-            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
-            auto tA0 = A.template slice<32, 16>(0, 0);
-            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
-            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
-            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
-              auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
-            }
-            float acc[16], accb[16];
-            for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
-            const int m0 = mrow, m1 = mrow + 8;
-            const int sj = int(lane & 7u), sc = int(lane >> 3);
-            const device uint32_t* wsrc = w + (size_t)(n0 + sc) * (K / 4) + sj;
-            threadgroup uint32_t* sdst = bs[sg] + sc * 8 + sj;
-            uint32_t wv[8];
-            for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + int(sg) * 8]; }
-            for (int g = int(sg); g < G; g += SPLIT) {
-              for (int t = 0; t < 8; t++) { sdst[32 * t] = wv[t] ^ 0x80808080u; }
-              if (g + SPLIT < G) { for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + (g + SPLIT) * 8]; } }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
-              auto tA = A.template slice<32, 16>(g * 32, 0);
-              op.run(tA, Bt, cT);
-              const device float* sr = sT + (size_t)g * N + n0 + nb;
-              const device float* br = bT + (size_t)g * N + n0 + nb;
-              const float4 s0v = *(const device float4*)sr, s1v = *(const device float4*)(sr + 16);
-              const float4 b0v = fma(float4(128.0f), s0v, *(const device float4*)br);
-              const float4 b1v = fma(float4(128.0f), s1v, *(const device float4*)(br + 16));
-              const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
-              const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
-              for (int i = 0; i < 16; i++) {
-                const int j = (i & 3);
-                const float s = (i >> 3) ? s1v[j] : s0v[j];
-                const float b = (i >> 3) ? b1v[j] : b0v[j];
-                const bool hi = (i >> 2) & 1;
-                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-                accb[i] = fma(b, hi ? x1 : x0, accb[i]);
-              }
-              simdgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            threadgroup float red[SPLIT][16 * 32];
-            for (int i = 0; i < 16; i++) {
-              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
-              red[sg][m * 32 + n] = acc[i] + accb[i];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
-              float v = 0.0f;
-              for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
-              out[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
-            }
-            """
+        if columns == 16 {
+            return pick + """
+                const int G = K / 32;
+                const int n0 = bx * 16;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint tid = thread_position_in_threadgroup.x;
+                constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 16, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+                mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+                tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+                threadgroup uint32_t bs[SPLIT][16 * 8];
+                tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 16));
+                auto tA0 = A.template slice<32, 16>(0, 0);
+                auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+                const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+                const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+                bool ok = cT.get_capacity() == 8;
+                for (int i = 0; i < 8 && ok; i++) {
+                  auto ids = cT.get_multidimensional_index(i);
+                  ok = ids[0] == nb + (i & 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+                }
+                float acc[8], accb[ROW_CORRECTION ? 2 : 8];
+                for (int i = 0; i < 8; i++) { acc[i] = 0.0f; }
+                for (int i = 0; i < (ROW_CORRECTION ? 2 : 8); i++) { accb[i] = 0.0f; }
+                const int m0 = mrow, m1 = mrow + 8;
+                const int sj = int(lane & 7u), sc = int(lane >> 3);
+                const device uint32_t* wsrc = w + (size_t)(n0 + sc) * (K / 4) + sj;
+                threadgroup uint32_t* sdst = bs[sg] + sc * 8 + sj;
+                uint32_t wv[4];
+                for (int t = 0; t < 4; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + int(sg) * 8]; }
+                for (int g = int(sg); g < G; g += SPLIT) {
+                  for (int t = 0; t < 4; t++) { sdst[32 * t] = wv[t] ^ 0x80808080u; }
+                  if (g + SPLIT < G) { for (int t = 0; t < 4; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + (g + SPLIT) * 8]; } }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                  auto tA = A.template slice<32, 16>(g * 32, 0);
+                  op.run(tA, Bt, cT);
+                  const device float* sr = sT + (size_t)g * N + n0 + nb;
+                  const device float* br = bT + (size_t)g * N + n0 + nb;
+                  const float4 s0v = *(const device float4*)sr;
+                  float4 b0v;
+                  if constexpr (!ROW_CORRECTION) {
+                    b0v = fma(float4(128.0f), s0v, *(const device float4*)br);
+                  }
+                  const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+                  const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
+                  if constexpr (ROW_CORRECTION) {
+                    const float b = fma(128.0f, s0v[0], br[0]);
+                    accb[0] = fma(b, x0, accb[0]);
+                    accb[1] = fma(b, x1, accb[1]);
+                  }
+                  for (int i = 0; i < 8; i++) {
+                    const int j = (i & 3);
+                    const float s = s0v[j];
+                    const bool hi = (i >> 2) & 1;
+                    acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                    if constexpr (!ROW_CORRECTION) {
+                      const float b = b0v[j];
+                      accb[i] = fma(b, hi ? x1 : x0, accb[i]);
+                    }
+                  }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                threadgroup float red[SPLIT][16 * 16];
+                for (int i = 0; i < 8; i++) {
+                  const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3);
+                  red[sg][m * 16 + n] = acc[i] + accb[ROW_CORRECTION ? ((i >> 2) & 1) : i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = int(tid); e < ksz[1] * 16; e += SPLIT * 32) {
+                  float v = 0.0f;
+                  for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
+                  out[(size_t)(e >> 4) * N + n0 + (e & 15)] = ok ? v : as_type<float>(0x7fc00000u);
+                }
+                """
+        } else {
+            return pick + """
+                const int G = K / 32;
+                const int n0 = bx * 32;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint tid = thread_position_in_threadgroup.x;
+                constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+                mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+                tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+                threadgroup uint32_t bs[SPLIT][32 * 8];
+                tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs[sg], dextents<int, 2>(32, 32));
+                auto tA0 = A.template slice<32, 16>(0, 0);
+                auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
+                const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+                const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+                bool ok = cT.get_capacity() == 16;
+                for (int i = 0; i < 16 && ok; i++) {
+                  auto ids = cT.get_multidimensional_index(i);
+                  ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+                }
+                float acc[16], accb[ROW_CORRECTION ? 2 : 16];
+                for (int i = 0; i < 16; i++) { acc[i] = 0.0f; }
+                for (int i = 0; i < (ROW_CORRECTION ? 2 : 16); i++) { accb[i] = 0.0f; }
+                const int m0 = mrow, m1 = mrow + 8;
+                const int sj = int(lane & 7u), sc = int(lane >> 3);
+                const device uint32_t* wsrc = w + (size_t)(n0 + sc) * (K / 4) + sj;
+                threadgroup uint32_t* sdst = bs[sg] + sc * 8 + sj;
+                uint32_t wv[8];
+                for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + int(sg) * 8]; }
+                for (int g = int(sg); g < G; g += SPLIT) {
+                  for (int t = 0; t < 8; t++) { sdst[32 * t] = wv[t] ^ 0x80808080u; }
+                  if (g + SPLIT < G) { for (int t = 0; t < 8; t++) { wv[t] = wsrc[(size_t)(4 * t) * (K / 4) + (g + SPLIT) * 8]; } }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                  auto tA = A.template slice<32, 16>(g * 32, 0);
+                  op.run(tA, Bt, cT);
+                  const device float* sr = sT + (size_t)g * N + n0 + nb;
+                  const device float* br = bT + (size_t)g * N + n0 + nb;
+                  const float4 s0v = *(const device float4*)sr, s1v = *(const device float4*)(sr + 16);
+                  float4 b0v, b1v;
+                  if constexpr (!ROW_CORRECTION) {
+                    b0v = fma(float4(128.0f), s0v, *(const device float4*)br);
+                    b1v = fma(float4(128.0f), s1v, *(const device float4*)(br + 16));
+                  }
+                  const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
+                  const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
+                  if constexpr (ROW_CORRECTION) {
+                    const float b = fma(128.0f, s0v[0], br[0]);
+                    accb[0] = fma(b, x0, accb[0]);
+                    accb[1] = fma(b, x1, accb[1]);
+                  }
+                  for (int i = 0; i < 16; i++) {
+                    const int j = (i & 3);
+                    const float s = (i >> 3) ? s1v[j] : s0v[j];
+                    const bool hi = (i >> 2) & 1;
+                    acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                    if constexpr (!ROW_CORRECTION) {
+                      const float b = (i >> 3) ? b1v[j] : b0v[j];
+                      accb[i] = fma(b, hi ? x1 : x0, accb[i]);
+                    }
+                  }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                threadgroup float red[SPLIT][16 * 32];
+                for (int i = 0; i < 16; i++) {
+                  const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+                  red[sg][m * 32 + n] = acc[i] + accb[ROW_CORRECTION ? ((i >> 2) & 1) : i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+                  float v = 0.0f;
+                  for (int q = 0; q < SPLIT; q++) { v += red[q][e]; }
+                  out[(size_t)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+                }
+                """
+        }
     }
 
     static let matmuls: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
@@ -2395,13 +2497,100 @@ enum DF2Fast {
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
-            source: matmulSource(layers: layers), header: header, ensureRowContiguous: true)
+            source: matmulSource(layers: layers, columns: 32), header: header, ensureRowContiguous: true)
     }
+
+    static let matmuls16: [MLXFast.MLXFastKernel] = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "df2_i8_matmul\(layers)_c16",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: matmulSource(layers: layers, columns: 16), header: header, ensureRowContiguous: true)
+    }
+
+    private static func narrowAdmissionCheck() -> Bool {
+        guard split > 0 else { return false }
+        let wordMultiplier = MLXArray(UInt32(1103515245))
+        let wordOffset = MLXArray(UInt32(12345))
+        var checked = 0
+        for k in [256, 4096, 12288, 32768] where k / 32 >= split {
+            let g = k / 32
+            let xq = (arange(16 * k, dtype: .int32) % 25 - 12).asType(.int8)
+            let ascale = (arange(16 * g, dtype: .int32) % 20 + 1).asType(.float32) * 0.05
+            let xs = (arange(16 * g, dtype: .int32) % 30 - 15).asType(.float32) * 0.1
+            for ns in [[32], [32, 64], [32, 64, 96]] {
+                let layers = ns.count, totalN = ns.reduce(0, +)
+                let ws = ns.map { n in
+                    arange(n * (k / 4), dtype: .uint32) * wordMultiplier + wordOffset
+                }
+                let sTs = ns.map { n in
+                    (arange(g * n, dtype: .int32) % 100 + 1).asType(.float32) * 0.001
+                }
+                for rowCorrection in [true, false] {
+                    let bTs = zip(sTs, ns).map { sT, n in
+                        rowCorrection
+                            ? -128.0 * sT
+                            : (arange(g * n, dtype: .int32) % 50).asType(.float32) * 0.002 - 0.05
+                    }
+                    for rows in [1, 15, 16] {
+                        var inputs: [MLXArray] = []
+                        inputs.reserveCapacity(3 * layers + 4)
+                        inputs.append(xq)
+                        for w in ws { inputs.append(w) }
+                        for sT in sTs { inputs.append(sT) }
+                        for bT in bTs { inputs.append(bT) }
+                        inputs.append(ascale)
+                        inputs.append(xs)
+                        inputs.append(MLXArray([Int32(k), Int32(rows)] + ns.map { Int32($0) }))
+                        let outputShapes = ns.map { [rows, $0] }
+                        let outputDTypes = ns.map { _ in DType.float32 }
+                        let out32 = matmuls[layers - 1](
+                            inputs, template: [("SPLIT", split), ("ROW_CORRECTION", rowCorrection), ("KC", k)],
+                            grid: (totalN / 32 * split * 32, 1, 1),
+                            threadGroup: (split * 32, 1, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        let out16 = matmuls16[layers - 1](
+                            inputs, template: [("SPLIT", split), ("ROW_CORRECTION", rowCorrection), ("KC", k)],
+                            grid: (totalN / 16 * split * 32, 1, 1),
+                            threadGroup: (split * 32, 1, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        var checks: [MLXArray] = []
+                        checks.reserveCapacity(3 * layers)
+                        for (o32, o16) in zip(out32, out16) {
+                            checks.append(isFinite(o32).all())
+                            checks.append(isFinite(o16).all())
+                            checks.append(MLX.all(o32.view(dtype: .uint32) .== o16.view(dtype: .uint32)))
+                        }
+                        let match = MLX.all(MLX.stacked(checks))
+                        eval(match)
+                        guard match.item(Bool.self) else {
+                            FileHandle.standardError.write(Data(
+                                "DF2 Q8 narrow matmul: wide retained (nonfinite or word mismatch at K\(k) R\(rows) L\(layers) correction=\(rowCorrection))\n".utf8))
+                            return false
+                        }
+                        checked += 1
+                    }
+                }
+            }
+        }
+        guard checked > 0 else {
+            FileHandle.standardError.write(Data("DF2 Q8 narrow matmul: wide retained (no eligible check shape)\n".utf8))
+            return false
+        }
+        FileHandle.standardError.write(Data(
+            "DF2 Q8 narrow matmul: 16 columns admitted by \(checked) finite, raw-word-exact shape checks\n".utf8))
+        return true
+    }
+
+    static let narrowAdmitted: Bool = narrowAdmissionCheck()
 
     final class Operands {
         let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
-        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
+        let rowCorrection: Bool
+        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int, rowCorrection: Bool) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
+            self.rowCorrection = rowCorrection
         }
     }
     final class FusedKVOperands {
@@ -2446,13 +2635,16 @@ enum DF2Fast {
             return array
         }
     }
-    struct W4Codes {
+    struct Group32Codes {
         let xq: MLXArray
         let ascale: MLXArray
         let xs: MLXArray
         let rows: Int
         let K: Int
         let group: Int
+        init(xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int, K: Int, group: Int = 32) {
+            self.xq = xq; self.ascale = ascale; self.xs = xs; self.rows = rows; self.K = K; self.group = group
+        }
     }
 
     nonisolated(unsafe) static var operandCache: [ObjectIdentifier: Operands] = [:]
@@ -2569,8 +2761,16 @@ enum DF2Fast {
         else { return nil }
         let sT = contiguous(q.scales.asType(.float32).transposed())
         let bT = contiguous(biases.asType(.float32).transposed())
-        eval(sT, bT)
-        let o = Operands(w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4)
+        // Normal scales keep exact cancellation stable under device input flushing.
+        let rowCorrection = MLX.all(MLX.stacked([
+            isFinite(sT).all(), isFinite(bT).all(),
+            (MLX.abs(sT) .>= Float.leastNormalMagnitude).all(),
+            (bT .== -128 * sT).all(),
+        ]))
+        eval(sT, bT, rowCorrection)
+        let o = Operands(
+            w: q.weight, sT: sT, bT: bT, n: q.weight.dim(0), k: q.weight.dim(1) * 4,
+            rowCorrection: rowCorrection.item(Bool.self))
         operandCache[ObjectIdentifier(layer)] = o
         return o
     }
@@ -2590,292 +2790,6 @@ enum DF2Fast {
         return (o[0], o[1], o[2], rows)
     }
 
-    /// `layers(x)` (or of silu(x) * up) for sibling drafter linears sharing x; nil when not eligible.
-    static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
-        guard on, (1 ... 3).contains(layers.count) else { return nil }
-        if let group = w4Group, let y = w4Linears(x, layers, up: up, group: group) {
-            return y
-        }
-        guard (1 ... 16).contains(x.size / x.dim(-1)) else { return nil }
-        let ops = layers.compactMap { operands($0) }
-        guard ops.count == layers.count, ops.allSatisfy({ $0.k == x.dim(-1) }),
-            let (xq, ascale, xs, rows) = codes(x, up: up)
-        else { return nil }
-        let ns = ops.map(\.n)
-        let outs = matmuls[layers.count - 1](
-            [xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT)
-                + [ascale, xs, MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
-            template: [("SPLIT", split)],
-            grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-        let lead = Array(x.shape.dropLast())
-        return zip(outs, ns).map { $0.reshaped(lead + [$1]) }
-    }
-
-    // MARK: 4-bit drafter linears, re-quantized at load (drafter numerics only)
-
-    /// Input columns per 4-bit group (64 or 128); nil (`DF2_W4=0`) keeps the pinned 8-bit g32 codes.
-    static let w4Group: Int? = {
-        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "64"
-        return v == "128" ? 128 : (v == "0" ? nil : 64)
-    }()
-
-    final class W4Operands {
-        var w: MLXArray, sT: MLXArray, bT: MLXArray
-        let n: Int, k: Int
-        var pair24: W4Pair24? = nil
-        /// The same codes, scales and offsets in `w4Tile` order once `w4AdoptTiles` admitted them;
-        /// `w`, `sT` and `bT` are then released.
-        var tiles: MLXArray? = nil
-        private let sizeLock = NSLock()
-        private var cachedSizes: (words: [Int32], array: MLXArray)?
-        init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
-            self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
-        }
-
-        func dispatchSizes(K: Int, rows: Int, ns: [Int]) -> MLXArray {
-            let words = [Int32(K), Int32(rows)] + ns.map { Int32($0) }
-            sizeLock.lock()
-            defer { sizeLock.unlock() }
-            if let cachedSizes, cachedSizes.words == words {
-                return cachedSizes.array
-            }
-            let array = MLXArray(words)
-            cachedSizes = (words, array)
-            return array
-        }
-    }
-    nonisolated(unsafe) static var w4Cache: [ObjectIdentifier: W4Operands] = [:]
-
-    /// An in-memory 4-bit affine copy of one pinned linear (the file on disk is untouched), built once
-    /// at load: per group of `group` input columns, the range [lo, hi] shrunk toward zero by the factor
-    /// in {1, 0.95, ..., 0.75} with the least squared error against the pinned weights, then FP16
-    /// scale (hi - lo) / 15 and offset lo. Codes are row-major [N, K / 2]; a word holds k = 8j ... 8j + 3
-    /// in its low nibbles and k = 8j + 4 ... 8j + 7 in its high nibbles. Scales and offsets are [G, N].
-    static func w4Operands(_ layer: Linear, group: Int) -> W4Operands? {
-        if let o = w4Cache[ObjectIdentifier(layer)] { return o }
-        guard let q = layer as? QuantizedLinear, q.mode == .affine, let biases = q.biases, q.bias == nil
-        else { return nil }
-        let N = q.weight.dim(0)
-        let K = q.weight.dim(1) * 32 / q.bits
-        guard N % 32 == 0, K % group == 0 else { return nil }
-        let G = K / group
-        let w = dequantized(
-            q.weight, scales: q.scales, biases: biases, groupSize: q.groupSize, bits: q.bits,
-            dtype: .float32
-        ).reshaped([N, G, group])
-        let lo0 = w.min(axis: -1), hi0 = w.max(axis: -1)
-        var best: MLXArray? = nil
-        var lo = lo0, hi = hi0
-        for c: Float in [1.0, 0.95, 0.9, 0.85, 0.8, 0.75] {
-            let l = lo0 * c, h = hi0 * c
-            let sc = which(h .> l, (h - l) / 15, Float(1)).asType(.float16).asType(.float32)
-            let bc = l.asType(.float16).asType(.float32)
-            let u = clip(
-                round((w - bc.expandedDimensions(axis: -1)) / sc.expandedDimensions(axis: -1)),
-                min: 0, max: 15)
-            let e = square(u * sc.expandedDimensions(axis: -1) + bc.expandedDimensions(axis: -1) - w)
-                .sum(axis: -1)
-            if let b0 = best {
-                let better = e .< b0
-                best = which(better, e, b0)
-                lo = which(better, l, lo)
-                hi = which(better, h, hi)
-            } else {
-                best = e
-            }
-            eval(best!, lo, hi)
-        }
-        let s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
-        let b = lo.asType(.float16).asType(.float32)
-        let u = clip(
-            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15
-        ).asType(.uint32).reshaped([N, K / 8, 2, 4])
-        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
-        let packed = (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
-        let sT = contiguous(s.asType(.float16).transposed())
-        let bT = contiguous(b.asType(.float16).transposed())
-        eval(packed, sT, bT)
-        let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
-        if group == 64 && ((N == 4096 && K == 32768)
-            || (N == 12288 && K == 4096) || (N == 4096 && K == 12288))
-        {
-            o.pair24 = W4Pair24(sT, bT)
-        }
-        if w4TilesOn {
-            // A linear first used after adoption: same layout function as the checked ones.
-            o.tiles = w4Tile(packed, sT: sT, bT: bT, n: N, k: K, group: group)
-            eval(o.tiles!)
-            w4Release(o)
-        }
-        w4Cache[ObjectIdentifier(layer)] = o
-        return o
-    }
-
-    // MARK: 4-bit codes in load-time tiles
-
-    /// uint4 words per tile: one 32-column block of one group, codes then FP16 scales then FP16 offsets.
-    static func w4TileU4(group: Int) -> Int { 32 * (group / 32) + 8 }
-
-    /// The record operands of one linear as tiles `[N / 32, G, w4TileU4]` (uint4 words; stored as
-    /// uint32): per 32-column block and group, the block's 32 rows of `group / 2` code bytes in row
-    /// order (the bytes the record kernel reads, unchanged), then the block's 32 FP16 scales, then its
-    /// 32 FP16 offsets. A pure reordering of the same bits: no value is converted.
-    static func w4Tile(_ w: MLXArray, sT: MLXArray, bT: MLXArray, n N: Int, k K: Int, group: Int) -> MLXArray {
-        let G = K / group
-        let words = group / 8
-        let codes = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
-        func cols(_ a: MLXArray) -> MLXArray {
-            contiguous(a.reshaped([G, N / 32, 32]).transposed(1, 0, 2)).view(dtype: .uint32)
-        }
-        return contiguous(concatenated([codes, cols(sT), cols(bT)], axis: 2))
-    }
-
-    /// Drop the record-layout arrays of an operand that reads tiles (the tiles hold the same bits).
-    static func w4Release(_ o: W4Operands) {
-        let none = MLXArray.zeros([1], dtype: .uint32)
-        o.w = none
-        o.sT = none
-        o.bT = none
-    }
-
-    /// True once every recorded launch passed `w4AdoptTiles`; later linears are built tiled at once.
-    nonisolated(unsafe) static var w4TilesOn = false
-    /// While true, `w4LinearsFromCodes` records each distinct launch (its linears, K, form, narrow).
-    nonisolated(unsafe) static var w4Recording = false
-    nonisolated(unsafe) static var w4Launches: [[ObjectIdentifier]] = []
-    nonisolated(unsafe) static var w4LaunchSeen: Set<[ObjectIdentifier]> = []
-
-    /// Load time, after the warm-up proposals built every 4-bit operand: build each linear's tiles,
-    /// run every recorded launch through the record kernel (record layout) and the tiled kernel (tiles)
-    /// on a fixed probe at rows 16 and 15, and compare the outputs bit for bit. All equal: every operand
-    /// switches to its tiles and its record arrays are released. Any difference, compile or run error,
-    /// or an operand that cannot be tiled: nothing changes and the record kernels keep running.
-    /// `DF2_W4_TILES=0` skips this. One stderr line either way.
-    static func w4AdoptTiles() {
-        let value = ProcessInfo.processInfo.environment["DF2_W4_TILES"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let launches = w4Launches
-        w4Launches = []
-        w4LaunchSeen = []
-        guard !w4TilesOn, let group = w4Group else { return }
-        let note: String
-        if ["0", "false", "no", "off"].contains(value ?? "") {
-            note = "off (DF2_W4_TILES=0)"
-        } else if launches.isEmpty {
-            note = "off (no 4-bit launch recorded)"
-        } else {
-            var ops: [ObjectIdentifier: W4Operands] = [:]
-            for launch in launches {
-                for id in launch { ops[id] = w4Cache[id] }
-            }
-            var failure: String? = nil
-            var tiles: [ObjectIdentifier: MLXArray] = [:]
-            for (id, o) in ops where o.tiles == nil {
-                guard o.n % 32 == 0, o.k % group == 0 else {
-                    failure = "linear N \(o.n) K \(o.k) not tileable"
-                    break
-                }
-                tiles[id] = w4Tile(o.w, sT: o.sT, bT: o.bT, n: o.n, k: o.k, group: group)
-            }
-            if failure == nil {
-                eval(Array(tiles.values))
-                failure = w4TilesCheck(launches, ops: ops, tiles: tiles, group: group)
-            }
-            if let failure {
-                note = "off, record layout kept (\(failure))"
-            } else {
-                for (id, t) in tiles {
-                    ops[id]!.tiles = t
-                    w4Release(ops[id]!)
-                }
-                w4TilesOn = true
-                note = "on (\(launches.count) launches, \(ops.count) linears; bit-identical to the record kernel at rows 16 and 15)"
-            }
-        }
-        FileHandle.standardError.write(Data("DF2 w4 tiles: \(note)\n".utf8))
-    }
-
-    /// Nil when every launch's tiled output equals its record output bit for bit, else why not.
-    static func w4TilesCheck(
-        _ launches: [[ObjectIdentifier]], ops: [ObjectIdentifier: W4Operands],
-        tiles: [ObjectIdentifier: MLXArray], group: Int
-    ) -> String? {
-        var failure: String? = nil
-        w4CheckFailed = false
-        w4CheckNote = ""
-        withErrorHandler({ message in
-            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
-            DF2Fast.w4CheckFailed = true
-        }) {
-            for launch in launches {
-                let lops = launch.map { ops[$0]! }
-                let K = lops[0].k
-                let G = K / group
-                let ns = lops.map(\.n)
-                let (form, narrow) = w4LaunchForm(ns)
-                let xq = (arange(16 * K, dtype: .int32) * MLXArray(Int32(37)) + MLXArray(Int32(11 + K)))
-                    % MLXArray(Int32(255)) - MLXArray(Int32(127))
-                let j = arange(16 * G, dtype: .int32)
-                let ascale = ((j % MLXArray(Int32(11))).asType(.float32) + 1) / 256
-                let xs = ((j % MLXArray(Int32(17))).asType(.float32) - 8) / 64
-                let xq8 = xq.asType(.int8)
-                // The same operands reading tiles; the record objects keep their arrays until adoption.
-                let none = MLXArray.zeros([1], dtype: .uint32)
-                let tops = zip(launch, lops).map { (id, o) -> W4Operands in
-                    let t = W4Operands(w: none, sT: none, bT: none, n: o.n, k: o.k)
-                    t.tiles = tiles[id] ?? o.tiles
-                    t.pair24 = o.pair24
-                    return t
-                }
-                for rows in [16, 15] {
-                    let outputs: (record: [MLXArray], candidate: [MLXArray])
-                    var method = "plain"
-                    if let metadata = w4LaunchMetadata(lops, K: K, rows: rows, group: group) {
-                        // The kernel this launch runs at these rows: the record's cached choice.
-                        let m = w4Pair24Selected(lops, ns: ns, metadata: metadata, form: form, narrow: narrow)
-                            .method(rows: rows)
-                        method = "\(m)"
-                        func run(_ o: [W4Operands]) -> [MLXArray] {
-                            w4Pair24Output(
-                                m, form: form, narrow: narrow, xq: xq8, ascale: ascale, xs: xs, rows: rows,
-                                ops: o, ns: ns, metadata: metadata)
-                        }
-                        outputs = (run(lops), run(tops))
-                    } else {
-                        outputs = (
-                            w4Run(
-                                form: form, narrow: narrow, xq: xq8, ascale: ascale, xs: xs, rows: rows, K: K,
-                                ws: lops.map(\.w), sTs: lops.map(\.sT), bTs: lops.map(\.bT), ns: ns),
-                            w4Run(
-                                form: form, narrow: narrow, tiled: true, xq: xq8, ascale: ascale, xs: xs,
-                                rows: rows, K: K, ws: w4CodeArrays(tops), sTs: [], bTs: [], ns: ns)
-                        )
-                    }
-                    let record = concatenated(outputs.record, axis: 1).view(dtype: .uint32)
-                    let candidate = concatenated(outputs.candidate, axis: 1).view(dtype: .uint32)
-                    let differ = (record .!= candidate).asType(.int32).sum()
-                    let nan = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
-                    eval(differ, nan)
-                    if w4CheckFailed {
-                        failure = "compile or run error: \(w4CheckNote)"
-                        return
-                    }
-                    let d = differ.item(Int32.self)
-                    if d != 0 {
-                        failure = "\(d) words differ at K \(K), N \(ns), rows \(rows), form \(form), narrow \(narrow), \(method)"
-                        return
-                    }
-                    if nan.item(Int32.self) != 0 {
-                        failure = "record output NaN at K \(K), N \(ns), rows \(rows)"
-                        return
-                    }
-                }
-            }
-        }
-        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
-        return failure
-    }
 
     /// x [R, K] (or silu(x) * x2, or head-major [1, 32, R, 128]) -> int8 codes per row and per KG-column group.
     /// 16 contiguous columns per thread (`c0 = tid * 16`), single-pass register buffering, and SIMD-shuffle group reduction.
@@ -2911,7 +2825,9 @@ enum DF2Fast {
               local_amax = max(local_amax, fabs(a));
             }
             local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG >= 64) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            }
             if (KG == 128) {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
@@ -2973,7 +2889,9 @@ enum DF2Fast {
               local_amax = max(local_amax, fabs(a));
             }
             local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG >= 64) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            }
             if (KG == 128) {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
@@ -2998,1379 +2916,19 @@ enum DF2Fast {
             }
             """)
 
-    /// Optional FC metadata. Original half arrays remain available for the accepted fallback.
-    final class W4Pair24 {
-        let words: MLXArray, bases: MLXArray
-        let shape: [Int]
-        let count: Int
-        let selection = W4Pair24SelectionCache()
-
-        init?(_ scales: MLXArray, _ offsets: MLXArray) {
-            guard scales.dtype == .float16, offsets.dtype == .float16,
-                scales.ndim == 2, scales.shape == offsets.shape, scales.dim(1) % 4 == 0,
-                scales.strides == [scales.dim(1), 1], offsets.strides == scales.strides,
-                scales.size > 0, scales.size % 4 == 0, scales.size / 4 <= Int.max / 3
-            else { return nil }
-            let s = scales.view(dtype: .uint16).asArray(UInt16.self)
-            let b = offsets.view(dtype: .uint16).asArray(UInt16.self)
-            let sb = UInt32(s.min()!), bb = UInt32(b.min()!)
-            guard UInt32(s.max()!) - sb <= 4095, UInt32(b.max()!) - bb <= 4095 else { return nil }
-            func pair(_ i: Int) -> UInt32 {
-                (UInt32(s[i]) - sb) | ((UInt32(b[i]) - bb) << 12)
-            }
-            var packed = [UInt32](repeating: 0, count: s.count / 4 * 3)
-            for i in stride(from: 0, to: s.count, by: 4) {
-                let a = pair(i), c = pair(i + 1), d = pair(i + 2), e = pair(i + 3)
-                let j = i / 4 * 3
-                packed[j] = a | (c << 24)
-                packed[j + 1] = (c >> 8) | (d << 16)
-                packed[j + 2] = (d >> 16) | (e << 8)
-            }
-            // Check every inverse before admitting this representation.
-            for i in s.indices {
-                let bit = (i & 3) * 24, j = i / 4 * 3 + bit / 32, shift = bit & 31
-                var value = packed[j] >> shift
-                if shift > 8 { value |= packed[j + 1] << (32 - shift) }
-                guard sb + (value & 4095) == UInt32(s[i]),
-                    bb + ((value >> 12) & 4095) == UInt32(b[i])
-                else { return nil }
-            }
-            shape = scales.shape
-            count = s.count
-            words = MLXArray(packed)
-            bases = MLXArray([sb | (bb << 16)])
-        }
-    }
-
-    /// Three scalar loads; uint3 would add padding between these12-byte tiles.
-    static let pair24Header = """
-        inline void df2_pair24_load(const device uint* words, uint bases, size_t tile,
-                                   thread half4& scales, thread half4& offsets) {
-            const uint a = words[3 * tile], b = words[3 * tile + 1], c = words[3 * tile + 2];
-            const uint4 pairs(a & 0x00ffffffu, ((a >> 24) | (b << 8)) & 0x00ffffffu,
-                              ((b >> 16) | (c << 16)) & 0x00ffffffu, c >> 8);
-            const ushort4 s = ushort4(pairs & uint4(4095u)) + ushort(bases & 65535u);
-            const ushort4 o = ushort4((pairs >> 12) & uint4(4095u)) + ushort(bases >> 16);
-            scales = as_type<half4>(s);
-            offsets = as_type<half4>(o);
-        }
-
-        """
-
-    /// Only metadata loads change. The original raw generator and FP32 arithmetic stay intact.
-    /// `tiled`: the codes come from `w4Tile` tiles (`w4Source(tiled:recordMetadata:)`).
-    static func w4Pair24Source(form: Int, narrow: Bool, tiled: Bool = false) -> String {
-        var source = w4Source(layers: 1, group: 64, form: form, narrow: narrow, tiled: tiled, recordMetadata: true)
-        func change(_ before: String, _ after: String) {
-            precondition(source.contains(before))
-            source = source.replacingOccurrences(of: before, with: after)
-        }
-        change("const device half* sT = s0; const device half* bT = b0;",
-               "const device uint* metadata = s0; const uint metadataBases = b0[0];")
-        if form == 0 {
-            change("const device half* sr = sT + (size_t)g * N + n0 + nb;", """
-                half4 sm0, sm1, om0, om1;
-                const size_t tile = ((size_t)g * N + n0 + nb) / 4;
-                df2_pair24_load(metadata, metadataBases, tile, sm0, om0);
-                df2_pair24_load(metadata, metadataBases, tile + 4, sm1, om1);
-                """)
-            change("const device half* br = bT + (size_t)g * N + n0 + nb;", "")
-            change("const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));",
-                   "const float4 s0v = float4(sm0), s1v = float4(sm1);")
-            change("float4(*(const device half4*)br)", "float4(om0)")
-            change("float4(*(const device half4*)(br + 16))", "float4(om1)")
-        } else {
-            change("const device half* sc = sT + n0 + nb;", "const size_t tile = (n0 + nb) / 4;")
-            change("const device half* oc = bT + n0 + nb;", "")
-            if narrow {
-                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);", """
-                    half4 ps0, po0;
-                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
-                    """)
-                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N);", "")
-                change("ps0 = *(const device half4*)(sc + r);",
-                       "df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);")
-                change("po0 = *(const device half4*)(oc + r);", "")
-            } else {
-                change("half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);", """
-                    half4 ps0, ps1, po0, po1;
-                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile, ps0, po0);
-                    df2_pair24_load(metadata, metadataBases, (size_t)sg * N / 4 + tile + 4, ps1, po1);
-                    """)
-                change("half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);", "")
-                change("ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);", """
-                    df2_pair24_load(metadata, metadataBases, r / 4 + tile, ps0, po0);
-                    df2_pair24_load(metadata, metadataBases, r / 4 + tile + 4, ps1, po1);
-                    """)
-                change("po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);", "")
-            }
-        }
-        precondition(!source.contains("sT") && !source.contains("bT") && !source.contains("const device half4*"))
-        return source
-    }
-
-    static let w4Pair24Kernels: [Int: MLXFast.MLXFastKernel] = {
-        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-        for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)] {
-            kernels[form * 2 + (narrow ? 1 : 0)] = MLXFast.metalKernel(
-                name: "df2_w4g64_pair24f\(form)_n\(narrow ? 16 : 32)",
-                inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
-                source: w4Pair24Source(form: form, narrow: narrow), header: header + pair24Header,
-                ensureRowContiguous: true)
-        }
-        return kernels
-    }()
-
-    static func w4Pair24Run(
-        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        op: W4Operands, metadata: W4Pair24, sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        let columns = narrow ? 16 : 32
-        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(rows), Int32(4096)])
-        let kernel = op.tiles == nil
-            ? w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!
-            : w4TiledVariant("df2_w4tg64_pair24f\(form)_n\(columns)") { name in
-                MLXFast.metalKernel(
-                    name: name, inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
-                    source: w4Pair24Source(form: form, narrow: narrow, tiled: true), header: header + pair24Header,
-                    ensureRowContiguous: true)
-            }
-        return kernel(
-            [xq, op.tiles ?? op.w, metadata.words, metadata.bases, ascale, xs, sizes],
-            template: [("SPLIT", split)], grid: (4096 / columns * split * 32, 1, 1),
-            threadGroup: (split * 32, 1, 1), outputShapes: [[rows, 4096]], outputDTypes: [.float32])
-    }
-
-    /// Shared by the compact MLP consumer and its metadata-only proof.
-    static func w4Pair24MLPSelection(layers: Int) -> String {
-        precondition(layers == 1 || layers == 2)
-        var source = """
-            const device uint* metadata = s0;
-            uint metadataBases = b0[0];
-
-            """
-        if layers == 2 {
-            source += "if (li == 1) { metadata = s1; metadataBases = b1[0]; }\n"
-        }
-        return source
-    }
-
-    /// Keep the FC bodies exact; the MLP adds sibling selection and the accepted static-K form.
-    static func w4Pair24MLPSource(layers: Int, form: Int, narrow: Bool, tiled: Bool = false) -> String {
-        precondition(layers == 1 || (layers == 2 && !narrow))
-        var source = w4Pair24Source(form: form, narrow: narrow, tiled: tiled)
-        let pointer = "const device uint* metadata = s0; const uint metadataBases = b0[0];"
-        precondition(source.contains(pointer))
-        source = source.replacingOccurrences(of: pointer, with: "int li = 0;")
-        if layers == 2 {
-            let pick = "device float* out = out0; int N = ksz[2];"
-            precondition(source.contains(pick))
-            source = source.replacingOccurrences(of: pick, with: pick + """
-
-                if (bx >= N / 32) { bx -= N / 32; w = w1; li = 1; out = out1; N = ksz[3]; }
-                """)
-        }
-        precondition(source.contains("#define LO(v)"))
-        source = source.replacingOccurrences(of: "#define LO(v)",
-            with: w4Pair24MLPSelection(layers: layers) + "#define LO(v)")
-        return w4Specialize(source)
-    }
-
-    static let w4Pair24MLPKernels: [Int: MLXFast.MLXFastKernel] = {
-        var kernels: [Int: MLXFast.MLXFastKernel] = [:]
-        for layers in 1 ... 2 {
-            for (form, narrow) in [(0, false), (1, false), (2, false), (1, true), (2, true)]
-                where layers == 1 || !narrow
-            {
-                let key = (layers - 1) * 6 + form * 2 + (narrow ? 1 : 0)
-                kernels[key] = MLXFast.metalKernel(
-                    name: "df2_w4g64_pair24_mlp_f\(form)_n\(narrow ? 16 : 32)_forms_\(layers)",
-                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                    outputNames: (0 ..< layers).map { "out\($0)" },
-                    source: w4Pair24MLPSource(layers: layers, form: form, narrow: narrow),
-                    header: header + pair24Header, ensureRowContiguous: true)
-            }
-        }
-        return kernels
-    }()
-
-    static func w4Pair24MLPMetadata(_ ops: [W4Operands]) -> [W4Pair24]? {
-        let gateUp = ops.count == 2 && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 }
-        let down = ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
-        guard gateUp || down else { return nil }
-        let metadata = ops.compactMap(\.pair24)
-        return metadata.count == ops.count ? metadata : nil
-    }
-
-    /// These ordered inputs are also used by the proof; each payload keeps its own data header.
-    static func w4Pair24MLPMetadataInputs(_ metadata: [W4Pair24]) -> [MLXArray] {
-        metadata.map(\.words) + metadata.map(\.bases)
-    }
-
-    static func w4Pair24MLPRun(
-        form: Int, narrow: Bool, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        ops: [W4Operands], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        let K = ops[0].k, ns = ops.map(\.n)
-        precondition(w4FormsFit(K: K, rows: rows, ns: ns) && ops.count == metadata.count)
-        let key = (ops.count - 1) * 6 + form * 2 + (narrow ? 1 : 0)
-        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
-        let layers = ops.count
-        let kernel = !w4Tiled(ops)
-            ? w4Pair24MLPKernels[key]!
-            : w4TiledVariant("df2_w4tg64_pair24_mlp_f\(form)_n\(narrow ? 16 : 32)_forms_\(layers)") { name in
-                MLXFast.metalKernel(
-                    name: name,
-                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                    outputNames: (0 ..< layers).map { "out\($0)" },
-                    source: w4Pair24MLPSource(layers: layers, form: form, narrow: narrow, tiled: true),
-                    header: header + pair24Header, ensureRowContiguous: true)
-            }
-        return kernel(
-            [xq] + w4CodeArrays(ops) + w4Pair24MLPMetadataInputs(metadata)
-                + [ascale, xs, sizes],
-            template: [("SPLIT", split), ("KC", K)],
-            grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
-            threadGroup: (split * 32, 1, 1),
-            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-    }
-
-    enum W4Pair24Method: Int {
-        case raw, compact, quartet, rawWide, fcStatic
-    }
-    struct W4Pair24Choice: Equatable {
-        let ordinary: W4Pair24Method
-        let full16: W4Pair24Method
-        func method(rows: Int) -> W4Pair24Method { rows == 16 ? full16 : ordinary }
-    }
-    struct W4Pair24SelectionKey: Equatable {
-        let operands: [ObjectIdentifier]
-        let K: Int
-        let ns: [Int]
-        let group: Int
-        let form: Int
-        let narrow: Bool
-        let split: Int
-    }
-    final class W4Pair24SelectionCache {
-        private let lock = NSLock()
-        private var cached: (key: W4Pair24SelectionKey, choice: W4Pair24Choice)?
-        func resolve(
-            _ ops: [W4Operands], K: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int,
-            build: () -> W4Pair24Choice
-        ) -> W4Pair24Choice {
-            lock.lock()
-            defer { lock.unlock() }
-            if let cached {
-                let key = cached.key
-                guard key.K == K, key.ns == ns, key.group == group, key.form == form,
-                    key.narrow == narrow, key.split == split, key.operands.count == ops.count
-                else { return W4Pair24Choice(ordinary: .raw, full16: .raw) }
-                for index in ops.indices {
-                    if key.operands[index] != ObjectIdentifier(ops[index]) {
-                        return W4Pair24Choice(ordinary: .raw, full16: .raw)
-                    }
-                }
-                return cached.choice
-            }
-            let key = W4Pair24SelectionKey(operands: ops.map { ObjectIdentifier($0) }, K: K, ns: ns,
-                group: group, form: form, narrow: narrow, split: split)
-            let choice = build()
-            cached = (key, choice)
-            return choice
-        }
-
-        func fcLookupPrefixCompatible(_ op: W4Operands) -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            guard let cached else { return false }
-            let key = cached.key
-            guard key.operands.count == 1, key.operands[0] == ObjectIdentifier(op),
-                key.K == 32768, key.ns.count == 1, key.ns[0] == 4096,
-                key.group == 64, key.form == 2, key.narrow, key.split == 8,
-                (cached.choice.ordinary == cached.choice.full16 || cached.choice.full16 == .fcStatic)
-            else { return false }
-            return cached.choice.ordinary == .raw || cached.choice.ordinary == .compact
-        }
-    }
-
-    static func fcLookupPrefixReuseEligible(_ layer: Linear, input: MLXArray) -> Bool {
-        guard on, w4Group == 64, split == 8, input.dtype == .bfloat16,
-            input.ndim == 3, input.dim(0) == 1, input.dim(1) == 16, input.dim(2) == 32768,
-            w4SelectedForm == 2, w4Narrow, w4Form2Narrow,
-            let op = w4Cache[ObjectIdentifier(layer)], op.k == 32768, op.n == 4096,
-            let metadata = op.pair24
-        else { return false }
-        let wide = DF2WideLanes.serves(
-            .init(kind: .quantG, dtype: input.dtype, dtype2: input.dtype, k: 32768, group: 64, flag: 0))
-        return !wide && metadata.selection.fcLookupPrefixCompatible(op)
-    }
-
-    /// Raw is the incumbent.3% in all3 rounds is a conservative initial policy.
-    static func w4Pair24Choose(valid: [Bool], samples: [[UInt64]]) -> W4Pair24Choice {
-        func wins(_ candidate: W4Pair24Method, _ control: W4Pair24Method) -> Bool {
-            let a = candidate.rawValue, b = control.rawValue
-            guard valid[a], valid[b], samples[a].count == 3, samples[b].count == 3 else { return false }
-            return zip(samples[a], samples[b]).allSatisfy {
-                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
-            }
-        }
-        let ordinary: W4Pair24Method = wins(.compact, .raw) ? .compact : .raw
-        let full16: W4Pair24Method =
-            wins(.quartet, .raw) && (ordinary == .raw || wins(.quartet, .compact)) ? .quartet : ordinary
-        return W4Pair24Choice(ordinary: ordinary, full16: full16)
-    }
-
-    static func w4Pair24DownWideEligible(
-        _ ops: [W4Operands], rows: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int
-    ) -> Bool {
-        rows == 16 && group == 64 && split == 8 && form == 2 && narrow && ops.count == 1
-            && ops[0].k == 12288 && ops[0].n == 4096 && ns == [4096]
-    }
-
-    static func w4Pair24ChooseWithWide(
-        valid: [Bool], samples: [[UInt64]], eligible: Bool
-    ) -> W4Pair24Choice {
-        let current = w4Pair24Choose(valid: valid, samples: samples)
-        guard eligible, valid.count == 4, samples.count == 4 else { return current }
-        func beats(_ control: W4Pair24Method) -> Bool {
-            let index = control.rawValue
-            guard valid[3], valid[index], samples[3].count == 3, samples[index].count == 3 else { return false }
-            return zip(samples[3], samples[index]).allSatisfy {
-                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
-            }
-        }
-        if beats(.raw) && (current.full16 == .raw || beats(current.full16)) {
-            return W4Pair24Choice(ordinary: current.ordinary, full16: .rawWide)
-        }
-        return current
-    }
-
-    static func w4FCStaticEligible(
-        _ ops: [W4Operands], rows: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int
-    ) -> Bool {
-        guard rows == 16, group == 64, form == 2, narrow, split == 8, ops.count == 1,
-            ops[0].k == 32768, ops[0].n == 4096, ns == [4096] else { return false }
-        let span = ops[0].n.multipliedReportingOverflow(by: ops[0].k)
-        return !span.overflow && span.partialValue > 0 && span.partialValue < Int(UInt32.max)
-    }
-
-    static func w4Pair24ChooseWithFCStatic(
-        valid: [Bool], samples: [[UInt64]], wideEligible: Bool, eligible: Bool
-    ) -> W4Pair24Choice {
-        let current = w4Pair24ChooseWithWide(valid: valid, samples: samples, eligible: wideEligible)
-        guard eligible, valid.count == 5, samples.count == 5 else { return current }
-        func beats(_ control: W4Pair24Method) -> Bool {
-            let index = control.rawValue
-            guard valid[4], valid[index], samples[4].count == 3, samples[index].count == 3 else { return false }
-            return zip(samples[4], samples[index]).allSatisfy {
-                $0.0 > 0 && $0.1 > 0 && Double($0.1) / Double($0.0) >= 1.03
-            }
-        }
-        if beats(.raw) && (current.full16 == .raw || beats(current.full16)) {
-            return W4Pair24Choice(ordinary: current.ordinary, full16: .fcStatic)
-        }
-        return current
-    }
-
-    static func w4FCStaticRun(
-        xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(16), Int32(4096)])
-        if let tiles = op.tiles {
-            return w4TiledKernel(form: 2, narrow: true, specialized: true, layers: 1)(
-                [xq, tiles, ascale, xs, sizes],
-                template: [("SPLIT", split), ("KC", 32768)],
-                grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-                outputShapes: [[16, 4096]], outputDTypes: [.float32])
-        }
-        return w4Form2NarrowFormsKernels[0](
-            [xq, op.w, op.sT, op.bT, ascale, xs, sizes],
-            template: [("SPLIT", split), ("KC", 32768)],
-            grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-            outputShapes: [[16, 4096]], outputDTypes: [.float32])
-    }
-
-    /// Build plus eval/encoding/default-stream completion; output roots live past the stop clock.
-    static func w4Pair24Time(_ build: () -> [MLXArray]) -> UInt64? {
-        do {
-            return try withError {
-                Stream.gpu.synchronize()
-                let start = DispatchTime.now().uptimeNanoseconds
-                let outputs = build()
-                eval(outputs)
-                Stream.gpu.synchronize()
-                let end = DispatchTime.now().uptimeNanoseconds
-                withExtendedLifetime(outputs) {}
-                return end > start ? end - start : nil
-            }
-        } catch { return nil }
-    }
-
-    static func w4Pair24Exact(_ build: () -> [MLXArray], reference: MLXArray) -> Bool {
-        (try? withError {
-            let output = concatenated(build(), axis: 1)
-            let finite = isFinite(output).all()
-            eval(finite)
-            guard finite.item(Bool.self) else { return false }
-            let exact = (reference.view(dtype: .uint32) .== output.view(dtype: .uint32)).all()
-            eval(exact)
-            return exact.item(Bool.self)
-        }) ?? false
-    }
-
-    static func w4Pair24Output(
-        _ method: W4Pair24Method, form: Int, narrow: Bool,
-        xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        ops: [W4Operands], ns: [Int], metadata: [W4Pair24], sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        switch method {
-        case .raw:
-            return w4Run(form: form, narrow: narrow, tiled: w4Tiled(ops), xq: xq, ascale: ascale, xs: xs, rows: rows,
-                K: ops[0].k, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-                ns: ns, sizeDescriptor: sizeDescriptor)
-        case .compact:
-            if ops[0].k == 32768 {
-                return w4Pair24Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
-                    rows: rows, op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
-            }
-            return w4Pair24MLPRun(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs,
-                rows: rows, ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
-        case .quartet:
-            if rows == 16 && ops.count == 2 && ops.allSatisfy({ $0.k == 4096 && $0.n == 12288 })
-                && form == 2 && !narrow
-            {
-                return w4Pair24QuartetWideRun(xq: xq, ascale: ascale, xs: xs,
-                    ops: ops, metadata: metadata, sizeDescriptor: sizeDescriptor)
-            }
-            precondition(rows == 16 && ops.count == 1 && ops[0].k == 12288 && ops[0].n == 4096
-                && form == 2 && narrow)
-            return w4Pair24QuartetRun(xq: xq, ascale: ascale, xs: xs,
-                op: ops[0], metadata: metadata[0], sizeDescriptor: sizeDescriptor)
-        case .rawWide:
-            precondition(w4Pair24DownWideEligible(ops, rows: rows, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split))
-            return w4Run(form: form, narrow: false, tiled: w4Tiled(ops), xq: xq, ascale: ascale, xs: xs, rows: rows,
-                K: ops[0].k, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-                ns: ns, sizeDescriptor: sizeDescriptor)
-        case .fcStatic:
-            precondition(w4FCStaticEligible(ops, rows: rows, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split))
-            return w4FCStaticRun(xq: xq, ascale: ascale, xs: xs,
-                op: ops[0], sizeDescriptor: sizeDescriptor)
-        }
-    }
-
-    /// The existing bind preparation reaches this R16 key; runtime row changes do not retune it.
-    static func w4Pair24Selected(
-        _ ops: [W4Operands], ns: [Int], metadata: [W4Pair24], form: Int, narrow: Bool
-    ) -> W4Pair24Choice {
-        let K = ops[0].k, G = K / 64
-        return metadata[0].selection.resolve(ops, K: K, ns: ns, group: 64,
-            form: form, narrow: narrow, split: split) {
-            let coldStart = DispatchTime.now().uptimeNanoseconds
-            let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
-            let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
-            let x = MLXArray((0 ..< 16 * G).map { Float($0 % 17 - 8) / 64 }, [16 * G])
-            let sizes = MLXArray([Int32(K), Int32(16)] + ns.map { Int32($0) })
-            func build(_ index: Int) -> [MLXArray] {
-                w4Pair24Output(W4Pair24Method(rawValue: index)!, form: form, narrow: narrow,
-                    xq: xq, ascale: a, xs: x, rows: 16, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizes)
-            }
-            let quartet = ops.count == 1 && K == 12288 && ns == [4096] && form == 2 && narrow
-            let wideQuartet = ops.count == 2 && K == 4096 && ns == [12288, 12288] && form == 2 && !narrow
-            let rawWide = w4Pair24DownWideEligible(ops, rows: 16, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split)
-            let fcStatic = w4FCStaticEligible(ops, rows: 16, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split)
-            let methods = fcStatic ? [0, 1, 4] : (rawWide ? [0, 1, 2, 3] : (quartet || wideQuartet ? [0, 1, 2] : [0, 1]))
-            let candidateCount = fcStatic ? 5 : (rawWide ? 4 : 3)
-            var valid = [Bool](repeating: false, count: candidateCount)
-            var reference: MLXArray?
-            valid[0] = (try? withError {
-                let output = concatenated(build(0), axis: 1)
-                let finite = isFinite(output).all()
-                eval(finite)
-                reference = output
-                return finite.item(Bool.self)
-            }) ?? false
-            if valid[0], let reference {
-                for index in methods.dropFirst() {
-                    valid[index] = w4Pair24Exact({ build(index) }, reference: reference)
-                }
-            }
-            reference = nil
-            var warm = [UInt64](repeating: 0, count: candidateCount)
-            var samples = [[UInt64]](repeating: [], count: candidateCount)
-            var legs = [[[UInt64]]](repeating: [], count: candidateCount)
-            if valid[0] {
-                for index in methods where valid[index] {
-                    if let elapsed = w4Pair24Time({ build(index) }) { warm[index] = elapsed }
-                    else { valid[index] = false }
-                }
-                if valid[0] {
-                    let orders = fcStatic
-                        ? [[0, 1, 4], [1, 4, 0], [4, 0, 1]]
-                        : (rawWide
-                            ? [[0, 1, 2, 3], [1, 2, 3, 0], [2, 3, 0, 1]]
-                            : [[0, 1, 2], [1, 2, 0], [2, 0, 1]])
-                    for order in orders {
-                        if !valid[0] { break }
-                        var round = [[UInt64]](repeating: [], count: candidateCount)
-                        for mirrored in [order, Array(order.reversed())] {
-                            if !valid[0] { break }
-                            for index in mirrored where methods.contains(index) && valid[index] {
-                                if let elapsed = w4Pair24Time({ build(index) }) { round[index].append(elapsed) }
-                                else { valid[index] = false; samples[index] = [] }
-                            }
-                        }
-                        for index in methods {
-                            legs[index].append(round[index])
-                            if valid[index] && round[index].count == 2 {
-                                samples[index].append(round[index][0] + round[index][1])
-                            }
-                        }
-                    }
-                }
-            }
-            let choice = w4Pair24ChooseWithFCStatic(valid: valid, samples: samples, wideEligible: rawWide, eligible: fcStatic)
-            withExtendedLifetime((xq, a, x, sizes)) {}
-            let cold = DispatchTime.now().uptimeNanoseconds - coldStart
-            FileHandle.standardError.write(Data(
-                "DF2 pair24 select K\(K) N\(ns) form\(form) narrow=\(narrow) R16 policy=all3>=1.03 valid=\(valid) warm_ns=\(warm) legs_ns=\(legs) round_sums_ns=\(samples) ordinary=\(choice.ordinary) full16=\(choice.full16) calibration_ns=\(cold)\n".utf8))
-            return choice
-        }
-    }
-
-    /// All32 lanes reach each gather; bits4,3,0 identify one four-lane quartet.
-    static let pair24QuartetHeader = """
-        inline void df2_pair24_quartet_load(const device uint* words, uint bases, uint lane, size_t tile,
-                                           thread half4& scales, thread half4& offsets) {
-            const uint component = (lane >> 1) & 3u;
-            const uint bit = 24u * component, shift = bit & 31u;
-            const size_t word = 3 * tile + bit / 32u;
-            uint value = words[word] >> shift;
-            if (shift > 8u) value |= words[word + 1] << (32u - shift);
-            const ushort s = ushort(bases & 65535u) + ushort(value & 4095u);
-            const ushort o = ushort(bases >> 16) + ushort((value >> 12) & 4095u);
-            const uint pair = uint(s) | (uint(o) << 16);
-            uint4 pairs(pair, simd_shuffle_xor(pair, 2), simd_shuffle_xor(pair, 4),
-                        simd_shuffle_xor(pair, 6));
-            pairs = (component & 1u) != 0u ? pairs.yxwz : pairs;
-            pairs = (component & 2u) != 0u ? pairs.zwxy : pairs;
-            scales = as_type<half4>(ushort4(pairs & uint4(65535u)));
-            offsets = as_type<half4>(ushort4(pairs >> 16));
-        }
-        
-        """
-
-    static func w4Pair24QuartetSource(tiled: Bool = false) -> String {
-        let source = w4Pair24MLPSource(layers: 1, form: 2, narrow: true, tiled: tiled)
-        let call = "df2_pair24_load(metadata, metadataBases, "
-        precondition(source.components(separatedBy: call).count == 3)
-        return source.replacingOccurrences(of: call,
-            with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
-    }
-
-    static let w4Pair24QuartetKernel = MLXFast.metalKernel(
-        name: "df2_w4g64_pair24_quartet_xor_mlp_f2_n16_forms_1",
-        inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
-        source: w4Pair24QuartetSource(), header: header + pair24Header + pair24QuartetHeader,
-        ensureRowContiguous: true)
-
-    static func w4Pair24QuartetRun(
-        xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, metadata: W4Pair24,
-        sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        precondition(op.k == 12288 && op.n == 4096)
-        let sizes = sizeDescriptor ?? MLXArray([Int32(12288), Int32(16), Int32(4096)])
-        let kernel = op.tiles == nil
-            ? w4Pair24QuartetKernel
-            : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n16_forms_1") { name in
-                MLXFast.metalKernel(
-                    name: name, inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
-                    source: w4Pair24QuartetSource(tiled: true), header: header + pair24Header + pair24QuartetHeader,
-                    ensureRowContiguous: true)
-            }
-        return kernel(
-            [xq, op.tiles ?? op.w, metadata.words, metadata.bases, ascale, xs, sizes],
-            template: [("SPLIT", split), ("KC", 12288)],
-            grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-            outputShapes: [[16, 4096]], outputDTypes: [.float32])
-    }
-
-    /// Form2 wide gate/up only. The existing selector checks and measures this alternative.
-    static func w4Pair24QuartetWideSource(tiled: Bool = false) -> String {
-        let source = w4Pair24MLPSource(layers: 2, form: 2, narrow: false, tiled: tiled)
-        let call = "df2_pair24_load(metadata, metadataBases, "
-        precondition(source.components(separatedBy: call).count == 5)
-        return source.replacingOccurrences(of: call,
-            with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
-    }
-
-    static let w4Pair24QuartetWideKernel = MLXFast.metalKernel(
-        name: "df2_w4g64_pair24_quartet_xor_mlp_f2_n32_forms_2",
-        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs", "ksz"],
-        outputNames: ["out0", "out1"],
-        source: w4Pair24QuartetWideSource(), header: header + pair24Header + pair24QuartetHeader,
-        ensureRowContiguous: true)
-
-    static func w4Pair24QuartetWideRun(
-        xq: MLXArray, ascale: MLXArray, xs: MLXArray, ops: [W4Operands], metadata: [W4Pair24],
-        sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        precondition(ops.count == 2 && metadata.count == 2
-            && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 })
-        let sizes = sizeDescriptor ?? MLXArray([Int32(4096), Int32(16), Int32(12288), Int32(12288)])
-        let kernel = !w4Tiled(ops)
-            ? w4Pair24QuartetWideKernel
-            : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n32_forms_2") { name in
-                MLXFast.metalKernel(
-                    name: name, inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs", "ksz"],
-                    outputNames: ["out0", "out1"],
-                    source: w4Pair24QuartetWideSource(tiled: true),
-                    header: header + pair24Header + pair24QuartetHeader, ensureRowContiguous: true)
-            }
-        return kernel(
-            [xq] + w4CodeArrays(ops) + w4Pair24MLPMetadataInputs(metadata) + [ascale, xs, sizes],
-            template: [("SPLIT", split), ("KC", 4096)],
-            grid: (24576 / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
-            outputShapes: [[16, 12288], [16, 12288]], outputDTypes: [.float32, .float32])
-    }
-
-    /// int8 activations x the 4-bit codes on the NAX tensor units, one 16 x 32 x `group` op per group,
-    /// SPLIT simdgroups over K, 32 output columns per threadgroup, the codes of the next group
-    /// prefetched in registers; the epilogue adds s * a * C + (lo + 8 s) * sum(x) per group.
-    /// `form` 0 (the record kernel): each simdgroup stages its 32 x `group` tile as int8 (nibble - 8)
-    /// in threadgroup memory and reads the group's scales, offsets and activation sums after the op.
-    /// Form 1: the same, with those epilogue operands loaded one group ahead, beside the code
-    /// prefetch, so no device load sits between the op and the epilogue. The tile, the op and the
-    /// epilogue arithmetic are the same in both forms, so the output bits are the same; `w4Form`
-    /// checks that on the device before form 1 is used.
-    /// `narrow` (form 1 only): 16 output columns per threadgroup instead of 32, so a call launches
-    /// twice the threadgroups. The op, its layout guard, the group loop and the FP32 steps per output
-    /// are form 1's; columns 16-31 of the staged tile and their destination elements (8-15) are dead.
-    /// `tiled`: the operands are `w4Tile` tiles (input `w<l>` only, no `s<l>` / `b<l>`). Lane `lane`'s
-    /// load p of group g is uint4 `p * 32 + lane` of the tile (the record reads the same 16 bytes from
-    /// row `lane / ru + p * 32 / ru`, uint4 `lane % ru`), so each load is 512 contiguous bytes; scales
-    /// and offsets are read from the tile's tail at the record's columns. Staging, op, epilogue and
-    /// reduction text are the record's. `recordMetadata` (with `tiled`): only the codes come from the
-    /// tiles; inputs `s<l>` / `b<l>` and every scale and offset read stay the record's text.
-    static func w4Source(
-        layers: Int, group: Int, form: Int = 0, narrow: Bool = false, tiled: Bool = false,
-        recordMetadata: Bool = false
-    ) -> String {
-        precondition(!narrow || form == 1 || form == 2)
-        let ru = group / 32  // packed uint4 per row and group
-        let tw = group / 16  // unpacked uint4 per row and group
-        let cols = narrow ? 16 : 32  // output columns per threadgroup
-        let pr = narrow ? ru / 2 : ru  // packed uint4 rows each lane stages per group
-        let ne = narrow ? 8 : 16  // live destination elements per lane
-        let tileMetadata = tiled && !recordMetadata
-        var pick = tileMetadata
-            ? """
-            const int K = ksz[0];
-            int bx = int(threadgroup_position_in_grid.x);
-            const device uint32_t* w = w0;
-            device float* out = out0; int N = ksz[2];
-
-            """
-            : """
-            const int K = ksz[0];
-            int bx = int(threadgroup_position_in_grid.x);
-            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
-            device float* out = out0; int N = ksz[2];
-
-            """
-        for l in 1 ..< layers {
-            pick += tileMetadata
-                ? "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
-                : "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
-        }
-        let operandB =
-            """
-            threadgroup uint4 tiles[SPLIT * 32 * \(tw)];
-            threadgroup uint4* bs = tiles + sg * (32 * \(tw));
-            tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bs, dextents<int, 2>(\(group), 32));
-            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
-
-            """
-        let tileU4 = w4TileU4(group: group)
-        let codeSetup = tiled
-            ? """
-            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
-            const device uint4* tb = (const device uint4*)w + (size_t)(n0 >> 5) * (size_t)G * \(tileU4);
-            const device uint4* wsrc = tb + \(narrow ? "(n0 & 16) * \(ru) + " : "")int(lane);
-            \(tileMetadata ? "const device half* tsc = (const device half*)(tb + \(32 * ru)) + (n0 & 31) + nb;" : "")
-            uint4 wv[\(pr)];
-            for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)sg * \(tileU4) + p * 32]; }
-
-            """
-            : """
-            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
-            const size_t rowU4 = (size_t)K / 32;
-            const device uint4* wsrc = (const device uint4*)w + (size_t)(n0 + lr) * rowU4 + lc;
-            uint4 wv[\(pr)];
-            for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + int(sg) * \(ru)]; }
-
-            """
-        let stage =
-            """
-              for (int p = 0; p < \(pr); p++) {
-                const int r = lr + p * \(32 / ru);
-                const uint4 x = wv[p];
-                bs[r * \(tw) + 2 * lc] = uint4(LO(x.x), HI(x.x), LO(x.y), HI(x.y));
-                bs[r * \(tw) + 2 * lc + 1] = uint4(LO(x.z), HI(x.z), LO(x.w), HI(x.w));
-              }
-
-            """
-        let prefetchCodes = tiled
-            ? "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(g + SPLIT) * \(tileU4) + p * 32]; }"
-            : "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; }"
-        let pickS = narrow ? "s0v[j]" : "(i >> 3) ? s1v[j] : s0v[j]"
-        let pickB = narrow ? "b0v[j]" : "(i >> 3) ? b1v[j] : b0v[j]"
-        let epilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float s = \(pickS);
-                  const float b = \(pickB);
-                  const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-                  accb[i] = fma(b, hi ? x1 : x0, accb[i]);
-                }
-
-            """
-        let biasEpilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float b = \(pickB);
-                  const bool hi = (i >> 2) & 1;
-                  accb[i] = fma(b, hi ? x1 : x0, accb[i]);
-                }
-
-            """
-        let dotEpilogue = """
-                for (int i = 0; i < \(ne); i++) {
-                  const int j = (i & 3);
-                  const float s = \(pickS);
-                  const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
-                }
-
-            """
-        var loop: String
-        if form == 0 {
-            loop = """
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  if (g + SPLIT < G) { \(prefetchCodes) }
-                  simdgroup_barrier(mem_flags::mem_threadgroup);
-                  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const device half* sr = sT + (size_t)g * N + n0 + nb;
-                  const device half* br = bT + (size_t)g * N + n0 + nb;
-                  const float4 s0v = float4(*(const device half4*)sr), s1v = float4(*(const device half4*)(sr + 16));
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(*(const device half4*)br));
-                  const float4 b1v = fma(float4(8.0f), s1v, float4(*(const device half4*)(br + 16)));
-                  const float a0 = ascale[m0 * G + g], a1 = ascale[m1 * G + g];
-                  const float x0 = xs[m0 * G + g], x1 = xs[m1 * G + g];
-                \(epilogue)  simdgroup_barrier(mem_flags::mem_threadgroup);
-                }
-
-                """
-        } else if form == 2 && narrow {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0;
-                  const float a0 = pa0, a1 = pa1;
-                  {
-                    const half4 co0 = po0;
-                    const float x0 = px0, x1 = px1;
-                    const float4 s0v = float4(cs0);
-                    const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                \(biasEpilogue)  }
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r);
-                    po0 = *(const device half4*)(oc + r);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0);
-                \(dotEpilogue)\(barrier)}
-
-                """
-        } else if form == 2 {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, cs1 = ps1;
-                  const float a0 = pa0, a1 = pa1;
-                  {
-                    const half4 co0 = po0, co1 = po1;
-                    const float x0 = px0, x1 = px1;
-                    const float4 s0v = float4(cs0), s1v = float4(cs1);
-                    const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                    const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
-                \(biasEpilogue)  }
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
-                    po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0), s1v = float4(cs1);
-                \(dotEpilogue)\(barrier)}
-
-                """
-        } else if narrow {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, co0 = po0;
-                  const float a0 = pa0, a1 = pa1, x0 = px0, x1 = px1;
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r);
-                    po0 = *(const device half4*)(oc + r);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0);
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                \(epilogue)\(barrier)}
-
-                """
-        } else {
-            let barrier = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-            loop = """
-                const device half* sc = sT + n0 + nb;
-                const device half* oc = bT + n0 + nb;
-                half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);
-                half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
-                for (int g = int(sg); g < G; g += SPLIT) {
-                \(stage)  const half4 cs0 = ps0, cs1 = ps1, co0 = po0, co1 = po1;
-                  const float a0 = pa0, a1 = pa1, x0 = px0, x1 = px1;
-                  if (g + SPLIT < G) {
-                    \(prefetchCodes)
-                    const size_t r = (size_t)(g + SPLIT) * N;
-                    ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
-                    po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
-                  }
-                \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
-                  op.run(tA, Bt, cT);
-                  const float4 s0v = float4(cs0), s1v = float4(cs1);
-                  const float4 b0v = fma(float4(8.0f), s0v, float4(co0));
-                  const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
-                \(epilogue)\(barrier)}
-
-                """
-        }
-        if tileMetadata {
-            // Scale and offset rows of group g: the tile's tail, one tile (8 * tileU4 halves) per group.
-            let tileH = 8 * tileU4
-            for (from, to) in [
-                ("sT + (size_t)g * N + n0 + nb", "tsc + (size_t)g * \(tileH)"),
-                ("bT + (size_t)g * N + n0 + nb", "tsc + 32 + (size_t)g * \(tileH)"),
-                ("sT + n0 + nb", "tsc"),
-                ("bT + n0 + nb", "tsc + 32"),
-                ("(size_t)sg * N", "(size_t)sg * \(tileH)"),
-                ("(size_t)(g + SPLIT) * N", "(size_t)(g + SPLIT) * \(tileH)"),
-            ] {
-                loop = loop.replacingOccurrences(of: from, with: to)
-            }
-            precondition(!loop.contains("sT") && !loop.contains("bT") && !loop.contains("* N"))
-        }
-        let reduce =
-            """
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            threadgroup float* red = (threadgroup float*)tiles;
-
-            """
-        return pick + """
-            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            const int G = K / \(group);
-            const int n0 = bx * \(cols);
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg = simdgroup_index_in_threadgroup;
-            const uint tid = thread_position_in_threadgroup.x;
-            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, \(group), false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-            auto tA0 = A.template slice<\(group), 16>(0, 0);
-
-            """ + operandB + """
-            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
-            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
-              auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
-            }
-            float acc[\(ne)], accb[\(ne)];
-            for (int i = 0; i < \(ne); i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
-            const int m0 = mrow, m1 = mrow + 8;
-
-            """ + codeSetup + loop + reduce + """
-            for (int i = 0; i < \(ne); i++) {
-              const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
-              red[sg * \(16 * cols) + m * \(cols) + n] = acc[i] + accb[i];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int e = int(tid); e < ksz[1] * \(cols); e += SPLIT * 32) {
-              float v = 0.0f;
-              for (int q = 0; q < SPLIT; q++) { v += red[q * \(16 * cols) + e]; }
-              out[(size_t)(e >> \(narrow ? 4 : 5)) * N + n0 + (e & \(cols - 1))] = ok ? v : as_type<float>(0x7fc00000u);
-            }
-            #undef LO
-            #undef HI
-            """
-    }
-
-    /// One kernel set per form (index = form), for 1 ... 6 sibling layers; form 0 keeps the record names.
-    static let w4KernelSets: [[MLXFast.MLXFastKernel]] = (0 ... 2).map { form in
-        (1 ... 6).map { layers in
-            let group = w4Group ?? 64
-            return MLXFast.metalKernel(
-                name: form == 0 ? "df2_w4g\(group)_\(layers)" : "df2_w4g\(group)f\(form)_\(layers)",
-                inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                    + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                outputNames: (0 ..< layers).map { "out\($0)" },
-                source: w4Source(layers: layers, group: group, form: form), header: header,
-                ensureRowContiguous: true)
-        }
-    }
-
-    static func w4Run(
-        form: Int, narrow: Bool = false, tiled: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray,
-        rows: Int, K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
-        sizeDescriptor: MLXArray? = nil
-    ) -> [MLXArray] {
-        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
-        let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
-        if tiled {
-            return w4TiledKernel(form: form, narrow: narrow, specialized: formsFit, layers: ws.count)(
-                [xq] + ws + [ascale, xs, sizes],
-                template: formsFit ? [("SPLIT", split), ("KC", K)] : [("SPLIT", split)],
-                grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
-                threadGroup: (split * 32, 1, 1),
-                outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-        }
-        let kernels =
-            narrow
-            ? (form == 2
-                ? (formsFit ? w4Form2NarrowFormsKernels : w4Form2NarrowKernels)
-                : (formsFit ? w4NarrowFormsKernels : w4NarrowKernels))
-            : (formsFit ? w4FormsKernelSets : w4KernelSets)[form]
-        return kernels[ws.count - 1](
-            [xq] + ws + sTs + bTs + [ascale, xs, sizes],
-            template: formsFit ? [("SPLIT", split), ("KC", K)] : [("SPLIT", split)],
-            grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
-            threadGroup: (split * 32, 1, 1),
-            outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
-    }
-
-    nonisolated(unsafe) private static var w4TiledKernels: [String: MLXFast.MLXFastKernel] = [:]
-
-    /// The tiled twin of the w4 kernel `w4Run` picks for (form, narrow, specialized, layers): the same
-    /// source with the code, scale and offset reads taken from `w4Tile` tiles (`w4Source(tiled: true)`).
-    static func w4TiledKernel(form: Int, narrow: Bool, specialized: Bool, layers: Int) -> MLXFast.MLXFastKernel {
-        let group = w4Group ?? 64
-        let name = "df2_w4tg\(group)f\(form)\(narrow ? "n" : "")\(specialized ? "_forms" : "")_\(layers)"
-        if let k = w4TiledKernels[name] { return k }
-        let raw = w4Source(layers: layers, group: group, form: form, narrow: narrow, tiled: true)
-        let k = MLXFast.metalKernel(
-            name: name,
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + ["ascale", "xs", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: specialized ? w4Specialize(raw) : raw, header: header,
-            ensureRowContiguous: true)
-        w4TiledKernels[name] = k
-        return k
-    }
-
-    /// A tiled twin built on first use and kept by name (the pair24 kernel families).
-    static func w4TiledVariant(_ name: String, _ make: (String) -> MLXFast.MLXFastKernel) -> MLXFast.MLXFastKernel {
-        if let k = w4TiledKernels[name] { return k }
-        let k = make(name)
-        w4TiledKernels[name] = k
-        return k
-    }
-
-    /// True when these operands read tiles (adoption is all or nothing, so never a mix).
-    static func w4Tiled(_ ops: [W4Operands]) -> Bool {
-        let tiled = !ops.isEmpty && ops.allSatisfy { $0.tiles != nil }
-        precondition(tiled || ops.allSatisfy { $0.tiles == nil })
-        return tiled
-    }
-
-    /// The code input of each operand: its tiles once adopted, else the record codes.
-    static func w4CodeArrays(_ ops: [W4Operands]) -> [MLXArray] {
-        w4Tiled(ops) ? ops.map { $0.tiles! } : ops.map(\.w)
-    }
-
-    nonisolated(unsafe) private static var w4CheckFailed = false
-    nonisolated(unsafe) private static var w4CheckNote = ""
-
-    /// The w4 kernel form, decided once, at the first 4-bit matmul. `DF2_W4_FORM=0` keeps the
-    /// record kernel. Otherwise form 1 is used only when it compiles and its output bits equal the
-    /// record kernel's on a fixed, input-independent problem at each drafter K (4096, 12288, 32768),
-    /// 15 and 16 rows, and 1, 2, 3 and 6 sibling layers of 64 columns each; a compile error or any
-    /// differing bit keeps the record kernel. Each problem runs the kernel variant the engine runs for
-    /// its shape (the specialized set at K 4096 and 12288, the general set at 32768).
-    static let w4Form: Int = {
-        let value = ProcessInfo.processInfo.environment["DF2_W4_FORM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let group = w4Group ?? 64
-        let chosen: Int
-        let note: String
-        if ["0", "false", "no", "off"].contains(value ?? "") {
-            chosen = 0
-            note = "off (DF2_W4_FORM=0)"
-        } else {
-            var finite = true
-            let failure = w4Check(form: 1, group: group, finite: &finite)
-            chosen = failure == nil ? 1 : 0
-            note = failure.map { "record kernel kept (\($0))" }
-                ?? "bit-identical to the record kernel at K 4096, 12288, 32768; rows 15, 16; layers 1, 2, 3, 6"
-                    + (finite ? "" : " (record output not finite on this device)")
-        }
-        FileHandle.standardError.write(
-            Data("DF2 w4 matmul form \(chosen): \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Form 2 keeps the admitted form 1 as its first fallback.
-    static let w4SelectedForm: Int = {
-        let accepted = w4Form
-        guard accepted == 1 else { return accepted }
-        let value = ProcessInfo.processInfo.environment["DF2_W4_FORM"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if value == "1" { return accepted }
-        var finite = true
-        let failure = w4Check(form: 2, group: w4Group ?? 64, finite: &finite)
-        let chosen = failure == nil ? 2 : accepted
-        let note = failure.map { "accepted form 1 kept (\($0))" }
-            ?? "finite and bit-identical to accepted form 1 on fixed checks"
-        FileHandle.standardError.write(Data("DF2 w4 current-bias form \(chosen): \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Nil when `form` matches the record kernel bit for bit on every check problem, else why not.
-    static func w4Check(form: Int, group: Int, finite: inout Bool) -> String? {
-        let n = 64
-        var failure: String? = nil
-        w4CheckFailed = false
-        w4CheckNote = ""
-        withErrorHandler({ message in
-            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
-            DF2Fast.w4CheckFailed = true
-        }) {
-            for k in [4096, 12288, 32768] where k % group == 0 && k / group >= split {
-                let g = k / group
-                let w = MLXArray(
-                    (0 ..< n * k / 8).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) },
-                    [n, k / 8])
-                let scaleValues: [Float16] = (0 ..< g * n).map { (i: Int) -> Float16 in
-                    let numerator: Float = Float(1 + i % 13)
-                    let value: Float = numerator / 1024
-                    return Float16(value)
-                }
-                let sT = MLXArray(scaleValues, [g, n])
-                let bT = MLXArray((0 ..< g * n).map { Float16(-Float($0 % 7) / 512) }, [g, n])
-                let xq = MLXArray(
-                    (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let activationScales: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
-                    let numerator: Float = Float(1 + i % 11)
-                    return numerator / 256
-                }
-                let ascale = MLXArray(activationScales, [16 * g])
-                let activationSums: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
-                    let numerator: Float = Float(i % 17 - 8)
-                    return numerator / 64
-                }
-                let xs = MLXArray(activationSums, [16 * g])
-                for rows in [16, 15] {
-                    for layers in [1, 2, 3, 6] {
-                        func bits(_ f: Int) -> MLXArray {
-                            let outs = w4Run(
-                                form: f, xq: xq, ascale: ascale, xs: xs, rows: rows, K: k,
-                                ws: Array(repeating: w, count: layers),
-                                sTs: Array(repeating: sT, count: layers),
-                                bTs: Array(repeating: bT, count: layers),
-                                ns: Array(repeating: n, count: layers))
-                            return concatenated(outs, axis: 1).view(dtype: .uint32)
-                        }
-                        let record = bits(form == 2 ? 1 : 0)
-                        let candidate = bits(form)
-                        if form == 2 {
-                            let recordFinite = isFinite(record.view(dtype: .float32)).all()
-                            let candidateFinite = isFinite(candidate.view(dtype: .float32)).all()
-                            eval(recordFinite, candidateFinite)
-                            if w4CheckFailed {
-                                failure = "compile or run error: \(w4CheckNote)"
-                                return
-                            }
-                            if !recordFinite.item(Bool.self) || !candidateFinite.item(Bool.self) {
-                                finite = false
-                                failure = "non-finite control or candidate at K \(k), rows \(rows), layers \(layers)"
-                                return
-                            }
-                        }
-                        let differ = (record .!= candidate).asType(.int32).sum()
-                        let nonFinite = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
-                        eval(differ, nonFinite)
-                        if w4CheckFailed {
-                            failure = "compile or run error: \(w4CheckNote)"
-                            return
-                        }
-                        let d = differ.item(Int32.self)
-                        if d != 0 {
-                            failure = "\(d) words differ at K \(k), rows \(rows), layers \(layers)"
-                            return
-                        }
-                        if nonFinite.item(Int32.self) != 0 { finite = false }
-                    }
-                }
-            }
-        }
-        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
-        return failure
-    }
-
-    /// The eligible W4 matrices fit in 32-bit element offsets. Specialize their
-    /// input stride while leaving tensor products and all FP32 reductions unchanged.
-    /// One set per w4 kernel form (index = form); form 0 keeps the names above.
-    static let w4FormsKernelSets: [[MLXFast.MLXFastKernel]] = (0 ... 2).map { form in
-        (1 ... 6).map { layers in
-            let group = w4Group ?? 64
-            let source = w4Specialize(w4Source(layers: layers, group: group, form: form))
-            return MLXFast.metalKernel(
-                name: form == 0 ? "df2_w4g\(group)_forms_\(layers)" : "df2_w4g\(group)f\(form)_forms_\(layers)",
-                inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                    + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-                outputNames: (0 ..< layers).map { "out\($0)" },
-                source: source, header: header, ensureRowContiguous: true)
-        }
-    }
-
-    /// The compile-time K and 32-bit offset text replacements of the specialized kernels.
-    static func w4Specialize(_ source: String) -> String {
-        source
-            .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            .replacingOccurrences(of: "const size_t rowU4", with: "const uint rowU4")
-            .replacingOccurrences(of: "(size_t)", with: "(uint)")
-    }
-
-    /// Form 1 at 16 output columns per threadgroup (`w4Source(narrow: true)`), for 1 ... 6 sibling
-    /// layers: the general set, and the specialized set `w4FormsFit` picks, as for the wide kernels.
-    static let w4NarrowKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: false)
-    }
-    static let w4NarrowFormsKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: true)
-    }
-    static let w4Form2NarrowKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: false, form: 2)
-    }
-    static let w4Form2NarrowFormsKernels: [MLXFast.MLXFastKernel] = (1 ... 6).map { layers in
-        w4NarrowKernel(layers: layers, specialized: true, form: 2)
-    }
-    static func w4NarrowKernel(layers: Int, specialized: Bool, form: Int = 1) -> MLXFast.MLXFastKernel {
-        let group = w4Group ?? 64
-        let source = w4Source(layers: layers, group: group, form: form, narrow: true)
-        return MLXFast.metalKernel(
-            name: "df2_w4g\(group)f\(form)n\(specialized ? "_forms" : "")_\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: specialized ? w4Specialize(source) : source, header: header,
-            ensureRowContiguous: true)
-    }
-
-    /// The widest call (output columns summed over its sibling layers) that takes the narrow
-    /// kernels: 4096 columns launch 256 threadgroups instead of 128.
-    static let w4NarrowColumns = 4096
-
-    /// The drafter's own narrow-eligible shapes: (K, output columns per sibling layer).
-    static let w4NarrowShapes: [(k: Int, ns: [Int])] = [
-        (4096, [4096]), (12288, [4096]), (32768, [4096]), (4096, [1024]), (4096, [256]),
-        (4096, [1024, 1024]), (4096, [64, 64, 64]), (12288, [64, 64, 64, 64, 64, 64]),
-    ]
-
-    /// Whether narrow calls take the narrow kernels, decided once, at the first narrow-eligible
-    /// 4-bit matmul. `DF2_W4_NARROW=0` keeps the wide kernels. Otherwise the narrow kernels are used
-    /// only when form 1 is in use and their output bits equal the record kernel's (form 0, 32
-    /// columns) on a fixed, input-independent problem at each of `w4NarrowShapes`, 15 and 16 rows;
-    /// a compile error or any differing bit keeps the wide kernels.
-    static let w4Narrow: Bool = {
-        let value = ProcessInfo.processInfo.environment["DF2_W4_NARROW"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let chosen: Bool
-        let note: String
-        if ["0", "false", "no", "off"].contains(value ?? "") {
-            chosen = false
-            note = "off (DF2_W4_NARROW=0)"
-        } else if w4Form != 1 {
-            chosen = false
-            note = "off (w4 matmul form \(w4Form))"
-        } else {
-            var finite = true
-            let failure = w4NarrowCheck(group: w4Group ?? 64, finite: &finite)
-            chosen = failure == nil
-            note = failure.map { "wide kernels kept (\($0))" }
-                ?? "16 columns per threadgroup for calls up to \(w4NarrowColumns) columns; bit-identical to the record kernel at "
-                    + w4NarrowShapes.map { "K \($0.k) N \($0.ns.map(String.init).joined(separator: "+"))" }
-                    .joined(separator: ", ") + "; rows 15, 16"
-                    + (finite ? "" : " (record output not finite on this device)")
-        }
-        FileHandle.standardError.write(Data("DF2 w4 matmul narrow: \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Narrow form 2 must pass after accepted narrow form 1 has passed.
-    static let w4Form2Narrow: Bool = {
-        guard w4SelectedForm == 2, w4Narrow else { return false }
-        var finite = true
-        let failure = w4NarrowCheck(group: w4Group ?? 64, form: 2, finite: &finite)
-        let chosen = failure == nil
-        let note = failure.map { "accepted narrow form 1 kept (\($0))" }
-            ?? "finite and bit-identical to accepted narrow form 1 on fixed checks"
-        FileHandle.standardError.write(Data("DF2 w4 current-bias narrow: \(note)\n".utf8))
-        return chosen
-    }()
-
-    /// Nil when the narrow kernels match the record kernel bit for bit at every narrow shape.
-    static func w4NarrowCheck(group: Int, form: Int = 1, finite: inout Bool) -> String? {
-        var failure: String? = nil
-        w4CheckFailed = false
-        w4CheckNote = ""
-        withErrorHandler({ message in
-            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
-            DF2Fast.w4CheckFailed = true
-        }) {
-            for (k, ns) in w4NarrowShapes where k % group == 0 && k / group >= split {
-                let g = k / group
-                let xq = MLXArray(
-                    (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let activationScales: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
-                    let numerator: Float = Float(1 + i % 11)
-                    return numerator / 256
-                }
-                let ascale = MLXArray(activationScales, [16 * g])
-                let activationSums: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
-                    let numerator: Float = Float(i % 17 - 8)
-                    return numerator / 64
-                }
-                let xs = MLXArray(activationSums, [16 * g])
-                var ws: [MLXArray] = [], sTs: [MLXArray] = [], bTs: [MLXArray] = []
-                for (l, n) in ns.enumerated() {
-                    let i = arange(n * k / 8, dtype: .uint32) + MLXArray(UInt32(l * 7919 + 1))
-                    let h = i * MLXArray(UInt32(2_654_435_761))
-                    ws.append((h ^ (h >> MLXArray(UInt32(15)))).reshaped([n, k / 8]))
-                    let j = arange(g * n, dtype: .int32) + MLXArray(Int32(l))
-                    sTs.append(
-                        ((j % MLXArray(Int32(13))).asType(.float32) + 1) / 1024)
-                    bTs.append(-(j % MLXArray(Int32(7))).asType(.float32) / 512)
-                    sTs[l] = sTs[l].asType(.float16).reshaped([g, n])
-                    bTs[l] = bTs[l].asType(.float16).reshaped([g, n])
-                }
-                eval(ws + sTs + bTs)
-                for rows in [16, 15] {
-                    let record = concatenated(
-                        w4Run(
-                            form: form == 2 ? 1 : 0, narrow: form == 2,
-                            xq: xq, ascale: ascale, xs: xs, rows: rows, K: k, ws: ws, sTs: sTs,
-                            bTs: bTs, ns: ns), axis: 1
-                    ).view(dtype: .uint32)
-                    let candidate = concatenated(
-                        w4Run(
-                            form: form, narrow: true, xq: xq, ascale: ascale, xs: xs, rows: rows, K: k,
-                            ws: ws, sTs: sTs, bTs: bTs, ns: ns), axis: 1
-                    ).view(dtype: .uint32)
-                    if form == 2 {
-                        let recordFinite = isFinite(record.view(dtype: .float32)).all()
-                        let candidateFinite = isFinite(candidate.view(dtype: .float32)).all()
-                        eval(recordFinite, candidateFinite)
-                        if w4CheckFailed {
-                            failure = "compile or run error: \(w4CheckNote)"
-                            return
-                        }
-                        if !recordFinite.item(Bool.self) || !candidateFinite.item(Bool.self) {
-                            finite = false
-                            failure = "non-finite control or candidate at K \(k), rows \(rows), N \(ns)"
-                            return
-                        }
-                    }
-                    let differ = (record .!= candidate).asType(.int32).sum()
-                    let nonFinite = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
-                    eval(differ, nonFinite)
-                    if w4CheckFailed {
-                        failure = "compile or run error: \(w4CheckNote)"
-                        return
-                    }
-                    let d = differ.item(Int32.self)
-                    if d != 0 {
-                        failure = "\(d) words differ at K \(k), N \(ns), rows \(rows)"
-                        return
-                    }
-                    if nonFinite.item(Int32.self) != 0 { finite = false }
-                }
-            }
-        }
-        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
-        return failure
-    }
-
-    /// The matrices the specialized kernels above take: K 4096 or 12288, 1 ... 16 rows, and every
-    /// N * K below 2^32.
-    static func w4FormsFit(K: Int, rows: Int, ns: [Int]) -> Bool {
-        (K == 4096 || K == 12288) && (1 ... 16).contains(rows)
-            && ns.allSatisfy { $0 > 0 && UInt64($0) * UInt64(K) < UInt64(UInt32.max) }
-    }
-
-    static func w4Quant(
-        _ x: MLXArray, up: MLXArray?, group: Int, headMajor: Bool, rowsOverride: Int? = nil,
+    static func quantCodes(
+        _ x: MLXArray, up: MLXArray? = nil, group: Int = 32, headMajor: Bool = false, rowsOverride: Int? = nil,
         kOverride: Int? = nil
-    ) -> W4Codes? {
+    ) -> Group32Codes? {
         let K = kOverride ?? x.dim(-1)
         let rows = rowsOverride ?? (x.size / K)
-        guard (1 ... 16).contains(rows), (group == 64 || group == 128), K % group == 0,
+        if let up, !headMajor {
+            guard on, group == 32, K == x.dim(-1), rows == x.size / K,
+                let (xq, ascale, xs, actualRows) = codes(x, up: up)
+            else { return nil }
+            return Group32Codes(xq: xq, ascale: ascale, xs: xs, rows: actualRows, K: K)
+        }
+        guard on, (1 ... 16).contains(rows), group == 32, K % 32 == 0,
             K % 16 == 0, split > 0, K / group >= split
         else {
             return nil
@@ -4380,7 +2938,7 @@ enum DF2Fast {
             .init(kind: .quantG, dtype: x.dtype, dtype2: x2.dtype, k: K, group: group,
                 flag: (up == nil ? 0 : 1) + (headMajor ? 2 : 0)))
         let q = quantGRun(x, x2, K: K, rows: rows, group: group, headMajor: headMajor, swiglu: up != nil, wide: wide)
-        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
+        return Group32Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
     }
 
     /// `df2_act_q8g` at 16 columns per thread, or its `DF2WideLaneSource` twin (`wide`).
@@ -4413,86 +2971,92 @@ enum DF2Fast {
             outputDTypes: [.int8, .float32, .float32])
     }
 
-    static func w4LinearsFromCodes(
-        _ codes: W4Codes, leadShape: [Int], _ layers: [Linear]
+    static func linearsFromCodes(
+        _ codes: Group32Codes, leadShape: [Int], _ layers: [Linear]
     ) -> [MLXArray]? {
-        guard on, (1 ... 6).contains(layers.count) else { return nil }
-        let ops = layers.compactMap { w4Operands($0, group: codes.group) }
+        guard on, (1 ... 6).contains(layers.count), codes.group == 32,
+            (1 ... 16).contains(codes.rows), split > 0, codes.K / 32 >= split
+        else { return nil }
+        let ops = layers.compactMap { operands($0) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == codes.K }) else { return nil }
         let ns = ops.map(\.n)
-        let (form, narrow) = w4LaunchForm(ns)
-        if w4Recording {
-            let ids = layers.map { ObjectIdentifier($0) }
-            if w4LaunchSeen.insert(ids).inserted { w4Launches.append(ids) }
-        }
-        let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
-        let metadata = w4LaunchMetadata(ops, K: codes.K, rows: codes.rows, group: codes.group)
-        let outs: [MLXArray]
-        if let metadata {
-            let method = w4Pair24Selected(ops, ns: ns, metadata: metadata, form: form, narrow: narrow).method(rows: codes.rows)
-            outs = w4Pair24Output(method, form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale,
-                xs: codes.xs, rows: codes.rows, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizeDescriptor)
-        } else {
-            outs = w4Run(
-                form: form, narrow: narrow, tiled: w4Tiled(ops), xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
-                rows: codes.rows, K: codes.K, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
-                ns: ns, sizeDescriptor: sizeDescriptor)
+        let rows = codes.rows
+        var outs: [MLXArray] = []
+        outs.reserveCapacity(layers.count)
+        var index = 0
+        while index < layers.count {
+            let remaining = layers.count - index
+            let chunkSize: Int
+            if remaining == 4 {
+                chunkSize = 2
+            } else if remaining >= 3 {
+                chunkSize = 3
+            } else {
+                chunkSize = remaining
+            }
+            let chunkOps = ops[index ..< (index + chunkSize)]
+            let chunkNs = ns[index ..< (index + chunkSize)]
+            var inputs: [MLXArray] = []
+            inputs.reserveCapacity(3 * chunkSize + 4)
+            inputs.append(codes.xq)
+            for op in chunkOps { inputs.append(op.w) }
+            for op in chunkOps { inputs.append(op.sT) }
+            for op in chunkOps { inputs.append(op.bT) }
+            inputs.append(codes.ascale)
+            inputs.append(codes.xs)
+            inputs.append(MLXArray([Int32(codes.K), Int32(rows)] + chunkNs.map { Int32($0) }))
+            let chunkSum = chunkNs.reduce(0, +)
+            let useNarrow = chunkSum <= 4096 && narrowAdmitted
+            let cols = useNarrow ? 16 : 32
+            let chunkOuts = (useNarrow ? matmuls16 : matmuls)[chunkSize - 1](
+                inputs, template: [
+                    ("SPLIT", split), ("ROW_CORRECTION", chunkOps.allSatisfy({ $0.rowCorrection })),
+                    ("KC", codes.K),
+                ],
+                grid: (chunkSum / cols * split * 32, 1, 1),
+                threadGroup: (split * 32, 1, 1),
+                outputShapes: chunkNs.map { [rows, $0] },
+                outputDTypes: chunkNs.map { _ in .float32 })
+            outs.append(contentsOf: chunkOuts)
+            index += chunkSize
         }
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
-    }
-
-    /// The compact metadata a launch reads (the record's choice), or nil for the plain kernels.
-    static func w4LaunchMetadata(_ ops: [W4Operands], K: Int, rows: Int, group: Int) -> [W4Pair24]? {
-        if group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
-            return ops[0].pair24.map { [$0] }
-        } else if group == 64, w4FormsFit(K: K, rows: rows, ns: ops.map(\.n)) {
-            return w4Pair24MLPMetadata(ops)
-        }
-        return nil
-    }
-
-    /// The kernel form and width a launch of these output widths takes (the record's choice).
-    static func w4LaunchForm(_ ns: [Int]) -> (form: Int, narrow: Bool) {
-        let preferredForm = w4SelectedForm
-        let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
-        let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
-        return (form, narrow)
-    }
-
-    /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
-    static func w4Linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray?, group: Int) -> [MLXArray]? {
-        guard let codes = w4Quant(x, up: up, group: group, headMajor: false) else { return nil }
-        return w4LinearsFromCodes(codes, leadShape: Array(x.shape.dropLast()), layers)
     }
 
     /// `layers(dynConv(h, dyn, base, part: 0, residual: nil))` with `dynConv(part: 0)` fused into `quantGConv0`.
     static func linearsConv0(
         _ h: MLXArray, dyn: MLXArray, base: MLXArray, _ layers: [Linear]
     ) -> [MLXArray]? {
-        guard on, (1 ... 6).contains(layers.count), let group = w4Group, (group == 64 || group == 128)
-        else { return nil }
+        guard on, (1 ... 6).contains(layers.count) else { return nil }
         let K = h.dim(-1)
         let rows = h.size / K
-        guard (1 ... 16).contains(rows), K % group == 0, K % 16 == 0, split > 0, K / group >= split
+        guard (1 ... 16).contains(rows), K % 32 == 0, K % 16 == 0, split > 0, K / 32 >= split
         else { return nil }
-        let ops = layers.compactMap { w4Operands($0, group: group) }
+        let ops = layers.compactMap { operands($0) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == K }) else { return nil }
         let wide = DF2WideLanes.serves(
-            .init(kind: .quantGConv0, dtype: h.dtype, dtype2: dyn.dtype, k: K, group: group, flag: base.dtype == .float32 ? 0 : 1))
-        let q = conv0Run(h.reshaped([rows, K]), dyn: dyn, base: base, K: K, rows: rows, group: group, wide: wide)
-        let codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: group)
-        return w4LinearsFromCodes(codes, leadShape: Array(h.shape.dropLast()), layers)
+            .init(kind: .quantGConv0, dtype: h.dtype, dtype2: dyn.dtype, k: K, group: 32, flag: base.dtype == .float32 ? 0 : 1))
+        let q = conv0Run(h.reshaped([rows, K]), dyn: dyn, base: base, K: K, rows: rows, group: 32, wide: wide)
+        let codes = Group32Codes(xq: q[0], ascale: q[1], xs: q[2], rows: rows, K: K, group: 32)
+        return linearsFromCodes(codes, leadShape: Array(h.shape.dropLast()), layers)
     }
 
     /// `layer(output.transposed(0, 2, 1, 3).reshaped(1, L, 4096))` reading head-major `[1, 32, L, 128]` directly.
     static func linearHeadMajor(_ xHeadMajor: MLXArray, _ layer: Linear, L: Int) -> MLXArray? {
-        guard on, let group = w4Group,
-            let codes = w4Quant(
-                xHeadMajor, up: nil, group: group, headMajor: true, rowsOverride: L,
+        guard on,
+            let codes = quantCodes(
+                xHeadMajor, up: nil, group: 32, headMajor: true, rowsOverride: L,
                 kOverride: 4096),
-            let outs = w4LinearsFromCodes(codes, leadShape: [1, L], [layer])
+            let outs = linearsFromCodes(codes, leadShape: [1, L], [layer])
         else { return nil }
         return outs[0]
+    }
+
+    static func linears(_ x: MLXArray, _ layers: [Linear], up: MLXArray? = nil) -> [MLXArray]? {
+        guard on, (1 ... 6).contains(layers.count) else { return nil }
+        let K = x.dim(-1)
+        guard let codes = quantCodes(x, up: up, group: 32, headMajor: false, kOverride: K) else { return nil }
+        return linearsFromCodes(codes, leadShape: Array(x.shape.dropLast()), layers)
     }
 
     static func linear(_ x: MLXArray, _ layer: Linear) -> MLXArray {
@@ -4856,7 +3420,7 @@ enum DF2Fast {
         return (outs[0], outs[1], outs[2])
     }
 
-    /// Fused `rmsNorm(x, weight, eps)` + `W4Codes` int8 group quantization for `D = 4096, L <= 16`.
+    /// Fused `rmsNorm(x, weight, eps)` + group-32 int8 activation quantization for `D = 4096, L <= 16`.
     static let rmsQuantKernel = MLXFast.metalKernel(
         name: "df2_rms_q8g",
         inputNames: ["x", "weight", "dsz", "eps_arr"],
@@ -4919,7 +3483,9 @@ enum DF2Fast {
               local_amax = max(local_amax, fabs(y));
             }
             local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG >= 64) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            }
             if (KG == 128) {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
@@ -4929,6 +3495,8 @@ enum DF2Fast {
                 seq_sum = simd_shuffle_up(seq_sum, 1);
               }
               if ((int(lane) & ((KG / 16) - 1)) == step) {
+                #pragma clang fp contract(off)
+                #pragma clang fp reassociate(off)
                 for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
               }
             }
@@ -5020,7 +3588,9 @@ enum DF2Fast {
               local_amax = max(local_amax, fabs(y));
             }
             local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-            local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            if (KG >= 64) {
+              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+            }
             if (KG == 128) {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
@@ -5030,6 +3600,8 @@ enum DF2Fast {
                 seq_sum = simd_shuffle_up(seq_sum, 1);
               }
               if ((int(lane) & ((KG / 16) - 1)) == step) {
+                #pragma clang fp contract(off)
+                #pragma clang fp reassociate(off)
                 for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
               }
             }
@@ -5072,14 +3644,14 @@ enum DF2Fast {
     static func rmsQuantPhases(
         _ x: MLXArray, _ norm: RMSNorm, group: Int, ropeSpec: RopeSpec,
         C: Int, offset: Int
-    ) -> (MLXArray, W4Codes, RopeSpec)? {
+    ) -> (MLXArray, Group32Codes, RopeSpec)? {
         let D = x.dim(-1), L = x.size / D
         guard on, D == 4096, (1 ... 16).contains(L), (1 ... 16).contains(C),
-            (group == 64 || group == 128), split > 0, D / group >= split,
+            group == 32, split > 0, D / group >= split,
             offset >= 0, offset <= Int(Int32.max) - C - L
         else { return nil }
         let w = normWeight(norm)
-        // Keep the existing alternate-wide selection and self-check path intact.
+        // Alternate-wide selection and self-check path.
         let wide = DF2WideLanes.serves(
             .init(kind: .rmsQuant, dtype: x.dtype, dtype2: w.dtype, k: D, group: group, flag: 0))
         let rows = C + L, G = D / group
@@ -5091,7 +3663,7 @@ enum DF2Fast {
             grid: (lanes, 16, 1), threadGroup: (lanes, 1, 1),
             outputShapes: [x.shape, [16 * D], [16 * G], [16 * G], [rows, 32, 4]],
             outputDTypes: [.float32, .int8, .float32, .float32, .float32])
-        let codes = W4Codes(
+        let codes = Group32Codes(
             xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
         let phases = RopeSpec(
             freqs: ropeSpec.freqs, mscale: ropeSpec.mscale, phases: outs[4],
@@ -5101,10 +3673,10 @@ enum DF2Fast {
 
     static func rmsQuant(
         _ x: MLXArray, _ norm: RMSNorm, group: Int, writeNorm: Bool = true
-    ) -> (MLXArray, W4Codes)? {
+    ) -> (MLXArray, Group32Codes)? {
         let D = x.dim(-1), L = x.size / D
         guard on, D == 4096, (1 ... 16).contains(L),
-            (group == 64 || group == 128), split > 0, D / group >= split
+            group == 32, split > 0, D / group >= split
         else {
             return nil
         }
@@ -5113,7 +3685,7 @@ enum DF2Fast {
             .init(kind: .rmsQuant, dtype: x.dtype, dtype2: w.dtype, k: D, group: group, flag: 0))
         let outs = rmsQuantRun(
             x, w, D: D, L: L, eps: norm.eps, group: group, wide: wide, writeNorm: writeNorm)
-        let codes = W4Codes(xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
+        let codes = Group32Codes(xq: outs[1], ascale: outs[2], xs: outs[3], rows: L, K: D, group: group)
         return (outs[0], codes)
     }
 
@@ -5227,7 +3799,7 @@ enum DF2Fast {
             }
             """)
 
-    /// Fused `dynConv(part: 1, residual: res)` + `rmsNorm(out_res, weight, eps)` + `W4Codes` int8 quantization
+    /// Fused `dynConv(part: 1, residual: res)` + `rmsNorm(out_res, weight, eps)` + group-32 int8 activation quantization
     /// on rows `qStart ..< L` for `D = 4096`.
     static let convRmsQuantKernel = MLXFast.metalKernel(
         name: "df2_dyn_conv_rms_q8g",
@@ -5307,7 +3879,9 @@ enum DF2Fast {
                 out_norm[qRowBase + u] = nv[u];
               }
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
-              local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+              if (KG >= 64) {
+                local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+              }
               if (KG == 128) {
                 local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
               }
@@ -5317,6 +3891,8 @@ enum DF2Fast {
                   seq_sum = simd_shuffle_up(seq_sum, 1);
                 }
                 if ((int(lane) & ((KG / 16) - 1)) == step) {
+                  #pragma clang fp contract(off)
+                  #pragma clang fp reassociate(off)
                   for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
                 }
               }
@@ -5337,12 +3913,13 @@ enum DF2Fast {
     static func dynConvRms(
         _ h: MLXArray, dyn: MLXArray, base: MLXArray, residual: MLXArray, norm: RMSNorm,
         qStart: Int = 0
-    ) -> (MLXArray, MLXArray, W4Codes?)? {
+    ) -> (MLXArray, MLXArray, Group32Codes?)? {
         let D = h.dim(-1), L = h.size / D
         guard on, D == 4096 else { return nil }
         let w = normWeight(norm)
         let qRows = L - qStart
-        if (1 ... 16).contains(qRows), let group = w4Group, (group == 64 || group == 128),
+        let group = 32
+        if (1 ... 16).contains(qRows), group == 32,
             split > 0, D / group >= split
         {
             let wide = DF2WideLanes.serves(
@@ -5351,7 +3928,7 @@ enum DF2Fast {
             let outs = convRmsQuantRun(
                 h, dyn: dyn, base: base, residual: residual, weight: w,
                 D: D, L: L, qStart: qStart, eps: norm.eps, group: group, wide: wide)
-            let codes = W4Codes(
+            let codes = Group32Codes(
                 xq: outs[2], ascale: outs[3], xs: outs[4], rows: qRows, K: D, group: group)
             return (outs[0], outs[1], codes)
         }
@@ -5821,7 +4398,7 @@ final class DFlash2LayerZeroFront {
     let h: MLXArray
     let normed: MLXArray
     /// Layer 0's input codes, kept only for the load check (p1 replaces them at runtime).
-    let codes: DF2Fast.W4Codes?
+    let codes: DF2Fast.Group32Codes?
     let ropeSpec: DF2Fast.RopeSpec
     let p1: MLXArray
     let queries: MLXArray
@@ -5829,7 +4406,7 @@ final class DFlash2LayerZeroFront {
     let values: MLXArray
 
     init(
-        cacheOffset: Int, h: MLXArray, normed: MLXArray, codes: DF2Fast.W4Codes?,
+        cacheOffset: Int, h: MLXArray, normed: MLXArray, codes: DF2Fast.Group32Codes?,
         ropeSpec: DF2Fast.RopeSpec, p1: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray
     ) {
         self.cacheOffset = cacheOffset
@@ -5913,14 +4490,14 @@ extension DFlash2DraftModel {
         let layer = layers[0]
         let attention = layer.selfAttn
         let projections: [Linear] = [attention.qProj, attention.kProj, attention.vProj]
-        guard let group = DF2Fast.w4Group, let baseSpec = DF2Fast.ropeSpec(self),
+        guard let baseSpec = DF2Fast.ropeSpec(self),
             let mask = DF2Fast.maskEmbedCache[ObjectIdentifier(self)]
         else { return "no record operands" }
         let h: MLXArray = concatenated([use.anchorEmbedding, mask], axis: 1)
         guard
             let record = DF2Fast.rmsQuantPhases(
-                h, layer.inputLayerNorm, group: group, ropeSpec: baseSpec, C: rows, offset: offset),
-            let p1 = DF2Fast.w4LinearsFromCodes(
+                h, layer.inputLayerNorm, group: 32, ropeSpec: baseSpec, C: rows, offset: offset),
+            let p1 = DF2Fast.linearsFromCodes(
                 record.1, leadShape: [1, L], [layer.attentionConv.kernelProjection])?.first,
             let qkv = DF2Fast.linearsConv0(
                 record.0, dyn: p1, base: layer.attentionConv.fastBase, projections),
@@ -5981,7 +4558,7 @@ extension DFlash2DraftModel {
     private func proposalOutputs(
         _ projection: DFlash2ContextProjection, front: DFlash2LayerZeroFront?, rows: Int,
         anchor: Int, hidden: MLXArray, offset: Int
-    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?, used: Bool) {
+    ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.Group32Codes?, used: Bool) {
         let blockSize: Int = config.dflash.blockSize
         let cache = try makeCache()
         for layerCache in cache {
@@ -5999,8 +4576,15 @@ extension DFlash2DraftModel {
     }
 
     /// Every bit equal. BF16, FP32, int8 and token ids all widen to FP32 exactly.
+    /// Floating-point values must be finite before bitwise admission.
     private static func bitsEqual(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
         guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+        let isFloat = a.dtype == .bfloat16 || a.dtype == .float16 || a.dtype == .float32
+        if isFloat {
+            let finite = isFinite(a).all() .&& isFinite(b).all()
+            let bits = contiguous(a.asType(.float32)).view(dtype: .uint32) .== contiguous(b.asType(.float32)).view(dtype: .uint32)
+            return finite .&& bits.all()
+        }
         let x: MLXArray = contiguous(a.asType(.float32)).view(dtype: .uint32)
         let y: MLXArray = contiguous(b.asType(.float32)).view(dtype: .uint32)
         return MLX.all(x .== y)
@@ -6076,6 +4660,11 @@ enum DF2WideLanes {
     private static func same(_ a: [MLXArray], _ b: [MLXArray], skip: Set<Int> = []) -> MLXArray {
         var eq: [MLXArray] = []
         for (j, (x, y)) in zip(a, b).enumerated() where !skip.contains(j) {
+            let isFloat = x.dtype == .bfloat16 || x.dtype == .float16 || x.dtype == .float32
+            if isFloat {
+                eq.append(isFinite(x).all())
+                eq.append(isFinite(y).all())
+            }
             eq.append(MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32)))
         }
         return MLX.all(MLX.stacked(eq))
@@ -6208,6 +4797,8 @@ enum DF2WideLaneSource {
             seq_sum = simd_shuffle_up(seq_sum, 1);
           }
           if ((int(lane) & ((KG / \(e)) - 1)) == step) {
+            #pragma clang fp contract(off)
+            #pragma clang fp reassociate(off)
             for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
           }
         }
