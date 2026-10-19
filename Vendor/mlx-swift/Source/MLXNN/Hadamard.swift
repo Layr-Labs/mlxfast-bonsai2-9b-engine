@@ -4654,6 +4654,18 @@ enum VerifyInt8Matmul {
     }()
     nonisolated(unsafe) private static var wideStore = false
 
+    /// `DARKBLOOM_BONSAI_VERIFY_TILE2=0` keeps one B tile per simdgroup in
+    /// the 32-column streamed verify forms. Otherwise each simdgroup stages
+    /// alternate groups into two tiles, so the barrier after each group's
+    /// epilogue goes: the next group's barrier already orders this group's
+    /// tile reads before the stores two groups later. The load-time check
+    /// runs these kernels first and falls back to the one-tile kernels.
+    static let tile2Allowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_TILE2"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) static var tile2 = false
+
     private static func streamLoad(columns: Int) -> String {
         "for (int t = 0; t < \(columns / 4); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
     }
@@ -4738,7 +4750,7 @@ enum VerifyInt8Matmul {
 
     /// Same staged B tile, int32 tensor result and FP32 epilogue. Only the
     /// word addresses/load width and the position of next-group loads change.
-    private static func makeStreamedBody(_ body: String, columns: Int) -> String? {
+    private static func makeStreamedBody(_ body: String, columns: Int, twoTiles: Bool = false) -> String? {
         let words = columns / 4
         let oldPointer = "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
         let pointer = "const device uint32_t* wcol = w + (size_t)bx * (\(columns / 16)) * Kg * 128;"
@@ -4772,7 +4784,34 @@ enum VerifyInt8Matmul {
         result.removeSubrange(start.lowerBound ..< end.lowerBound)
         let issue = "  op.run(tA, B, cT);"
         guard result.components(separatedBy: issue).count == 2 else { return nil }
-        return result.replacingOccurrences(of: issue, with: issue + "\n" + prefetch)
+        result = result.replacingOccurrences(of: issue, with: issue + "\n" + prefetch)
+        return twoTiles && columns == 32 ? twoTileBody(result) : result
+    }
+
+    /// Group i of a simdgroup stages into bs[sg + 4 * (i & 1)]; the barrier
+    /// that closed each group moves after the loop, ahead of the reduction's
+    /// reuse of bs[sg]. A missing anchor keeps the one-tile body.
+    private static func twoTileBody(_ body: String) -> String {
+        let tile2Decl = "threadgroup uint32_t bs[4][32 * 32];"
+        let tile2DeclNew = "threadgroup uint32_t bs[8][32 * 32];"
+        let tile2Loop = "for (int g = int(sg); g < Kg; g += 4) {\n"
+        let tile2LoopNew = "for (int g = int(sg); g < Kg; g += 4) {\n  threadgroup uint32_t* bt = bs[sg + 4u * ((uint(g) >> 2) & 1u)];\n"
+        let tile2Store = "(bs[sg] + col * 32u"
+        let tile2StoreNew = "(bt + col * 32u"
+        let tile2Run = "  op.run(tA, B, cT);"
+        let tile2RunNew = "  tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> Bt((threadgroup int8_t*)bt, dextents<int, 2>(128, 32));\n  op.run(tA, Bt, cT);"
+        let tile2End = "  simdgroup_barrier(mem_flags::mem_threadgroup);\n}\nthreadgroup float* red"
+        let tile2EndNew = "}\nsimdgroup_barrier(mem_flags::mem_threadgroup);\nthreadgroup float* red"
+        let swaps: [(String, String)] = [
+            (tile2Decl, tile2DeclNew), (tile2Loop, tile2LoopNew), (tile2Store, tile2StoreNew),
+            (tile2Run, tile2RunNew), (tile2End, tile2EndNew),
+        ]
+        var result = body
+        for (old, new) in swaps {
+            guard result.components(separatedBy: old).count == 2 else { return body }
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
     }
 
     private static let streamedSourcesReady = makeStreamedBody(naxFastBody, columns: 32) != nil
@@ -4782,9 +4821,10 @@ enum VerifyInt8Matmul {
         makeStreamedBody(body, columns: columns) ?? body
     }
 
-    static func streamedFormsSource(layers: Int) -> String {
+    static func streamedFormsSource(layers: Int, twoTiles: Bool = false) -> String {
         let prefix = naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-        let body = streamedBody(naxFastBody, columns: 32).replacingOccurrences(of: "(size_t)", with: "(uint)")
+        let streamed = makeStreamedBody(naxFastBody, columns: 32, twoTiles: twoTiles) ?? naxFastBody
+        let body = streamed.replacingOccurrences(of: "(size_t)", with: "(uint)")
         return prefix + body
     }
 
@@ -4795,6 +4835,16 @@ enum VerifyInt8Matmul {
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
             source: streamedFormsSource(layers: layers), header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+    private static let streamedTwoTileKernels = (1 ... 3).map { (layers: Int) -> MLXFast.MLXFastKernel in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_streamed_tile2_col\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { (i: Int) -> String in "w\(i)" }
+                + (0 ..< layers).map { (i: Int) -> String in "s\(i)" }
+                + (0 ..< layers).map { (i: Int) -> String in "b\(i)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { (i: Int) -> String in "out\(i)" },
+            source: streamedFormsSource(layers: layers, twoTiles: true), header: PromptInt8Matmul.naxHeader,
             ensureRowContiguous: true)
     }
     private static let streamedNarrowKernel = MLXFast.metalKernel(
@@ -5821,7 +5871,7 @@ enum VerifyInt8Matmul {
             let withScales: [MLXArray] = codeAndWeights + scaleInputs
             let withBiases: [MLXArray] = withScales + biasInputs
             let inputs: [MLXArray] = withBiases + [ascale, rsb, dims]
-            let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
+            let kernels = streamedWeights == nil ? naxFormsKernels : tile2 ? streamedTwoTileKernels : streamedKernels
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
             return kernels[layers.count - 1](
                 inputs, template: template,
@@ -6191,7 +6241,18 @@ enum VerifyInt8Matmul {
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
         }
+        tile2 = tile2Allowed && chosen == .nax && naxFast
         streamReady = chosen == .nax && naxFast && checkStreamed()
+        if tile2 {
+            let passed = streamReady
+            if !passed {
+                tile2 = false
+                streamReady = checkStreamed()
+            }
+            FileHandle.standardError.write(Data("int8 verify streamed two tiles: \(passed ? "passed" : "FAILED; one-tile kernels kept")\n".utf8))
+        } else {
+            FileHandle.standardError.write(Data("int8 verify streamed two tiles: off\n".utf8))
+        }
         FileHandle.standardError.write(
             "int8 verify streamed: \(streamReady ? "on (M16 guard, fast/shared/N16/dense-b/a bit-identical)" : "off")\n".data(using: .utf8)!)
         return chosen
@@ -6422,8 +6483,8 @@ public enum VerifyDenseBA {
     /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
     /// that each run four b/a columns and return; every later threadgroup
     /// runs the two-layer body unchanged, `BAG` threadgroups later.
-    static func fusedSource(streamed: Bool = false) -> String {
-        let forms = streamed ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2)
+    static func fusedSource(streamed: Bool = false, twoTiles: Bool = false) -> String {
+        let forms = streamed ? VerifyInt8Matmul.streamedFormsSource(layers: 2, twoTiles: twoTiles) : VerifyInt8Matmul.naxFormsSource(layers: 2)
         let anchor = "int bx = int(threadgroup_position_in_grid.x);"
         guard forms.components(separatedBy: anchor).count == 2 else { return "" }
         return forms.replacingOccurrences(
@@ -6459,6 +6520,12 @@ public enum VerifyDenseBA {
         outputNames: ["out0", "out1", "ob", "oa"], source: fusedSource(streamed: true),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
 
+    static let streamedTwoTileKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_streamed_tile2_col_dense_ba",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
+        outputNames: ["out0", "out1", "ob", "oa"], source: fusedSource(streamed: true, twoTiles: true),
+        header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+
     /// The standalone kernel: `x` `[rows, K]` FP32, `wb` and `wa` `[N, K]` FP32.
     public static func standalone(_ x: MLXArray, wb: MLXArray, wa: MLXArray) -> (MLXArray, MLXArray) {
         let rows = x.dim(0)
@@ -6488,7 +6555,7 @@ public enum VerifyDenseBA {
         let template = [
             ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
         ] as [(String, any KernelTemplateArg)]
-        let kernel = streamedWeights == nil ? fusedKernel : streamedKernel
+        let kernel = streamedWeights == nil ? fusedKernel : VerifyInt8Matmul.tile2 ? streamedTwoTileKernel : streamedKernel
         return kernel(
             inputs, template: template,
             grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
