@@ -2582,7 +2582,7 @@ enum DF2Fast {
         guard (1 ... 16).contains(rows), K % 32 == 0 else { return nil }
         let x2 = up ?? x
         let o = quant(
-            [x.reshaped([rows, K]), x2.reshaped([rows, K]), MLXArray([Int32(K), Int32(rows)])],
+            [x.reshaped([rows, K]), x2.reshaped([rows, K]), HostConstants.int32([Int32(K), Int32(rows)])],
             template: [("SWIGLU", up == nil ? 0 : 1)],
             grid: (128, 16, 1), threadGroup: (128, 1, 1),
             outputShapes: [[16 * K], [16 * (K / 32)], [16 * (K / 32)]],
@@ -2604,7 +2604,7 @@ enum DF2Fast {
         let ns = ops.map(\.n)
         let outs = matmuls[layers.count - 1](
             [xq] + ops.map(\.w) + ops.map(\.sT) + ops.map(\.bT)
-                + [ascale, xs, MLXArray([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
+                + [ascale, xs, HostConstants.int32([Int32(x.dim(-1)), Int32(rows)] + ns.map { Int32($0) })],
             template: [("SPLIT", split)],
             grid: (ns.reduce(0, +) / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -3126,7 +3126,7 @@ enum DF2Fast {
         op: W4Operands, metadata: W4Pair24, sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
         let columns = narrow ? 16 : 32
-        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(rows), Int32(4096)])
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(32768), Int32(rows), Int32(4096)])
         let kernel = op.tiles == nil
             ? w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!
             : w4TiledVariant("df2_w4tg64_pair24f\(form)_n\(columns)") { name in
@@ -3215,7 +3215,7 @@ enum DF2Fast {
         let K = ops[0].k, ns = ops.map(\.n)
         precondition(w4FormsFit(K: K, rows: rows, ns: ns) && ops.count == metadata.count)
         let key = (ops.count - 1) * 6 + form * 2 + (narrow ? 1 : 0)
-        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(K), Int32(rows)] + ns.map { Int32($0) })
         let layers = ops.count
         let kernel = !w4Tiled(ops)
             ? w4Pair24MLPKernels[key]!
@@ -3378,7 +3378,7 @@ enum DF2Fast {
     static func w4FCStaticRun(
         xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
-        let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(16), Int32(4096)])
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(32768), Int32(16), Int32(4096)])
         if let tiles = op.tiles {
             return w4TiledKernel(form: 2, narrow: true, specialized: true, layers: 1)(
                 [xq, tiles, ascale, xs, sizes],
@@ -3585,7 +3585,7 @@ enum DF2Fast {
         sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
         precondition(op.k == 12288 && op.n == 4096)
-        let sizes = sizeDescriptor ?? MLXArray([Int32(12288), Int32(16), Int32(4096)])
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(12288), Int32(16), Int32(4096)])
         let kernel = op.tiles == nil
             ? w4Pair24QuartetKernel
             : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n16_forms_1") { name in
@@ -3623,7 +3623,7 @@ enum DF2Fast {
     ) -> [MLXArray] {
         precondition(ops.count == 2 && metadata.count == 2
             && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 })
-        let sizes = sizeDescriptor ?? MLXArray([Int32(4096), Int32(16), Int32(12288), Int32(12288)])
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(4096), Int32(16), Int32(12288), Int32(12288)])
         let kernel = !w4Tiled(ops)
             ? w4Pair24QuartetWideKernel
             : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n32_forms_2") { name in
@@ -3981,7 +3981,7 @@ enum DF2Fast {
         rows: Int, K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
         sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
-        let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
+        let sizes = sizeDescriptor ?? HostConstants.int32([Int32(K), Int32(rows)] + ns.map { Int32($0) })
         let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
         if tiled {
             return w4TiledKernel(form: form, narrow: narrow, specialized: formsFit, layers: ws.count)(
@@ -4391,7 +4391,7 @@ enum DF2Fast {
         let totalThreads = K / (wide ? DF2WideLanes.e : 16)
         let tg = Swift.min(256, totalThreads)
         return (wide ? DF2WideLanes.quantG : quantG)(
-            [x, x2, MLXArray([Int32(K), Int32(rows)])],
+            [x, x2, HostConstants.int32([Int32(K), Int32(rows)])],
             template: [("SWIGLU", swiglu ? 1 : 0), ("KG", group), ("HEAD_MAJOR", headMajor ? 1 : 0)],
             grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
@@ -4406,7 +4406,7 @@ enum DF2Fast {
         let totalThreads = K / (wide ? DF2WideLanes.e : 16)
         let tg = Swift.min(256, totalThreads)
         return (wide ? DF2WideLanes.quantGConv0 : quantGConv0)(
-            [h, dyn, base, MLXArray([Int32(K), Int32(rows)])],
+            [h, dyn, base, HostConstants.int32([Int32(K), Int32(rows)])],
             template: [("KG", group)],
             grid: (totalThreads, 16, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[16 * K], [16 * G], [16 * G]],
@@ -5085,7 +5085,7 @@ enum DF2Fast {
         let rows = C + L, G = D / group
         let lanes = D / (wide ? DF2WideLanes.e : 16)
         let outs = (wide ? rmsQuantPhasesWideKernel : rmsQuantPhasesKernel)(
-            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps]), ropeSpec.freqs,
+            [x, w, HostConstants.int32([Int32(D), Int32(L)]), HostConstants.float32([norm.eps]), ropeSpec.freqs,
                 MLXArray([Int32(rows), Int32(offset)])],
             template: [("D", D), ("KG", group), ("WRITE_NORM", 1)],
             grid: (lanes, 16, 1), threadGroup: (lanes, 1, 1),
@@ -5125,7 +5125,7 @@ enum DF2Fast {
         let G = D / group
         let lanes = D / (wide ? DF2WideLanes.e : 16)
         return (wide ? DF2WideLanes.rmsQuant : rmsQuantKernel)(
-            [x, w, MLXArray([Int32(D), Int32(L)]), MLXArray([eps])],
+            [x, w, HostConstants.int32([Int32(D), Int32(L)]), HostConstants.float32([eps])],
             template: [("D", D), ("KG", group), ("WRITE_NORM", writeNorm ? 1 : 0)],
             grid: (lanes, Swift.max(L, 16), 1), threadGroup: (lanes, 1, 1),
             outputShapes: [writeNorm ? x.shape : [1], [16 * D], [16 * G], [16 * G]],
@@ -5146,8 +5146,8 @@ enum DF2Fast {
         return (wide ? DF2WideLanes.convRmsQuant : convRmsQuantKernel)(
             [
                 h, dyn, base, residual, weight,
-                MLXArray([Int32(D), Int32(L), Int32(qStart)]),
-                MLXArray([eps]),
+                HostConstants.int32([Int32(D), Int32(L), Int32(qStart)]),
+                HostConstants.float32([eps]),
             ],
             template: [("D", D), ("KG", group), ("WRITE_RES", writeRes ? 1 : 0)],
             grid: (lanes, Swift.max(L, qStart + 16), 1), threadGroup: (lanes, 1, 1),
@@ -5356,7 +5356,7 @@ enum DF2Fast {
             return (outs[0], outs[1], codes)
         }
         let outs = convRms(
-            [h, dyn, base, residual, w, MLXArray([Int32(D), Int32(L)]), MLXArray([norm.eps])],
+            [h, dyn, base, residual, w, HostConstants.int32([Int32(D), Int32(L)]), HostConstants.float32([norm.eps])],
             template: [("D", D)],
             grid: (256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape, h.shape], outputDTypes: [.float32, .float32])
@@ -5366,7 +5366,7 @@ enum DF2Fast {
     static func dynConv(_ h: MLXArray, dyn: MLXArray, base: MLXArray, part: Int, residual: MLXArray?) -> MLXArray {
         let D = h.dim(-1), L = h.size / D
         return conv(
-            [h, dyn, base, residual ?? h, MLXArray([Int32(D), Int32(L)])],
+            [h, dyn, base, residual ?? h, HostConstants.int32([Int32(D), Int32(L)])],
             template: [("D", D), ("PART", part), ("RES", residual == nil ? 0 : 1)],
             grid: ((L * D + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [h.shape], outputDTypes: [.float32])[0]
@@ -5522,7 +5522,11 @@ enum DF2Fast {
             }
             """
 
-    private static var selectorLookupSentinel: MLXArray { MLXArray([UInt16(0)]) }
+    nonisolated(unsafe) private static let cachedSelectorLookupSentinel = MLXArray([UInt16(0)])
+    /// One shared `[0]` uint16 stand-in (a fresh one per call with `DARKBLOOM_BONSAI_HOSTCUT=0`).
+    private static var selectorLookupSentinel: MLXArray {
+        HostConstants.enabled ? cachedSelectorLookupSentinel : MLXArray([UInt16(0)])
+    }
 
     /// `topk` over `[..., V]` logits: `[P, 128]` ids and values. The selectors
     /// read only these pairs, in any order.

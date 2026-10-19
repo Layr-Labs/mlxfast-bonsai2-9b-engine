@@ -19,6 +19,7 @@
 import Cmlx
 import Foundation
 import MLX
+import MLXNN
 
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
@@ -1317,7 +1318,7 @@ enum CBv2VerifyVectorAttention {
         let nKeys = keys.dim(2)
 
         if L > 8 && classesPerGroup == 2 {
-            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])]
+            let inputs = [queries, keys, values, HostConstants.float32([scale]), MLXArray([Int32(nKeys)])]
             let states = pairedPartial(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
@@ -1328,7 +1329,7 @@ enum CBv2VerifyVectorAttention {
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
         let parts = partial(
-            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])],
+            [queries, keys, values, HostConstants.float32([scale]), MLXArray([Int32(nKeys)])],
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
@@ -1353,7 +1354,7 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
-        let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))]), tree]
+        let inputs = [queries, keys, values, HostConstants.float32([scale]), MLXArray([Int32(keys.dim(2))]), tree]
         if L > 8 && classesPerGroup == 2 {
             guard let pairedTree else { return nil }
             let states = pairedTree(

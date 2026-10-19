@@ -4034,7 +4034,7 @@ enum Qwen35VerifyQKNormRoPE {
         let L = keyProjection.dim(1)
         let outputs = treeKernel(
             [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)]), tree],
+                HostConstants.float32([queryEps, keyEps]), offsets, HostConstants.float32([log2(ropeBase)]), tree],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", false)],
             grid: (32, queryHeads + keyHeads, L),
@@ -4068,7 +4068,7 @@ enum Qwen35VerifyQKNormRoPE {
         let queryRows = lastQueryOnly ? 1 : L
         let outputs = (hoisted ? hoistKernel : kernel)(
             [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
+                HostConstants.float32([queryEps, keyEps]), offsets, HostConstants.float32([log2(ropeBase)])],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", lastQueryOnly)],
             grid: lastQueryOnly ? (32, 1, queryHeads + keyHeads * L) : (32, queryHeads + keyHeads, L),
@@ -5781,6 +5781,18 @@ extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
 }
 
 extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
+    /// `MLXFAST_MTP_DIAGNOSTICS` unset, read once at first use instead of
+    /// copying the process environment on every verify forward
+    /// (`DARKBLOOM_BONSAI_HOSTCUT=0` reads it per call again).
+    private static let mtpDiagnosticsUnset: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+
+    fileprivate static func mtpDiagnosticsOff() -> Bool {
+        HostConstants.enabled
+            ? mtpDiagnosticsUnset
+            : ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+    }
+
     /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
     /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
     /// finalize can commit the accepted position on device. Attention and
@@ -5805,7 +5817,7 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             !model.exactTargetVerify,
             let head = lmHead as? HadamardQuantizedLinear,
             Qwen35InlineMTPAssistant.shortlistSize == nil,
-            ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil,
+            Qwen35TextModel.mtpDiagnosticsOff(),
             let fusedTopTwo = head.topTwoRowsAfterResidualNorm(
                 hiddenRaw, delta: delta, weight: model.norm.weight, eps: model.norm.eps)
         {
@@ -5826,7 +5838,7 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             {
                 verifyHeadTopTwo.value = topTwo
                 if Qwen35InlineMTPAssistant.shortlistSize == nil,
-                    ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+                    Qwen35TextModel.mtpDiagnosticsOff()
                 {
                     logits = broadcast(
                         normalized[0..., 0..., 0 ..< 1],
