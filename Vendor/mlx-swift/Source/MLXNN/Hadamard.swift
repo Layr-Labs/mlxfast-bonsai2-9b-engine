@@ -4726,7 +4726,11 @@ enum VerifyInt8Matmul {
         }
         """
 
-    private static let compactHeadKernel = {
+    private static let compactHeadKernel = makeCompactHeadKernel(tiled: false)
+    /// The compact head over the body after `tiledLoads`; reads tiled words.
+    private static let compactHeadTiledKernel = makeCompactHeadKernel(tiled: true)
+
+    private static func makeCompactHeadKernel(tiled: Bool) -> MLXFast.MLXFastKernel {
         let store = """
             for (int e = int(tid); e < ROWS * 8; e += 128) {
               float4 v = r0[e] + r1[e];
@@ -4735,18 +4739,18 @@ enum VerifyInt8Matmul {
               *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = good ? v : float4(as_type<float>(0x7fc00000u));
             }
             """
-        let original = naxFastSource(layers: 1)
+        let original = tiled ? naxFastPick(layers: 1) + tiledLoads(naxFastBody) : naxFastSource(layers: 1)
         precondition(original.components(separatedBy: store).count == 2)
         let source = original.replacingOccurrences(of: store, with: compactHeadEpilogue)
             .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
             .replacingOccurrences(of: "(size_t)", with: "(uint)")
         return MLXFast.metalKernel(
-            name: "bonsai_q8_verify_head_top4_nax_front_v1_forms",
+            name: "bonsai_q8_verify_head_top4_nax_front_v1_forms" + (tiled ? "_tiled" : ""),
             inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"],
             outputNames: ["out0", "part_ids", "omitted", "part_bad"], source: source,
             header: PromptInt8Matmul.naxHeader + Float16ConstantQMV.topTwoHeader,
             ensureRowContiguous: true)
-    }()
+    }
 
     static func compactHeadAvailable(rows: Int, k: Int, n: Int) -> Bool {
         route == .nax && naxFast && rows == 16 && k == 4096 && n % 64 == 0
@@ -4759,15 +4763,28 @@ enum VerifyInt8Matmul {
     ) -> (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)? {
         guard compactHeadAvailable(rows: activation.rows, k: activation.k, n: weight.dim(0))
         else { return nil }
+        let result = runCompactHead(
+            codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
+            scalesT: scalesT, biasesT: biasesT, k: activation.k, negative: negative && negativeForms)
+        return (result[1], result[0], result[2], result[3])
+    }
+
+    /// The compact head kernel at 16 rows: outputs `out0`, `part_ids`,
+    /// `omitted`, `part_bad`. `tiledWords` as `tiledWords(_:_:)`.
+    private static func runCompactHead(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, k: Int, negative: Bool, tiledWords explicit: [MLXArray]? = nil
+    ) -> [MLXArray] {
         let tiles = weight.dim(0) / 32
-        let result = compactHeadKernel(
-            [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb,
-             MLXArray([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
-            template: [("ROWS", 16), ("NEG", negative && negativeForms ? 1 : 0), ("KC", activation.k)],
+        let tiled = tiledWords([weight], explicit)
+        let kernel = tiled == nil ? compactHeadKernel : compactHeadTiledKernel
+        return kernel(
+            [codes, tiled?[0] ?? weight, scalesT, biasesT, ascale, rsb,
+             MLXArray([Int32(k), Int32(16), Int32(weight.dim(0))])],
+            template: [("ROWS", 16), ("NEG", negative ? 1 : 0), ("KC", k)],
             grid: (tiles * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[16, tiles, 4], [16, tiles, 4], [16, tiles], [16, tiles]],
             outputDTypes: [.float32, .int32, .float32, .int32])
-        return (result[1], result[0], result[2], result[3])
     }
 
     /// `naxFastBody` for `layers` sibling projections of one activation in
@@ -4785,9 +4802,38 @@ enum VerifyInt8Matmul {
     /// route takes (`formsFit`), so each address, and so each value read and
     /// each FP32 step, is the same: the same bits, which `checkForms` checks
     /// at each real K before a form is used.
-    static func naxFormsSource(layers: Int) -> String {
+    /// `tiled`: the body after `tiledLoads`, then the same 32-bit indexing.
+    static func naxFormsSource(layers: Int, tiled: Bool = false) -> String {
         naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + naxFastBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
+            + (tiled ? tiledLoads(naxFastBody) : naxFastBody)
+                .replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    /// `body` (`naxFastBody`, 32 columns per threadgroup, or `naxNarrowBody`,
+    /// 16) reading the words of `tileVerifyWeight` instead of the stored
+    /// layout. Lane l still loads one uint32, word l & 7 of the group in
+    /// column n0 + (l >> 3) + 4t, and stages it into the same slot with the
+    /// same expression; only the address moves. In the tiled layout the 32
+    /// columns of a block keep a group's 8 words each side by side, so load
+    /// t of the 32 lanes reads 128 contiguous bytes (word 32t + l of the
+    /// block's 1 KB group tile) instead of 32 B from each of 4 columns a
+    /// column stride apart. At 16 columns (n0 = 16 * bx) the column offset
+    /// inside the block is (n0 & 31) + c.
+    static func tiledLoads(_ body: String) -> String {
+        func swap(_ text: String, _ old: String, _ new: String, count: Int) -> String {
+            let found = text.components(separatedBy: old).count - 1
+            precondition(found == count, "tiledLoads: fragment found \(found) times, expected \(count)")
+            return text.replacingOccurrences(of: old, with: new)
+        }
+        let text = swap(
+            body,
+            "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;",
+            "const device uint32_t* wcol = w + (size_t)(n0 >> 5) * (size_t)(KW * 32) + (size_t)((n0 & 31) + c) * 8 + j;",
+            count: 1)
+        return swap(
+            text,
+            "wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8];",
+            "wv[t] = wcol[(size_t)(32 * t) + (size_t)gl * 256];", count: 2)
     }
 
     private static func naxFastPick(layers: Int) -> String {
@@ -4922,13 +4968,17 @@ enum VerifyInt8Matmul {
 
     /// The narrow output uses only 16 columns. Keep the accepted N32
     /// operation as fallback; use this N16 operation only after its check.
-    static let naxNarrow16Body = naxNarrowBody
-        .replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
+    static let naxNarrow16Body = narrow16(naxNarrowBody)
+
+    /// The N16 changes to a narrow body (record or `tiledLoads`).
+    static func narrow16(_ body: String) -> String {
+        body.replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
         .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];", with: "threadgroup uint32_t bs[4][16 * 32];")
         .replacingOccurrences(of: "dextents<int, 2>(128, 32));", with: "dextents<int, 2>(128, 16));")
         .replacingOccurrences(of: "bool ok = cap == 16;", with: "bool ok = cap == 8;")
         .replacingOccurrences(of: "for (int i = 0; i < 16; i++) {", with: "for (int i = 0; i < 8; i++) {")
         .replacingOccurrences(of: "  #pragma clang loop unroll(full)\n  for (int e = 0; e < 4; e++) {\n    const float t0 = float(cA[e]) * float(cT[e]);\n    acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n    if (ROWS > 8) {\n      const float t2 = float(cA[e]) * float(cT[4 + e]);\n      acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n    }\n  }\n", with: "  if (good) {\n    #pragma clang loop unroll(full)\n    for (int e = 0; e < 4; e++) {\n      const float t0 = float(cA[e]) * float(cT[e]);\n      acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n      if (ROWS > 8) {\n        const float t2 = float(cA[e]) * float(cT[4 + e]);\n        acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n      }\n    }\n  }\n")
+    }
 
     static let naxNarrowPick = """
         #pragma clang fp contract(off)
@@ -4975,6 +5025,24 @@ enum VerifyInt8Matmul {
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
             source: naxFormsSource(layers: layers),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
+    /// `naxFormsSource(layers:tiled: true)`; reads tiled words only.
+    private static let naxFormsTiledKernels = (1 ... 3).map { (layers: Int) -> MLXFast.MLXFastKernel in
+        var inputNames: [String] = ["xq"]
+        for i in 0 ..< layers { inputNames.append("w\(i)") }
+        for i in 0 ..< layers { inputNames.append("s\(i)") }
+        for i in 0 ..< layers { inputNames.append("b\(i)") }
+        inputNames += ["ascale", "rsb", "ksz"]
+        var outputNames: [String] = []
+        for i in 0 ..< layers { outputNames.append("out\(i)") }
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_nax_forms_tiled\(layers)",
+            inputNames: inputNames,
+            outputNames: outputNames,
+            source: naxFormsSource(layers: layers, tiled: true),
             header: PromptInt8Matmul.naxHeader,
             ensureRowContiguous: true)
     }
@@ -5046,6 +5114,25 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    /// The narrow (or, `compact`, N16) compile-time form over the body after
+    /// `tiledLoads`, the same 32-bit indexing.
+    static func naxNarrowTiledFormsSource(compact: Bool) -> String {
+        let body = tiledLoads(naxNarrowBody)
+        return naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + (compact ? narrow16(body) : body).replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    /// `naxNarrowTiledFormsSource`; reads tiled words only.
+    private static let naxNarrowTiledKernels = [false, true].map { (compact: Bool) -> MLXFast.MLXFastKernel in
+        MLXFast.metalKernel(
+            name: compact ? "bonsai_q8_verify_matmul_nax_narrow16_forms_tiled" : "bonsai_q8_verify_matmul_nax_narrow_forms_tiled",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: naxNarrowTiledFormsSource(compact: compact),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// The widest one-layer call that takes the narrow kernel, and the
     /// inner sizes of the model's calls that fit: attention o and GDN out
     /// (4096) and MLP down (12288).
@@ -5070,6 +5157,29 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
     nonisolated(unsafe) private static var naxShared = false
+    /// Set once by `checkTiled` at load: each packed projection then gets a
+    /// tiled copy of its words (`VerifyTiledWeights`), and every
+    /// compile-time form the verify path takes runs its `tiledLoads` twin on
+    /// that copy. `DARKBLOOM_BONSAI_INT8_VERIFY_TILED=0` keeps the stored
+    /// words and the record kernels, and makes no copy.
+    nonisolated(unsafe) static var naxTiled = false
+    static let tiledAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_TILED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var tiledFailed = false
+    nonisolated(unsafe) private static var tiledNote = ""
+
+    /// The words a tiled kernel reads for `weights`: `explicit` when given
+    /// (the load-time check), else each weight's tiled copy while `naxTiled`.
+    /// Nil, so the record kernel reads the stored words, when the tiled
+    /// kernels are off or any weight has no copy (a slice, a new array).
+    static func tiledWords(_ weights: [MLXArray], _ explicit: [MLXArray]?) -> [MLXArray]? {
+        if let explicit { return explicit }
+        guard naxTiled else { return nil }
+        return VerifyTiledWeights.copies(of: weights)
+    }
 
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
@@ -5091,7 +5201,7 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil, tiledWords explicit: [MLXArray]? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
@@ -5099,6 +5209,14 @@ enum VerifyInt8Matmul {
             + [ascale, rsb, dims]
         if forms ?? usesForms(k: k, layers: layers) {
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
+            if let words = tiledWords(layers.map { $0.weight }, explicit) {
+                let tiledInputs: [MLXArray] = [codes] + words + layers.map { $0.scalesT } + layers.map { $0.biasesT }
+                    + [ascale, rsb, dims]
+                return naxFormsTiledKernels[layers.count - 1](
+                    tiledInputs, template: template,
+                    grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+            }
             return naxFormsKernels[layers.count - 1](
                 inputs, template: template,
                 grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -5113,14 +5231,17 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false,
+        tiledWords explicit: [MLXArray]? = nil
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
-            let kernel = compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            let tiled = tiledWords([weight], explicit)
+            let kernel = tiled != nil
+                ? naxNarrowTiledKernels[compact ? 1 : 0] : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             return kernel(
-                [codes, weight, scalesT, biasesT, ascale, rsb, dims],
+                [codes, tiled?[0] ?? weight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
                 grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -5282,6 +5403,185 @@ enum VerifyInt8Matmul {
         return matched
     }
 
+    /// Runs each `tiledLoads` twin the verify path would take, on the tiled
+    /// copy (`VerifyTiledWeights.tile`) of fixed, input-independent words,
+    /// against the same record kernel on the stored words, with all 16 code
+    /// rows filled (64 columns, two 32-column blocks; both offset forms where
+    /// the offset skip is on) at each real K, at the row counts the record
+    /// checks build: the compile-time forms (each matched layer count, each
+    /// layer's own copy) at 16 rows, the narrow form this K takes at 2 ... 16
+    /// (column offsets 0 and 16 inside a block), the compact head at 16, the
+    /// fused b/a form at 2 ... 16. Every record output must be finite (the
+    /// record writes NaN where the tensor layout differs) and every tiled
+    /// output equal to it bit for bit; any difference or compile error keeps
+    /// the stored words and the record kernels everywhere, and no copy is
+    /// made. Runs last in `route`, and drives the kernels directly because
+    /// `route` is not decided yet.
+    private static func checkTiled() -> String {
+        naxTiled = false
+        guard tiledAllowed else { return "off (DARKBLOOM_BONSAI_INT8_VERIFY_TILED=0)" }
+        guard formsAllowed else { return "off (compile-time forms off)" }
+        let n = 64
+        var cases = 0
+        var matched = true
+        tiledFailed = false
+        tiledNote = ""
+        let exponent = MLXArray(UInt32(0x7f80_0000))
+        func same(_ record: [MLXArray], _ tiled: [MLXArray], floats: [Int]) -> Bool {
+            var checks: [MLXArray] = []
+            for (r, w) in zip(record, tiled) {
+                let rBits: MLXArray = r.view(dtype: .uint32)
+                let wBits: MLXArray = w.view(dtype: .uint32)
+                let equal: MLXArray = rBits .== wBits
+                checks.append(MLX.all(equal))
+            }
+            for f in floats {
+                let bits: MLXArray = record[f].view(dtype: .uint32)
+                let masked: MLXArray = bits & exponent
+                let finite: MLXArray = masked .!= exponent
+                checks.append(MLX.all(finite))
+            }
+            eval(checks)
+            cases += 1
+            let allTrue: Bool = checks.allSatisfy { (c: MLXArray) -> Bool in c.item(Bool.self) }
+            return !tiledFailed && record.count == tiled.count && allTrue
+        }
+        withErrorHandler({ message in
+            if !VerifyInt8Matmul.tiledFailed { VerifyInt8Matmul.tiledNote = String(message.prefix(80)) }
+            VerifyInt8Matmul.tiledFailed = true
+        }) {
+            for k in formsK where matched {
+                let kg = k / 128
+                let codeCount: Int = tileRows * k
+                let codeValues: [Int8] = (0 ..< codeCount).map { (i: Int) -> Int8 in
+                    let v: Int = (i * 53 + 29) % 255 - 127
+                    return Int8(truncatingIfNeeded: v)
+                }
+                let codes = MLXArray(codeValues, [tileRows, k])
+                let wordCount: Int = n * k / 16
+                let weightValues: [UInt32] = (0 ..< wordCount).map { (i: Int) -> UInt32 in
+                    let v: UInt64 = UInt64(i + 7) &* UInt64(2_246_822_519)
+                    return UInt32(truncatingIfNeeded: v)
+                }
+                let weight = MLXArray(weightValues, [n, k / 16])
+                let tiledWeight: MLXArray = VerifyTiledWeights.tile(weight)
+                let groupCount: Int = kg * n
+                let scaleValues: [Float16] = (0 ..< groupCount).map { (i: Int) -> Float16 in
+                    let v: Float = Float(1 + i % 13) / Float(1024)
+                    return Float16(v)
+                }
+                let scalesT = MLXArray(scaleValues, [kg, n])
+                let biasValues: [Float16] = (0 ..< groupCount).map { (i: Int) -> Float16 in
+                    let v: Float = -Float(i % 7) / Float(512)
+                    return Float16(v)
+                }
+                let biasesT = MLXArray(biasValues, [kg, n])
+                let signBit = MLXArray(UInt16(0x8000))
+                let scaleBits: MLXArray = scalesT.view(dtype: .uint16)
+                let negatedBits: MLXArray = scaleBits ^ signBit
+                let negatedT: MLXArray = negatedBits.view(dtype: .float16)
+                let rowGroups: Int = tileRows * kg
+                let ascaleValues: [Float] = (0 ..< rowGroups).map { (i: Int) -> Float in
+                    Float(1 + i % 11) / Float(256)
+                }
+                let ascale = MLXArray(ascaleValues, [rowGroups])
+                let rsbValues: [Float] = (0 ..< rowGroups).map { (i: Int) -> Float in
+                    Float(i % 17 - 8) / Float(64)
+                }
+                let rsb = MLXArray(rsbValues, [rowGroups])
+                let fusedUsed = k == 4096 && VerifyDenseBA.fusedMatched
+                let ban = fusedUsed ? 32 : 1
+                let banCount: Int = ban * k
+                let wbValues: [Float] = (0 ..< banCount).map { (i: Int) -> Float in
+                    let v: Int = (i * 29 + 3) % 97 - 48
+                    return Float(v) / Float(3072)
+                }
+                let wb = MLXArray(wbValues, [ban, k])
+                let waValues: [Float] = (0 ..< banCount).map { (i: Int) -> Float in
+                    let v: Int = (i * 53 + 7) % 89 - 44
+                    return Float(v) / Float(2048)
+                }
+                let wa = MLXArray(waValues, [ban, k])
+                let xValues: [Float] = (0 ..< codeCount).map { (i: Int) -> Float in
+                    let v: Int = (i * 41 + 5) % 211 - 105
+                    return Float(v) / Float(64)
+                }
+                let xAll = MLXArray(xValues, [tileRows, k])
+                var offsetForms: [(MLXArray, Bool)] = [(biasesT, false)]
+                if negativeForms { offsetForms.append((negatedT, true)) }
+                for (offsets, negative) in offsetForms where matched {
+                    let splits: [[Range<Int>]] = [[0 ..< n], [0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]]
+                    for layers in 1 ... 3 where matched && formsMatched.contains("\(k) \(layers)") {
+                        let parts: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] =
+                            splits[layers - 1].map { (cols: Range<Int>) -> (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray) in
+                                (weight: weight[cols], scalesT: scalesT[0..., cols], biasesT: offsets[0..., cols])
+                            }
+                        let partWords: [MLXArray] = splits[layers - 1].map { (cols: Range<Int>) -> MLXArray in
+                            VerifyTiledWeights.tile(weight[cols])
+                        }
+                        func outputs(_ tiled: Bool) -> [MLXArray] {
+                            runFast(
+                                codes: codes, ascale: ascale, rsb: rsb, layers: parts, m: tileRows, k: k,
+                                negative: negative, forms: true, tiledWords: tiled ? partWords : nil)
+                        }
+                        let record = outputs(false)
+                        matched = same(record, outputs(true), floats: Array(record.indices))
+                    }
+                    let compact = narrow16K.contains(k)
+                    if narrowK.contains(k), (compact ? narrow16FormsK : narrowFormsK).contains(k) {
+                        for m in 2 ... tileRows where matched {
+                            func outputs(_ tiled: Bool) -> MLXArray {
+                                runNarrow(
+                                    codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scalesT,
+                                    biasesT: offsets, m: m, k: k, negative: negative, forms: true,
+                                    compact: compact, tiledWords: tiled ? [tiledWeight] : nil)
+                            }
+                            matched = same([outputs(false)], [outputs(true)], floats: [0])
+                        }
+                    }
+                    if matched, k == 4096, formsMatched.contains("4096 1") {
+                        func outputs(_ tiled: Bool) -> [MLXArray] {
+                            runCompactHead(
+                                codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scalesT,
+                                biasesT: offsets, k: k, negative: negative, tiledWords: tiled ? [tiledWeight] : nil)
+                        }
+                        let record = outputs(false)
+                        let zero = MLXArray(Int32(0))
+                        let isZero: MLXArray = record[3] .== zero
+                        let clean: MLXArray = MLX.all(isZero)
+                        eval(clean)
+                        matched = !tiledFailed && clean.item(Bool.self) && same(record, outputs(true), floats: [0, 2])
+                    }
+                    if matched, fusedUsed {
+                        let halves: [Range<Int>] = [0 ..< 32, 32 ..< 64]
+                        let parts: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] =
+                            halves.map { (cols: Range<Int>) -> (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray) in
+                                (weight: weight[cols], scalesT: scalesT[0..., cols], biasesT: offsets[0..., cols])
+                            }
+                        let halfWords: [MLXArray] = halves.map { (cols: Range<Int>) -> MLXArray in
+                            VerifyTiledWeights.tile(weight[cols])
+                        }
+                        for m in 2 ... tileRows where matched {
+                            func outputs(_ tiled: Bool) -> [MLXArray] {
+                                VerifyDenseBA.fused(
+                                    codes: codes, ascale: ascale, rsb: rsb, layers: parts, m: m, k: k,
+                                    negative: negative, x: xAll[0 ..< m], wb: wb, wa: wa,
+                                    tiledWords: tiled ? halfWords : nil)
+                            }
+                            let record = outputs(false)
+                            matched = same(record, outputs(true), floats: Array(record.indices))
+                        }
+                    }
+                }
+            }
+        }
+        if tiledFailed { matched = false }
+        tiledFailed = false
+        naxTiled = matched
+        return matched
+            ? "on (\(cases) cases bit-identical)" : "off (" + (tiledNote.isEmpty ? "outputs differ" : tiledNote) + ")"
+    }
+
     nonisolated(unsafe) private static var formsFailed = false
 
     /// Runs each compile-time form against the record's fast kernel on a
@@ -5380,6 +5680,9 @@ enum VerifyInt8Matmul {
             FileHandle.standardError.write(
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
+        }
+        if chosen == .nax, naxFast {
+            FileHandle.standardError.write("int8 verify tiled weights: \(checkTiled())\n".data(using: .utf8)!)
         }
         return chosen
     }()
@@ -5480,8 +5783,8 @@ public enum VerifyDenseBA {
     /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
     /// that each run four b/a columns and return; every later threadgroup
     /// runs the two-layer body unchanged, `BAG` threadgroups later.
-    static var fusedSource: String {
-        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2)
+    static func fusedSource(tiled: Bool) -> String {
+        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2, tiled: tiled)
         let anchor = "int bx = int(threadgroup_position_in_grid.x);"
         guard forms.components(separatedBy: anchor).count == 2 else { return "" }
         return forms.replacingOccurrences(
@@ -5507,7 +5810,16 @@ public enum VerifyDenseBA {
         name: "bonsai_q8_verify_matmul_nax_forms2_dense_ba",
         inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
         outputNames: ["out0", "out1", "ob", "oa"],
-        source: fusedSource,
+        source: fusedSource(tiled: false),
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// `fusedSource(tiled: true)`; reads tiled words only.
+    static let fusedTiledKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_forms2_dense_ba_tiled",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
+        outputNames: ["out0", "out1", "ob", "oa"],
+        source: fusedSource(tiled: true),
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -5525,17 +5837,21 @@ public enum VerifyDenseBA {
     static func fused(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray
+        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray,
+        tiledWords explicit: [MLXArray]? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let N = wb.dim(0)
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
-        let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
+        let stored: [MLXArray] = layers.map { $0.weight }
+        let tiled = VerifyInt8Matmul.tiledWords(stored, explicit)
+        let words: [MLXArray] = tiled ?? stored
+        let inputs: [MLXArray] = [codes] + words + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims, x, wb, wa]
         let template = [
             ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
         ] as [(String, any KernelTemplateArg)]
-        return fusedKernel(
+        return (tiled == nil ? fusedKernel : fusedTiledKernel)(
             inputs, template: template,
             grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] } + [[m, N], [m, N]],
@@ -5661,6 +5977,51 @@ extension VerifyInt8Matmul {
     }
 }
 
+/// The verify int8 kernels' tiled copies of packed projections' words
+/// (`VerifyInt8Matmul.tiledLoads`). A copy holds the stored uint32 words
+/// unchanged, only reordered; the stored array is never written and every
+/// other path keeps reading it. Plain static storage, never a Module or a
+/// parameter, keyed on the stored array object, which each entry holds, so
+/// an identity cannot be reused while its entry lives.
+enum VerifyTiledWeights {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [ObjectIdentifier: (source: MLXArray, tiled: MLXArray)] = [:]
+
+    /// `[N, K/16]` words reordered to `[N/32, K/128, 32, 8]` (each 32-row
+    /// block's 8 words per row of a 128-group side by side, a 1 KB run per
+    /// block and group), returned as `[N, K/16]`. N % 32 == 0, K % 128 == 0.
+    static func tile(_ weight: MLXArray) -> MLXArray {
+        let n: Int = weight.dim(0)
+        let kw: Int = weight.dim(1)
+        let blocks: [Int] = [n / 32, 32, kw / 8, 8]
+        let grouped: MLXArray = weight.reshaped(blocks).transposed(0, 2, 1, 3)
+        return grouped.contiguous().reshaped([n, kw])
+    }
+
+    /// Builds and evaluates `weight`'s copy (replacing any earlier one) when
+    /// the tiled kernels passed their load-time check and the shape tiles.
+    static func register(_ weight: MLXArray) {
+        guard VerifyInt8Matmul.naxTiled, weight.ndim == 2, weight.dtype == .uint32,
+            weight.dim(0) % 32 == 0, weight.dim(1) % 8 == 0
+        else { return }
+        let tiled = tile(weight)
+        eval(tiled)
+        lock.withLock { entries[ObjectIdentifier(weight)] = (weight, tiled) }
+    }
+
+    /// The copies of `weights`, in order; nil when any has none.
+    static func copies(of weights: [MLXArray]) -> [MLXArray]? {
+        lock.withLock {
+            var found: [MLXArray] = []
+            for weight in weights {
+                guard let entry = entries[ObjectIdentifier(weight)], entry.source === weight else { return nil }
+                found.append(entry.tiled)
+            }
+            return found
+        }
+    }
+}
+
 /// Group-major copies of a packed module's F16 scales and offsets for
 /// `PromptInt8Matmul`, made on first use. A plain class, so nothing enters the
 /// module parameter tree.
@@ -5737,7 +6098,33 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            registerVerifyTiledWeight()
         }
+    }
+
+    /// A parameter update that carries `weight` replaces the stored words in
+    /// place, so the verify kernels' tiled copy is rebuilt from the updated
+    /// array (at load, where the loader updates every module once).
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        let updated = try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        if parameters[unwrapping: "weight"] != nil {
+            registerVerifyTiledWeight()
+        }
+        return updated
+    }
+
+    /// The tiled copy the verify int8 kernels read, for a projection the
+    /// verify route takes (`verifyInt8Forward`'s packing conditions).
+    private func registerVerifyTiledWeight() {
+        guard readsFloat16ConstantsInPlace, transform.blockSize == 4096, transform.width % 512 == 0,
+            weight.dim(0) % 32 == 0
+        else { return }
+        VerifyTiledWeights.register(weight)
     }
 
     /// Fixed at init: the packing `Float16ConstantQMV` reads in place.
