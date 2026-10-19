@@ -323,11 +323,6 @@ public protocol DFlash2Target: AnyObject {
     /// the target head's first `rows` output rows, through the same module type
     /// and transform. Proposals only; the target's verify head stays full.
     func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray
-    /// The fast selectors' `[15, 128]` ids and values from the same prefix head
-    /// without its full logits: every value is the head's own at that id, the
-    /// ids may differ from the logits' top-k (proposals only). Nil keeps the
-    /// logits.
-    func draftShortlistForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> (ids: MLXArray, values: MLXArray)?
     /// Build, at load, the per-process state the target's `rows`-row verify head
     /// would otherwise build inside the first measured window. Never changes a token.
     func prepareDFlash2Verify(rows: Int)
@@ -338,9 +333,6 @@ extension DFlash2Target {
     public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
         logitsForDFlash2Hidden(hidden)
     }
-    public func draftShortlistForDFlash2Hidden(
-        _ hidden: MLXArray, rows: Int
-    ) -> (ids: MLXArray, values: MLXArray)? { nil }
 }
 
 /// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 96k
@@ -361,25 +353,14 @@ public final class DFlash2DraftHeadSlot {
     private var source: ObjectIdentifier?
     private var rows = 0
     private var prefix: HadamardQuantizedLinear?
-    private var screened = false
 
     public init() {}
-
-    /// The prefix head's screened candidates (`HadamardQuantizedLinear.draftScreen`);
-    /// nil unless the screen qualified at bind.
-    public func shortlist(
-        _ hidden: MLXArray, of full: HadamardQuantizedLinear, rows: Int
-    ) -> (ids: MLXArray, values: MLXArray)? {
-        guard let prefix = head(of: full, rows: rows), screened else { return nil }
-        return prefix.draftScreen(hidden, shortlist: DF2Fast.shortlist)
-    }
 
     public func head(of full: HadamardQuantizedLinear, rows: Int) -> HadamardQuantizedLinear? {
         if source == ObjectIdentifier(full), self.rows == rows { return prefix }
         source = ObjectIdentifier(full)
         self.rows = rows
         prefix = nil
-        screened = false
         guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
             rows > 0, rows < full.weight.dim(0)
         else {
@@ -400,13 +381,6 @@ public final class DFlash2DraftHeadSlot {
             return nil
         }
         Self.report(rows, "on (bitwise equal to the full head's first \(rows) columns, 15 rows, FP32 and BF16)")
-        if DF2Fast.screenAllowed, rows == 98304 {
-            let failure: String? = candidate.qualifyDraftScreen(shortlist: DF2Fast.shortlist)
-            screened = failure == nil
-            let state: String = failure.map { "off (\($0))" }
-                ?? "on (bit-identical to its reference; rescore bit-identical to the head)"
-            Self.report(rows, "K 2048 screen \(state)")
-        }
         prefix = candidate
         return prefix
     }
@@ -1164,6 +1138,9 @@ private final class DFlash2MLP: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil
     ) -> MLXArray {
+        if let codes = DF2Fast.w4SwiGLUCodes(x, gate: gate, up: up, conv0: conv0),
+            let y = DF2Fast.w4LinearsFromCodes(codes, leadShape: Array(x.shape.dropLast()), [down])
+        { return y[0] }
         if let conv0,
             let gu = DF2Fast.linearsConv0(conv0.n, dyn: conv0.dyn, base: conv0.base, [gate, up]),
             let y = DF2Fast.linears(gu[0], [down], up: gu[1])
@@ -1988,23 +1965,6 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return logits
     }
 
-    /// The fast selectors' 128 (id, value) pairs per position: the target's
-    /// screened prefix head when it qualified and this block takes it (15
-    /// positions, the 98,304-row prefix, no logit transform), else the top-k
-    /// of the full draft logits.
-    private func draftTop(_ hidden: MLXArray, blockSize: Int) throws -> [MLXArray] {
-        guard let target else { throw DFlash2Error.notBound }
-        let rows: Int = DF2Vocab.rows
-        let softcap: Float = config.dflash.finalLogitSoftcapping ?? 0
-        if DF2Fast.screenAllowed, blockSize == 16, rows == 98304, rows < config.vocabularySize,
-            rows >= config.dflash.selectorTopK, config.dflash.outputMultiplier == 1, softcap <= 0,
-            let screened = target.draftShortlistForDFlash2Hidden(hidden, rows: rows)
-        {
-            return [screened.ids, screened.values]
-        }
-        return DF2Fast.top(try logits(hidden))
-    }
-
     // MARK: Context projection ahead of acceptance
 
     /// The acceptance-independent head of the next block's forward, over every
@@ -2167,10 +2127,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
-            let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize)
             if DF2Fast.treeOn, blockSize == 16 {
                 let (tokens, desc) = DF2Fast.selectTree(
-                    top: top, projected: projected,
+                    logits: try logits(hidden), projected: projected,
                     anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                     succ: sel.successorCodebook,
                     predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
@@ -2178,7 +2137,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 return (tokens, hidden, finalCodes)
             }
             let tokens = DF2Fast.select(
-                top: top, projected: projected,
+                logits: try logits(hidden), projected: projected,
                 anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                 succ: sel.successorCodebook,
                 predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
@@ -2267,9 +2226,6 @@ enum DF2Fast {
     /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
     static let tokenMajorOProj =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
-    /// `DARKBLOOM_BONSAI_DF2_SCREEN=0` keeps the full draft head (no K 2048 screen).
-    static let screenAllowed =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_SCREEN"] != "0"
     /// `DARKBLOOM_BONSAI_DF2_FRONT=0` keeps layer 0's projections in the attention-half submit.
     static let earlyFront =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_FRONT"] != "0"
@@ -2624,6 +2580,46 @@ enum DF2Fast {
         var w: MLXArray, sT: MLXArray, bT: MLXArray
         let n: Int, k: Int
         var pair24: W4Pair24? = nil
+        private let swigluLock = NSLock()
+        private var cachedSwiGLU: [Bool: (up: ObjectIdentifier, admitted: Bool)] = [:]
+        func admitsSwiGLU(up: W4Operands, build: () -> Bool) -> Bool {
+            swigluLock.lock()
+            defer { swigluLock.unlock() }
+            let tiled: Bool = tiles != nil
+            if let cachedSwiGLU = cachedSwiGLU[tiled] {
+                return cachedSwiGLU.up == ObjectIdentifier(up) && cachedSwiGLU.admitted
+            }
+            let admitted = build()
+            cachedSwiGLU[tiled] = (ObjectIdentifier(up), admitted)
+            return admitted
+        }
+        private var cachedPair24SwiGLU: [Bool: (up: ObjectIdentifier, method: W4Pair24Method, admitted: Bool)] = [:]
+        func admitsPair24SwiGLU(up: W4Operands, method: W4Pair24Method, build: () -> Bool) -> Bool {
+            swigluLock.lock()
+            defer { swigluLock.unlock() }
+            let tiled: Bool = tiles != nil
+            if let cachedPair24SwiGLU = cachedPair24SwiGLU[tiled] {
+                return cachedPair24SwiGLU.up == ObjectIdentifier(up)
+                    && cachedPair24SwiGLU.method == method && cachedPair24SwiGLU.admitted
+            }
+            let admitted = build()
+            cachedPair24SwiGLU[tiled] = (ObjectIdentifier(up), method, admitted)
+            return admitted
+        }
+        private var cachedColumns64SwiGLU: (up: ObjectIdentifier, method: W4Pair24Method, admitted: Bool)?
+        func admitsColumns64SwiGLU(up: W4Operands, method: W4Pair24Method, build: () -> Bool) -> Bool {
+            swigluLock.lock()
+            defer { swigluLock.unlock() }
+            if let cachedColumns64SwiGLU {
+                return cachedColumns64SwiGLU.up == ObjectIdentifier(up)
+                    && cachedColumns64SwiGLU.method == method && cachedColumns64SwiGLU.admitted
+            }
+            let admitted: Bool = build()
+            cachedColumns64SwiGLU = (ObjectIdentifier(up), method, admitted)
+            let message: String = "DF2 swiglu_n64 rows=16 K=\(k) Ns=[\(n),\(up.n)] group=64 form=2 narrow=false SPLIT=8 method=\(method) admitted=\(admitted)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            return admitted
+        }
         /// The same codes, scales and offsets in `w4Tile` order once `w4AdoptTiles` admitted them;
         /// `w`, `sT` and `bT` are then released.
         var tiles: MLXArray? = nil
@@ -4441,6 +4437,741 @@ enum DF2Fast {
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
     }
 
+    /// The existing split fold, followed by the current quantG SwiGLU arithmetic.
+    static let w4SwiGLUStore = """
+        for (int e = int(tid); e < 16 * 32; e += SPLIT * 32) {
+          float v = 0.0f;
+          for (int q = 0; q < SPLIT; q++) { v += red[q * (16 * 32) + e]; }
+          const float value = ok ? v : as_type<float>(0x7fc00000u);
+          if (li == 0) { gateValue[e / (SPLIT * 32)] = value; }
+          else {
+            const float a = gateValue[e / (SPLIT * 32)];
+            activationValue[2 * halfTile + e / (SPLIT * 32)] = a / (1.0f + metal::exp(-a)) * value;
+          }
+        }
+        """
+
+    /// All reduction reads end at the last existing projection barrier. Publish only after it.
+    static let w4SwiGLUPublish = """
+        threadgroup float* activated = (threadgroup float*)tiles;
+        const uint publishTid = thread_position_in_threadgroup.x;
+        for (int halfTile = 0; halfTile < 2; halfTile++) {
+          for (int e = int(publishTid); e < 16 * 32; e += SPLIT * 32) {
+            activated[(e >> 5) * 64 + halfTile * 32 + (e & 31)] = activationValue[2 * halfTile + e / (SPLIT * 32)];
+          }
+        }
+        """
+
+    /// The original group64 quantizer reads the locally completed SwiGLU values.
+    static let w4SwiGLUQuant = """
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        if (tid < 64u) {
+          const int m = int(tid) / 4, chunk = int(tid) & 3;
+          const int g = int(threadgroup_position_in_grid.x);
+          const int K = 12288, G = K / 64;
+          const int c0 = g * 64 + chunk * 16;
+          const size_t dstBase = (size_t)m * K + c0;
+          float nv[16];
+          float local_amax = 0.0f;
+          for (int u = 0; u < 16; u++) {
+            const float a = activated[m * 64 + chunk * 16 + u];
+            nv[u] = a;
+            local_amax = max(local_amax, fabs(a));
+          }
+          local_amax = max(local_amax, simd_shuffle_xor(local_amax, 1));
+          local_amax = max(local_amax, simd_shuffle_xor(local_amax, 2));
+          float seq_sum = 0.0f;
+          const uint grpBase = lane & ~uint(3);
+          for (int step = 0; step < 4; step++) {
+            seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+            if ((int(lane) & 3) == step) {
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+            }
+          }
+          const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
+          const float ia = 1.0f / a;
+          device char4* dst = (device char4*)(xq_out + dstBase);
+          for (int u = 0; u < 4; u++) {
+            const float4 fv = float4(nv[4 * u], nv[4 * u + 1], nv[4 * u + 2], nv[4 * u + 3]);
+            dst[u] = char4(int4(rint(fv * ia)));
+          }
+          if ((int(lane) & 3) == 3) {
+            ascale_out[m * G + g] = a;
+            xs_out[m * G + g] = seq_sum;
+          }
+        }
+        """
+
+    static func w4SwiGLUIndexSource(_ source: String) -> String {
+        source
+            .replacingOccurrences(of: "const size_t r =", with: "const uint r =")
+            .replacingOccurrences(of: "const size_t tile =", with: "const uint tile =")
+            .replacingOccurrences(of: "const size_t dstBase =", with: "const uint dstBase =")
+            .replacingOccurrences(of: "size_t tile,", with: "uint tile,")
+            .replacingOccurrences(of: "const size_t word =", with: "const uint word =")
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    static func w4SwiGLUSource(tiled: Bool = false) -> String {
+        var body = w4Specialize(w4Source(layers: 1, group: 64, form: 2, narrow: false, tiled: tiled))
+        let pick: String = tiled ? """
+            const int K = KC;
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0;
+            device float* out = out0; int N = ksz[2];
+            """ : """
+            const int K = KC;
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
+            device float* out = out0; int N = ksz[2];
+            """
+        let selected: String = tiled ? """
+            const int K = KC;
+            const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+            const device uint32_t* w = li == 0 ? w0 : w1;
+            const int N = 12288;
+            """ : """
+            const int K = KC;
+            const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+            const device uint32_t* w = li == 0 ? w0 : w1;
+            const device half* sT = li == 0 ? s0 : s1;
+            const device half* bT = li == 0 ? b0 : b1;
+            const int N = 12288;
+            """
+        let store = """
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(uint)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+        precondition(body.contains(pick) && body.contains(store))
+        body = body.replacingOccurrences(of: pick, with: selected)
+            .replacingOccurrences(of: store, with: w4SwiGLUStore)
+            .replacingOccurrences(of: "threadgroup uint4 tiles[SPLIT * 32 * 4];", with: "")
+        return w4SwiGLUIndexSource("""
+            threadgroup uint4 tiles[SPLIT * 32 * 4];
+            float gateValue[2];
+            float activationValue[4];
+            for (int halfTile = 0; halfTile < 2; halfTile++) {
+              for (int li = 0; li < 2; li++) {
+            \(body)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+              }
+            }
+            \(w4SwiGLUPublish)
+            \(w4SwiGLUQuant)
+            """)
+    }
+
+    static let w4SwiGLUKernel = MLXFast.metalKernel(
+        name: "df2_w4g64_f2_gate_up_swiglu_q8_scratch_alias_index32_v1",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+        outputNames: ["xq_out", "ascale_out", "xs_out"],
+        source: w4SwiGLUSource(), header: header, ensureRowContiguous: true)
+
+    static func w4SwiGLURun(_ codes: W4Codes, _ ops: [W4Operands]) -> W4Codes {
+        let tiled: Bool = w4Tiled(ops)
+        let kernel: MLXFast.MLXFastKernel
+        if tiled {
+            kernel = w4TiledVariant("df2_w4tg64_f2_gate_up_swiglu_q8_scratch_alias_index32_v1") { name in
+                MLXFast.metalKernel(
+                    name: name, inputNames: ["xq", "w0", "w1", "ascale", "xs"],
+                    outputNames: ["xq_out", "ascale_out", "xs_out"],
+                    source: w4SwiGLUSource(tiled: true), header: header, ensureRowContiguous: true)
+            }
+        } else { kernel = w4SwiGLUKernel }
+        var inputs: [MLXArray] = [codes.xq]
+        inputs.append(contentsOf: w4CodeArrays(ops))
+        if !tiled {
+            inputs.append(contentsOf: ops.map(\.sT))
+            inputs.append(contentsOf: ops.map(\.bT))
+        }
+        inputs.append(contentsOf: [codes.ascale, codes.xs])
+        let template: [(String, any KernelTemplateArg)] = [("SPLIT", 8), ("KC", 4096)]
+        let grid: (Int, Int, Int) = (12288 / 64 * 256, 1, 1)
+        let threadGroup: (Int, Int, Int) = (256, 1, 1)
+        let outputShapes: [[Int]] = [[16 * 12288], [16 * 192], [16 * 192]]
+        let outputDTypes: [DType] = [.int8, .float32, .float32]
+        let q: [MLXArray] = kernel(
+            inputs, template: template, grid: grid, threadGroup: threadGroup,
+            outputShapes: outputShapes, outputDTypes: outputDTypes)
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 12288, group: 64)
+    }
+
+    static func w4SwiGLUAdmitted(_ ops: [W4Operands]) -> Bool {
+        ops[0].admitsSwiGLU(up: ops[1]) {
+            (try? withError {
+                var codeValues: [Int8] = [Int8](repeating: 0, count: 16 * 4096)
+                for i in codeValues.indices {
+                    let value: Int = (i * 37 + 11) % 255 - 127
+                    codeValues[i] = Int8(truncatingIfNeeded: value)
+                }
+                var scaleValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                var sumValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                for i in scaleValues.indices {
+                    let scaleNumerator: Int = 1 + i % 11
+                    let sumNumerator: Int = i % 17 - 8
+                    scaleValues[i] = Float(scaleNumerator) / Float(256)
+                    sumValues[i] = Float(sumNumerator) / Float(64)
+                }
+                let codeArray: MLXArray = MLXArray(codeValues)
+                let scaleArray: MLXArray = MLXArray(scaleValues)
+                let sumArray: MLXArray = MLXArray(sumValues)
+                let codes: W4Codes = W4Codes(
+                    xq: codeArray, ascale: scaleArray, xs: sumArray,
+                    rows: 16, K: 4096, group: 64)
+                let gu = w4Run(form: 2, tiled: w4Tiled(ops), xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                    rows: 16, K: 4096, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT), ns: [12288, 12288])
+                let finite = isFinite(concatenated(gu, axis: 1)).all()
+                eval(finite)
+                guard finite.item(Bool.self) else { return false }
+                let ref = quantGRun(gu[0], gu[1], K: 12288, rows: 16, group: 64,
+                    headMajor: false, swiglu: true, wide: false)
+                let result = w4SwiGLURun(codes, ops)
+                let candidate = [result.xq, result.ascale, result.xs]
+                let valid = isFinite(result.ascale).all() .&& isFinite(result.xs).all()
+                eval(valid)
+                guard valid.item(Bool.self) else { return false }
+                for i in 0 ..< 3 {
+                    let bits = i == 0 ? DType.uint8 : .uint32
+                    let exact = (ref[i].view(dtype: bits) .== candidate[i].view(dtype: bits)).all()
+                    eval(exact)
+                    if !exact.item(Bool.self) { return false }
+                }
+                return true
+            }) ?? false
+        }
+    }
+
+    /// The existing compact form2 body shares the raw SwiGLU store, alias and quantizer.
+    static func w4SwiGLUPair24Source(quartet: Bool, tiled: Bool = false) -> String {
+        var body = w4Pair24MLPSource(layers: 1, form: 2, narrow: false, tiled: tiled)
+        let pick = """
+            const int K = KC;
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0; int li = 0;
+            device float* out = out0; int N = ksz[2];
+            """
+        let selected = """
+            const int K = KC;
+            const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+            const device uint32_t* w = li == 0 ? w0 : w1;
+            const int N = 12288;
+            """
+        let store = """
+            for (int e = int(tid); e < ksz[1] * 32; e += SPLIT * 32) {
+              float v = 0.0f;
+              for (int q = 0; q < SPLIT; q++) { v += red[q * 512 + e]; }
+              out[(uint)(e >> 5) * N + n0 + (e & 31)] = ok ? v : as_type<float>(0x7fc00000u);
+            }
+            """
+        precondition(body.contains(pick) && body.contains(store))
+        body = body.replacingOccurrences(of: pick, with: selected)
+            .replacingOccurrences(of: w4Pair24MLPSelection(layers: 1), with: w4Pair24MLPSelection(layers: 2))
+            .replacingOccurrences(of: store, with: w4SwiGLUStore)
+            .replacingOccurrences(of: "threadgroup uint4 tiles[SPLIT * 32 * 4];", with: "")
+        if quartet {
+            let call = "df2_pair24_load(metadata, metadataBases, "
+            precondition(body.components(separatedBy: call).count == 5)
+            body = body.replacingOccurrences(of: call,
+                with: "df2_pair24_quartet_load(metadata, metadataBases, lane, ")
+        }
+        return w4SwiGLUIndexSource("""
+            threadgroup uint4 tiles[SPLIT * 32 * 4];
+            float gateValue[2];
+            float activationValue[4];
+            for (int halfTile = 0; halfTile < 2; halfTile++) {
+              for (int li = 0; li < 2; li++) {
+            \(body)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+              }
+            }
+            \(w4SwiGLUPublish)
+            \(w4SwiGLUQuant)
+            """)
+    }
+
+    static let w4SwiGLUPair24Kernels: [MLXFast.MLXFastKernel] = [false, true].map { quartet in
+        MLXFast.metalKernel(
+            name: "df2_w4g64_pair24_\(quartet ? "xor" : "scalar")_f2_gate_up_swiglu_q8_scratch_alias_index32_v1",
+            inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+            outputNames: ["xq_out", "ascale_out", "xs_out"],
+            source: w4SwiGLUPair24Source(quartet: quartet),
+            header: header + w4SwiGLUIndexSource(pair24Header + pair24QuartetHeader), ensureRowContiguous: true)
+    }
+
+    static func w4SwiGLUPair24Run(
+        _ codes: W4Codes, _ ops: [W4Operands], metadata: [W4Pair24], method: W4Pair24Method
+    ) -> W4Codes {
+        precondition(method == .compact || method == .quartet)
+        let kernel: MLXFast.MLXFastKernel
+        if w4Tiled(ops) {
+            let quartet: Bool = method == .quartet
+            let name: String = "df2_w4tg64_pair24_\(quartet ? "xor" : "scalar")_f2_gate_up_swiglu_q8_scratch_alias_index32_v1"
+            kernel = w4TiledVariant(name) { name in
+                MLXFast.metalKernel(
+                    name: name,
+                    inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+                    outputNames: ["xq_out", "ascale_out", "xs_out"],
+                    source: w4SwiGLUPair24Source(quartet: quartet, tiled: true),
+                    header: header + w4SwiGLUIndexSource(pair24Header + pair24QuartetHeader),
+                    ensureRowContiguous: true)
+            }
+        } else { kernel = w4SwiGLUPair24Kernels[method == .quartet ? 1 : 0] }
+        var inputs: [MLXArray] = [codes.xq]
+        inputs.append(contentsOf: w4CodeArrays(ops))
+        inputs.append(contentsOf: w4Pair24MLPMetadataInputs(metadata))
+        inputs.append(contentsOf: [codes.ascale, codes.xs])
+        let template: [(String, any KernelTemplateArg)] = [("SPLIT", 8), ("KC", 4096)]
+        let grid: (Int, Int, Int) = (12288 / 64 * 256, 1, 1)
+        let threadGroup: (Int, Int, Int) = (256, 1, 1)
+        let outputShapes: [[Int]] = [[16 * 12288], [16 * 192], [16 * 192]]
+        let outputDTypes: [DType] = [.int8, .float32, .float32]
+        let q: [MLXArray] = kernel(
+            inputs, template: template, grid: grid, threadGroup: threadGroup,
+            outputShapes: outputShapes, outputDTypes: outputDTypes)
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 12288, group: 64)
+    }
+
+    static func w4SwiGLUPair24Admitted(
+        _ ops: [W4Operands], metadata: [W4Pair24], method: W4Pair24Method
+    ) -> Bool {
+        ops[0].admitsPair24SwiGLU(up: ops[1], method: method) {
+            (try? withError {
+                var codeValues: [Int8] = [Int8](repeating: 0, count: 16 * 4096)
+                for i in codeValues.indices {
+                    let value: Int = (i * 37 + 11) % 255 - 127
+                    codeValues[i] = Int8(truncatingIfNeeded: value)
+                }
+                var scaleValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                var sumValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                for i in scaleValues.indices {
+                    let scaleNumerator: Int = 1 + i % 11
+                    let sumNumerator: Int = i % 17 - 8
+                    scaleValues[i] = Float(scaleNumerator) / Float(256)
+                    sumValues[i] = Float(sumNumerator) / Float(64)
+                }
+                let codeArray: MLXArray = MLXArray(codeValues)
+                let scaleArray: MLXArray = MLXArray(scaleValues)
+                let sumArray: MLXArray = MLXArray(sumValues)
+                let codes: W4Codes = W4Codes(
+                    xq: codeArray, ascale: scaleArray, xs: sumArray,
+                    rows: 16, K: 4096, group: 64)
+                let gu = w4Pair24Output(method, form: 2, narrow: false,
+                    xq: codes.xq, ascale: codes.ascale, xs: codes.xs, rows: 16,
+                    ops: ops, ns: [12288, 12288], metadata: metadata)
+                let finite = isFinite(concatenated(gu, axis: 1)).all()
+                eval(finite)
+                guard finite.item(Bool.self) else { return false }
+                let ref = quantGRun(gu[0], gu[1], K: 12288, rows: 16, group: 64,
+                    headMajor: false, swiglu: true, wide: false)
+                let result = w4SwiGLUPair24Run(codes, ops, metadata: metadata, method: method)
+                let candidate = [result.xq, result.ascale, result.xs]
+                let valid = isFinite(result.ascale).all() .&& isFinite(result.xs).all()
+                eval(valid)
+                guard valid.item(Bool.self) else { return false }
+                for i in 0 ..< 3 {
+                    let bits = i == 0 ? DType.uint8 : .uint32
+                    let exact = (ref[i].view(dtype: bits) .== candidate[i].view(dtype: bits)).all()
+                    eval(exact)
+                    if !exact.item(Bool.self) { return false }
+                }
+                return true
+            }) ?? false
+        }
+    }
+
+    /// N64 keeps each integer K64 dot and FP32 partition/fold order.
+    static func w4SwiGLUColumns64Source(_ method: W4Pair24Method) -> String {
+        precondition(method == .raw || method == .compact || method == .quartet)
+        var source = method == .raw ? w4SwiGLUSource() : w4SwiGLUPair24Source(quartet: method == .quartet)
+        func change(_ old: String, _ new: String) {
+            precondition(source.contains(old))
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        change("""
+        threadgroup uint4 tiles[SPLIT * 32 * 4];
+        """ , """
+        threadgroup uint4 tiles[SPLIT * 64 * 4];
+        """)
+        change("""
+        float gateValue[2];
+        """ , """
+        float gateValue[4];
+        """)
+        change("""
+        for (int halfTile = 0; halfTile < 2; halfTile++) {
+          for (int li = 0; li < 2; li++) {
+        """ , """
+        for (int li = 0; li < 2; li++) {
+        """)
+        change("""
+        const int bx = int(threadgroup_position_in_grid.x) * 2 + halfTile;
+        """ , """
+        const int bx = int(threadgroup_position_in_grid.x);
+        """)
+        change("""
+        const int n0 = bx * 32;
+        """ , """
+        const int n0 = bx * 64;
+        """)
+        change("""
+        matmul2d_descriptor(16, 32, 64,
+        """ , """
+        matmul2d_descriptor(16, 64, 64,
+        """)
+        change("""
+        tiles + sg * (32 * 4)
+        """ , """
+        tiles + sg * (64 * 4)
+        """)
+        change("""
+        dextents<int, 2>(64, 32)
+        """ , """
+        dextents<int, 2>(64, 64)
+        """)
+        change("""
+        bool ok = cT.get_capacity() == 16;
+        for (int i = 0; i < 16 && ok; i++) {
+          auto ids = cT.get_multidimensional_index(i);
+          ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+        }
+        """ , """
+        bool ok = true;
+        if (li == 0) {
+          const int capacity = int(cT.get_capacity());
+          bool layoutValid = capacity == 32;
+          for (int i = 0; i < 32; i++) {
+            if (i < capacity && df2_w4_n64_valid_v1(cT, i, 0)) {
+              const auto ids = cT.get_multidimensional_index(i);
+              layoutValid = layoutValid && ids[0] == nb + (i & 3) + 16 * (i >> 3)
+                  && ids[1] == mrow + 8 * ((i >> 2) & 1);
+            } else { layoutValid = false; }
+          }
+          threadgroup uint* layoutFlags = (threadgroup uint*)tiles;
+          const bool simdValid = simd_all(layoutValid);
+          if (lane == 0) { layoutFlags[sg] = simdValid ? 1u : 0u; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const bool good = layoutFlags[0] != 0 && layoutFlags[1] != 0
+              && layoutFlags[2] != 0 && layoutFlags[3] != 0
+              && layoutFlags[4] != 0 && layoutFlags[5] != 0
+              && layoutFlags[6] != 0 && layoutFlags[7] != 0;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (!good) {
+            const uint block = threadgroup_position_in_grid.x;
+            for (uint e = tid; e < 1024u; e += 256u) {
+              xq_out[(e >> 6) * 12288u + block * 64u + (e & 63u)] = char(0);
+            }
+            if (tid < 16u) {
+              ascale_out[tid * 192u + block] = as_type<float>(0x7fc00000u);
+              xs_out[tid * 192u + block] = as_type<float>(0x7fc00000u);
+            }
+            return;
+          }
+        }
+        """)
+        change("""
+        float acc[16], accb[16];
+        """ , """
+        float acc[32], accb[32];
+        """)
+        change("""
+        for (int i = 0; i < 16; i++)
+        """ , """
+        for (int i = 0; i < 32; i++)
+        """)
+        change("""
+        uint4 wv[2];
+        """ , """
+        uint4 wv[4];
+        """)
+        change("""
+        for (int p = 0; p < 2; p++)
+        """ , """
+        for (int p = 0; p < 4; p++)
+        """)
+        change("""
+        const half4 cs0 = ps0, cs1 = ps1;
+        """ , """
+        const half4 cs0 = ps0, cs1 = ps1, cs2 = ps2, cs3 = ps3;
+        """)
+        change("""
+        const half4 co0 = po0, co1 = po1;
+        """ , """
+        const half4 co0 = po0, co1 = po1, co2 = po2, co3 = po3;
+        """)
+        change("""
+        const float4 s0v = float4(cs0), s1v = float4(cs1);
+        """ , """
+        const float4 s0v = float4(cs0), s1v = float4(cs1), s2v = float4(cs2), s3v = float4(cs3);
+        """)
+        change("""
+        const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
+        """ , """
+        const float4 b1v = fma(float4(8.0f), s1v, float4(co1));
+            const float4 b2v = fma(float4(8.0f), s2v, float4(co2));
+            const float4 b3v = fma(float4(8.0f), s3v, float4(co3));
+        """)
+        change("""
+        (i >> 3) ? b1v[j] : b0v[j]
+        """ , """
+        (i >> 3) == 0 ? b0v[j] : ((i >> 3) == 1 ? b1v[j] : ((i >> 3) == 2 ? b2v[j] : b3v[j]))
+        """)
+        change("""
+        (i >> 3) ? s1v[j] : s0v[j]
+        """ , """
+        (i >> 3) == 0 ? s0v[j] : ((i >> 3) == 1 ? s1v[j] : ((i >> 3) == 2 ? s2v[j] : s3v[j]))
+        """)
+        change("""
+        for (int i = 0; i < 32; i++) {
+          const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+          red[sg * 512 + m * 32 + n] = acc[i] + accb[i];
+        }
+        """ , """
+        for (int i = 0; i < 32; i++) {
+          const int m = mrow + 8 * ((i >> 2) & 1), n = nb + (i & 3) + 16 * (i >> 3);
+          red[sg * 1024 + m * 64 + n] = acc[i] + accb[i];
+        }
+        """)
+        change("""
+        for (int e = int(tid); e < 16 * 32; e += SPLIT * 32) {
+          float v = 0.0f;
+          for (int q = 0; q < SPLIT; q++) { v += red[q * (16 * 32) + e]; }
+          const float value = ok ? v : as_type<float>(0x7fc00000u);
+          if (li == 0) { gateValue[e / (SPLIT * 32)] = value; }
+          else {
+            const float a = gateValue[e / (SPLIT * 32)];
+            activationValue[2 * halfTile + e / (SPLIT * 32)] = a / (1.0f + metal::exp(-a)) * value;
+          }
+        }
+        """ , """
+        for (int e = int(tid); e < 16 * 64; e += SPLIT * 32) {
+          float v = 0.0f;
+          for (int q = 0; q < SPLIT; q++) { v += red[q * (16 * 64) + e]; }
+          const float value = ok ? v : as_type<float>(0x7fc00000u);
+          if (li == 0) { gateValue[e / (SPLIT * 32)] = value; }
+          else {
+            const float a = gateValue[e / (SPLIT * 32)];
+            activationValue[e / (SPLIT * 32)] = a / (1.0f + metal::exp(-a)) * value;
+          }
+        }
+        """)
+        change("""
+        #undef HI
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+        """ , """
+        #undef HI
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """)
+        change("""
+        threadgroup float* activated = (threadgroup float*)tiles;
+        const uint publishTid = thread_position_in_threadgroup.x;
+        for (int halfTile = 0; halfTile < 2; halfTile++) {
+          for (int e = int(publishTid); e < 16 * 32; e += SPLIT * 32) {
+            activated[(e >> 5) * 64 + halfTile * 32 + (e & 31)] = activationValue[2 * halfTile + e / (SPLIT * 32)];
+          }
+        }
+        """ , """
+        threadgroup float* activated = (threadgroup float*)tiles;
+        const uint publishTid = thread_position_in_threadgroup.x;
+        for (int e = int(publishTid); e < 16 * 64; e += SPLIT * 32) {
+          activated[e] = activationValue[e / (SPLIT * 32)];
+        }
+        """)
+        if method == .raw {
+            change("""
+            half4 ps0 = *(const device half4*)(sc + (uint)sg * N), ps1 = *(const device half4*)(sc + (uint)sg * N + 16);
+            """ , """
+            half4 ps0 = *(const device half4*)(sc + (uint)sg * N), ps1 = *(const device half4*)(sc + (uint)sg * N + 16);
+            half4 ps2 = *(const device half4*)(sc + (uint)sg * N + 32), ps3 = *(const device half4*)(sc + (uint)sg * N + 48);
+            """)
+            change("""
+            half4 po0 = *(const device half4*)(oc + (uint)sg * N), po1 = *(const device half4*)(oc + (uint)sg * N + 16);
+            """ , """
+            half4 po0 = *(const device half4*)(oc + (uint)sg * N), po1 = *(const device half4*)(oc + (uint)sg * N + 16);
+            half4 po2 = *(const device half4*)(oc + (uint)sg * N + 32), po3 = *(const device half4*)(oc + (uint)sg * N + 48);
+            """)
+            change("""
+            ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
+            """ , """
+            ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
+            ps2 = *(const device half4*)(sc + r + 32); ps3 = *(const device half4*)(sc + r + 48);
+            """)
+            change("""
+            po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
+            """ , """
+            po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
+            po2 = *(const device half4*)(oc + r + 32); po3 = *(const device half4*)(oc + r + 48);
+            """)
+        } else {
+            let call = method == .quartet
+                ? "df2_pair24_quartet_load(metadata, metadataBases, lane, "
+                : "df2_pair24_load(metadata, metadataBases, "
+            change("half4 ps0, ps1, po0, po1;", "half4 ps0, ps1, ps2, ps3, po0, po1, po2, po3;")
+            change(call + "(uint)sg * N / 4 + tile + 4, ps1, po1);",
+                call + "(uint)sg * N / 4 + tile + 4, ps1, po1);\n"
+                + call + "(uint)sg * N / 4 + tile + 8, ps2, po2);\n"
+                + call + "(uint)sg * N / 4 + tile + 12, ps3, po3);")
+            change(call + "r / 4 + tile + 4, ps1, po1);",
+                call + "r / 4 + tile + 4, ps1, po1);\n"
+                + call + "r / 4 + tile + 8, ps2, po2);\n"
+                + call + "r / 4 + tile + 12, ps3, po3);")
+        }
+        precondition(!source.contains("halfTile"))
+        return source
+    }
+
+    static let w4SwiGLUColumns64ValidityHeader = """
+        template<typename T>
+        inline auto df2_w4_n64_valid_v1(const thread T& tensor, int i, int)
+            -> decltype(tensor.is_valid_element(i), bool()) {
+          return bool(tensor.is_valid_element(i));
+        }
+        template<typename T>
+        inline bool df2_w4_n64_valid_v1(const thread T&, int, long) { return false; }
+        """
+
+    static let w4SwiGLUColumns64Kernels: [MLXFast.MLXFastKernel] = (0 ... 2).map { index in
+        let method: W4Pair24Method = W4Pair24Method(rawValue: index)!
+        return MLXFast.metalKernel(
+            name: "df2_w4g64_f2_swiglu_n64_v1_m\(index)",
+            inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs"],
+            outputNames: ["xq_out", "ascale_out", "xs_out"],
+            source: w4SwiGLUColumns64Source(method),
+            header: header + w4SwiGLUIndexSource(pair24Header + pair24QuartetHeader) + w4SwiGLUColumns64ValidityHeader,
+            ensureRowContiguous: true)
+    }
+
+    static func w4SwiGLUColumns64Run(
+        _ codes: W4Codes, _ ops: [W4Operands], metadata: [W4Pair24]?, method: W4Pair24Method
+    ) -> W4Codes {
+        let kernel: MLXFast.MLXFastKernel = w4SwiGLUColumns64Kernels[method.rawValue]
+        var inputs: [MLXArray] = [codes.xq]
+        inputs.append(contentsOf: ops.map(\.w))
+        if method == .raw {
+            inputs.append(contentsOf: ops.map(\.sT))
+            inputs.append(contentsOf: ops.map(\.bT))
+        } else {
+            inputs.append(contentsOf: w4Pair24MLPMetadataInputs(metadata!))
+        }
+        inputs.append(contentsOf: [codes.ascale, codes.xs])
+        let template: [(String, any KernelTemplateArg)] = [("SPLIT", 8), ("KC", 4096)]
+        let grid: (Int, Int, Int) = (192 * 256, 1, 1)
+        let threadGroup: (Int, Int, Int) = (256, 1, 1)
+        let shapes: [[Int]] = [[16 * 12288], [16 * 192], [16 * 192]]
+        let types: [DType] = [.int8, .float32, .float32]
+        let q: [MLXArray] = kernel(inputs, template: template, grid: grid, threadGroup: threadGroup,
+            outputShapes: shapes, outputDTypes: types)
+        return W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 12288, group: 64)
+    }
+
+    static func w4SwiGLUColumns64Admitted(
+        _ ops: [W4Operands], metadata: [W4Pair24]?, method: W4Pair24Method
+    ) -> Bool {
+        ops[0].admitsColumns64SwiGLU(up: ops[1], method: method) {
+            (try? withError {
+                var codeValues: [Int8] = [Int8](repeating: 0, count: 16 * 4096)
+                for i in codeValues.indices {
+                    let value: Int = (i * 37 + 11) % 255 - 127
+                    codeValues[i] = Int8(truncatingIfNeeded: value)
+                }
+                var scaleValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                var sumValues: [Float] = [Float](repeating: 0, count: 16 * 64)
+                for i in scaleValues.indices {
+                    let scaleNumerator: Int = 1 + i % 11
+                    let sumNumerator: Int = i % 17 - 8
+                    scaleValues[i] = Float(scaleNumerator) / Float(256)
+                    sumValues[i] = Float(sumNumerator) / Float(64)
+                }
+                let codeArray: MLXArray = MLXArray(codeValues)
+                let scaleArray: MLXArray = MLXArray(scaleValues)
+                let sumArray: MLXArray = MLXArray(sumValues)
+                let codes: W4Codes = W4Codes(
+                    xq: codeArray, ascale: scaleArray, xs: sumArray,
+                    rows: 16, K: 4096, group: 64)
+                let original: W4Codes
+                if let metadata, method != .raw {
+                    original = w4SwiGLUPair24Run(codes, ops, metadata: metadata, method: method)
+                } else {
+                    original = w4SwiGLURun(codes, ops)
+                }
+                let candidate: W4Codes = w4SwiGLUColumns64Run(codes, ops, metadata: metadata, method: method)
+                let references: [MLXArray] = [original.xq, original.ascale, original.xs]
+                let results: [MLXArray] = [candidate.xq, candidate.ascale, candidate.xs]
+                let finiteA: MLXArray = isFinite(original.ascale).all()
+                let finiteB: MLXArray = isFinite(original.xs).all()
+                let finiteC: MLXArray = isFinite(candidate.ascale).all()
+                let finiteD: MLXArray = isFinite(candidate.xs).all()
+                let finite: MLXArray = finiteA .&& finiteB .&& finiteC .&& finiteD
+                eval(finite)
+                guard finite.item(Bool.self) else { return false }
+                for i in 0 ..< 3 {
+                    let bits: DType = i == 0 ? .uint8 : .uint32
+                    let a: MLXArray = references[i].view(dtype: bits)
+                    let c: MLXArray = results[i].view(dtype: bits)
+                    let exact: MLXArray = (a .== c).all()
+                    eval(exact)
+                    if !exact.item(Bool.self) { return false }
+                }
+                return true
+            }) ?? false
+        }
+    }
+
+    /// Exact normal form2 gate/up; retain the chosen metadata decoder and original fallback.
+    static func w4SwiGLUCodes(
+        _ x: MLXArray, gate: Linear, up: Linear,
+        conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)?
+    ) -> W4Codes? {
+        guard on, w4Group == 64, split == 8, x.dim(-1) == 4096, x.size / 4096 == 16,
+            w4SelectedForm == 2,
+            !DF2WideLanes.serves(.init(kind: .quantG, dtype: .float32, dtype2: .float32,
+                k: 12288, group: 64, flag: 1)),
+            let g = w4Operands(gate, group: 64), let u = w4Operands(up, group: 64),
+            g.k == 4096, u.k == 4096, g.n == 12288, u.n == 12288,
+            !w4Recording
+        else { return nil }
+        let ops = [g, u], ns = [12288, 12288]
+        let tiled: Bool = w4Tiled(ops)
+        guard w4FormsFit(K: g.k, rows: 16, ns: ns) else { return nil }
+        let metadata = w4Pair24MLPMetadata(ops)
+        let method = metadata.map {
+            w4Pair24Selected(ops, ns: ns, metadata: $0, form: 2, narrow: false).full16
+        } ?? .raw
+        if method == .raw {
+            guard w4SwiGLUAdmitted(ops) else { return nil }
+        } else {
+            guard let metadata, method == .compact || method == .quartet,
+                w4SwiGLUPair24Admitted(ops, metadata: metadata, method: method)
+            else { return nil }
+        }
+        let columns64: Bool = !tiled && w4SwiGLUColumns64Admitted(ops, metadata: metadata, method: method)
+        let codes: W4Codes
+        if let conv0 {
+            let wide = DF2WideLanes.serves(.init(kind: .quantGConv0, dtype: conv0.n.dtype,
+                dtype2: conv0.dyn.dtype, k: 4096, group: 64, flag: conv0.base.dtype == .float32 ? 0 : 1))
+            let q = conv0Run(conv0.n.reshaped([16, 4096]), dyn: conv0.dyn, base: conv0.base,
+                K: 4096, rows: 16, group: 64, wide: wide)
+            codes = W4Codes(xq: q[0], ascale: q[1], xs: q[2], rows: 16, K: 4096, group: 64)
+        } else {
+            guard let q = w4Quant(x, up: nil, group: 64, headMajor: false) else { return nil }
+            codes = q
+        }
+        if columns64 {
+            return w4SwiGLUColumns64Run(codes, ops, metadata: metadata, method: method)
+        }
+        if let metadata, method != .raw {
+            return w4SwiGLUPair24Run(codes, ops, metadata: metadata, method: method)
+        }
+        return w4SwiGLURun(codes, ops)
+    }
+
     /// The compact metadata a launch reads (the record's choice), or nil for the plain kernels.
     static func w4LaunchMetadata(_ ops: [W4Operands], K: Int, rows: Int, group: Int) -> [W4Pair24]? {
         if group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
@@ -5521,35 +6252,16 @@ enum DF2Fast {
 
     private static var selectorLookupSentinel: MLXArray { MLXArray([UInt16(0)]) }
 
-    /// `topk` over `[..., V]` logits: `[P, 128]` ids and values. The selectors
-    /// read only these pairs, in any order.
-    static func top(_ logits: MLXArray) -> [MLXArray] {
-        let V = logits.dim(-1), P = logits.size / V
-        return topk(
-            [logits.reshaped([P, V]).asType(.float32)],
-            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
-    }
-
-    /// The ids of `top`, for the draft-head screen's partial scores.
-    static func shortlist(_ partial: MLXArray) -> MLXArray { top(partial)[0] }
-
     /// Fused top-16 + greedy selector for `selectGreedy` (B = 1).
     static func select(
         logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> MLXArray {
-        select(
-            top: top(logits), projected: projected, anchor: anchor, pred: pred, succ: succ,
-            predLookup: predLookup, succLookup: succLookup)
-    }
-
-    /// `select` on precomputed `top` pairs.
-    static func select(
-        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
-        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
-    ) -> MLXArray {
-        let P = top[0].dim(0)
+        let V = logits.dim(-1), P = logits.size / V
+        let top = topk(
+            [logits.reshaped([P, V]).asType(.float32)],
+            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
         let path = selector(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
@@ -5570,6 +6282,25 @@ enum DF2Fast {
         else { return nil }
         return String(s[s.index(after: a.lowerBound) ..< b.upperBound])
     }()
+
+    static let treeRejectSource = """
+            if (tid == 0) {
+              for (int i = 0; i < P; i++) { tokens[i] = anchor[0]; }
+              for (int t = 0; t < 16; t++) {
+                desc[t] = t == 0 || t > TREE_NODES ? -1 : t - 1;
+                desc[16 + t] = t <= TREE_NODES ? t : 0;
+                for (int d = 0; d < 16; d++) {
+                  desc[32 + 16 * t + d] = t <= TREE_NODES && d <= t ? d : -1;
+                }
+              }
+              for (int n = 0; n < 15; n++) {
+                desc[288 + 3 * n] = n < TREE_NODES ? n : -1;
+                desc[289 + 3 * n] = n < TREE_NODES ? 0 : -1;
+                desc[290 + 3 * n] = n < TREE_NODES ? n - 1 : -1;
+              }
+            }
+            return;
+            """
 
     /// Dynamic draft tree (EAGLE-2 style) in place of the greedy walk, `TREE_NODES` nodes for
     /// one 16-row verify. Each expanded node (the anchor first) scores its 16 candidates at the
@@ -5608,8 +6339,12 @@ enum DF2Fast {
               if (p < P) {
                 for (uint j = sg; j < 16u; j += NSG) {
                   const int c = tc[p][j];
+                  if (c < 0 || c >= VOCAB_LIMIT) {
+                    if (lane == 0) { tev[j] = as_type<float>(0x7fc00000u); }
+                  } else {
             \(edge)\
-                  if (lane == 0) { tev[j] = tu[p][j] + acc; }
+                    if (lane == 0) { tev[j] = tu[p][j] + acc; }
+                  }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid < 16u) {
@@ -5645,10 +6380,18 @@ enum DF2Fast {
               for (uint g = 1; g < NSG; g++) {
                 if (rv[g] > wv || (rv[g] == wv && ri[g] < ws)) { wv = rv[g]; ws = ri[g]; }
               }
+              if (ws < 0 || ws >= 16 * (e + 1)
+                  || (as_type<uint>(wv) & 0x7f800000u) == 0x7f800000u) {
+            \(treeRejectSource)
+              }
               const int pe = ws / 16 - 1;
               pj = ws % 16;
               pd = pe < 0 ? 0 : nd[pe] + 1;
-              pr = tc[pd][pj];
+              const int nextToken = tc[pd][pj];
+              if (nextToken < 0 || nextToken >= VOCAB_LIMIT) {
+            \(treeRejectSource)
+              }
+              pr = nextToken;
               pp = wv;
               threadgroup_barrier(mem_flags::mem_threadgroup);
               if (tid == 0) { nd[e] = pd; nj[e] = pj; npar[e] = pe; fprob[ws] = NEG; }
@@ -5722,24 +6465,18 @@ enum DF2Fast {
         logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
-        selectTree(
-            top: top(logits), projected: projected, anchor: anchor, pred: pred, succ: succ,
-            predLookup: predLookup, succLookup: succLookup)
-    }
-
-    /// `selectTree` on precomputed `top` pairs.
-    static func selectTree(
-        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
-        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
-    ) -> (MLXArray, MLXArray) {
-        let P = top[0].dim(0)
+        let V = logits.dim(-1), P = logits.size / V
         precondition(P == 15, "DF2 tree: block of \(P) positions")
+        let top = topk(
+            [logits.reshaped([P, V]).asType(.float32)],
+            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
         let threads = 512
         let outs = treeSelector!(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
             template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil),
-                ("TREE_NODES", 15)],
+                ("TREE_NODES", 15), ("VOCAB_LIMIT", V)],
             grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[P], [333]], outputDTypes: [.int32, .int32])
         return (outs[0].reshaped([1, P]), outs[1])
