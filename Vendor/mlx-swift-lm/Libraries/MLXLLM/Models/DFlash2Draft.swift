@@ -6197,7 +6197,9 @@ enum DF2WideLaneSource {
     }
 
     /// Group max, sequential group sum and int8 codes of `nv[e]`; scale and sum land at `row * G + group`.
-    static func tail(e: Int, row: String, group: String, base: String) -> String {
+    /// Only plain e8 quantG advances every lane: final-lane ordered prefix is unchanged.
+    /// SwiGLU, head-major and all fused families retain their original masked chain.
+    static func tail(e: Int, row: String, group: String, base: String, ordinaryPipeline: Bool = false) -> String {
         """
         for (int s = 1; s < (KG / \(e)); s <<= 1) {
           local_amax = max(local_amax, simd_shuffle_xor(local_amax, ushort(s)));
@@ -6207,7 +6209,7 @@ enum DF2WideLaneSource {
           if (step > 0) {
             seq_sum = simd_shuffle_up(seq_sum, 1);
           }
-          if ((int(lane) & ((KG / \(e)) - 1)) == step) {
+          if (\(ordinaryPipeline && e == 8 ? "(!SWIGLU && !HEAD_MAJOR) || " : "")(int(lane) & ((KG / \(e)) - 1)) == step) {
             for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
           }
         }
@@ -6296,7 +6298,7 @@ enum DF2WideLaneSource {
                   local_amax = max(local_amax, fabs(a));
                 }
 
-                """ + tail(e: e, row: "m", group: "g", base: "dstBase")
+                """ + tail(e: e, row: "m", group: "g", base: "dstBase", ordinaryPipeline: true)
         case .quantGConv0:
             return """
                 const int K = ksz[0]; const int R = ksz[1]; const int G = K / KG;
