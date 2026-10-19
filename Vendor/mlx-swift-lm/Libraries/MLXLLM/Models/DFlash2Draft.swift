@@ -1897,6 +1897,15 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
+            if DF2Fast.treeOn, blockSize == 16 {
+                let (tokens, desc) = DF2Fast.selectTree(
+                    logits: try logits(hidden), projected: projected,
+                    anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
+                    succ: sel.successorCodebook,
+                    predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
+                CBv2BranchVerify.register(tokens: tokens, desc: desc)
+                return tokens
+            }
             return DF2Fast.select(
                 logits: try logits(hidden), projected: projected,
                 anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
@@ -4064,7 +4073,9 @@ enum DF2Fast {
     static let selector = MLXFast.metalKernel(
         name: "df2_selector_mb8", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
         outputNames: ["path"],
-        source: """
+        source: selectorSource)
+
+    static let selectorSource = """
             const uint tid = thread_position_in_threadgroup.x;
             const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
             const int P = int(cand_shape[0]);
@@ -4149,7 +4160,7 @@ enum DF2Fast {
               pr = tc[p][best];
               if (tid == 0) { path[p] = pr; }
             }
-            """)
+            """
 
     private static var selectorLookupSentinel: MLXArray { MLXArray([UInt16(0)]) }
 
@@ -4170,6 +4181,168 @@ enum DF2Fast {
             grid: (512, 1, 1), threadGroup: (512, 1, 1),
             outputShapes: [[P]], outputDTypes: [.int32])[0]
         return path.reshaped([1, P])
+    }
+
+    /// The selector's edge sum for predecessor token `pr` and candidate `c` at position `p`,
+    /// cut verbatim from `selectorSource` (nil when the cut points are not found once each).
+    static let selectorEdgeText: String? = {
+        let s = selectorSource
+        let from = "\n  uint predBase = 0u, succBase = 0u;\n"
+        let to = "\n  acc = simd_sum(acc);\n"
+        guard s.components(separatedBy: from).count == 2, s.components(separatedBy: to).count == 2,
+            let a = s.range(of: from), let b = s.range(of: to), a.lowerBound < b.lowerBound
+        else { return nil }
+        return String(s[s.index(after: a.lowerBound) ..< b.upperBound])
+    }()
+
+    /// Dynamic draft tree (EAGLE-2 style) in place of the greedy walk, `TREE_NODES` nodes for
+    /// one 16-row verify. Each expanded node (the anchor first) scores its 16 candidates at the
+    /// next position with the selector's own ev (unary + the selector's edge sum, same lane
+    /// code) and gives each child its parent's path probability times the softmax of those 16
+    /// scores; the frontier node with the highest path probability (lowest insertion slot on a
+    /// tie) is expanded next. Rows: 0 = anchor, then the nodes in DFS preorder, children in
+    /// expansion order (a chain is the identity). Outputs `tokens` [15] (row order) and `desc`
+    /// int32 [333]: parent row [16], depth [16] (anchor 0), ancestor row by depth [16][16]
+    /// (-1 past the row's depth), then (depth, candidate, parent) per node in expansion order.
+    static let treeSource: String? = selectorEdgeText.flatMap { edge -> String? in
+        let s = selectorSource
+        guard let cut = s.range(of: "\nthreadgroup float ev[2][16];\n") else { return nil }
+        let merge = String(s[...cut.lowerBound])
+        let loop = "for (int p = int(sg); p < P; p += 16) {"
+        guard merge.components(separatedBy: loop).count == 2 else { return nil }
+        return merge.replacingOccurrences(of: loop, with: "for (int p = int(sg); p < P; p += int(NSG)) {")
+            .replacingOccurrences(
+                of: "const int P = int(cand_shape[0]);",
+                with: "const int P = int(cand_shape[0]);\nconst uint NSG = simdgroups_per_threadgroup;\nconst uint NT = threads_per_threadgroup.x;")
+            + """
+            threadgroup float fprob[256];
+            threadgroup float tev[16];
+            threadgroup float rv[32];
+            threadgroup int ri[32];
+            threadgroup int nd[16], nj[16], npar[16];
+            for (uint s = tid; s < 256u; s += NT) { fprob[s] = NEG; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int pr = anchor[0];
+            int pj = -1;
+            int pd = -1;
+            float pp = 1.0f;
+            for (int e = 0; e < TREE_NODES; e++) {
+              const int p = pd + 1;
+              if (p < P) {
+                for (uint j = sg; j < 16u; j += NSG) {
+                  const int c = tc[p][j];
+            \(edge)\
+                  if (lane == 0) { tev[j] = tu[p][j] + acc; }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < 16u) {
+                  float mx = tev[0];
+                  for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
+                  float z = 0.0f, mine = 0.0f;
+                  for (int c = 0; c < 16; c++) {
+                    const float x = metal::precise::exp(tev[c] - mx);
+                    z += x;
+                    if (c == int(tid)) { mine = x; }
+                  }
+                  fprob[16 * e + int(tid)] = pp * (mine / z);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              float bv = NEG;
+              int bs = 0x7fffffff;
+              for (uint s = tid; s < uint(16 * (e + 1)); s += NT) {
+                const float v = fprob[s];
+                if (v > bv) { bv = v; bs = int(s); }
+              }
+              const float m = simd_max(bv);
+              const int ms = simd_min(bv == m ? bs : 0x7fffffff);
+              if (lane == 0) { rv[sg] = m; ri[sg] = ms; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              float wv = rv[0];
+              int ws = ri[0];
+              for (uint g = 1; g < NSG; g++) {
+                if (rv[g] > wv || (rv[g] == wv && ri[g] < ws)) { wv = rv[g]; ws = ri[g]; }
+              }
+              const int pe = ws / 16 - 1;
+              pj = ws % 16;
+              pd = pe < 0 ? 0 : nd[pe] + 1;
+              pr = tc[pd][pj];
+              pp = wv;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (tid == 0) { nd[e] = pd; nj[e] = pj; npar[e] = pe; fprob[ws] = NEG; }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+              int order[16];
+              int row[16];
+              int stk[16];
+              int sp = 0, cnt = 0;
+              for (int n = TREE_NODES - 1; n >= 0; n--) { if (npar[n] < 0) { stk[sp++] = n; } }
+              while (sp > 0) {
+                const int u = stk[--sp];
+                order[cnt++] = u;
+                for (int n = TREE_NODES - 1; n > u; n--) { if (npar[n] == u) { stk[sp++] = n; } }
+              }
+              for (int i = 0; i < TREE_NODES; i++) { row[order[i]] = i + 1; }
+              int par[16];
+              int dep[16];
+              par[0] = -1;
+              dep[0] = 0;
+              for (int i = 0; i < TREE_NODES; i++) {
+                const int u = order[i];
+                tokens[i] = tc[nd[u]][nj[u]];
+                par[i + 1] = npar[u] < 0 ? 0 : row[npar[u]];
+                dep[i + 1] = nd[u] + 1;
+              }
+              for (int t = 0; t < 16; t++) {
+                desc[t] = t <= TREE_NODES ? par[t] : -1;
+                desc[16 + t] = t <= TREE_NODES ? dep[t] : 0;
+                for (int d = 0; d < 16; d++) { desc[32 + 16 * t + d] = -1; }
+                if (t <= TREE_NODES) {
+                  int x = t;
+                  for (int d = dep[t]; d >= 0; d--) { desc[32 + 16 * t + d] = x; x = par[x]; }
+                }
+              }
+              for (int n = 0; n < 15; n++) {
+                desc[288 + 3 * n] = n < TREE_NODES ? nd[n] : -1;
+                desc[289 + 3 * n] = n < TREE_NODES ? nj[n] : -1;
+                desc[290 + 3 * n] = n < TREE_NODES ? npar[n] : -1;
+              }
+            }
+            """
+    }
+
+    static let treeSelector: MLXFast.MLXFastKernel? = treeSource.map {
+        MLXFast.metalKernel(
+            name: "df2_tree_mb8",
+            inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+            outputNames: ["tokens", "desc"], source: $0)
+    }
+
+    /// Verify a draft tree instead of the greedy chain; `DARKBLOOM_BONSAI_TREE=0` keeps the chain.
+    static let treeOn: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE"] != "0"
+        && treeSelector != nil
+
+    /// Top-16 + the dynamic tree for one block: `(tokens [1, 15], desc [333])`.
+    static func selectTree(
+        logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
+        let V = logits.dim(-1), P = logits.size / V
+        precondition(P == 15, "DF2 tree: block of \(P) positions")
+        let top = topk(
+            [logits.reshaped([P, V]).asType(.float32)],
+            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
+        let threads = 512
+        let outs = treeSelector!(
+            [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
+             predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
+            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil),
+                ("TREE_NODES", 15)],
+            grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[P], [333]], outputDTypes: [.int32, .int32])
+        return (outs[0].reshaped([1, P]), outs[1])
     }
 }
 
@@ -4202,6 +4375,15 @@ public final class DFlash2ContextProjection {
         let anchorEmbedding: MLXArray
         let context: MLXArray
         let contextKV: [(MLXArray, MLXArray)]
+    }
+
+    /// The projection of the verify columns `rows` (a draft tree's accepted path), in order.
+    func gathered(_ rows: [Int32]) -> DFlash2ContextProjection {
+        let index = MLXArray(rows)
+        return DFlash2ContextProjection(
+            anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
+            context: context.take(index, axis: 1),
+            contextKV: contextKV.map { ($0.0.take(index, axis: 1), $0.1.take(index, axis: 1)) })
     }
 
     func use(rows: Int) -> Use {

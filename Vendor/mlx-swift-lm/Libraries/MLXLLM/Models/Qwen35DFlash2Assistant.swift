@@ -518,8 +518,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.preparedLookup = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
-        // Armed by this round's `projectRoundContext` (no rows committed yet).
-        let projection = state.projectionRows == 0 ? state.projection : nil
+        // Armed by this round's `projectRoundContext` (no rows committed yet). A draft tree's
+        // accepted path keeps the projection of its own columns.
+        let treePath = CBv2BranchVerify.committedRows
+        let projection = (state.projectionRows == 0 ? state.projection : nil).map { p in
+            treePath.map { p.gathered($0) } ?? p
+        }
         let pendingWasEmpty = state.pending.isEmpty
         state.projection = nil
         state.projectionRows = 0
