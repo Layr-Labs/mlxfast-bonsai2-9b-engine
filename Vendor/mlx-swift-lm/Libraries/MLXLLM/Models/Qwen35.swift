@@ -5912,7 +5912,6 @@ extension Qwen35TextModel: DFlash2TapTarget {
         {
             eval(fused.ids, fused.values, fused.residual)
         }
-        HadamardQuantizedLinear.prepareSharedVerifyWeights()
     }
 }
 

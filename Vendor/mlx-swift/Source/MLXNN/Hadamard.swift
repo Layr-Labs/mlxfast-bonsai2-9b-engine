@@ -3875,166 +3875,6 @@ enum PromptInt8Matmul {
     /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its
     /// register-weight forms `naxRegBody` and `naxRegCols128Source`. Each names its kernels (index `layers - 1`), its
     /// threads per threadgroup and its rows and columns per threadgroup.
-    // Read the same immutable C16 copies as verify. Each uint4 still expands
-    // into exactly the canonical staged B bytes. Independent allocations keep
-    // MLX's command-buffer grouping by input buffer unchanged.
-    private static let streamedSgBody: String = {
-        let first = naxSgBody.range(of: "        const int sc =")
-        // Multiline-string indentation is stripped by Swift.
-        let start = first ?? naxSgBody.range(of: "const int sc =")!
-        let end = naxSgBody.range(of: "const int nb =", range: start.lowerBound ..< naxSgBody.endIndex)!
-        let stage = """
-            const uint pl = tid & 31u;
-            const uint tile = tid >> 5;
-            const uint kj = pl & 7u;
-            const uint nc = pl >> 3;
-            auto stage = [&](int g, int buf) {
-              const elem_index at = ((elem_index)(n0 / 16 + int(tile)) * Kg + g) * 128
-                  + pl * 4u;
-              const uint4 v = *(const device uint4*)(w + at);
-              #pragma clang loop unroll(full)
-              for (int j = 0; j < 4; j++) {
-                const uint col = tile * 16u + uint(j) * 4u + nc;
-                threadgroup uint32_t* dst = bs[buf] + col * 32u + kj * 4u;
-                const uint wv = v[j];
-                *(threadgroup uint4*)dst = uint4(wv & 0x03030303u,
-                    (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
-              }
-            };
-
-            """
-        return naxSgBody.replacingCharacters(in: start.lowerBound ..< end.lowerBound, with: stage)
-    }()
-
-    private static let streamedSgKernels = (1 ... 3).map { layers in
-        MLXFast.metalKernel(
-            name: "bonsai_q8_prompt_ms1b_c16_sg\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: naxSgSource(layers: layers, body: streamedSgBody),
-            header: naxHeader, ensureRowContiguous: true)
-    }
-
-    private final class StreamPair {
-        weak var canonical: MLXArray?
-        weak var packed: MLXArray?
-        init(_ canonical: MLXArray, _ packed: MLXArray) {
-            self.canonical = canonical
-            self.packed = packed
-        }
-    }
-    private final class StreamTable: @unchecked Sendable {
-        let lock = NSLock()
-        var pairs: [ObjectIdentifier: StreamPair] = [:]
-    }
-    private static let streamTable = StreamTable()
-    // Opt-in: the prompt route keeps its own matched sg form and the stored
-    // words unless DARKBLOOM_BONSAI_PREFILL_STREAM=1.
-    private static let streamPromptAllowed = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_PREFILL_STREAM"] == "1"
-    private static let checkStreamActual = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_PREFILL_STREAM_CHECK"] == "1"
-    nonisolated(unsafe) private static var streamPromptReady = false
-    nonisolated(unsafe) private static var streamPromptPrepared = false
-    nonisolated(unsafe) private static var streamPromptError = false
-    nonisolated(unsafe) private static var streamPromptNoted = false
-
-    static func registerStream(_ weight: MLXArray, packed: MLXArray) {
-        streamTable.lock.lock()
-        defer { streamTable.lock.unlock() }
-        if streamTable.pairs.count > 1024 {
-            streamTable.pairs = streamTable.pairs.filter { $0.value.canonical != nil && $0.value.packed != nil }
-        }
-        streamTable.pairs[ObjectIdentifier(weight)] = StreamPair(weight, packed)
-    }
-
-    private static func promptStream(_ weight: MLXArray, m: Int, k: Int) -> MLXArray? {
-        guard streamPromptReady, m >= 64, m % 64 == 0, k >= 128, k % 128 == 0,
-            weight.dim(0) > 0, weight.dim(0) % 64 == 0
-        else { return nil }
-        streamTable.lock.lock()
-        defer { streamTable.lock.unlock() }
-        guard let pair = streamTable.pairs[ObjectIdentifier(weight)], pair.canonical === weight else { return nil }
-        return pair.packed
-    }
-
-    private static func streamOutputs(_ outputs: [MLXArray], reference: () -> [MLXArray]) -> [MLXArray] {
-        if !streamPromptNoted {
-            streamPromptNoted = true
-            FileHandle.standardError.write(Data("prompt shared verify weights: active\n".utf8))
-        }
-        guard checkStreamActual else { return outputs }
-        let original = reference()
-        let checks: [MLXArray] = zip(original, outputs).map { a, b in
-            MLX.all(a.view(dtype: .uint32) .== b.view(dtype: .uint32))
-        }
-        eval(checks)
-        let matched = checks.allSatisfy { $0.item(Bool.self) }
-        FileHandle.standardError.write(Data("prompt streamed real: \(matched ? "passed" : "FAILED") \(outputs.map { $0.shape })\n".utf8))
-        if !matched { streamPromptReady = false }
-        return matched ? outputs : original
-    }
-
-    static func prepareStreaming() {
-        guard !streamPromptPrepared else { return }
-        streamPromptPrepared = true
-        guard streamPromptAllowed, VerifyInt8Matmul.streamReady, route == .nax, naxSg else { return }
-        var allMatched = true
-        for k in [4096, 12288] where allMatched {
-            let n = 128, kg = k / 128
-            let ws: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
-                let v: UInt64 = UInt64(i + 1) &* 2_654_435_761
-                return UInt32(truncatingIfNeeded: v)
-            }
-            let sv: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
-                let v: Float = Float(i % 13 + 1) / 1024
-                return Float16(v)
-            }
-            let weight = MLXArray(ws, [n, k / 16])
-            let scales = MLXArray(sv, [kg, n])
-            let bias = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
-            let ranges: [[Range<Int>]] = [[0 ..< 128], [0 ..< 64, 64 ..< 128], [0 ..< 64, 64 ..< 128, 0 ..< 64]]
-            let copied: [[MLXArray]] = ranges.map { rs in rs.map { VerifyInt8Matmul.streamPack(weight[$0], k: k, columns: 16) } }
-            eval(copied.flatMap { $0 })
-            var matched = true
-            streamPromptError = false
-            withErrorHandler({ _ in PromptInt8Matmul.streamPromptError = true }) {
-                for m in [64, 128] where matched {
-                    let qs: [Int8] = (0 ..< m * k).map { (i: Int) -> Int8 in
-                        let v: Int = (i * 37 + 11) % 255 - 127
-                        return Int8(truncatingIfNeeded: v)
-                    }
-                    let av: [Float] = (0 ..< m * kg).map { (i: Int) -> Float in Float(i % 11 + 1) / 256 }
-                    let rv: [Float] = (0 ..< m * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }
-                    let codes = MLXArray(qs, [m, k]), ascale = MLXArray(av), rsb = MLXArray(rv)
-                    for negative in [false, true] where matched {
-                        for count in 1 ... 3 where matched {
-                            let canonical: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] = ranges[count - 1].map { r in
-                                (weight[r], scales[0..., r], bias[0..., r])
-                            }
-                            let packed: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] = canonical.enumerated().map { i, entry in
-                                (copied[count - 1][i], entry.scalesT, entry.biasesT)
-                            }
-                            let a = runSg(codes: codes, ascale: ascale, rsb: rsb, layers: canonical,
-                                m: m, k: k, negative: negative, form: sgForm)
-                            let b = runSg(codes: codes, ascale: ascale, rsb: rsb, layers: packed,
-                                m: m, k: k, negative: negative, form: .staged, streamed: true)
-                            let checks: [MLXArray] = zip(a, b).map { x, y in MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32)) }
-                            eval(checks)
-                            matched = !streamPromptError && checks.allSatisfy { $0.item(Bool.self) }
-                        }
-                    }
-                }
-            }
-            allMatched = matched && !streamPromptError
-        }
-        streamPromptReady = allMatched
-        // A failed prefill qualification keeps the canonical layout on both
-        // paths, rather than enabling copies with an unqualified consumer.
-        if !allMatched { VerifyInt8Matmul.streamReady = false }
-        FileHandle.standardError.write(Data("prompt streamed loadcheck: \(streamPromptReady ? "passed" : "FAILED")\n".utf8))
-    }
 
     enum SgForm {
         case staged, register, registerCols128
@@ -4062,7 +3902,7 @@ enum PromptInt8Matmul {
     private static func runSg(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, form: SgForm, streamed: Bool = false
+        m: Int, k: Int, negative: Bool, form: SgForm
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
@@ -4076,7 +3916,7 @@ enum PromptInt8Matmul {
         var template: [(String, any KernelTemplateArg)] = [("NEG", negative ? 1 : 0)]
         if form == .staged || form == .registerCols128 { template.append(("INDEX32", index32)) }
         let launch = form.launch
-        let kernels = streamed ? streamedSgKernels : launch.kernels
+        let kernels = launch.kernels
         return kernels[layers.count - 1](
             inputs, template: template,
             grid: ((ns.reduce(0, +) + launch.columns - 1) / launch.columns * launch.threads, m / launch.rows, 1),
@@ -4393,16 +4233,6 @@ enum PromptInt8Matmul {
         negative: Bool
     ) -> MLXArray? {
         guard route != .off else { return nil }
-        if let copied = promptStream(weight, m: activation.rows, k: activation.k) {
-            let output = runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
-                layers: [(copied, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, form: .staged, streamed: true)
-            return streamOutputs(output) {
-                runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
-                    layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                    negative: negative && negativeForms, form: sgForm)
-            }[0]
-        }
         if route == .nax && naxSg {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -4426,23 +4256,6 @@ enum PromptInt8Matmul {
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
         guard route != .off else { return nil }
-        if (2 ... 3).contains(layers.count) {
-            let copies = layers.compactMap { promptStream($0.weight, m: activation.rows, k: activation.k) }
-            if copies.count == layers.count {
-                let packed: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] = layers.enumerated().map { i, entry in
-                    (copies[i], entry.scalesT, entry.biasesT)
-                }
-                let negative = negativeForms && layers.allSatisfy { $0.negative }
-                let output = runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
-                    layers: packed, m: activation.rows, k: activation.k, negative: negative,
-                    form: .staged, streamed: true)
-                return streamOutputs(output) {
-                    runSg(codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
-                        layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
-                        m: activation.rows, k: activation.k, negative: negative, form: sgForm)
-                }
-            }
-        }
         if route == .nax, naxSg, naxSgShared, (2 ... 3).contains(layers.count) {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -4478,213 +4291,6 @@ enum PromptInt8Matmul {
 /// the same order: the same bits, which `checkKernels` checks on the device
 /// before `nax` is used.
 enum VerifyInt8Matmul {
-    /// The canonical 2-bit codes remain model parameters. This private working
-    /// copy only permutes uint32 words into [tile, group, lane, word].
-    static let streamAllowed: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_STREAM"]?.lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-    nonisolated(unsafe) static var streamReady = false
-    nonisolated(unsafe) private static var streamFailed = false
-
-    private static let streamRepack = MLXFast.metalKernel(
-        name: "bonsai_verify_stream_repack", inputNames: ["w"], outputNames: ["packed"],
-        source: """
-            const uint i = thread_position_in_grid.x;
-            const uint Kg = K / 128, W = C / 4;
-            if (i >= N * K / 16) return;
-            const uint bx = i / (Kg * C * 8), local = i % (Kg * C * 8);
-            const uint g = local / (C * 8), v = local % (C * 8);
-            const uint lane = v / W, t = v % W;
-            const uint col = bx * C + lane / 8 + 4 * t, j = lane % 8;
-            packed[i] = w[col * (K / 16) + g * 8 + j];
-            """, ensureRowContiguous: true)
-
-    static func streamPack(_ weight: MLXArray, k: Int, columns: Int) -> MLXArray {
-        let n = weight.dim(0)
-        return streamRepack(
-            [weight], template: [("K", k), ("N", n), ("C", columns)],
-            grid: (n * k / 16, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[n, k / 16]], outputDTypes: [.uint32])[0]
-    }
-
-    /// Same staged B tile, int32 tensor result and FP32 epilogue. Only the
-    /// word addresses/load width and the position of next-group loads change.
-    static func streamedBody(_ body: String, columns: Int) -> String {
-        let words = columns / 4
-        let oldPointer = "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
-        let pointer = "const device uint32_t* wcol = w + (size_t)bx * Kg * \(columns * 8);"
-        let oldLoad = "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
-        let load = "for (int t = 0; t < \(words); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
-        precondition(body.components(separatedBy: oldPointer).count == 2)
-        precondition(body.components(separatedBy: oldLoad).count == 3)
-        var result = body.replacingOccurrences(of: oldPointer, with: pointer)
-            .replacingOccurrences(of: oldLoad, with: load)
-        let start = result.range(of: "  if (g + 4 < Kg) {")!
-        let end = result.range(of: "  simdgroup_barrier(mem_flags::mem_threadgroup);", range: start.lowerBound ..< result.endIndex)!
-        let prefetch = String(result[start.lowerBound ..< end.lowerBound])
-        result.removeSubrange(start.lowerBound ..< end.lowerBound)
-        return result.replacingOccurrences(of: "  op.run(tA, B, cT);", with: "  op.run(tA, B, cT);\n" + prefetch)
-    }
-
-    static func streamedFormsSource(layers: Int) -> String {
-        let prefix = naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-        let body = streamedBody(naxFastBody, columns: 32).replacingOccurrences(of: "(size_t)", with: "(uint)")
-        return prefix + body
-    }
-
-    private static let streamedKernels = (1 ... 3).map { layers in
-        MLXFast.metalKernel(
-            name: "bonsai_q8_verify_streamed\(layers)",
-            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
-                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
-            outputNames: (0 ..< layers).map { "out\($0)" },
-            source: streamedFormsSource(layers: layers), header: PromptInt8Matmul.naxHeader,
-            ensureRowContiguous: true)
-    }
-    private static let streamedNarrowKernel = MLXFast.metalKernel(
-        name: "bonsai_q8_verify_streamed_n16", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
-        outputNames: ["out"],
-        source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)"),
-        header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
-
-    static func streamColumns(k: Int, n: Int) -> Int { 16 }
-
-    /// Input-independent guard at load, before any request. Compare new
-    /// pipelines with the unchanged canonical forms, including dense b/a.
-    private static func checkStreamed() -> Bool {
-        guard streamAllowed, naxShared, formsAllowed else { return false }
-        var matched = true
-        streamFailed = false
-        withErrorHandler({ _ in VerifyInt8Matmul.streamFailed = true }) {
-            for k in formsK where matched {
-                let kg = k / 128, n = 64
-                let q: [Int8] = (0 ..< tileRows * k).map { (i: Int) -> Int8 in
-                    let centered: Int = (i * 37 + 11) % 255 - 127
-                    return Int8(truncatingIfNeeded: centered)
-                }
-                let w: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
-                    let value: UInt64 = UInt64(i + 1) &* 2_654_435_761
-                    return UInt32(truncatingIfNeeded: value)
-                }
-                let sv: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
-                    let value: Float = Float(1 + i % 13) / 1024
-                    return Float16(value)
-                }
-                let bv: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
-                    let value: Float = -Float(i % 7) / 512
-                    return Float16(value)
-                }
-                let av: [Float] = (0 ..< tileRows * kg).map { (i: Int) -> Float in
-                    let value: Float = Float(1 + i % 11) / 256
-                    return value
-                }
-                let rv: [Float] = (0 ..< tileRows * kg).map { (i: Int) -> Float in
-                    let centered: Int = i % 17 - 8
-                    return Float(centered) / 64
-                }
-                let codes = MLXArray(q, [tileRows, k]), weight = MLXArray(w, [n, k / 16])
-                let scales = MLXArray(sv, [kg, n]), biases = MLXArray(bv, [kg, n])
-                let ascale = MLXArray(av), rsb = MLXArray(rv)
-                let negativeBias = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
-                let ranges: [[Range<Int>]] = [[0 ..< 64], [0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]]
-                let packed: [[MLXArray]] = ranges.map { ranges in
-                    ranges.map { streamPack(weight[$0], k: k, columns: 16) }
-                }
-                let narrowWeight = streamPack(weight, k: k, columns: 16)
-                eval(packed.flatMap { $0 } + [narrowWeight])
-                func equal(_ lhs: [MLXArray], _ rhs: [MLXArray]) -> Bool {
-                    let checks: [MLXArray] = zip(lhs, rhs).map { a, b in MLX.all(a.view(dtype: .uint32) .== b.view(dtype: .uint32)) }
-                    eval(checks)
-                    return !streamFailed && checks.allSatisfy { $0.item(Bool.self) }
-                }
-                let full = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_STREAM_FULL_CHECK"] == "1"
-                let checkRows: [Int] = full ? Array((1 ... tileRows).reversed()) : [tileRows]
-                for m in checkRows where matched {
-                    for negative in [false, true] where matched {
-                        let offsets = negative ? negativeBias : biases
-                        for count in 1 ... 3 where matched {
-                            guard formsMatched.contains("\(k) \(count)") else { matched = false; break }
-                            let layers = ranges[count - 1].map { (weight: weight[$0], scalesT: scales[0..., $0], biasesT: offsets[0..., $0]) }
-                            let a = runFast(codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative, forms: true)
-                            let b = runFast(codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative, forms: true, streamedWeights: packed[count - 1])
-                            matched = equal(a, b)
-                            if k == 4096, count == 2, matched {
-                                let x = codes[0 ..< m].asType(.float32)
-                                let wb = MLXArray.ones([32, k], dtype: .float32) / 1024
-                                let wa = wb * 2
-                                let ref = VerifyDenseBA.fused(codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative, x: x, wb: wb, wa: wa)
-                                let out = VerifyDenseBA.fused(codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: negative, x: x, wb: wb, wa: wa, streamedWeights: packed[count - 1])
-                                matched = equal(ref, out)
-                            }
-                        }
-                        if matched, narrow16FormsK.contains(k) {
-                            let a = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scales, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: true)
-                            let b = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scales, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: true, streamedWeight: narrowWeight)
-                            matched = equal([a], [b])
-                        }
-                    }
-                }
-            }
-        }
-        return matched && !streamFailed
-    }
-
-
-    // An opt-in validation pass over the pinned weights, once per real shape.
-    // It is load-only and input-independent; timing legs leave it disabled.
-    static let checkRealStreams = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_VERIFY_STREAM_FULL_CHECK"] == "1"
-    private static let checkedStreamShapes = OSAllocatedUnfairLock(initialState: Set<String>())
-
-    static func checkRealStream(
-        weight: MLXArray, copied: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
-        k: Int, negative: Bool
-    ) -> Bool {
-        let n = weight.dim(0), kg = k / 128
-        let shape = "K\(k) N\(n)"
-        let first = checkedStreamShapes.withLock { $0.insert(shape).inserted }
-        guard first else { return true }
-        let q: [Int8] = (0 ..< tileRows * k).map { (i: Int) -> Int8 in
-            let v: Int = (i * 37 + 11) % 255 - 127
-            return Int8(truncatingIfNeeded: v)
-        }
-        let av: [Float] = (0 ..< tileRows * kg).map { (i: Int) -> Float in Float(i % 11 + 1) / 256 }
-        let rv: [Float] = (0 ..< tileRows * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }
-        let codes = MLXArray(q, [tileRows, k])
-        let ascale = MLXArray(av), rsb = MLXArray(rv)
-        let layers = [(weight: weight, scalesT: scalesT, biasesT: biasesT)]
-        var matched = true
-        streamFailed = false
-        func equal(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
-            let checks: [MLXArray] = zip(a, b).map { x, y in MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32)) }
-            eval(checks)
-            return !streamFailed && checks.allSatisfy { $0.item(Bool.self) }
-        }
-        withErrorHandler({ _ in VerifyInt8Matmul.streamFailed = true }) {
-            for m in (1 ... tileRows).reversed() where matched {
-                let a = runFast(codes: codes, ascale: ascale, rsb: rsb, layers: layers,
-                    m: m, k: k, negative: negative, forms: true)
-                let b = runFast(codes: codes, ascale: ascale, rsb: rsb, layers: layers,
-                    m: m, k: k, negative: negative, forms: true, streamedWeights: [copied])
-                matched = equal(a, b)
-                if matched, n <= narrowColumns, narrow16FormsK.contains(k) {
-                    let a = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                        scalesT: scalesT, biasesT: biasesT, m: m, k: k, negative: negative,
-                        forms: true, compact: true)
-                    let b = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                        scalesT: scalesT, biasesT: biasesT, m: m, k: k, negative: negative,
-                        forms: true, compact: true, streamedWeight: copied)
-                    matched = equal([a], [b])
-                }
-            }
-        }
-        matched = matched && !streamFailed
-        FileHandle.standardError.write(Data("verify streamed real: \(matched ? "passed" : "FAILED") \(shape) rows 1...16\n".utf8))
-        return matched
-    }
-
     enum Route { case nax, plain, off }
 
     // The plain kernel maps one row to lane & 7.
@@ -5509,19 +5115,19 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil, streamedWeights: [MLXArray]? = nil
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         if forms ?? usesForms(k: k, layers: layers) {
-            let weightInputs: [MLXArray] = streamedWeights ?? layers.map { $0.weight }
+            let weightInputs: [MLXArray] = layers.map { $0.weight }
             let scaleInputs: [MLXArray] = layers.map { $0.scalesT }
             let biasInputs: [MLXArray] = layers.map { $0.biasesT }
             let codeAndWeights: [MLXArray] = [codes] + weightInputs
             let withScales: [MLXArray] = codeAndWeights + scaleInputs
             let withBiases: [MLXArray] = withScales + biasInputs
             let inputs: [MLXArray] = withBiases + [ascale, rsb, dims]
-            let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
+            let kernels = naxFormsKernels
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
             return kernels[layers.count - 1](
                 inputs, template: template,
@@ -5539,16 +5145,14 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
-            let stream = compact && streamedWeight != nil
-            let kernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
-            let kernelWeight = stream ? streamedWeight! : weight
+            let kernel = compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             return kernel(
-                [codes, kernelWeight, scalesT, biasesT, ascale, rsb, dims],
+                [codes, weight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
                 grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -5870,28 +5474,25 @@ enum VerifyInt8Matmul {
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
         }
-        streamReady = chosen == .nax && naxFast && checkStreamed()
-        FileHandle.standardError.write(
-            "int8 verify streamed: \(streamReady ? "on (M16 guard, fast/shared/N16/dense-b/a bit-identical)" : "off")\n".data(using: .utf8)!)
         return chosen
     }()
 
     static func matmul(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
-        negative: Bool, streamedWeight: MLXArray? = nil
+        negative: Bool
     ) -> MLXArray? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
                 scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, compact: narrow16K.contains(activation.k), streamedWeight: streamedWeight)
+                negative: negative && negativeForms, compact: narrow16K.contains(activation.k))
         }
         if route == .nax && naxFast {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, streamedWeights: streamedWeight.map { [$0] })[0]
+                negative: negative && negativeForms)[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -5907,8 +5508,7 @@ enum VerifyInt8Matmul {
     /// bit for bit the negated scales wherever `NEG = 1` would apply).
     static func matmul(
         _ activation: PromptInt8Activation,
-        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
-        streamedWeights: [MLXArray]? = nil
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> [MLXArray]? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
@@ -5916,7 +5516,7 @@ enum VerifyInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights)
+                negative: negativeForms && layers.allSatisfy { $0.negative })
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
@@ -5930,13 +5530,12 @@ enum VerifyInt8Matmul {
     /// skip matched at load.
     static var screenAvailable: Bool { route == .nax && naxFast && negativeForms }
 
-    /// The one-layer compile-time form (stored or streamed words) over the
+    /// The one-layer compile-time form (stored words) over the
     /// first `SG` 128-groups only. Physical K, every stride and every operand
     /// stay as they are; only the group loop and its next-group load stop at
-    /// `SG`. The streaming conversion runs first, since it searches for the
-    /// prefetch bound.
-    static func screenSource(streamed: Bool) -> String? {
-        var source: String = streamed ? streamedFormsSource(layers: 1) : naxFormsSource(layers: 1)
+    /// `SG`.
+    static func screenSource() -> String? {
+        var source: String = naxFormsSource(layers: 1)
         let swaps: [(String, String)] = [
             ("for (int g = int(sg); g < Kg; g += 4) {", "for (int g = int(sg); g < SG; g += 4) {"),
             ("if (g + 4 < Kg) {", "if (g + 4 < SG) {"),
@@ -5948,21 +5547,19 @@ enum VerifyInt8Matmul {
         return source
     }
 
-    private static let screenKernels: [MLXFast.MLXFastKernel?] = [false, true].map { streamed in
-        screenSource(streamed: streamed).map { source in
-            MLXFast.metalKernel(
-                name: streamed ? "bonsai_q8_head_screen_streamed" : "bonsai_q8_head_screen",
-                inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"], outputNames: ["out0"],
-                source: source, header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
-        }
+    private static let screenKernel: MLXFast.MLXFastKernel? = screenSource().map { source in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_head_screen",
+            inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"], outputNames: ["out0"],
+            source: source, header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
     }
 
     /// `[rows, N]` FP32 sums over the first `groups` 128-groups, `NEG = 1`.
     static func screen(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
-        streamed: Bool, groups: Int
+        groups: Int
     ) -> MLXArray? {
-        guard let kernel = screenKernels[streamed ? 1 : 0] else { return nil }
+        guard let screenKernel else { return nil }
         let n: Int = weight.dim(0)
         let dims = MLXArray([Int32(activation.k), Int32(activation.rows), Int32(n)])
         let template = [("ROWS", activation.rows), ("NEG", 1), ("KC", activation.k), ("SG", groups)]
@@ -5970,7 +5567,7 @@ enum VerifyInt8Matmul {
         let inputs: [MLXArray] = [
             activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb, dims,
         ]
-        return kernel(
+        return screenKernel(
             inputs, template: template, grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[activation.rows, n]], outputDTypes: [.float32])[0]
     }
@@ -6101,8 +5698,8 @@ public enum VerifyDenseBA {
     /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
     /// that each run four b/a columns and return; every later threadgroup
     /// runs the two-layer body unchanged, `BAG` threadgroups later.
-    static func fusedSource(streamed: Bool = false) -> String {
-        let forms = streamed ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2)
+    static func fusedSource() -> String {
+        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2)
         let anchor = "int bx = int(threadgroup_position_in_grid.x);"
         guard forms.components(separatedBy: anchor).count == 2 else { return "" }
         return forms.replacingOccurrences(
@@ -6132,11 +5729,6 @@ public enum VerifyDenseBA {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
-    static let streamedKernel = MLXFast.metalKernel(
-        name: "bonsai_q8_verify_streamed_dense_ba",
-        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
-        outputNames: ["out0", "out1", "ob", "oa"], source: fusedSource(streamed: true),
-        header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
 
     /// The standalone kernel: `x` `[rows, K]` FP32, `wb` and `wa` `[N, K]` FP32.
     public static func standalone(_ x: MLXArray, wb: MLXArray, wa: MLXArray) -> (MLXArray, MLXArray) {
@@ -6152,12 +5744,12 @@ public enum VerifyDenseBA {
     static func fused(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray, streamedWeights: [MLXArray]? = nil
+        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let N = wb.dim(0)
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
-        let weightInputs: [MLXArray] = streamedWeights ?? layers.map { $0.weight }
+        let weightInputs: [MLXArray] = layers.map { $0.weight }
         let scaleInputs: [MLXArray] = layers.map { $0.scalesT }
         let biasInputs: [MLXArray] = layers.map { $0.biasesT }
         let codeAndWeights: [MLXArray] = [codes] + weightInputs
@@ -6167,8 +5759,7 @@ public enum VerifyDenseBA {
         let template = [
             ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
         ] as [(String, any KernelTemplateArg)]
-        let kernel = streamedWeights == nil ? fusedKernel : streamedKernel
-        return kernel(
+        return fusedKernel(
             inputs, template: template,
             grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] } + [[m, N], [m, N]],
@@ -6295,7 +5886,7 @@ extension VerifyInt8Matmul {
     static func matmulWithDenseBA(
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
-        x: MLXArray, wb: MLXArray, wa: MLXArray, streamedWeights: [MLXArray]? = nil
+        x: MLXArray, wb: MLXArray, wa: MLXArray
     ) -> (outputs: [MLXArray], b: MLXArray, a: MLXArray)? {
         let plain = layers.map { ($0.weight, $0.scalesT, $0.biasesT) }
         guard layers.count == 2, activation.k == 4096, denseBAEligible(k: activation.k),
@@ -6309,7 +5900,7 @@ extension VerifyInt8Matmul {
         let outputs = VerifyDenseBA.fused(
             codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, layers: plain,
             m: activation.rows, k: activation.k,
-            negative: negativeForms && layers.allSatisfy { $0.negative }, x: x, wb: wb, wa: wa, streamedWeights: streamedWeights)
+            negative: negativeForms && layers.allSatisfy { $0.negative }, x: x, wb: wb, wa: wa)
         return ([outputs[0], outputs[1]], outputs[2], outputs[3])
     }
 }
@@ -6318,27 +5909,13 @@ extension VerifyInt8Matmul {
 /// `PromptInt8Matmul`, made on first use. A plain class, so nothing enters the
 /// module parameter tree.
 final class PromptInt8Constants {
-    private var streamed: [Int: MLXArray] = [:]
     private var transposed: (MLXArray, MLXArray)?
     /// Every FP16 offset is bit for bit its negated scale, so the int8
     /// kernels may use `-s` for the offset (`NEG = 1`). Read once at init.
     let negative: Bool
 
-    private var allowStream: Bool
-
-    init(negative: Bool, allowStream: Bool) {
+    init(negative: Bool) {
         self.negative = negative
-        self.allowStream = allowStream
-    }
-
-    func streamWeight(_ weight: MLXArray, k: Int, columns: Int) -> MLXArray? {
-        guard allowStream && VerifyInt8Matmul.streamReady else { return nil }
-        if let value = streamed[columns] { return value }
-        let value = VerifyInt8Matmul.streamPack(weight, k: k, columns: columns)
-        eval(value)
-        streamed[columns] = value
-        if columns == 16 { PromptInt8Matmul.registerStream(weight, packed: value) }
-        return value
     }
 
     func get(scales: MLXArray, biases: MLXArray) -> (MLXArray, MLXArray) {
@@ -6349,10 +5926,9 @@ final class PromptInt8Constants {
     }
 }
 
-/// The operand form a packed module's draft-head screen qualified with at
-/// bind (`streamed` words or the stored ones); nil until it qualifies.
+/// Qualification state for a packed module's draft-head screen; true once qualified.
 final class DraftHeadScreenState {
-    var streamed: Bool?
+    var qualified: Bool = false
     nonisolated(unsafe) static var failure: String?
 }
 
@@ -6361,14 +5937,6 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
-    /// Qualify the prompt route's use of the verify weight copies before
-    /// serving requests. Off by default (`DARKBLOOM_BONSAI_PREFILL_STREAM=1`
-    /// opts in), so prefill reads the stored words; verify reads the copies
-    /// whenever its own load check passed. No allocator policy or request
-    /// scratch is changed, and no request work is moved into begin.
-    public static func prepareSharedVerifyWeights() {
-        PromptInt8Matmul.prepareStreaming()
-    }
 
     public let transform: SignedBlockHadamard
     public let gdnLayout: HadamardGDNLayout?
@@ -6387,7 +5955,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public init(
         weight: MLXArray, bias: MLXArray? = nil, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, transform: SignedBlockHadamard,
-        gdnLayout: HadamardGDNLayout? = nil, verifyStreaming: Bool = true
+        gdnLayout: HadamardGDNLayout? = nil
     ) throws {
         try validateHadamardWeights(
             weight, scales: scales, biases: biases,
@@ -6414,7 +5982,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let flipped = scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))
             negative = MLX.all(biases.view(dtype: .uint16) .== flipped).item(Bool.self)
         }
-        self.promptConstants = PromptInt8Constants(negative: negative, allowStream: verifyStreaming)
+        self.promptConstants = PromptInt8Constants(negative: negative)
         super.init(
             weight: weight, bias: bias, scales: scales, biases: biases,
             groupSize: groupSize, bits: bits)
@@ -6422,17 +5990,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
-            if weight.dim(0) % 32 == 0, VerifyInt8Matmul.formsK.contains(transform.width) {
-                if let copied = promptConstants.streamWeight(weight, k: transform.width, columns: 16),
-                    VerifyInt8Matmul.checkRealStreams, let biases
-                {
-                    let pair = promptConstants.get(scales: scales, biases: biases)
-                    let matched = VerifyInt8Matmul.checkRealStream(
-                        weight: weight, copied: copied, scalesT: pair.0, biasesT: pair.1,
-                        k: transform.width, negative: negative)
-                    if !matched { VerifyInt8Matmul.streamReady = false }
-                }
-            }
         }
     }
 
@@ -6524,7 +6081,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             ? VerifyInt8Matmul.matmul(
                 PromptInt8Activation(
                     codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
-                layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
+                layers: packed.map(\.verifyOperands))
             : nil
         let outputs = packed.enumerated().map { index, layer in
             if verify {
@@ -6534,7 +6091,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                         codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
                     let single = VerifyInt8Matmul.matmul(
                         codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
-                        negative: layer.promptConstants.negative, streamedWeight: layer.streamedVerifyWeight)!
+                        negative: layer.promptConstants.negative)!
                         .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
                     return layer.bias.map { single + $0 } ?? single
                 }
@@ -6722,7 +6279,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             })
         else { return nil }
         guard let outputs = VerifyInt8Matmul.matmul(
-            boundary.activation, layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
+            boundary.activation, layers: packed.map(\.verifyOperands))
         else { return nil }
         return zip(packed, outputs).map { layer, output in
             output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
@@ -6750,7 +6307,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             x.shape == boundary.normalized.shape,
             let fused = VerifyInt8Matmul.matmulWithDenseBA(
                 boundary.activation, layers: packed.map(\.verifyOperands),
-                x: x.reshaped([rows, 4096]), wb: wb, wa: wa, streamedWeights: Self.streamedWeights(packed))
+                x: x.reshaped([rows, 4096]), wb: wb, wa: wa)
         else { return nil }
         let lead = Array(boundary.normalized.shape.dropLast())
         return (
@@ -6779,7 +6336,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             packed.allSatisfy({ $0.weight.dim(0) % 32 == 0 }),
             let activation = first.transform.quantizedForVerify(x)
         {
-            let outputs = VerifyInt8Matmul.matmul(activation, layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
+            let outputs = VerifyInt8Matmul.matmul(activation, layers: packed.map(\.verifyOperands))
             return packed.enumerated().map { index, layer in
                 guard let output = outputs?[index] else { return layer(x) }
                 let reshaped = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
@@ -6796,21 +6353,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return nil
     }
 
-    private var streamedVerifyWeight: MLXArray? {
-        let columns = VerifyInt8Matmul.streamColumns(k: transform.width, n: weight.dim(0))
-        return promptConstants.streamWeight(weight, k: transform.width, columns: columns)
-    }
-
-    private static func streamedWeights(_ layers: [HadamardQuantizedLinear]) -> [MLXArray]? {
-        guard (2 ... 3).contains(layers.count), VerifyInt8Matmul.streamReady else { return nil }
-        var weights: [MLXArray] = []
-        for layer in layers {
-            guard let weight = layer.promptConstants.streamWeight(layer.weight, k: layer.transform.width, columns: 16)
-            else { return nil }
-            weights.append(weight)
-        }
-        return weights
-    }
 
     /// This layer's operands for `VerifyInt8Matmul.matmul(_:layers:)` and
     /// `PromptInt8Matmul.matmul(_:layers:)`.
@@ -6830,7 +6372,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamedVerifyWeight)
+            negative: promptConstants.negative)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
     }
@@ -6906,7 +6448,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamedVerifyWeight)
+            negative: promptConstants.negative)
         else { return nil }
         let shaped = output.reshaped(Array(x.shape.dropLast(2)) + [weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
@@ -6948,7 +6490,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let output = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamedVerifyWeight)
+            negative: promptConstants.negative)
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
@@ -7156,7 +6698,7 @@ extension HadamardQuantizedLinear {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         guard let logits = VerifyInt8Matmul.matmul(
             activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamedVerifyWeight)
+            negative: promptConstants.negative)
         else { return nil }
         let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
         let parallel = ExactVerifyHead.parallelApplies(rows: rows, N: weight.dim(0))
@@ -7615,16 +7157,14 @@ extension HadamardQuantizedLinear {
     public func draftScreen(
         _ x: MLXArray, shortlist: (MLXArray) -> MLXArray
     ) -> (ids: MLXArray, values: MLXArray)? {
-        guard let streamed = draftScreenState.streamed, let biases,
+        guard draftScreenState.qualified, let biases,
             let activation = draftScreenActivation(x)
         else { return nil }
-        let copy: MLXArray? = streamedVerifyWeight
-        guard (copy != nil) == streamed else { return nil }
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases)
         guard
             let partial = VerifyInt8Matmul.screen(
-                activation, weight: copy ?? weight, scalesT: scalesT, biasesT: biasesT,
-                streamed: streamed, groups: Self.draftScreenGroups)
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+                groups: Self.draftScreenGroups)
         else { return nil }
         let ids: MLXArray = shortlist(partial)
         let values: MLXArray = VerifyInt8Matmul.gather(
@@ -7639,7 +7179,7 @@ extension HadamardQuantizedLinear {
     /// from both; (iii) the full-width gather equals `self(x)` at those ids
     /// and at every 97th id and the last. Nil when it qualified, else why not.
     public func qualifyDraftScreen(shortlist: (MLXArray) -> MLXArray) -> String? {
-        draftScreenState.streamed = nil
+        draftScreenState.qualified = false
         let k: Int = transform.width
         let values: [Float] = (0 ..< 16 * k).map { (i: Int) -> Float in
             let t = Double(i)
@@ -7649,29 +7189,27 @@ extension HadamardQuantizedLinear {
         guard x.dtype == .float32, x.shape == [1, 15, k], let biases, draftScreenPacking else {
             return "route, packing or shape does not qualify"
         }
-        let streamed: Bool = streamedVerifyWeight != nil
         DraftHeadScreenState.failure = nil
         var reason: String? = nil
         withErrorHandler({ message in DraftHeadScreenState.failure = String(message.prefix(160)) }) {
-            reason = draftScreenMismatch(x, biases: biases, streamed: streamed, shortlist: shortlist)
+            reason = draftScreenMismatch(x, biases: biases, shortlist: shortlist)
         }
         if let failure = DraftHeadScreenState.failure { return "error: \(failure)" }
-        if reason == nil { draftScreenState.streamed = streamed }
+        if reason == nil { draftScreenState.qualified = true }
         return reason
     }
 
     private func draftScreenMismatch(
-        _ x: MLXArray, biases: MLXArray, streamed: Bool, shortlist: (MLXArray) -> MLXArray
+        _ x: MLXArray, biases: MLXArray, shortlist: (MLXArray) -> MLXArray
     ) -> String? {
         guard let activation = draftScreenActivation(x) else { return "no verify activation" }
         let n: Int = weight.dim(0)
         let rows: Int = activation.rows
-        let copy: MLXArray? = streamedVerifyWeight
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases)
-        guard (copy != nil) == streamed,
+        guard
             let partial = VerifyInt8Matmul.screen(
-                activation, weight: copy ?? weight, scalesT: scalesT, biasesT: biasesT,
-                streamed: streamed, groups: Self.draftScreenGroups)
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+                groups: Self.draftScreenGroups)
         else { return "screen kernel unavailable" }
         let reference: MLXArray = VerifyInt8Matmul.gather(
             activation, weight: weight, scales: scales, biases: biases, ids: nil,
