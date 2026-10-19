@@ -2714,17 +2714,21 @@ enum DF2Fast {
 
     // MARK: 4-bit codes in load-time tiles
 
+    static let signedNibbles =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_SIGNED_NIBBLES"] != "0"
+
     /// uint4 words per tile: one 32-column block of one group, codes then FP16 scales then FP16 offsets.
     static func w4TileU4(group: Int) -> Int { 32 * (group / 32) + 8 }
 
     /// The record operands of one linear as tiles `[N / 32, G, w4TileU4]` (uint4 words; stored as
     /// uint32): per 32-column block and group, the block's 32 rows of `group / 2` code bytes in row
-    /// order (the bytes the record kernel reads, unchanged), then the block's 32 FP16 scales, then its
-    /// 32 FP16 offsets. A pure reordering of the same bits: no value is converted.
+    /// order (with each nibble stored as `u ^ 8` when `signedNibbles` is on), then the block's 32 FP16
+    /// scales, then its 32 FP16 offsets. A bijection on the stored bits: no value is rounded or dropped.
     static func w4Tile(_ w: MLXArray, sT: MLXArray, bT: MLXArray, n N: Int, k K: Int, group: Int) -> MLXArray {
         let G = K / group
         let words = group / 8
-        let codes = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
+        let rawCodes = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
+        let codes = signedNibbles ? (rawCodes ^ MLXArray(UInt32(0x8888_8888))) : rawCodes
         func cols(_ a: MLXArray) -> MLXArray {
             contiguous(a.reshaped([G, N / 32, 32]).transposed(1, 0, 2)).view(dtype: .uint32)
         }
@@ -2916,12 +2920,11 @@ enum DF2Fast {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
             float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
             for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              if (step > 0) {
+                seq_sum = simd_shuffle_up(seq_sum, 1);
               }
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
             }
             const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
             const float ia = 1.0f / a;
@@ -2978,12 +2981,11 @@ enum DF2Fast {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
             float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
             for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
+              if (step > 0) {
+                seq_sum = simd_shuffle_up(seq_sum, 1);
               }
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
             }
             const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
             const float ia = 1.0f / a;
@@ -3915,15 +3917,27 @@ enum DF2Fast {
             }
             precondition(!loop.contains("sT") && !loop.contains("bT") && !loop.contains("* N"))
         }
+        if tiled && signedNibbles {
+            loop = loop.replacingOccurrences(of: "ascale[", with: "0.0625f * ascale[")
+            precondition(loop.components(separatedBy: "0.0625f * ascale[").count == (form == 0 ? 3 : 5))
+        }
+        let unpack = (tiled && signedNibbles)
+            ? """
+            #define LO(v) (((v) << 4) & 0xF0F0F0F0u)
+            #define HI(v) ((v) & 0xF0F0F0F0u)
+            """
+            : """
+            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            """
         let reduce =
             """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             threadgroup float* red = (threadgroup float*)tiles;
 
             """
-        return pick + """
-            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+        return pick + unpack + """
+
             const int G = K / \(group);
             const int n0 = bx * \(cols);
             const uint lane = thread_index_in_simdgroup;
@@ -4928,9 +4942,7 @@ enum DF2Fast {
               if (step > 0) {
                 seq_sum = simd_shuffle_up(seq_sum, 1);
               }
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
             }
             const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
             const float ia = 1.0f / a;
@@ -5029,9 +5041,7 @@ enum DF2Fast {
               if (step > 0) {
                 seq_sum = simd_shuffle_up(seq_sum, 1);
               }
-              if ((int(lane) & ((KG / 16) - 1)) == step) {
-                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-              }
+              for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
             }
             const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
             const float ia = 1.0f / a;
@@ -5316,9 +5326,7 @@ enum DF2Fast {
                 if (step > 0) {
                   seq_sum = simd_shuffle_up(seq_sum, 1);
                 }
-                if ((int(lane) & ((KG / 16) - 1)) == step) {
-                  for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
-                }
+                for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
               }
               const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
               const float ia = 1.0f / a;
@@ -6207,9 +6215,7 @@ enum DF2WideLaneSource {
           if (step > 0) {
             seq_sum = simd_shuffle_up(seq_sum, 1);
           }
-          if ((int(lane) & ((KG / \(e)) - 1)) == step) {
-            for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
-          }
+          for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
         }
         const float a = local_amax > 0.0f ? local_amax / 127.0f : 1.0f;
         const float ia = 1.0f / a;
@@ -6470,11 +6476,14 @@ private enum DraftSDPA {
     static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
                           scale: Float) -> MLXArray? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
-            q.shape == [1, 32, 16, 128], k.ndim == 4, v.shape == k.shape,
-            k.dim(0) == 1, k.dim(1) == 8, k.dim(2) >= 16, k.dim(3) == 128,
-            q.strides[3] == 1, k.strides[3] == 1, v.strides[3] == 1,
-            q.strides.allSatisfy({ $0 >= 0 }), k.strides.allSatisfy({ $0 >= 0 }),
-            v.strides.allSatisfy({ $0 >= 0 })
+            q.ndim == 4, k.ndim == 4, v.ndim == 4,
+            q.shape4 == (1, 32, 16, 128)
+        else { return nil }
+        let kShape = k.shape4
+        guard kShape.0 == 1, kShape.1 == 8, kShape.2 >= 16, kShape.3 == 128,
+            v.shape4 == kShape,
+            q.hasNonNegativeUnitInnerStride4, k.hasNonNegativeUnitInnerStride4,
+            v.hasNonNegativeUnitInnerStride4
         else { return nil }
         return run(q, k, v, scale: scale, columns: columns, cacheQueries: cachedQueries,
                    queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads)
@@ -6646,19 +6655,34 @@ private enum DraftSDPA {
             inputNames: ["q", "k", "v", "scale_in"], outputNames: ["out"],
             source: s, header: h, ensureRowContiguous: false)
     }
-    static let plain: [Int: MLXFast.MLXFastKernel] = [
-        1: makeKernel(heads: 1, limitThreads: false), 2: makeKernel(heads: 2, limitThreads: false),
-        4: makeKernel(heads: 4, limitThreads: false)]
-    static let limited: [Int: MLXFast.MLXFastKernel] = [
-        1: makeKernel(heads: 1, limitThreads: true), 2: makeKernel(heads: 2, limitThreads: true),
-        4: makeKernel(heads: 4, limitThreads: true)]
+    private static let plain1 = makeKernel(heads: 1, limitThreads: false)
+    private static let plain2 = makeKernel(heads: 2, limitThreads: false)
+    private static let plain4 = makeKernel(heads: 4, limitThreads: false)
+    private static let limited1 = makeKernel(heads: 1, limitThreads: true)
+    private static let limited2 = makeKernel(heads: 2, limitThreads: true)
+    private static let limited4 = makeKernel(heads: 4, limitThreads: true)
+    private static let defaultScale: Float = Float(1.0 / Double(128).squareRoot())
+    nonisolated(unsafe) private static let defaultScaleArray: MLXArray = {
+        let a = MLXArray(defaultScale)
+        eval(a)
+        return a
+    }()
 
     static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
                     columns: Int = 128, cacheQueries: Bool = false,
                     queryRows: Int = 16, headsPerGroup: Int = 1,
                     limitThreads: Bool = false) -> MLXArray {
-        let kernel = (limitThreads ? limited : plain)[headsPerGroup]!
-        return kernel([q, k, v, MLXArray(scale)],
+        let kernel: MLXFast.MLXFastKernel
+        switch (limitThreads, headsPerGroup) {
+        case (false, 1): kernel = plain1
+        case (false, 2): kernel = plain2
+        case (false, _): kernel = plain4
+        case (true, 1): kernel = limited1
+        case (true, 2): kernel = limited2
+        case (true, _): kernel = limited4
+        }
+        let scaleArray = scale.bitPattern == defaultScale.bitPattern ? defaultScaleArray : MLXArray(scale)
+        return kernel([q, k, v, scaleArray],
                template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
