@@ -4726,7 +4726,11 @@ enum VerifyInt8Matmul {
         }
         """
 
-    private static let compactHeadKernel = {
+    private static let compactHeadKernel = makeCompactHeadKernel(wide: false)
+    /// The compact head over the body after `wideLoads`; used only while `naxWide`.
+    private static let compactHeadWideKernel = makeCompactHeadKernel(wide: true)
+
+    private static func makeCompactHeadKernel(wide: Bool) -> MLXFast.MLXFastKernel {
         let store = """
             for (int e = int(tid); e < ROWS * 8; e += 128) {
               float4 v = r0[e] + r1[e];
@@ -4735,18 +4739,18 @@ enum VerifyInt8Matmul {
               *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = good ? v : float4(as_type<float>(0x7fc00000u));
             }
             """
-        let original = naxFastSource(layers: 1)
+        let original = wide ? naxFastPick(layers: 1) + wideLoads(naxFastBody, columns: 32) : naxFastSource(layers: 1)
         precondition(original.components(separatedBy: store).count == 2)
         let source = original.replacingOccurrences(of: store, with: compactHeadEpilogue)
             .replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
             .replacingOccurrences(of: "(size_t)", with: "(uint)")
         return MLXFast.metalKernel(
-            name: "bonsai_q8_verify_head_top4_nax_front_v1_forms",
+            name: "bonsai_q8_verify_head_top4_nax_front_v1_forms" + (wide ? "_wide" : ""),
             inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"],
             outputNames: ["out0", "part_ids", "omitted", "part_bad"], source: source,
             header: PromptInt8Matmul.naxHeader + Float16ConstantQMV.topTwoHeader,
             ensureRowContiguous: true)
-    }()
+    }
 
     static func compactHeadAvailable(rows: Int, k: Int, n: Int) -> Bool {
         route == .nax && naxFast && rows == 16 && k == 4096 && n % 64 == 0
@@ -4759,15 +4763,26 @@ enum VerifyInt8Matmul {
     ) -> (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)? {
         guard compactHeadAvailable(rows: activation.rows, k: activation.k, n: weight.dim(0))
         else { return nil }
+        let result = runCompactHead(
+            codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
+            scalesT: scalesT, biasesT: biasesT, k: activation.k, negative: negative && negativeForms)
+        return (result[1], result[0], result[2], result[3])
+    }
+
+    /// The compact head kernel at 16 rows: outputs `out0`, `part_ids`,
+    /// `omitted`, `part_bad`. `wide` nil takes `naxWide`.
+    private static func runCompactHead(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, k: Int, negative: Bool, wide: Bool? = nil
+    ) -> [MLXArray] {
         let tiles = weight.dim(0) / 32
-        let result = compactHeadKernel(
-            [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb,
-             MLXArray([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
-            template: [("ROWS", 16), ("NEG", negative && negativeForms ? 1 : 0), ("KC", activation.k)],
+        return ((wide ?? naxWide) ? compactHeadWideKernel : compactHeadKernel)(
+            [codes, weight, scalesT, biasesT, ascale, rsb,
+             MLXArray([Int32(k), Int32(16), Int32(weight.dim(0))])],
+            template: [("ROWS", 16), ("NEG", negative ? 1 : 0), ("KC", k)],
             grid: (tiles * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[16, tiles, 4], [16, tiles, 4], [16, tiles], [16, tiles]],
             outputDTypes: [.float32, .int32, .float32, .int32])
-        return (result[1], result[0], result[2], result[3])
     }
 
     /// `naxFastBody` for `layers` sibling projections of one activation in
@@ -4785,9 +4800,70 @@ enum VerifyInt8Matmul {
     /// route takes (`formsFit`), so each address, and so each value read and
     /// each FP32 step, is the same: the same bits, which `checkForms` checks
     /// at each real K before a form is used.
-    static func naxFormsSource(layers: Int) -> String {
+    /// `wide`: the body after `wideLoads`, then the same 32-bit indexing.
+    static func naxFormsSource(layers: Int, wide: Bool = false) -> String {
         naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + naxFastBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
+            + (wide ? wideLoads(naxFastBody, columns: 32) : naxFastBody)
+                .replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    /// `body` (`naxFastBody`, 32 columns per threadgroup, or `naxNarrowBody`,
+    /// 16) with the stored 2-bit words read 16 bytes per lane: lane l reads
+    /// words 4 * (l & 1) ... + 3 of the group in rows (l >> 1) + 16t, one
+    /// uint4 load per 16 rows (two per group at 32 columns, one at 16)
+    /// instead of one uint32 per 4 rows (eight or four loads), so each load
+    /// instruction covers 16 rows x 32 B instead of 4 rows x 32 B, one group
+    /// ahead as before. The stored words and their layout are unchanged.
+    /// Each word is expanded by the same expression into the same staged
+    /// slot (row * 8 + word), so the tensor op sees the record's tile and
+    /// every later step is unchanged. A lane's four stores rotate by
+    /// (l >> 1) & 3, which spreads them over the banks as the record's do.
+    static func wideLoads(_ body: String, columns: Int) -> String {
+        let words = columns / 4, loads = columns / 16
+        func swap(_ text: String, _ old: String, _ new: String, count: Int) -> String {
+            let found = text.components(separatedBy: old).count - 1
+            precondition(found == count, "wideLoads: fragment found \(found) times, expected \(count)")
+            return text.replacingOccurrences(of: old, with: new)
+        }
+        var text = swap(
+            body,
+            """
+            const int j = int(lane & 7u);
+            const int c = int(lane >> 3);
+            const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
+            threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
+            uint32_t wv[\(words)];
+            """,
+            """
+            const int qrow = int(lane >> 1);
+            const int qrot = qrow & 3;
+            const device uint4* qsrc = (const device uint4*)(w + (size_t)(n0 + qrow) * KW) + int(lane & 1u);
+            threadgroup uint4* qdst = (threadgroup uint4*)bs[sg] + qrow * 8 + 4 * int(lane & 1u);
+            uint4 wq[\(loads)];
+            """, count: 1)
+        text = swap(
+            text,
+            "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }",
+            "for (int t = 0; t < \(loads); t++) { wq[t] = qsrc[(size_t)(4 * t) * KW + gl * 2]; }", count: 2)
+        return swap(
+            text,
+            """
+              for (int t = 0; t < \(words); t++) {
+                const uint32_t v = wv[t];
+                dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+              }
+            """,
+            """
+              for (int t = 0; t < \(loads); t++) {
+                const uint4 q = wq[t];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < 4; u++) {
+                  const int r = (u + qrot) & 3;
+                  const uint32_t v = r == 0 ? q.x : r == 1 ? q.y : r == 2 ? q.z : q.w;
+                  qdst[128 * t + r] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+                }
+              }
+            """, count: 1)
     }
 
     private static func naxFastPick(layers: Int) -> String {
@@ -4922,13 +4998,17 @@ enum VerifyInt8Matmul {
 
     /// The narrow output uses only 16 columns. Keep the accepted N32
     /// operation as fallback; use this N16 operation only after its check.
-    static let naxNarrow16Body = naxNarrowBody
-        .replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
+    static let naxNarrow16Body = narrow16(naxNarrowBody)
+
+    /// The N16 changes to a narrow body (record or `wideLoads`).
+    static func narrow16(_ body: String) -> String {
+        body.replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
         .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];", with: "threadgroup uint32_t bs[4][16 * 32];")
         .replacingOccurrences(of: "dextents<int, 2>(128, 32));", with: "dextents<int, 2>(128, 16));")
         .replacingOccurrences(of: "bool ok = cap == 16;", with: "bool ok = cap == 8;")
         .replacingOccurrences(of: "for (int i = 0; i < 16; i++) {", with: "for (int i = 0; i < 8; i++) {")
         .replacingOccurrences(of: "  #pragma clang loop unroll(full)\n  for (int e = 0; e < 4; e++) {\n    const float t0 = float(cA[e]) * float(cT[e]);\n    acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n    if (ROWS > 8) {\n      const float t2 = float(cA[e]) * float(cT[4 + e]);\n      acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n    }\n  }\n", with: "  if (good) {\n    #pragma clang loop unroll(full)\n    for (int e = 0; e < 4; e++) {\n      const float t0 = float(cA[e]) * float(cT[e]);\n      acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n      if (ROWS > 8) {\n        const float t2 = float(cA[e]) * float(cT[4 + e]);\n        acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n      }\n    }\n  }\n")
+    }
 
     static let naxNarrowPick = """
         #pragma clang fp contract(off)
@@ -4975,6 +5055,18 @@ enum VerifyInt8Matmul {
                 + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
             outputNames: (0 ..< layers).map { "out\($0)" },
             source: naxFormsSource(layers: layers),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
+    /// `naxFormsSource(layers:wide: true)`; used only while `naxWide`.
+    private static let naxFormsWideKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_nax_forms_wide\(layers)",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: naxFormsSource(layers: layers, wide: true),
             header: PromptInt8Matmul.naxHeader,
             ensureRowContiguous: true)
     }
@@ -5046,6 +5138,25 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
+    /// The narrow (or, `compact`, N16) compile-time form over the body after
+    /// `wideLoads`, the same 32-bit indexing.
+    static func naxNarrowWideFormsSource(compact: Bool) -> String {
+        let body = wideLoads(naxNarrowBody, columns: 16)
+        return naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+            + (compact ? narrow16(body) : body).replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    /// `naxNarrowWideFormsSource`; used only while `naxWide`.
+    private static let naxNarrowWideKernels = [false, true].map { compact in
+        MLXFast.metalKernel(
+            name: compact ? "bonsai_q8_verify_matmul_nax_narrow16_forms_wide" : "bonsai_q8_verify_matmul_nax_narrow_forms_wide",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: naxNarrowWideFormsSource(compact: compact),
+            header: PromptInt8Matmul.naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// The widest one-layer call that takes the narrow kernel, and the
     /// inner sizes of the model's calls that fit: attention o and GDN out
     /// (4096) and MLP down (12288).
@@ -5070,6 +5181,17 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
     nonisolated(unsafe) private static var naxShared = false
+    /// Set once by `checkWide` at load: every compile-time form the verify
+    /// path takes runs its `wideLoads` twin instead.
+    /// `DARKBLOOM_BONSAI_INT8_VERIFY_WIDE=0` keeps the record loads.
+    nonisolated(unsafe) static var naxWide = false
+    static let wideAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY_WIDE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var wideFailed = false
+    nonisolated(unsafe) private static var wideNote = ""
 
     private static func run(
         _ route: Route, codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
@@ -5091,7 +5213,7 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil, wide: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
@@ -5099,7 +5221,7 @@ enum VerifyInt8Matmul {
             + [ascale, rsb, dims]
         if forms ?? usesForms(k: k, layers: layers) {
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
-            return naxFormsKernels[layers.count - 1](
+            return ((wide ?? naxWide) ? naxFormsWideKernels : naxFormsKernels)[layers.count - 1](
                 inputs, template: template,
                 grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
@@ -5113,12 +5235,14 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false,
+        wide: Bool? = nil
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
-            let kernel = compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            let kernel = (wide ?? naxWide)
+                ? naxNarrowWideKernels[compact ? 1 : 0] : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             return kernel(
                 [codes, weight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
@@ -5282,6 +5406,116 @@ enum VerifyInt8Matmul {
         return matched
     }
 
+    /// Runs each `wideLoads` twin the verify path would take against the
+    /// same record kernel on fixed, input-independent problems with all 16
+    /// code rows filled (64 columns, both offset forms where the offset skip
+    /// is on) at each real K, at the row counts the record checks build: the
+    /// compile-time forms (each matched layer count) at 16 rows, the narrow
+    /// form this K takes at 2 ... 16, the compact head at 16, the fused b/a
+    /// form at 2 ... 16. Every record output must be finite (the record
+    /// writes NaN where the tensor layout differs) and every wide output
+    /// equal to it bit for bit; any difference or compile error keeps the
+    /// record kernels everywhere. Runs last in `route`, and drives the
+    /// kernels directly because `route` is not decided yet.
+    private static func checkWide() -> String {
+        naxWide = false
+        guard wideAllowed else { return "off (DARKBLOOM_BONSAI_INT8_VERIFY_WIDE=0)" }
+        guard formsAllowed else { return "off (compile-time forms off)" }
+        let n = 64
+        var cases = 0
+        var matched = true
+        wideFailed = false
+        wideNote = ""
+        let exponent = MLXArray(UInt32(0x7f80_0000))
+        func same(_ record: [MLXArray], _ wide: [MLXArray], floats: [Int]) -> Bool {
+            var checks = zip(record, wide).map { MLX.all($0.0.view(dtype: .uint32) .== $0.1.view(dtype: .uint32)) }
+            checks += floats.map { MLX.all((record[$0].view(dtype: .uint32) & exponent) .!= exponent) }
+            eval(checks)
+            cases += 1
+            return !wideFailed && record.count == wide.count && checks.allSatisfy { $0.item(Bool.self) }
+        }
+        withErrorHandler({ message in
+            if !VerifyInt8Matmul.wideFailed { VerifyInt8Matmul.wideNote = String(message.prefix(80)) }
+            VerifyInt8Matmul.wideFailed = true
+        }) {
+            for k in formsK where matched {
+                let kg = k / 128
+                let codes = MLXArray(
+                    (0 ..< tileRows * k).map { Int8(truncatingIfNeeded: ($0 * 53 + 29) % 255 - 127) }, [tileRows, k])
+                let weight = MLXArray(
+                    (0 ..< n * k / 16).map { UInt32(truncatingIfNeeded: UInt64($0 + 7) &* 2_246_822_519) }, [n, k / 16])
+                let scalesT = MLXArray((0 ..< kg * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [kg, n])
+                let biasesT = MLXArray((0 ..< kg * n).map { Float16(-Float($0 % 7) / 512) }, [kg, n])
+                let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                let ascale = MLXArray((0 ..< tileRows * kg).map { Float(1 + $0 % 11) / 256 }, [tileRows * kg])
+                let rsb = MLXArray((0 ..< tileRows * kg).map { Float($0 % 17 - 8) / 64 }, [tileRows * kg])
+                let fusedUsed = k == 4096 && VerifyDenseBA.fusedMatched
+                let ban = fusedUsed ? 32 : 1
+                let wb = MLXArray((0 ..< ban * k).map { Float(($0 * 29 + 3) % 97 - 48) / 3072 }, [ban, k])
+                let wa = MLXArray((0 ..< ban * k).map { Float(($0 * 53 + 7) % 89 - 44) / 2048 }, [ban, k])
+                let xAll = MLXArray((0 ..< tileRows * k).map { Float(($0 * 41 + 5) % 211 - 105) / 64 }, [tileRows, k])
+                let offsetForms = [(biasesT, false)] + (negativeForms ? [(negatedT, true)] : [])
+                for (offsets, negative) in offsetForms where matched {
+                    let splits: [[Range<Int>]] = [[0 ..< n], [0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]]
+                    for layers in 1 ... 3 where matched && formsMatched.contains("\(k) \(layers)") {
+                        let parts = splits[layers - 1].map {
+                            (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0])
+                        }
+                        func outputs(_ wide: Bool) -> [MLXArray] {
+                            runFast(
+                                codes: codes, ascale: ascale, rsb: rsb, layers: parts, m: tileRows, k: k,
+                                negative: negative, forms: true, wide: wide)
+                        }
+                        let record = outputs(false)
+                        matched = same(record, outputs(true), floats: Array(record.indices))
+                    }
+                    let compact = narrow16K.contains(k)
+                    if narrowK.contains(k), (compact ? narrow16FormsK : narrowFormsK).contains(k) {
+                        for m in 2 ... tileRows where matched {
+                            func outputs(_ wide: Bool) -> MLXArray {
+                                runNarrow(
+                                    codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scalesT,
+                                    biasesT: offsets, m: m, k: k, negative: negative, forms: true,
+                                    compact: compact, wide: wide)
+                            }
+                            matched = same([outputs(false)], [outputs(true)], floats: [0])
+                        }
+                    }
+                    if matched, k == 4096, formsMatched.contains("4096 1") {
+                        func outputs(_ wide: Bool) -> [MLXArray] {
+                            runCompactHead(
+                                codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scalesT,
+                                biasesT: offsets, k: k, negative: negative, wide: wide)
+                        }
+                        let record = outputs(false)
+                        let clean = MLX.all(record[3] .== MLXArray(Int32(0)))
+                        eval(clean)
+                        matched = !wideFailed && clean.item(Bool.self) && same(record, outputs(true), floats: [0, 2])
+                    }
+                    if matched, fusedUsed {
+                        let parts = [0 ..< 32, 32 ..< 64].map {
+                            (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0])
+                        }
+                        for m in 2 ... tileRows where matched {
+                            func outputs(_ wide: Bool) -> [MLXArray] {
+                                VerifyDenseBA.fused(
+                                    codes: codes, ascale: ascale, rsb: rsb, layers: parts, m: m, k: k,
+                                    negative: negative, x: xAll[0 ..< m], wb: wb, wa: wa, wide: wide)
+                            }
+                            let record = outputs(false)
+                            matched = same(record, outputs(true), floats: Array(record.indices))
+                        }
+                    }
+                }
+            }
+        }
+        if wideFailed { matched = false }
+        wideFailed = false
+        naxWide = matched
+        return matched
+            ? "on (\(cases) cases bit-identical)" : "off (" + (wideNote.isEmpty ? "outputs differ" : wideNote) + ")"
+    }
+
     nonisolated(unsafe) private static var formsFailed = false
 
     /// Runs each compile-time form against the record's fast kernel on a
@@ -5380,6 +5614,9 @@ enum VerifyInt8Matmul {
             FileHandle.standardError.write(
                 "int8 verify narrow N16: K \(narrow16K.sorted()); compile-time K forms: K \(narrow16FormsK.sorted())\n"
                     .data(using: .utf8)!)
+        }
+        if chosen == .nax, naxFast {
+            FileHandle.standardError.write("int8 verify wide loads: \(checkWide())\n".data(using: .utf8)!)
         }
         return chosen
     }()
@@ -5480,8 +5717,8 @@ public enum VerifyDenseBA {
     /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
     /// that each run four b/a columns and return; every later threadgroup
     /// runs the two-layer body unchanged, `BAG` threadgroups later.
-    static var fusedSource: String {
-        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2)
+    static func fusedSource(wide: Bool) -> String {
+        let forms = VerifyInt8Matmul.naxFormsSource(layers: 2, wide: wide)
         let anchor = "int bx = int(threadgroup_position_in_grid.x);"
         guard forms.components(separatedBy: anchor).count == 2 else { return "" }
         return forms.replacingOccurrences(
@@ -5507,7 +5744,16 @@ public enum VerifyDenseBA {
         name: "bonsai_q8_verify_matmul_nax_forms2_dense_ba",
         inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
         outputNames: ["out0", "out1", "ob", "oa"],
-        source: fusedSource,
+        source: fusedSource(wide: false),
+        header: PromptInt8Matmul.naxHeader,
+        ensureRowContiguous: true)
+
+    /// `fusedSource(wide: true)`; used only while `VerifyInt8Matmul.naxWide`.
+    static let fusedWideKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_verify_matmul_nax_forms2_dense_ba_wide",
+        inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
+        outputNames: ["out0", "out1", "ob", "oa"],
+        source: fusedSource(wide: true),
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -5525,7 +5771,7 @@ public enum VerifyDenseBA {
     static func fused(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray
+        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray, wide: Bool? = nil
     ) -> [MLXArray] {
         let ns = layers.map { $0.weight.dim(0) }
         let N = wb.dim(0)
@@ -5535,7 +5781,7 @@ public enum VerifyDenseBA {
         let template = [
             ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
         ] as [(String, any KernelTemplateArg)]
-        return fusedKernel(
+        return ((wide ?? VerifyInt8Matmul.naxWide) ? fusedWideKernel : fusedKernel)(
             inputs, template: template,
             grid: ((N / 2 + ns.reduce(0, +) / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: ns.map { [m, $0] } + [[m, N], [m, N]],
