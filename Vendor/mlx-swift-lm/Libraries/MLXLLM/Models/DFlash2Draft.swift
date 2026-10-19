@@ -745,8 +745,15 @@ private final class DFlash2Attention: Module {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
 
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        let output: MLXArray
+        if mask == nil,
+            let specialized = DraftSDPA.attention(queries, keys, values, scale: scale)
+        {
+            output = specialized
+        } else {
+            output = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        }
         // MLX's full-attention path (L > 8) writes the output token-major, so the
         // [1, L, 4096] view is already row-contiguous: read it in place rather than
         // have the head-major quantizer's input check copy it. Same values, same
@@ -2865,12 +2872,25 @@ enum DF2Fast {
                 let w = MLXArray(
                     (0 ..< n * k / 8).map { UInt32(truncatingIfNeeded: UInt64($0 + 1) &* 2_654_435_761) },
                     [n, k / 8])
-                let sT = MLXArray((0 ..< g * n).map { Float16(Float(1 + $0 % 13) / 1024) }, [g, n])
+                let scaleValues: [Float16] = (0 ..< g * n).map { (i: Int) -> Float16 in
+                    let numerator: Float = Float(1 + i % 13)
+                    let value: Float = numerator / 1024
+                    return Float16(value)
+                }
+                let sT = MLXArray(scaleValues, [g, n])
                 let bT = MLXArray((0 ..< g * n).map { Float16(-Float($0 % 7) / 512) }, [g, n])
                 let xq = MLXArray(
                     (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let ascale = MLXArray((0 ..< 16 * g).map { Float(1 + $0 % 11) / 256 }, [16 * g])
-                let xs = MLXArray((0 ..< 16 * g).map { Float($0 % 17 - 8) / 64 }, [16 * g])
+                let activationScales: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
+                    let numerator: Float = Float(1 + i % 11)
+                    return numerator / 256
+                }
+                let ascale = MLXArray(activationScales, [16 * g])
+                let activationSums: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
+                    let numerator: Float = Float(i % 17 - 8)
+                    return numerator / 64
+                }
+                let xs = MLXArray(activationSums, [16 * g])
                 for rows in [16, 15] {
                     for layers in [1, 2, 3, 6] {
                         func bits(_ f: Int) -> MLXArray {
@@ -3034,8 +3054,16 @@ enum DF2Fast {
                 let g = k / group
                 let xq = MLXArray(
                     (0 ..< 16 * k).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * k])
-                let ascale = MLXArray((0 ..< 16 * g).map { Float(1 + $0 % 11) / 256 }, [16 * g])
-                let xs = MLXArray((0 ..< 16 * g).map { Float($0 % 17 - 8) / 64 }, [16 * g])
+                let activationScales: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
+                    let numerator: Float = Float(1 + i % 11)
+                    return numerator / 256
+                }
+                let ascale = MLXArray(activationScales, [16 * g])
+                let activationSums: [Float] = (0 ..< 16 * g).map { (i: Int) -> Float in
+                    let numerator: Float = Float(i % 17 - 8)
+                    return numerator / 64
+                }
+                let xs = MLXArray(activationSums, [16 * g])
                 var ws: [MLXArray] = [], sTs: [MLXArray] = [], bTs: [MLXArray] = []
                 for (l, n) in ns.enumerated() {
                     let i = arange(n * k / 8, dtype: .uint32) + MLXArray(UInt32(l * 7919 + 1))
@@ -4645,3 +4673,230 @@ enum DF2WideLaneSource {
     }
 }
 // WIDELANES-GEN END
+
+
+// The FP32 NAX 16x32x16 operations and the 32-key online softmax below retain
+// steel_attention_nax's per-row reduction order. Only live query rows run.
+private enum DraftSDPA {
+
+    static let enabled: Bool = {
+        guard #available(macOS 26.2, *) else { return false }
+        guard ProcessInfo.processInfo.environment["DF2_SDPA16"] != "0" else { return false }
+        guard ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] != "0" else { return false }
+        return GPU.deviceInfo().architecture.hasPrefix("applegpu_g17")
+    }()
+
+    static let columns: Int = {
+        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_COLUMNS"] ?? "32") ?? 32
+        return [32, 64, 128].contains(requested) ? requested : 32
+    }()
+
+    static let queryRows: Int = {
+        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_QROWS"] ?? "16") ?? 16
+        return [4, 8, 16].contains(requested) ? requested : 16
+    }()
+    static let groupedHeads: Int = {
+        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_HEADS"] ?? "1") ?? 1
+        return queryRows == 16 && [1, 2, 4].contains(requested) ? requested : 1
+    }()
+    static let cachedQueries = ProcessInfo.processInfo.environment["DF2_SDPA16_CACHEQ"] != "0"
+    static let limitedThreads = ProcessInfo.processInfo.environment["DF2_SDPA16_LIMIT"] != "0"
+
+    static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
+                          scale: Float) -> MLXArray? {
+        guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
+            q.shape == [1, 32, 16, 128], k.ndim == 4, v.shape == k.shape,
+            k.dim(0) == 1, k.dim(1) == 8, k.dim(2) >= 16, k.dim(3) == 128,
+            q.strides[3] == 1, k.strides[3] == 1, v.strides[3] == 1,
+            q.strides.allSatisfy({ $0 >= 0 }), k.strides.allSatisfy({ $0 >= 0 }),
+            v.strides.allSatisfy({ $0 >= 0 })
+        else { return nil }
+        return run(q, k, v, scale: scale, columns: columns, cacheQueries: cachedQueries,
+                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads)
+    }
+
+    static let header = """
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        // Fragment layout and reduction from Apple's steel/attn/nax.h.
+        namespace df2sdpa {
+        using F = metal::vec<float, 8>;
+        METAL_FUNC short2 fragment_coord() {
+          const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+          const short qid = lane >> 2;
+          return short2{short(((qid & 2) | (lane & 1)) * 4),
+                        short((qid & 4) | ((lane >> 1) & 3))};
+        }
+        METAL_FUNC F load(const device float* p, int stride, int rows = 16) {
+          const short2 sc = fragment_coord();
+          F f;
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 2; ++i) {
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+              const int r = sc.y + i * 8;
+              f[i * 4 + j] = r < rows ? p[r * stride + sc.x + j] : 0.0f;
+            }
+          }
+          return f;
+        }
+        template<bool TRANSPOSE_B>
+        METAL_FUNC void mma(thread F& c0, thread F& c1,
+                            const thread F& a, const thread F& b0, const thread F& b1) {
+          constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+              16, 32, 16, false, TRANSPOSE_B, true,
+              mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+          auto at = op.template get_left_input_cooperative_tensor<float, float, float>();
+          auto bt = op.template get_right_input_cooperative_tensor<float, float, float>();
+          auto ct = op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(at)>,
+              metal::remove_addrspace_t<decltype(bt)>, float>();
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 8; ++i) {
+            at[i] = a[i]; bt[i] = b0[i]; bt[8 + i] = b1[i];
+            ct[i] = c0[i]; ct[8 + i] = c1[i];
+          }
+          op.run(at, bt, ct);
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 8; ++i) { c0[i] = ct[i]; c1[i] = ct[8 + i]; }
+        }
+        template<bool MAXIMUM>
+        METAL_FUNC float reduce_op(float a, float b) {
+          if constexpr (MAXIMUM) { return metal::max(a, b); }
+          else { return a + b; }
+        }
+        template<bool MAXIMUM>
+        METAL_FUNC void row_reduce(const thread F& f, thread float2& acc) {
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 2; ++i) {
+            float t = reduce_op<MAXIMUM>(
+                reduce_op<MAXIMUM>(f[i * 4], f[i * 4 + 1]),
+                reduce_op<MAXIMUM>(f[i * 4 + 2], f[i * 4 + 3]));
+            float x = simd_shuffle_xor(t, ushort(1));
+            t = reduce_op<MAXIMUM>(t, x);
+            x = simd_shuffle_xor(t, ushort(8));
+            t = reduce_op<MAXIMUM>(t, x);
+            acc[i] = reduce_op<MAXIMUM>(acc[i], t);
+          }
+        }
+        }
+        """
+
+    static let source = """
+        using namespace df2sdpa;
+        const int head = int(threadgroup_position_in_grid.y) * HCOUNT + int(simdgroup_index_in_threadgroup);
+        const int ds = int(threadgroup_position_in_grid.x) * DCS;
+        const int qs = int(threadgroup_position_in_grid.z) * Q_ROWS;
+        const int n = k_shape[2];
+        const device float* Q = q + head * q_strides[1] + qs * q_strides[2];
+        const device float* K = k + (head / 4) * k_strides[1];
+        const device float* V = v + (head / 4) * v_strides[1];
+        const short2 sc = fragment_coord();
+        const metal::uniform<float> scale2 = make_uniform(scale_in) * make_uniform(1.44269504089f);
+        F o[DCS / 16];
+        F cached_q[8];
+        if constexpr (CACHE_Q) {
+          #pragma clang loop unroll(full)
+          for (short d = 0; d < 8; ++d) { cached_q[d] = load(Q + d * 16, int(q_strides[2]), Q_ROWS); }
+        }
+        #pragma clang loop unroll(full)
+        for (short d = 0; d < DCS / 16; ++d) { o[d] = F(0); }
+        float2 mx(-FLT_MAX), sum(0);
+        for (int kb = 0; kb < n; kb += 32) {
+          F s0(0), s1(0);
+          #pragma clang loop unroll_count(4)
+          for (short d = 0; d < 8; ++d) {
+            F a;
+            if constexpr (CACHE_Q) { a = cached_q[d]; }
+            else { a = load(Q + d * 16, int(q_strides[2]), Q_ROWS); }
+            const F b0 = load(K + kb * k_strides[2] + d * 16, int(k_strides[2]), n - kb);
+            const F b1 = load(K + (kb + 16) * k_strides[2] + d * 16, int(k_strides[2]), n - kb - 16);
+            mma<true>(s0, s1, a, b0, b1);
+          }
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 8; ++i) {
+            s0[i] *= float(scale2); s1[i] *= float(scale2);
+            const int c = kb + sc.x + i % 4;
+            s0[i] = c < n ? s0[i] : -FLT_MAX;
+            s1[i] = c + 16 < n ? s1[i] : -FLT_MAX;
+          }
+          float2 nm = mx;
+          row_reduce<true>(s0, nm); row_reduce<true>(s1, nm);
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 8; ++i) {
+            s0[i] = fast::exp2(s0[i] - nm[i / 4]);
+            s1[i] = fast::exp2(s1[i] - nm[i / 4]);
+          }
+          const float2 factor = fast::exp2(mx - nm);
+          mx = nm;
+          sum *= factor;
+          row_reduce<false>(s0, sum); row_reduce<false>(s1, sum);
+          #pragma clang loop unroll(full)
+          for (short d = 0; d < DCS / 16; ++d) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) { o[d][i] *= factor[i / 4]; }
+          }
+          simdgroup_barrier(mem_flags::mem_none);
+          #pragma clang loop unroll(full)
+          for (short d = 0; d < DCS / 16; d += 2) {
+            if constexpr (DCS == 128) {
+              if (d == 4) { threadgroup_barrier(mem_flags::mem_none); }
+            }
+            const F b00 = load(V + kb * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb);
+            const F b01 = load(V + kb * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb);
+            mma<false>(o[d], o[d + 1], s0, b00, b01);
+            const F b10 = load(V + (kb + 16) * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb - 16);
+            const F b11 = load(V + (kb + 16) * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb - 16);
+            mma<false>(o[d], o[d + 1], s1, b10, b11);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+        float2 rcp;
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; ++i) { rcp[i] = 1.0f / sum[i]; }
+        #pragma clang loop unroll(full)
+        for (short d = 0; d < DCS / 16; ++d) {
+          #pragma clang loop unroll(full)
+          for (short i = 0; i < 8; ++i) {
+            const int r = sc.y + (i / 4) * 8;
+            const int c = ds + d * 16 + sc.x + i % 4;
+            // Match MLX full attention's token-major physical output layout.
+            if (r < Q_ROWS) { out[((qs + r) * 32 + head) * 128 + c] = o[d][i] * rcp[i / 4]; }
+          }
+        }
+        """
+
+    static func makeKernel(heads: Int, limitThreads: Bool) -> MLXFast.MLXFastKernel {
+        var h = header
+        var s = source
+        if limitThreads {
+            // Scope the attribute to the definition; Metal rejects it when
+            // repeated on MLX's following explicit instantiation declaration.
+            h += "\n#pragma clang attribute push([[max_total_threads_per_threadgroup(\(32 * heads))]], apply_to=function)\n"
+            s += "\n#pragma clang attribute pop\n"
+        }
+        return MLXFast.metalKernel(
+            name: "df2_sdpa16_h\(heads)_t\(limitThreads ? 32 * heads : 0)",
+            inputNames: ["q", "k", "v", "scale_in"], outputNames: ["out"],
+            source: s, header: h, ensureRowContiguous: false)
+    }
+    static let plain: [Int: MLXFast.MLXFastKernel] = [
+        1: makeKernel(heads: 1, limitThreads: false), 2: makeKernel(heads: 2, limitThreads: false),
+        4: makeKernel(heads: 4, limitThreads: false)]
+    static let limited: [Int: MLXFast.MLXFastKernel] = [
+        1: makeKernel(heads: 1, limitThreads: true), 2: makeKernel(heads: 2, limitThreads: true),
+        4: makeKernel(heads: 4, limitThreads: true)]
+
+    static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
+                    columns: Int = 128, cacheQueries: Bool = false,
+                    queryRows: Int = 16, headsPerGroup: Int = 1,
+                    limitThreads: Bool = false) -> MLXArray {
+        let kernel = (limitThreads ? limited : plain)[headsPerGroup]!
+        return kernel([q, k, v, MLXArray(scale)],
+               template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
+               grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
+               threadGroup: (32 * headsPerGroup, 1, 1),
+               outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+    }
+}
