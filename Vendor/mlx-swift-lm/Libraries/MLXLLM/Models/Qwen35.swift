@@ -2322,12 +2322,53 @@ enum Qwen35FusedGDNVerify {
         }
         """
 
+    /// `DARKBLOOM_BONSAI_GDN_STEP=0` keeps the record scan text (no deferred output reduction)
+    /// in the chain kernel and the fast tree twins.
+    static let stepOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDN_STEP"] != "0"
+    private static let stepText: String? = stepOffered ? Qwen35FusedGDNVerify.stepSource(source) : nil
+
     private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
+        name: stepText != nil ? "qwen35_gdn_verify_fused_step" : "qwen35_gdn_verify_fused",
         inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
         outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: source,
+        source: stepText ?? source,
         header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `source` with each row's output reduction moved off the scan's serial path: row t's
+    /// q-state partial sums are reduced across the value pair's 8 lanes inside row t+1's kv
+    /// reduction and stored at the end of row t+1; the last row's after the loop. Every value
+    /// takes the same fmas and shuffles in the same order, so the bits are the record's; the next
+    /// row's state update no longer waits for the output shuffles and store.
+    static func stepSource(_ record: String) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        var ok = swap("float qr[R];", "float qr[R];\nfloat po[DVPL] = {0.f, 0.f};\ndevice float* py_ = y_;")
+        for x in [4, 2, 1] {
+            ok = ok && swap(
+                "kv[0] += simd_shuffle_xor(kv[0], \(x));",
+                "po[0] += simd_shuffle_xor(po[0], \(x));\npo[1] += simd_shuffle_xor(po[1], \(x));\nkv[0] += simd_shuffle_xor(kv[0], \(x));")
+            ok = ok && swap("out[0] += simd_shuffle_xor(out[0], \(x));", "")
+            ok = ok && swap("out[1] += simd_shuffle_xor(out[1], \(x));", "")
+        }
+        ok = ok && swap("if (lane % LPD == 0) {", "if (t > 0 && lane % LPD == 0) {")
+            && swap("*((device float2*)y_) = float2(out[0], out[1]);", "*((device float2*)py_) = float2(po[0], po[1]);")
+            && swap("q_ += Dk;", "po[0] = out[0]; po[1] = out[1];\npy_ = y_;\nq_ += Dk;")
+        guard ok, let store = s.range(of: "device float4* s_out4"),
+            let loop = s.range(of: "#pragma clang loop unroll(full)", options: .backwards,
+                range: s.startIndex ..< store.lowerBound)
+        else { return nil }
+        let tail = [4, 2, 1].map { (x: Int) -> String in
+            "po[0] += simd_shuffle_xor(po[0], \(x));\npo[1] += simd_shuffle_xor(po[1], \(x));\n"
+        }.joined()
+        s.insert(contentsOf: tail + "if (lane % LPD == 0) {\n*((device float2*)py_) = float2(po[0], po[1]);\n}\n",
+            at: loop.lowerBound)
+        return s
+    }
 
     /// Tree twin of `source`. `tree` is the draft tree descriptor (int32, at least 288):
     /// parent row [16], depth [16] (row 0 = anchor, depth 0), ancestor row by depth [16][16].
@@ -2588,12 +2629,14 @@ enum Qwen35FusedGDNVerify {
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SNAPSHOT"] != "0"
 
     private static let treeKernel: MLXFast.MLXFastKernel? = {
-        let plainFast = fastTreeOffered ? fastTreeSource(source) : nil
+        let stepFast = fastTreeOffered ? stepText.flatMap(Qwen35FusedGDNVerify.fastTreeSource) : nil
+        let plainFast = stepFast ?? (fastTreeOffered ? fastTreeSource(source) : nil)
         let snapshot = snapshotOffered ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
         let fast = snapshot ?? plainFast
         guard let text = fast ?? treeSource(source) else { return nil }
-        let name = snapshot != nil ? "qwen35_gdn_verify_fused_tree_fast_snapshot"
-            : fast != nil ? "qwen35_gdn_verify_fused_tree_fast" : "qwen35_gdn_verify_fused_tree"
+        let step = stepFast != nil ? "_step" : ""
+        let name = snapshot != nil ? "qwen35_gdn_verify_fused_tree_fast_snapshot" + step
+            : fast != nil ? "qwen35_gdn_verify_fused_tree_fast" + step : "qwen35_gdn_verify_fused_tree"
         return MLXFast.metalKernel(
             name: name,
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
