@@ -3381,24 +3381,10 @@ enum DF2Fast {
             const float eps = fparams[0];
             const float mscale = fparams[1];
             const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
-            if (vecIdx >= 32 * L + 16 * CL) return;
+            if (vecIdx >= 32 * L + 8 * CL) return;
             const uint lane = thread_index_in_simdgroup;
             const int d0 = int(lane);
             const int d1 = d0 + 32;
-            if (vecIdx >= 32 * L + 8 * CL) {
-              const int vIdx = vecIdx - (32 * L + 8 * CL);
-              const int h = vIdx / CL;
-              const int t = vIdx % CL;
-              const device float* vsrc = (t < C) ? cv : bv;
-              const int s = (t < C) ? t : (t - C);
-              const size_t srcBase = ((size_t)s * 8 + h) * 128;
-              const size_t dstBase = ((size_t)h * CL + t) * 128;
-              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
-              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
-              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
-              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
-              return;
-            }
             const bool isK = vecIdx >= 32 * L;
             int h, t, s, H, S_out;
             const device float* src;
@@ -3429,6 +3415,14 @@ enum DF2Fast {
               dst = k_out;
               pos = float(offset + t);
               posRow = t;
+              // The matching value row shares this key row's address geometry.
+              const device float* vsrc = (t < C) ? cv : bv;
+              const size_t valueSrcBase = ((size_t)s * 8 + h) * 128;
+              const size_t valueDstBase = ((size_t)h * CL + t) * 128;
+              v_out[valueDstBase + d0] = float(vsrc[valueSrcBase + d0]);
+              v_out[valueDstBase + d0 + 64] = float(vsrc[valueSrcBase + d0 + 64]);
+              v_out[valueDstBase + d1] = float(vsrc[valueSrcBase + d1]);
+              v_out[valueDstBase + d1 + 64] = float(vsrc[valueSrcBase + d1 + 64]);
             }
             const size_t srcBase = ((size_t)s * H + h) * 128;
             const size_t dstBase = ((size_t)h * S_out + t) * 128;
@@ -3473,7 +3467,7 @@ enum DF2Fast {
         let qw = normWeight(qNorm)
         let kw = normWeight(kNorm)
         let CL = C + L
-        let totalVecs = 32 * L + 16 * CL
+        let totalVecs = 32 * L + 8 * CL
         let tgs = (totalVecs + 3) / 4
         let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows == C + L
             ? ropeSpec.phases : nil
