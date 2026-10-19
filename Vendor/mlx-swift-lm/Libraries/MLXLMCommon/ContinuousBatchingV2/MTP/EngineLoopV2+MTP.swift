@@ -135,9 +135,9 @@ extension EngineLoopV2 {
     ) {
         guard verify.rows.count == 1, let block = mtp.blockDrafter,
             let state = verify.rows[0].assistantState,
-            let rec = scheduler.record(for: verify.rows[0].id),
-            rec.request.maxTokens - rec.generatedTokenCount > 1 + verify.k
+            let rec = scheduler.record(for: verify.rows[0].id)
         else { return }
+        let mayContinue = rec.request.maxTokens - rec.generatedTokenCount > 1 + verify.k
         // Packet layout for one row: k draft ids, then the 1 + k target ids.
         let k = verify.k
         var draftTokens = verify.acceptancePacket[0 ..< k]
@@ -148,9 +148,10 @@ extension EngineLoopV2 {
             let chainRows = treeDesc[1 ..< 16] .== MLXArray(Array(Int32(0) ..< Int32(15)))
             draftTokens = which(chainRows, draftTokens, MLXArray(Int32(-1)))
         }
-        var arrays = block.submitDeferredContext(requestState: state, after: targetTokens)
+        var arrays = block.submitDeferredContext(
+            requestState: state, after: targetTokens, prepareContext: mayContinue)
         let row = verify.rows[0]
-        if Self.mtpRoundContextProjectionEnabled, mtp.lookupNgram == nil,
+        if mayContinue, Self.mtpRoundContextProjectionEnabled, mtp.lookupNgram == nil,
             row.lookupCarry == nil, let blockContext = verify.blockContext
         {
             arrays.append(

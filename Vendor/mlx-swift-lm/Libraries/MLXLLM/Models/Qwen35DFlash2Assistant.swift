@@ -142,6 +142,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// One request's drafter cache and the committed context rows it has not
     /// absorbed yet.
     final class RequestState: CBv2MTPRequestState {
+        let calibration = DFlash2TreeCalibration()
         var caches: [any KVCache]
         var promptDraft: [Int32]?
         var preparedLookup: (history: [Int], depth: Int)?
@@ -159,7 +160,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var contextAbsorbed = false
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
-        var prestaged: (anchor: Int, depth: Int, tokens: MLXArray)?
+        var prestaged: (anchor: Int, depth: Int, tokens: MLXArray, probabilities: MLXArray?, topTokens: MLXArray?)?
         /// The in-flight verify's context projection (`projectRoundContext`),
         /// and how many of its columns the round committed (0 until then).
         var projection: DFlash2ContextProjection?
@@ -190,6 +191,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
         var materializedBytes: Int {
             var arrays = caches.flatMap { $0.innerState() } + pending + roots
+            calibration.appendEvaluationTargets(to: &arrays)
             if let retainedFC = lookupFC?.output ?? projection?.lookupFCOutput { arrays.append(retainedFC) }
             return arrays.reduce(0) { total, array in
                 let (next, overflow) = total.addingReportingOverflow(array.nbytes)
@@ -239,6 +241,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             roots.removeAll(keepingCapacity: false)
             prestaged = nil
             pendingRows = 0
+            calibration.release()
             isReleased = true
         }
     }
@@ -310,8 +313,12 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         if let p = state.prestaged {
             state.prestaged = nil
             if p.anchor == anchor && p.depth == depth {
+                if let pr = p.probabilities, let tt = p.topTokens {
+                    state.calibration.recordProposal(probabilities: pr, topTokens: tt)
+                }
                 return p.tokens
             }
+            state.calibration.clearPendingRound()
         }
         runDeferredAbsorption(state)
         state.lastProposalLookup = false
@@ -343,6 +350,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             if Self.deferLookupAbsorption, absorptionWillTakeAllPending(state) {
                 state.absorbDeferred = true
                 state.lastProposalLookup = true
+                state.calibration.clearPendingRound()
                 let tokens = MLXArray(ids).reshaped([1, depth])
                 state.roots.append(tokens)
                 return tokens
@@ -350,6 +358,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             _ = absorbPendingContext(requestState: requestState)
             if state.pending.isEmpty, state.contextAbsorbed {
                 state.lastProposalLookup = true
+                state.calibration.clearPendingRound()
                 let tokens = MLXArray(ids).reshaped([1, depth])
                 state.roots.append(tokens)
                 return tokens
@@ -373,7 +382,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1, projection: projection)
+            blockSize: depth + 1, projection: projection, calibration: state.calibration)
         state.absorbPending()
         state.contextAbsorbed = false
         state.roots.append(tokens)
@@ -388,7 +397,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         let preparedLookup = state.preparedLookup
         guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
         else { return }
-        state.prestaged = (anchor: anchor, depth: depth, tokens: tokens)
+        let probs = state.calibration.pendingProbabilities
+        let topTokens = state.calibration.pendingTopTokens
+        state.prestaged = (anchor: anchor, depth: depth, tokens: tokens, probabilities: probs, topTokens: topTokens)
         state.preparedLookup = preparedLookup
         asyncEval(evaluationTargets(for: requestState))
     }
@@ -463,6 +474,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let state = self.state(requestState)
+        state.calibration.recordTargetTokens(targetTokens)
         state.projection = nil
         state.projectionRows = 0
         state.frontAccepted = nil
@@ -507,13 +519,16 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state(requestState).frontAccepted = accepted
     }
 
-    /// Build and return a lookup round's deferred absorption (see
-    /// `proposeBlock`); the engine evaluates it right behind the round's verify.
+    /// Observe confirmed target tokens unconditionally for this round's causal calibration,
+    /// and build deferred context absorption behind the verify only when `prepareContext` is true.
     public func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray
+        requestState: any CBv2MTPRequestState, after: MLXArray, prepareContext: Bool
     ) -> [MLXArray] {
         let state = self.state(requestState)
-        guard state.absorbDeferred, after.size > 0 else { return [] }
+        if after.size >= 16 {
+            state.calibration.recordTargetTokens(after)
+        }
+        guard prepareContext, state.absorbDeferred, after.size > 0 else { return [] }
         // An exact select that reads `after` puts the absorption behind it on
         // the GPU: an encoder waits only for the arrays it reads, and the
         // pending rows are long finished, so without it the absorption would
@@ -559,7 +574,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
-        return state.caches.flatMap { $0.innerState() } + state.roots
+        var arrays = state.caches.flatMap { $0.innerState() } + state.roots
+        state.calibration.appendEvaluationTargets(to: &arrays)
+        return arrays
     }
 
     /// A round's confirmed columns become the next block's context.
@@ -579,11 +596,21 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         runDeferredAbsorption(state)
         state.promptDraft = nil
         state.preparedLookup = nil
+        let count = committedTargetHidden.dim(1)
+        let treePath = CBv2BranchVerify.committedRows
+        let committedIndices: MLXArray
+        if let branch = treePath, CBv2BranchVerify.isBranch(branch) {
+            committedIndices = branch.withUnsafeBufferPointer {
+                MLXArray(UnsafeBufferPointer(rebasing: $0.prefix(count)))
+            }
+        } else {
+            committedIndices = MLXArray(Array(Int32(0) ..< Int32(count)))
+        }
+        state.calibration.updatePosterior(committedRows: committedIndices)
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
         // Armed by this round's `projectRoundContext` (no rows committed yet). A draft tree's
         // accepted path keeps the projection of its own columns.
-        let treePath = CBv2BranchVerify.committedRows
         let projection = (state.projectionRows == 0 ? state.projection : nil).map { p in
             treePath.map { p.gathered($0) } ?? p
         }
@@ -616,6 +643,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.projectionRows = 0
         state.frontAccepted = nil
         state.lookupFC = nil
+        state.calibration.clearPendingRound()
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
     }

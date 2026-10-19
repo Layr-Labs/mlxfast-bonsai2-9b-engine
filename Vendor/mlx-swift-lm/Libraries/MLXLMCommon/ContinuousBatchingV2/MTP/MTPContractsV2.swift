@@ -542,8 +542,12 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// GPU (it reads it, so it does not compete with the verify). The drafter
     /// runs anything still postponed itself before its next use of the
     /// request state.
+    /// Observe confirmed target outputs and optionally submit deferred context preparation
+    /// behind this round's verify. `after` is the actual target tokens array. When `prepareContext`
+    /// is true, the drafter may build expensive context projections for subsequent rounds;
+    /// false skips unneeded context work when the request budget cannot continue.
     func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray) -> [MLXArray]
+        requestState: any CBv2MTPRequestState, after: MLXArray, prepareContext: Bool) -> [MLXArray]
 }
 
 extension CBv2MTPBlockDrafter {
@@ -573,7 +577,7 @@ extension CBv2MTPBlockDrafter {
     ) {}
 
     public func submitDeferredContext(
-        requestState: any CBv2MTPRequestState, after: MLXArray
+        requestState: any CBv2MTPRequestState, after: MLXArray, prepareContext: Bool
     ) -> [MLXArray] {
         []
     }
