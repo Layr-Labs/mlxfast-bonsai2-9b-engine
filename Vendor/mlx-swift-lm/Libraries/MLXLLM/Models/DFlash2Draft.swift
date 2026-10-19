@@ -5273,9 +5273,10 @@ enum DF2WideLaneSource {
           local_amax = max(local_amax, simd_shuffle_xor(local_amax, ushort(s)));
         }
         float seq_sum = 0.0f;
-        const uint grpBase = lane & ~uint((KG / \(e)) - 1);
+        // Only the next lane consumes the running sum. Propagate it one
+        // lane at a time, retaining the record's scalar addition order.
         for (int step = 0; step < (KG / \(e)); step++) {
-          seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+          if (step > 0) { seq_sum = simd_shuffle_up(seq_sum, 1); }
           if ((int(lane) & ((KG / \(e)) - 1)) == step) {
             for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
           }
