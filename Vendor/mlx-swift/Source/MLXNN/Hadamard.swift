@@ -4643,6 +4643,101 @@ enum VerifyInt8Matmul {
             outputShapes: [[n, k / 16]], outputDTypes: [.uint32])[0]
     }
 
+    /// `DARKBLOOM_BONSAI_VERIFY_COLRUN=0` keeps two lanes per column in the
+    /// 32-column streamed body. Otherwise each lane stages one whole column
+    /// (two 16-B loads, eight 16-B stores in one 128-B run) once the staging
+    /// twin below writes the same tile words as the two-lane form at load.
+    static let colRunAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_COLRUN"]?.lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var colRun = false
+
+    private static func streamLoad(columns: Int, colRun: Bool) -> String {
+        if colRun && columns == 32 {
+            return "for (int t = 0; t < 8; t += 4) { const uint4 u = *((const device uint4*)(wcol + (lane >> 4) * Kg * 128 + gl * 128 + (lane & 15u) * 8u + uint(t))); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
+        }
+        return "for (int t = 0; t < \(columns / 4); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
+    }
+
+    private static func streamStore(columns: Int, colRun: Bool) -> String {
+        if colRun && columns == 32 {
+            return "threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + lane * 32u + uint(t) * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
+        }
+        return "const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4); threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + col * 32u + word * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
+    }
+
+    /// The 32-column staging alone (no tensor op): one simdgroup per (tile,
+    /// group) loads the copy's words and writes the 32 x 32-word B tile to
+    /// device memory with the body's own load and store statements.
+    private static func stagingTwinSource(colRun: Bool) -> String {
+        let store = streamStore(columns: 32, colRun: colRun)
+            .replacingOccurrences(of: "threadgroup uint4*", with: "device uint4*")
+            .replacingOccurrences(of: "bs[sg]", with: "tile")
+        return """
+            const uint lane = thread_index_in_simdgroup;
+            const int bx = int(threadgroup_position_in_grid.x);
+            const int gl = int(threadgroup_position_in_grid.y);
+            const int Kg = K / 128;
+            const device uint32_t* wcol = w + (size_t)bx * (2) * Kg * 128;
+            device uint32_t* tile = out + ((size_t)bx * Kg + gl) * 1024;
+            uint32_t wv[8];
+            \(streamLoad(columns: 32, colRun: colRun))
+            for (int t = 0; t < 8; t++) {
+              const uint32_t v = wv[t];
+              \(store)
+            }
+            """
+    }
+
+    private static let stagingTwinKernels = [false, true].map { (wholeColumn: Bool) -> MLXFast.MLXFastKernel in
+        MLXFast.metalKernel(
+            name: wholeColumn ? "bonsai_verify_stream_staging_colrun" : "bonsai_verify_stream_staging_pair",
+            inputNames: ["w"], outputNames: ["out"], source: stagingTwinSource(colRun: wholeColumn),
+            ensureRowContiguous: true)
+    }
+
+    /// Every word of every tile and group at each streamed K, both forms over
+    /// one real copy of hashed words; 255 marks an unwritten word (a staged
+    /// word holds bytes 0...3 only). A compile or run error is a mismatch.
+    private static func checkColRun() -> Bool {
+        let n = 64
+        var matched = true
+        let failed = OSAllocatedUnfairLock(initialState: false)
+        withErrorHandler({ _ in failed.withLock { $0 = true } }) {
+            for k in [4096, 12288] where matched {
+                let kg = k / 128
+                let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+                    let value: UInt64 = UInt64(i + 7) &* 2_654_435_761
+                    return UInt32(truncatingIfNeeded: value)
+                }
+                let packed = streamPack(MLXArray(words, [n, k / 16]), k: k, columns: 16)
+                let tiles: [MLXArray] = stagingTwinKernels.map { kernel in
+                    kernel([packed], template: [("K", k)], grid: (n / 32 * 32, kg, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[n / 32 * kg * 1024]], outputDTypes: [.uint32], initValue: 255)[0]
+                }
+                let same = MLX.all(tiles[0] .== tiles[1])
+                let full = MLX.all(tiles[0] .!= MLXArray(UInt32(255)))
+                eval(same, full)
+                let didFail = failed.withLock { $0 }
+                matched = !didFail && same.item(Bool.self) && full.item(Bool.self)
+            }
+        }
+        let didFail = failed.withLock { $0 }
+        return matched && !didFail
+    }
+
+    /// Runs before any streamed kernel is built, so a failed twin keeps the
+    /// two-lane form in every streamed source.
+    static func prepareColRun() {
+        guard colRunAllowed else {
+            FileHandle.standardError.write(Data("int8 verify streamed column runs: off (DARKBLOOM_BONSAI_VERIFY_COLRUN=0)\n".utf8))
+            return
+        }
+        colRun = checkColRun()
+        FileHandle.standardError.write(Data("int8 verify streamed column runs: \(colRun ? "passed" : "FAILED; two-lane store kept") staging twin K 4096/12288 all tiles/groups/lanes\n".utf8))
+    }
+
     /// Same staged B tile, int32 tensor result and FP32 epilogue. Only the
     /// word addresses/load width and the position of next-group loads change.
     private static func makeStreamedBody(_ body: String, columns: Int) -> String? {
@@ -4650,9 +4745,9 @@ enum VerifyInt8Matmul {
         let oldPointer = "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
         let pointer = "const device uint32_t* wcol = w + (size_t)bx * (\(columns / 16)) * Kg * 128;"
         let oldLoad = "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
-        let load = "for (int t = 0; t < \(words); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
+        let load = streamLoad(columns: columns, colRun: colRun)
         let oldStore = "dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
-        let store = "const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4); threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + col * 32u + word * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
+        let store = streamStore(columns: columns, colRun: colRun)
         guard body.components(separatedBy: oldPointer).count == 2,
             body.components(separatedBy: oldLoad).count == 3,
             body.components(separatedBy: oldStore).count == 2 else { return nil }
@@ -6048,6 +6143,7 @@ enum VerifyInt8Matmul {
     /// the record's float path everywhere; `=nax` runs the check and the
     /// tensor kernel on any device (the M2 emulates the tensor ops).
     static let route: Route = {
+        prepareColRun()
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_VERIFY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let architecture = GPU.deviceInfo().architecture
