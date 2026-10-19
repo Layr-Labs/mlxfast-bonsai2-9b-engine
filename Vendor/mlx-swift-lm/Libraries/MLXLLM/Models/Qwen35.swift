@@ -3000,16 +3000,19 @@ final class Qwen35GatedDeltaNet: Module {
     private func canUsePromptMiddle(_ inputs: MLXArray, ssmState: MLXArray) -> Bool {
         guard inputs.ndim == 3 else { return false }
         let S = inputs.dim(1)
-        return inputs.dim(0) == 1 && (64 ... 1365).contains(S) &&
+        guard inputs.dim(0) == 1 && (64 ... 1365).contains(S) &&
             S <= Qwen35PromptGatedGDN.maximumSteps && inputs.dtype == .float32 &&
-            headKDim == 128 && headVDim == 128 && convKernelSize == 4 &&
-            !(inProjB is QuantizedLinear) && !(inProjA is QuantizedLinear) &&
+            headKDim == 128 && headVDim == 128 && convKernelSize == 4
+        else { return false }
+        guard !(inProjB is QuantizedLinear) && !(inProjA is QuantizedLinear) &&
             inProjB.bias == nil && inProjA.bias == nil &&
-            inProjB.weight.dtype == .float32 && inProjA.weight.dtype == .float32 &&
-            inProjB.weight.shape == [numVHeads, inputs.dim(2)] && inProjA.weight.shape == inProjB.weight.shape &&
+            inProjB.weight.dtype == .float32 && inProjA.weight.dtype == .float32
+        else { return false }
+        guard inProjB.weight.shape == [numVHeads, inputs.dim(2)] && inProjA.weight.shape == inProjB.weight.shape &&
             conv1d.bias == nil && conv1d.weight.dtype == .float32 &&
-            aLog.dtype == .float32 && dtBias.dtype == .float32 && aLog.size == numVHeads && dtBias.size == numVHeads &&
-            ssmState.dtype == .float32 && ssmState.shape == [1, numVHeads, headVDim, headKDim]
+            aLog.dtype == .float32 && dtBias.dtype == .float32 && aLog.size == numVHeads && dtBias.size == numVHeads
+        else { return false }
+        return ssmState.dtype == .float32 && ssmState.shape == [1, numVHeads, headVDim, headKDim]
     }
 
     /// The prompt-width (S >= 64, one row) middle of `cbv2Forward`: the
@@ -5829,6 +5832,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
         {
             eval(fused.ids, fused.values, fused.residual)
         }
+        HadamardQuantizedLinear.prepareSharedVerifyWeights()
     }
 }
 
