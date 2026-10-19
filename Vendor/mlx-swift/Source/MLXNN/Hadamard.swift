@@ -3871,17 +3871,148 @@ enum PromptInt8Matmul {
             ensureRowContiguous: true)
     }
 
+    // `naxRegCols128Source` on a 64 x 128 tile: each simdgroup takes 64 rows
+    // of its 32 columns, builds the right operand from the packed words once
+    // per group and runs the same 32 x 32 x 128 op on it twice, rows ms ...
+    // ms + 31 into cT0 and ms + 32 ... ms + 63 into cT1. Each half is
+    // `naxRegBody`'s tile: the same integer C per group, the same epilogue in
+    // the same order with groups ascending from `acc = 0`, and its activation
+    // constants at the same indices (half 1 is the `(ml >> 5) * 2` term of
+    // `bonsai_q8_cidx`, so one float4 holds as[0], as[1] of both halves).
+    // Same layout guard (on both destinations) and stores, so every output is
+    // `naxSgBody`'s bits (checked at load, `checkRegisterRows64`). Same
+    // layer pick as the 128-column form. grid (ceil(sum N / 128) * 128, M / 64).
+    static let naxRegRows64Body = """
+        using elem_index = metal::conditional_t<INDEX32, uint, size_t>;
+        if (bx >= N / 64) { return; }
+        const int Kg = K / 128;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int ms = int(threadgroup_position_in_grid.y) * 64;
+        const int ns = bx * 64 + 32 * int(sg & 1);
+        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        auto tA0 = A.template slice<128, 32>(0, ms);
+        auto cT0 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        auto cT1 = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        const int nb = ns + fn;
+        const int mb = ms + fm;
+        thread int8_t* b0p = &bT[0];
+        bool ok = int(bT.get_capacity()) == 128 && int(cT0.get_capacity()) == 32 && int(cT1.get_capacity()) == 32
+            && (reinterpret_cast<ulong>(b0p) & 3ul) == 0;
+        if (ok) {
+          for (int i = 1; i < 128; i++) { ok = ok && &bT[i] == b0p + i; }
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 32; i++) {
+            auto ids0 = cT0.get_multidimensional_index(i);
+            auto ids1 = cT1.get_multidimensional_index(i);
+            const int row = fm + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+            const int col = fn + 16 * ((i >> 3) & 1) + (i & 3);
+            ok = ok && int(ids0[1]) == row && int(ids0[0]) == col && int(ids1[1]) == row && int(ids1[0]) == col;
+          }
+        }
+        if (!simd_all(ok)) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 64; i += 4) {
+            const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1) + 32 * ((i >> 5) & 1);
+            *(device float4*)(out + (elem_index)mm * N + nb + 16 * ((i >> 3) & 1)) = float4(as_type<float>(0x7fc00000u));
+          }
+          return;
+        }
+        thread uint32_t* bw = (thread uint32_t*)b0p;
+        const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+        const uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));
+        const elem_index cs = (elem_index)(K / 8);
+        const device uint4* wcol = (const device uint4*)(w + (elem_index)(ns + nl) * (elem_index)(K / 16));
+        uint4 wv[8];
+        const device half4* sp0 = (const device half4*)(scalesT + nb);
+        const device half4* sp1 = (const device half4*)(scalesT + nb + 16);
+        const device half4* bp0 = (const device half4*)(biasesT + nb);
+        const device half4* bp1 = (const device half4*)(biasesT + nb + 16);
+        const int NQ = N / 4;
+        const elem_index tbase = (elem_index)(ms / 64) * (elem_index)Kg * 64 + (elem_index)(4 * fm);
+        float acc0[32], acc1[32];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
+        for (int g = 0; g < Kg; g++) {
+          const device uint4* src = wcol + (elem_index)g * 2;
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * cs]; wv[2 * c + 1] = src[c * cs + 1]; }
+          #pragma clang loop unroll(full)
+          for (int c = 0; c < 4; c++) {
+            const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];
+            bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;
+            bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;
+            bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;
+            bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;
+          }
+          auto tA = A.template slice<128, 32>(g * 128, ms);
+          auto tB = A.template slice<128, 32>(g * 128, ms + 32);
+          op.run(tA, bT, cT0);
+          op.run(tB, bT, cT1);
+          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
+          const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
+          const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
+          const float4 a0 = *(const device float4*)(ascale + tbase + (elem_index)g * 64);
+          const float4 a1 = *(const device float4*)(ascale + tbase + 32 + (elem_index)g * 64);
+          const float4 r0 = *(const device float4*)(rsb + tbase + (elem_index)g * 64);
+          const float4 r1 = *(const device float4*)(rsb + tbase + 32 + (elem_index)g * 64);
+          float as0[4], rb0[4], as1[4], rb1[4];
+          as0[0] = a0.x; as0[1] = a0.y; as0[2] = a1.x; as0[3] = a1.y;
+          rb0[0] = r0.x; rb0[1] = r0.y; rb0[2] = r1.x; rb0[3] = r1.y;
+          as1[0] = a0.z; as1[1] = a0.w; as1[2] = a1.z; as1[3] = a1.w;
+          rb1[0] = r0.z; rb1[1] = r0.w; rb1[2] = r1.z; rb1[3] = r1.w;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < 32; i++) {
+            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+            const float s = nh ? s1[c] : s0[c];
+            const float b = nh ? b1[c] : b0[c];
+            const float t0 = s * float(cT0[i]);
+            acc0[i] = fma(b, rb0[mh], fma(as0[mh], t0, acc0[i]));
+            const float t1 = s * float(cT1[i]);
+            acc1[i] = fma(b, rb1[mh], fma(as1[mh], t1, acc1[i]));
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 32; i += 4) {
+          const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+          const elem_index o = (elem_index)mm * N + nb + 16 * ((i >> 3) & 1);
+          *(device float4*)(out + o) = float4(acc0[i], acc0[i + 1], acc0[i + 2], acc0[i + 3]);
+          *(device float4*)(out + o + (elem_index)(32 * N)) = float4(acc1[i], acc1[i + 1], acc1[i + 2], acc1[i + 3]);
+        }
+        """
+
+    /// `naxRegRows64Body` for one, two and three layers (index `layers - 1`).
+    private static let naxRegRows64Kernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_matmul_nax_reg_rows64_\(layers)_v1",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: swapped(naxSgSource(layers: layers, body: naxRegRows64Body), [
+                (of: "int bx = int(threadgroup_position_in_grid.x);",
+                 with: "int bx = 2 * int(threadgroup_position_in_grid.x) + int(simdgroup_index_in_threadgroup >> 1);"),
+            ]),
+            header: naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its
-    /// register-weight forms `naxRegBody` and `naxRegCols128Source`. Each names its kernels (index `layers - 1`), its
+    /// register-weight forms `naxRegBody`, `naxRegCols128Source` and `naxRegRows64Body`. Each names its kernels (index `layers - 1`), its
     /// threads per threadgroup and its rows and columns per threadgroup.
     enum SgForm {
-        case staged, register, registerCols128
+        case staged, register, registerCols128, registerRows64
 
         var launch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
             switch self {
             case .staged: return (PromptInt8Matmul.naxSgKernels, 128, 64, 64)
             case .register: return (PromptInt8Matmul.naxRegKernels, 64, 32, 64)
             case .registerCols128: return (PromptInt8Matmul.naxRegCols128Kernels, 128, 32, 128)
+            case .registerRows64: return (PromptInt8Matmul.naxRegRows64Kernels, 128, 64, 128)
             }
         }
     }
@@ -3912,7 +4043,7 @@ enum PromptInt8Matmul {
                 n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
             }
         var template: [(String, any KernelTemplateArg)] = [("NEG", negative ? 1 : 0)]
-        if form == .staged || form == .registerCols128 { template.append(("INDEX32", index32)) }
+        if form != .register { template.append(("INDEX32", index32)) }
         let launch = form.launch
         return launch.kernels[layers.count - 1](
             inputs, template: template,
@@ -4052,6 +4183,17 @@ enum PromptInt8Matmul {
         return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
     }
 
+    /// `naxRegRows64Body` against `naxSgBody`, once the 128-column form
+    /// matched: `sgForm` becomes `.registerRows64` when every bit matched,
+    /// else the 128-column form stays. Returns the verdict for the stderr line.
+    private static func checkRegisterRows64() -> String {
+        if switchedOff("DARKBLOOM_BONSAI_PROMPT_REG_ROWS64") { return "off (DARKBLOOM_BONSAI_PROMPT_REG_ROWS64=0)" }
+        guard sgForm == .registerCols128 else { return "off (the 128-column register-weight kernel is not in use)" }
+        let (same, detail) = matchesStaged(.registerRows64)
+        if same { sgForm = .registerRows64 }
+        return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
+    }
+
     /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
     /// or later, 18 or later for a `p` part.
     static func architectureHasNAX(_ name: String) -> Bool {
@@ -4178,6 +4320,8 @@ enum PromptInt8Matmul {
                 "int8 prompt register-weight kernel: \(checkRegister())\n".data(using: .utf8)!)
             FileHandle.standardError.write(
                 "int8 prompt register-weight 128-column kernel: \(checkRegisterCols128())\n".data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "int8 prompt register-weight 64-row kernel: \(checkRegisterRows64())\n".data(using: .utf8)!)
         }
         return chosen
     }()
