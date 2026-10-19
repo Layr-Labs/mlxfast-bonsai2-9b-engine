@@ -2717,14 +2717,25 @@ enum DF2Fast {
     /// uint4 words per tile: one 32-column block of one group, codes then FP16 scales then FP16 offsets.
     static func w4TileU4(group: Int) -> Int { 32 * (group / 32) + 8 }
 
+    /// Tile codes hold each nibble u as u ^ 8, the 4-bit two's complement of u - 8, so the tiled kernels
+    /// stage 16 * (u - 8) with one mask (high nibble) or a shift and a mask (low nibble) instead of
+    /// mask, add and xor; their activation scale is read as ascale / 16. Both factors are powers of
+    /// two: s * (a / 16) is (s * a) / 16 exactly and the int32 dot is 16 times the record's, exactly
+    /// representable in FP32 (|C| <= 64 * 127 * 128), so every FP32 step sees the record's values and
+    /// the output bits are the record kernel's. `w4AdoptTiles` checks that on the device before any
+    /// tile is used. `DARKBLOOM_BONSAI_DF2_SIGNED_NIBBLES=0` keeps the record tile codes and staging.
+    static let w4SignedNibbles =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_SIGNED_NIBBLES"] != "0"
+
     /// The record operands of one linear as tiles `[N / 32, G, w4TileU4]` (uint4 words; stored as
     /// uint32): per 32-column block and group, the block's 32 rows of `group / 2` code bytes in row
-    /// order (the bytes the record kernel reads, unchanged), then the block's 32 FP16 scales, then its
-    /// 32 FP16 offsets. A pure reordering of the same bits: no value is converted.
+    /// order (the bytes the record kernel reads, each nibble XOR 8 under `w4SignedNibbles`), then the
+    /// block's 32 FP16 scales, then its 32 FP16 offsets. A lossless reordering: no value is rounded.
     static func w4Tile(_ w: MLXArray, sT: MLXArray, bT: MLXArray, n N: Int, k K: Int, group: Int) -> MLXArray {
         let G = K / group
         let words = group / 8
-        let codes = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
+        let ordered = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
+        let codes = w4SignedNibbles ? ordered ^ MLXArray(UInt32(0x8888_8888)) : ordered
         func cols(_ a: MLXArray) -> MLXArray {
             contiguous(a.reshaped([G, N / 32, 32]).transposed(1, 0, 2)).view(dtype: .uint32)
         }
@@ -3915,15 +3926,34 @@ enum DF2Fast {
             }
             precondition(!loop.contains("sT") && !loop.contains("bT") && !loop.contains("* N"))
         }
+        let signed = tiled && w4SignedNibbles
+        if signed {
+            // Every activation-scale read of the loop becomes ascale / 16 (see `w4SignedNibbles`).
+            let reads = loop.components(separatedBy: "ascale[").count - 1
+            for row in ["m0", "m1"] {
+                for index in ["g]", "int(sg)]", "g + SPLIT]"] {
+                    let read = "ascale[\(row) * G + \(index)"
+                    loop = loop.replacingOccurrences(of: read, with: "(0.0625f * \(read))")
+                }
+            }
+            precondition(reads > 0 && loop.components(separatedBy: "(0.0625f * ascale[").count - 1 == reads)
+        }
+        let unpack = signed
+            ? """
+            #define LO(v) (((v) << 4) & 0xF0F0F0F0u)
+            #define HI(v) ((v) & 0xF0F0F0F0u)
+            """
+            : """
+            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+            """
         let reduce =
             """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             threadgroup float* red = (threadgroup float*)tiles;
 
             """
-        return pick + """
-            #define LO(v) ((((v) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
-            #define HI(v) (((((v) >> 4) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u)
+        return pick + unpack + "\n" + """
             const int G = K / \(group);
             const int n0 = bx * \(cols);
             const uint lane = thread_index_in_simdgroup;
