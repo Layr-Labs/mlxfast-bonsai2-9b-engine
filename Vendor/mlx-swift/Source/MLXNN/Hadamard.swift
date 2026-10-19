@@ -3871,17 +3871,34 @@ enum PromptInt8Matmul {
             ensureRowContiguous: true)
     }
 
+    /// `naxRegCols128Source` with K a compile-time constant (template `KC`), so
+    /// the group count, strides and address arithmetic fold; the same
+    /// operations in the same order (checked at load, `checkRegisterCols128K`).
+    private static let naxRegCols128KKernels = (1 ... 3).map { layers in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_matmul_nax_reg_cols128_\(layers)_kc_v1",
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: swapped(naxRegCols128Source(layers: layers), [
+                (of: "const int K = ksz[0];", with: "const int K = KC;"),
+            ]),
+            header: naxHeader,
+            ensureRowContiguous: true)
+    }
+
     /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its
     /// register-weight forms `naxRegBody` and `naxRegCols128Source`. Each names its kernels (index `layers - 1`), its
     /// threads per threadgroup and its rows and columns per threadgroup.
     enum SgForm {
-        case staged, register, registerCols128
+        case staged, register, registerCols128, registerCols128K
 
         var launch: (kernels: [MLXFast.MLXFastKernel], threads: Int, rows: Int, columns: Int) {
             switch self {
             case .staged: return (PromptInt8Matmul.naxSgKernels, 128, 64, 64)
             case .register: return (PromptInt8Matmul.naxRegKernels, 64, 32, 64)
             case .registerCols128: return (PromptInt8Matmul.naxRegCols128Kernels, 128, 32, 128)
+            case .registerCols128K: return (PromptInt8Matmul.naxRegCols128KKernels, 128, 32, 128)
             }
         }
     }
@@ -3906,19 +3923,27 @@ enum PromptInt8Matmul {
         let dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
         let inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
             + [ascale, rsb, dims]
-        let limit = Int(Int32.max)
-        let index32 = m > 0 && m % 64 == 0 && k >= 128 && k % 128 == 0
-            && m <= limit / k && ns.allSatisfy { n in
-                n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
-            }
+        let index32 = fitsIndex32(m: m, k: k, ns: ns)
         var template: [(String, any KernelTemplateArg)] = [("NEG", negative ? 1 : 0)]
-        if form == .staged || form == .registerCols128 { template.append(("INDEX32", index32)) }
+        if form == .staged || form == .registerCols128 || form == .registerCols128K {
+            template.append(("INDEX32", index32))
+        }
+        if form == .registerCols128K { template.append(("KC", k)) }
         let launch = form.launch
         return launch.kernels[layers.count - 1](
             inputs, template: template,
             grid: ((ns.reduce(0, +) + launch.columns - 1) / launch.columns * launch.threads, m / launch.rows, 1),
             threadGroup: (launch.threads, 1, 1),
             outputShapes: ns.map { [m, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    /// Every element offset of a `runSg` call fits in 32 bits (`INDEX32`).
+    private static func fitsIndex32(m: Int, k: Int, ns: [Int]) -> Bool {
+        let limit = Int(Int32.max)
+        guard m > 0, m % 64 == 0, k >= 128, k % 128 == 0, m <= limit / k else { return false }
+        return ns.allSatisfy { n in
+            n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
+        }
     }
 
     /// The tensor kernel the `nax` route runs: the vector form when it
@@ -4052,6 +4077,27 @@ enum PromptInt8Matmul {
         return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
     }
 
+    /// `sgForm`, except that the compile-time-K form serves only the calls its
+    /// load check ran (`registerCheckShapes`, with 32-bit offsets); every other
+    /// call keeps the 128-column form, which matched on the same checks.
+    private static func checkedForm(m: Int, k: Int, ns: [Int]) -> SgForm {
+        guard sgForm == .registerCols128K else { return sgForm }
+        let checked: Bool = registerCheckShapes.contains { shape in shape.k == k && shape.ns == ns }
+        return checked && fitsIndex32(m: m, k: k, ns: ns) ? .registerCols128K : .registerCols128
+    }
+
+    /// `naxRegCols128Source` with compile-time K against `naxSgBody`, once the
+    /// 128-column form matched: `sgForm` becomes `.registerCols128K` when every
+    /// bit matched, else the 128-column form stays. Returns the verdict for the
+    /// stderr line.
+    private static func checkRegisterCols128K() -> String {
+        if switchedOff("DARKBLOOM_BONSAI_PROMPT_KC") { return "off (DARKBLOOM_BONSAI_PROMPT_KC=0)" }
+        guard sgForm == .registerCols128 else { return "off (the 128-column kernel is not in use)" }
+        let (same, detail) = matchesStaged(.registerCols128K)
+        if same { sgForm = .registerCols128K }
+        return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
+    }
+
     /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
     /// or later, 18 or later for a `p` part.
     static func architectureHasNAX(_ name: String) -> Bool {
@@ -4178,6 +4224,9 @@ enum PromptInt8Matmul {
                 "int8 prompt register-weight kernel: \(checkRegister())\n".data(using: .utf8)!)
             FileHandle.standardError.write(
                 "int8 prompt register-weight 128-column kernel: \(checkRegisterCols128())\n".data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "int8 prompt register-weight 128-column compile-time K kernel: \(checkRegisterCols128K())\n"
+                    .data(using: .utf8)!)
         }
         return chosen
     }()
@@ -4213,7 +4262,8 @@ enum PromptInt8Matmul {
             return runSg(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, form: sgForm)[0]
+                negative: negative && negativeForms,
+                form: checkedForm(m: activation.rows, k: activation.k, ns: [weight.dim(0)]))[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -4237,7 +4287,7 @@ enum PromptInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative }, form: sgForm)
+                negative: negativeForms && layers.allSatisfy { $0.negative }, form: checkedForm(m: activation.rows, k: activation.k, ns: layers.map { $0.weight.dim(0) }))
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
