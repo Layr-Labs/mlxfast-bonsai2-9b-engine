@@ -993,7 +993,9 @@ enum CBv2VerifyVectorAttention {
             constexpr int D = 256;
             constexpr int G = 4;
             const uint L = uint(N_QUERIES);
-            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint query_block = threadgroup_position_in_grid.y / 1u;
+            const uint t = query_block * uint(QPT) + simdgroup_index_in_threadgroup / uint(CPT);
+            if (t >= L) return;
             const uint kvh = threadgroup_position_in_grid.z;
             const uint h0 = kvh * G;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -1115,9 +1117,11 @@ enum CBv2VerifyVectorAttention {
             constexpr int D = 256;
             constexpr int G = GH;
             const uint L = uint(N_QUERIES);
-            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint query_block = threadgroup_position_in_grid.y / 2u;
+            const uint t = query_block * uint(QPT) + simdgroup_index_in_threadgroup / uint(CPT);
+            if (t >= L) return;
             const uint kvh = threadgroup_position_in_grid.z;
-            const uint h0 = kvh * 4u + threadgroup_position_in_grid.y * G;
+            const uint h0 = kvh * 4u + (threadgroup_position_in_grid.y % 2u) * G;
             const uint simd_lid = thread_index_in_simdgroup;
             const int c = int(threadgroup_position_in_grid.x * uint(CPT)
                 + simdgroup_index_in_threadgroup % uint(CPT));
@@ -1199,12 +1203,16 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
+        // Split full eight-query blocks only: partial blocks keep their original occupancy.
+        let queriesPerGroup = L.isMultiple(of: 8) ? (classesPerGroup == 1 ? 2 : 8) : L
+        let queryGroups = (L + queriesPerGroup - 1) / queriesPerGroup
 
         if L > 8 && classesPerGroup == 2 {
             let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])]
             let states = pairedPartial(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2), ("QPT", queriesPerGroup)],
+                grid: (32 * 32 * queriesPerGroup, 2 * queryGroups, 4),
+                threadGroup: (32 * queriesPerGroup, 1, 1),
                 outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
                 outputDTypes: [.float32, .float32, .float32])
             return combine(
@@ -1213,8 +1221,9 @@ enum CBv2VerifyVectorAttention {
         }
         let parts = partial(
             [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
-            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
-            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            template: [("N_QUERIES", L), ("CPT", classesPerGroup), ("QPT", queriesPerGroup)],
+            grid: (32 * 32 * queriesPerGroup, queryGroups, 4),
+            threadGroup: (32 * classesPerGroup * queriesPerGroup, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
             outputDTypes: [.float32, .float32, .float32])
         return combine(
