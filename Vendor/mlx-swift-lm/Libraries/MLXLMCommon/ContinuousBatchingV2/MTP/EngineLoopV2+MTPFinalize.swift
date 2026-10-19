@@ -41,6 +41,14 @@ extension EngineLoopV2 {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// `DARKBLOOM_BONSAI_EARLY_PRESTAGE=0` restores the parent: the next
+    /// block is submitted after the round's emission and journal entry.
+    static let mtpEarlyPrestageEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_EARLY_PRESTAGE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
     /// Seed boundary, called for a prompt row's FIRST sampled token before
     /// that token is emitted. The token is the first round's anchor and the
     /// prompt context is already absorbed, so the block drafter proposes the
@@ -296,11 +304,11 @@ extension EngineLoopV2 {
             }
             let rejected = (1 + k) - confirmed
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            // The next round's drafter block is built and submitted only
-            // after this round's tokens are handed to the stream and the
-            // round is journaled (below): the host's graph build no longer
-            // delays the emission, and the GPU sees the same submissions in
-            // the same order.
+            // The next round's drafter block is built and submitted right
+            // after the drafter finalize below, or, with the early prestage
+            // off, after this round's tokens are handed to the stream and the
+            // round is journaled. The GPU sees the same submissions in the
+            // same order either way.
             var prestage: (() -> Void)?
             let committedRows = outcome.path.prefix(max(confirmed, 1)).map { Int32($0) }
             let treeBranch = CBv2BranchVerify.isBranch(committedRows)
@@ -360,6 +368,18 @@ extension EngineLoopV2 {
                         }
                     }
                 }
+            }
+            // The next block depends only on the drafter state finalized
+            // above, so it is submitted now and the GPU, idle since the
+            // packet, starts on it while the host does the bookkeeping below.
+            // That bookkeeping builds no GPU work, so the GPU order is the
+            // record's. The block builds with no tree path set, as before.
+            if Self.mtpEarlyPrestageEnabled, let early = prestage {
+                prestage = nil
+                let treePath = CBv2BranchVerify.committedRows
+                CBv2BranchVerify.committedRows = nil
+                early()
+                CBv2BranchVerify.committedRows = treePath
             }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
@@ -473,9 +493,10 @@ extension EngineLoopV2 {
                 acceptedDepth: observedAccepted,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
-            // After the emission and this round's journal entry, so the
-            // gap between them stays the record's (the stream's reader
-            // snapshots the journal after draining).
+            // With the early prestage off: after the emission and this
+            // round's journal entry, so the gap between them stays the
+            // record's (the stream's reader snapshots the journal after
+            // draining).
             CBv2BranchVerify.committedRows = nil
             prestage?()
 

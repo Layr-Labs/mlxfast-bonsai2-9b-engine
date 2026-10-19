@@ -1370,24 +1370,31 @@ private final class DFlash2PackedCodebook {
         packed = MLXArray(words)
         // UInt8 exponent bases replace the dependent value lookup.
         lookup = MLXArray(bases)
-        let restored = materialize().view(dtype: .uint16)
+        let restored = try materialize().view(dtype: .uint16)
         let exact = MLX.all(restored .== source.view(dtype: .uint16))
         try withError { eval(exact) }
         guard exact.item(Bool.self) else { return nil }
     }
 
     func gather(_ ids: MLXArray, floatOutput: Bool = false) -> MLXArray {
-        let shape = ids.shape + [width]
-        let output = Self.gatherKernel(
-            [packed, lookup, ids.asType(.uint32).reshaped(-1)],
-            template: [("WIDTH", width), ("FLOAT_OUTPUT", floatOutput)],
-            grid: (ids.size * width / 2, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [shape], outputDTypes: [floatOutput ? .float32 : .uint16])[0]
+        let output = gatherOutputs(ids, floatOutput: floatOutput)[0]
         return floatOutput ? output : output.view(dtype: .bfloat16)
     }
 
-    func materialize() -> MLXArray {
-        gather(MLXArray(UInt32(0) ..< UInt32(rows)))
+    private func gatherOutputs(_ ids: MLXArray, floatOutput: Bool) -> [MLXArray] {
+        Self.gatherKernel(
+            [packed, lookup, ids.asType(.uint32).reshaped(-1)],
+            template: [("WIDTH", width), ("FLOAT_OUTPUT", floatOutput)],
+            grid: (ids.size * width / 2, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [ids.shape + [width]], outputDTypes: [floatOutput ? .float32 : .uint16])
+    }
+
+    /// Every row as BF16. Throws, instead of trapping on an index, when MLX refused the gather.
+    func materialize() throws -> MLXArray {
+        guard let output = gatherOutputs(MLXArray(UInt32(0) ..< UInt32(rows)), floatOutput: false).first else {
+            throw MLXError.caught("DFlash2 packed codebook: the gather returned no output")
+        }
+        return output.view(dtype: .bfloat16)
     }
 
     private static let gatherKernel = MLXFast.metalKernel(
@@ -1559,6 +1566,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     public func bind(target: any DFlash2Target) throws {
         // The per-row kernels' wide-form bit check (load time, before any proposal).
         if DF2Fast.on, let group = DF2Fast.w4Group { DF2WideLanes.prepare(group: group) }
+        if DF2Fast.on {
+            DF2Fast.prepareTopkFast()
+            HadamardQuantizedLinear.prepareDraftGather()
+        }
         guard target.dFlash2VocabularySize == config.vocabularySize else {
             throw DFlash2Error.vocabularyMismatch(
                 drafter: config.vocabularySize, target: target.dFlash2VocabularySize)
@@ -1576,6 +1587,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
         }
         if DF2Fast.on {
+            DF2Fast.TreeWide.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
             try prepareFirstRound(target)
             checkLayerZeroFront()
         }
@@ -5383,7 +5395,9 @@ enum DF2Fast {
     /// Multi-block parallel top-16 per (row, block): 8 blocks of 256 threads per row (120 blocks for P=15).
     static let topk = MLXFast.metalKernel(
         name: "df2_topk16_mb8", inputNames: ["logits"], outputNames: ["ids", "vals"],
-        source: """
+        source: topkSource)
+
+    static let topkSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint blk = threadgroup_position_in_grid.y;
             const uint tid = thread_position_in_threadgroup.x;
@@ -5436,7 +5450,141 @@ enum DF2Fast {
                 }
               }
             }
-            """)
+            """
+
+    /// `DARKBLOOM_BONSAI_DF2_TOPK_FAST=0` keeps the record top-k.
+    static let topkFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOPK_FAST"] != "0"
+    /// Written once by `prepareTopkFast` at bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var topkFastPassed = false
+    nonisolated(unsafe) private static var topkFastPrepared = false
+
+    /// `topkSource` with stage 1 issuing eight strided loads before it inserts them, in the
+    /// record's order. Every comparison and its order are the record's, so the ids and values
+    /// are too; the tail past the last full chunk runs the record loop. Nil unless the cut
+    /// matches once.
+    static let topkFastSource: String? = {
+        let loop = """
+            for (int n = int(blk * 256u + tid); n < Vn; n += 2048) {
+              const float v = lr[n];
+              if (v > tv[3]) {
+                int k = 3;
+                while (k > 0 && v > tv[k - 1]) { tv[k] = tv[k - 1]; ti[k] = ti[k - 1]; k--; }
+                tv[k] = v; ti[k] = n;
+              }
+            }
+            """
+        let chunked = """
+            int n = int(blk * 256u + tid);
+            for (; n + 7 * 2048 < Vn; n += 8 * 2048) {
+              float xs[8];
+              #pragma clang loop unroll(full)
+              for (int c = 0; c < 8; c++) { xs[c] = lr[n + c * 2048]; }
+              #pragma clang loop unroll(full)
+              for (int c = 0; c < 8; c++) {
+                const float v = xs[c];
+                if (v > tv[3]) {
+                  int k = 3;
+                  while (k > 0 && v > tv[k - 1]) { tv[k] = tv[k - 1]; ti[k] = ti[k - 1]; k--; }
+                  tv[k] = v; ti[k] = n + c * 2048;
+                }
+              }
+            }
+            for (; n < Vn; n += 2048) {
+              const float v = lr[n];
+              if (v > tv[3]) {
+                int k = 3;
+                while (k > 0 && v > tv[k - 1]) { tv[k] = tv[k - 1]; ti[k] = ti[k - 1]; k--; }
+                tv[k] = v; ti[k] = n;
+              }
+            }
+            """
+        guard topkSource.components(separatedBy: loop).count == 2 else { return nil }
+        return topkSource.replacingOccurrences(of: loop, with: chunked)
+    }()
+
+    static let topkFast: MLXFast.MLXFastKernel? = topkFastSource.map { source in
+        MLXFast.metalKernel(
+            name: "df2_topk16_mb8_c8", inputNames: ["logits"], outputNames: ["ids", "vals"], source: source)
+    }
+
+    /// Runs once at drafter bind, before any proposal or measured window: `topkFast` against
+    /// `topk` on `topkCheckRows`. `topkFastPassed` is set only when every id and value bit
+    /// matched; a mismatch or an MLX error keeps the record kernel.
+    static func prepareTopkFast() {
+        guard !topkFastPrepared else { return }
+        topkFastPrepared = true
+        var note = "off (DARKBLOOM_BONSAI_DF2_TOPK_FAST=0)"
+        if topkFastAllowed, let fast = topkFast {
+            do {
+                let detail: String? = try withError { try topkFastMismatch(fast) }
+                topkFastPassed = detail == nil
+                note = detail.map { "off (\($0))" }
+                    ?? "on (\(topkCheckShapes.reduce(0) { $0 + $1.rows }) rows of \(topkCheckKinds) kinds at V "
+                    + topkCheckShapes.map { String($0.vocab) }.joined(separator: ", ")
+                    + " bitwise equal to the record kernel, ids and values)"
+            } catch {
+                note = "off (error: \(error))"
+            }
+        } else if topkFastAllowed {
+            note = "off (a cut of the record source did not match once)"
+        }
+        FileHandle.standardError.write(Data("DF2 topk fast: \(note)\n".utf8))
+    }
+
+    static let topkCheckShapes: [(rows: Int, vocab: Int)] = [(15, 98304), (15, 98304), (15, 10540), (2, 248320)]
+    static let topkCheckKinds = 15
+
+    private static func topkFastMismatch(_ fast: MLXFast.MLXFastKernel) throws -> String? {
+        var first = 0
+        for (c, shape) in topkCheckShapes.enumerated() {
+            let logits = MLXArray(topkCheckRows(shape.rows, shape.vocab, first: first), [shape.rows, shape.vocab])
+            first += shape.rows
+            let record: [MLXArray] = try checkedOutputs(top(logits, kernel: topk), 2, "topk record")
+            let mine: [MLXArray] = try checkedOutputs(top(logits, kernel: fast), 2, "topk fast")
+            let same: MLXArray = MLX.all(record[0] .== mine[0])
+                .&& MLX.all(record[1].view(dtype: .uint32) .== mine[1].view(dtype: .uint32))
+            eval(same)
+            if !same.item(Bool.self) { return "mismatch at case \(c), \(shape.rows) x \(shape.vocab)" }
+        }
+        return nil
+    }
+
+    /// Row r of a check case has kind (first + r) mod 15: pseudo-random, ties on a 0.5 grid, all
+    /// zero, signed zeros, an ascending and a descending ramp, half NaN, all NaN, -inf with three
+    /// finite values in one block (the stale-id rounds of the merge), NaN with sparse finite
+    /// values, +inf sprinkled, subnormals, seven distinct values, one thread's elements on top,
+    /// and one lane per simdgroup tied on top over a 0.5 grid.
+    private static func topkCheckRows(_ rows: Int, _ vocab: Int, first: Int) -> [Float] {
+        var out = [Float](repeating: 0, count: rows * vocab)
+        for r in 0 ..< rows {
+            let kind = (first + r) % topkCheckKinds
+            for n in 0 ..< vocab {
+                let h = UInt32(truncatingIfNeeded: (UInt64(n) &* 2_654_435_761 &+ UInt64(first + r) &* 40_503) >> 7)
+                let x = Float(Int(h % 200_001) - 100_000) / 1000
+                let u = h % 1000
+                let v: Float
+                switch kind {
+                case 0: v = x
+                case 1: v = (x * 2).rounded() / 2
+                case 2: v = 0
+                case 3: v = u < 500 ? 0 : -0.0
+                case 4: v = Float(n) * 0.001 + Float(r)
+                case 5: v = -Float(n) * 0.001
+                case 6: v = u < 500 ? .nan : x
+                case 7: v = .nan
+                case 8: v = (n % 2048 == 300 && n < 6000) ? x : (u < 500 ? -.infinity : .nan)
+                case 9: v = n % 5003 == 11 ? x : .nan
+                case 10: v = n % 777 == 5 ? .infinity : x
+                case 11: v = x * 0x1p-130
+                case 12: v = Float(h % 7) * 0.25
+                case 13: v = n % 256 == 7 ? 1000 + x : x
+                default: v = n % 32 == 3 ? 50 : (x * 2).rounded() / 2
+                }
+                out[r * vocab + n] = v
+            }
+        }
+        return out
+    }
 
     static let selector = MLXFast.metalKernel(
         name: "df2_selector_mb8", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
@@ -5535,8 +5683,12 @@ enum DF2Fast {
     /// `topk` over `[..., V]` logits: `[P, 128]` ids and values. The selectors
     /// read only these pairs, in any order.
     static func top(_ logits: MLXArray) -> [MLXArray] {
+        top(logits, kernel: topkFastPassed ? topkFast ?? topk : topk)
+    }
+
+    static func top(_ logits: MLXArray, kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
         let V = logits.dim(-1), P = logits.size / V
-        return topk(
+        return kernel(
             [logits.reshaped([P, V]).asType(.float32)],
             grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
             outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
@@ -5720,8 +5872,13 @@ enum DF2Fast {
             name: treeSplit ? "df2_tree_split_mb8" : (treeSharp ? "df2_tree_t08_mb8" : "df2_tree_mb8"),
             inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
             outputNames: ["tokens", "desc"],
-            source: source.replacingOccurrences(of: "TREE_SCALE", with: treeSharp ? "1.25f" : "1.0f")
-                .replacingOccurrences(of: "TREE_SPLIT", with: treeSplit ? "true" : "false"))
+            source: treeConfigured(source))
+    }
+
+    /// A tree source with this process's `TREE_SCALE` and `TREE_SPLIT`.
+    static func treeConfigured(_ source: String) -> String {
+        source.replacingOccurrences(of: "TREE_SCALE", with: treeSharp ? "1.25f" : "1.0f")
+            .replacingOccurrences(of: "TREE_SPLIT", with: treeSplit ? "true" : "false")
     }
 
     /// Verify a draft tree instead of the greedy chain; `DARKBLOOM_BONSAI_TREE=0` keeps the chain.
@@ -5738,22 +5895,581 @@ enum DF2Fast {
             predLookup: predLookup, succLookup: succLookup)
     }
 
-    /// `selectTree` on precomputed `top` pairs.
+    /// `selectTree` on precomputed `top` pairs: the split kernels once `TreeWide.prepare` qualified them.
     static func selectTree(
         top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
+        if TreeWide.passed, let wide = TreeWide.kernels {
+            return wide.select(
+                top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+                predLookup: predLookup, succLookup: succLookup)
+        }
+        return recordTree(
+            top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+            predLookup: predLookup, succLookup: succLookup)
+    }
+
+    /// The single-kernel tree selector (`treeSelector`).
+    static func recordTree(
+        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
+        let P = top[0].dim(0)
+        let outs = recordTreeOutputs(
+            top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+            predLookup: predLookup, succLookup: succLookup)
+        return (outs[0].reshaped([1, P]), outs[1])
+    }
+
+    /// `treeSelector`'s outputs `[tokens [P], desc [333]]`, unchecked.
+    static func recordTreeOutputs(
+        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray?, succLookup: MLXArray?
+    ) -> [MLXArray] {
         let P = top[0].dim(0)
         precondition(P == 15, "DF2 tree: block of \(P) positions")
         let threads = 512
-        let outs = treeSelector!(
+        return treeSelector!(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
             template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil),
                 ("TREE_NODES", 15)],
             grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[P], [333]], outputDTypes: [.int32, .int32])
-        return (outs[0].reshaped([1, P]), outs[1])
+    }
+
+    /// `outputs` when it holds `count` arrays. A kernel application that MLX refused returns none,
+    /// so the load-time checks throw here instead of trapping on an index.
+    static func checkedOutputs(_ outputs: [MLXArray], _ count: Int, _ what: String) throws -> [MLXArray] {
+        guard outputs.count == count else {
+            throw MLXError.caught("\(what): \(outputs.count) of \(count) outputs")
+        }
+        return outputs
+    }
+}
+
+// MARK: - The tree selector as merge, edge and pick kernels
+
+extension DF2Fast {
+    /// The tree selector in three kernels. M merges each position's top 16 into device memory (one
+    /// simdgroup per position). W scores every (position, predecessor slot, candidate) edge into
+    /// `edges` [P][17][16], eight predecessor slots per simdgroup: slot 16 is the anchor (position 0),
+    /// slot i is the candidate `tc[p - 1][i]`. W scores rows the record may never expand, so it reads a
+    /// codebook row only for an id inside the codebook (row 0 otherwise); the record reads only expanded
+    /// rows, and an expanded out-of-range id is out of bounds there too. S' runs the 15 expansions on
+    /// one simdgroup, reading the expanded node's edge row by its slot, never by token. The merge, edge, softmax and descriptor
+    /// text is cut from `treeSource` and `selectorEdgeText`; `prepare` qualifies the three kernels
+    /// against the record kernel once, at bind. `DARKBLOOM_BONSAI_TREE_WIDE=0` keeps the record kernel.
+    enum TreeWide {
+        static let enabled: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_WIDE"] != "0"
+        /// Written once by `prepare` at bind, before any proposal; read-only afterwards.
+        nonisolated(unsafe) static var passed = false
+        nonisolated(unsafe) static var prepared = false
+        static let slotsPerGroup: Int = 8
+
+        struct Sources {
+            let merge: String
+            let edges: String
+            let pick: String
+            let reference: String
+            let pickReference: String
+        }
+
+        /// nil when any cut point of the record's sources is not found exactly once.
+        static let sources: Sources? = {
+            guard let tree = treeSource, let edge = selectorEdgeText, let wide = wideEdge(edge),
+                let fprob = tree.range(of: "threadgroup float fprob[256];"),
+                tree.components(separatedBy: "threadgroup float fprob[256];").count == 2,
+                let softmax = span(
+                    tree, from: "    if (tid < 16u) {\n      float mx = tev[0];",
+                    through: "      fprob[16 * e + int(tid)] = pp * (mine / z);\n    }\n"),
+                let desc = span(tree, from: "if (tid == 0) {\n  int order[16];", through: nil)
+            else { return nil }
+            let merge: String = String(tree[..<fprob.lowerBound]) + """
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = tid; s < uint(P * 16); s += NT) { mtc[s] = tc[s / 16][s % 16]; mtu[s] = tu[s / 16][s % 16]; }
+
+                """
+            let edges: String = "constexpr int KS = \(slotsPerGroup);\n" + """
+                const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+                const uint tg = threadgroup_position_in_grid.x;
+                const int p = tg == 0u ? 0 : 1 + int(tg - 1u) / (16 / KS);
+                const int s0 = tg == 0u ? 16 : KS * int((tg - 1u) % uint(16 / KS));
+                const uint j = sg;
+                const int predRows = PRED_PACKED ? int(pred_shape[0]) / 96 : int(pred_shape[0]);
+                const int succRows = SUCC_PACKED ? int(succ_shape[0]) / 96 : int(succ_shape[0]);
+                const int cRaw = mtc[p * 16 + int(j)];
+                const int c = cRaw >= 0 && cRaw < succRows
+                    && (!SUCC_PACKED || succLookup_shape[0] == 1 || cRaw < int(succLookup_shape[0])) ? cRaw : 0;
+                int pr[KS];
+                for (int k = 0; k < KS; k++) {
+                  const int t = p == 0 ? anchor[0] : mtc[(p - 1) * 16 + s0 + k];
+                  pr[k] = t >= 0 && t < predRows
+                      && (!PRED_PACKED || predLookup_shape[0] == 1 || t < int(predLookup_shape[0])) ? t : 0;
+                }
+
+                """ + wide + """
+                for (int k = 0; k < KS; k++) {
+                  const float sum = simd_sum(acc[k]);
+                  if (lane == 0 && (p > 0 || k == 0)) { edges[(p * 17 + s0 + k) * 16 + int(j)] = mtu[p * 16 + int(j)] + sum; }
+                }
+
+                """
+            let pick: String = """
+                const uint tid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const int P = int(mtc_shape[0]);
+                const float NEG = -INFINITY;
+                threadgroup int tc[16][16];
+                threadgroup float fprob[256];
+                threadgroup float tev[16];
+                threadgroup int nd[16], nj[16], npar[16];
+                for (uint s = lane; s < uint(P * 16); s += 32u) { tc[s / 16][s % 16] = mtc[s]; }
+                for (uint s = lane; s < 256u; s += 32u) { fprob[s] = NEG; }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                int pj = -1;
+                int pd = -1;
+                float pp = 1.0f;
+                float tsc = TREE_SCALE;
+                for (int e = 0; e < TREE_NODES; e++) {
+                  const int p = pd + 1;
+                  if (p < P) {
+                    if (tid < 16u) { tev[tid] = edges[(p * 17 + (p == 0 ? 16 : pj)) * 16 + int(tid)]; }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                """ + softmax + """
+                  }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                  float bv = NEG;
+                  int bs = 0x7fffffff;
+                  for (uint s = lane; s < uint(16 * (e + 1)); s += 32u) {
+                    const float v = fprob[s];
+                    if (v > bv) { bv = v; bs = int(s); }
+                  }
+                  const float m = simd_max(bv);
+                  const int ws = simd_min(bv == m ? bs : 0x7fffffff);
+                  const int pe = ws / 16 - 1;
+                  pj = ws % 16;
+                  pd = pe < 0 ? 0 : nd[pe] + 1;
+                  pp = m;
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                  if (lane == 0) { nd[e] = pd; nj[e] = pj; npar[e] = pe; fprob[ws] = NEG; }
+                  simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                """ + desc
+            guard let edgeStore = replacingOnce(
+                    tree, "if (lane == 0) { tev[j] = tu[p][j] + acc; }",
+                    "if (lane == 0) { tev[j] = tu[p][j] + acc; dtev[16 * e + int(j)] = tev[j]; }"),
+                let slotStore = replacingOnce(
+                    edgeStore, "  const int p = pd + 1;\n",
+                    "  const int p = pd + 1;\n  if (tid == 0u) { dslot[e] = p < P ? p * 17 + (p == 0 ? 16 : pj) : -1; }\n"),
+                let reference = instrumented(slotStore), let pickReference = instrumented(pick)
+            else { return nil }
+            return Sources(merge: merge, edges: edges, pick: pick, reference: reference, pickReference: pickReference)
+        }()
+
+        static let kernels: Kernels? = sources.map(Kernels.init)
+
+        /// `text` from the start of `from` through the end of `through` (or to the end), each found once.
+        static func span(_ text: String, from: String, through: String?) -> String? {
+            guard text.components(separatedBy: from).count == 2, let a = text.range(of: from) else { return nil }
+            guard let through else { return String(text[a.lowerBound...]) }
+            guard text.components(separatedBy: through).count == 2, let b = text.range(of: through),
+                a.lowerBound < b.lowerBound
+            else { return nil }
+            return String(text[a.lowerBound ..< b.upperBound])
+        }
+
+        /// `text` with `old` replaced by `new`; nil unless `old` occurs exactly once.
+        static func replacingOnce(_ text: String, _ old: String, _ new: String) -> String? {
+            guard text.components(separatedBy: old).count == 2 else { return nil }
+            return text.replacingOccurrences(of: old, with: new)
+        }
+
+        /// `text` split before each anchor; nil unless each anchor occurs once, after the previous one.
+        static func pieces(_ text: String, at anchors: [String]) -> [String]? {
+            var bounds: [String.Index] = [text.startIndex]
+            for anchor in anchors {
+                guard text.components(separatedBy: anchor).count == 2, let r = text.range(of: anchor),
+                    r.lowerBound > bounds[bounds.count - 1]
+                else { return nil }
+                bounds.append(r.lowerBound)
+            }
+            bounds.append(text.endIndex)
+            return (1 ..< bounds.count).map { String(text[bounds[$0 - 1] ..< bounds[$0]]) }
+        }
+
+        /// `selectorEdgeText` for `KS` predecessors `pr[k]` of one candidate `c`. The predecessor's
+        /// lookup, codes and value and the accumulation run once per slot inside the record's component
+        /// loop, so the slots' loads overlap; every statement is the record's text, with `pr`,
+        /// `predBase`, `predCodes` and `acc` indexed by the slot, so each slot keeps the record's
+        /// arithmetic and component order. The caller takes `simd_sum` of each `acc[k]`.
+        static func wideEdge(_ edge: String) -> String? {
+            guard let e = pieces(edge, at: [
+                "  if constexpr (PRED_PACKED) { predBase",
+                "  if constexpr (SUCC_PACKED) { succBase",
+                "  float acc = 0.0f;\n",
+                "  for (int r = int(lane); r < 256; r += 64) {\n",
+                "    uint predCodes = 0u, succCodes = 0u;\n",
+                "    if constexpr (PRED_PACKED) {\n      const size_t word",
+                "    if constexpr (SUCC_PACKED) {\n      const size_t word",
+                "      float pv, sv;\n",
+                "      if constexpr (PRED_PACKED) {\n        const uint code",
+                "      if constexpr (SUCC_PACKED) {\n        const uint code",
+                "      acc += pv",
+                "    }\n  }\n  acc = simd_sum(acc);\n",
+            ]) else { return nil }
+            let replaced: [Int: String] = [
+                0: "  uint predBase = 0u, succBase = 0u;\n", 3: "  float acc = 0.0f;\n",
+                5: "    uint predCodes = 0u, succCodes = 0u;\n", 8: "      float pv, sv;\n",
+                12: "    }\n  }\n  acc = simd_sum(acc);\n",
+            ]
+            guard replaced.allSatisfy({ e[$0.key] == $0.value }) else { return nil }
+            func perSlot(_ text: String) -> String {
+                ["pr", "predBase", "predCodes", "acc"].reduce(text) { t, name in
+                    t.replacingOccurrences(of: "\\b\(name)\\b", with: "\(name)[k]", options: .regularExpression)
+                }
+            }
+            return "uint predBase[KS];\nuint succBase = 0u;\n"
+                + "for (int k = 0; k < KS; k++) {\npredBase[k] = 0u;\n" + perSlot(e[1]) + "}\n"
+                + e[2]
+                + "float acc[KS];\nfor (int k = 0; k < KS; k++) { acc[k] = 0.0f; }\n"
+                + e[4]
+                + "uint predCodes[KS], succCodes = 0u;\n"
+                + "for (int k = 0; k < KS; k++) {\npredCodes[k] = 0u;\n" + perSlot(e[6]) + "}\n"
+                + e[7]
+                + "float sv;\n" + e[10]
+                + "for (int k = 0; k < KS; k++) {\nfloat pv;\n" + perSlot(e[9]) + perSlot(e[11]) + "}\n"
+                + "    }\n  }\n"
+        }
+
+        /// Stores of the anchor softmax's `z1` and the block's scale, every normalized probability
+        /// and every inserted `fprob`, added after the record's statements (stores only).
+        static func instrumented(_ text: String) -> String? {
+            let split: String = "if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }"
+            let insert: String = "fprob[16 * e + int(tid)] = pp * (mine / z);"
+            return replacingOnce(text, split, split + "\nif (tid == 0u) { dz1[0] = z1; dsc[0] = tsc; }")
+                .flatMap {
+                    replacingOnce(
+                        $0, insert,
+                        insert + " dq[16 * e + int(tid)] = mine / z; dfp[16 * e + int(tid)] = fprob[16 * e + int(tid)];")
+                }
+        }
+
+        struct Kernels {
+            let merger: MLXFast.MLXFastKernel
+            let scorer: MLXFast.MLXFastKernel
+            let picker: MLXFast.MLXFastKernel
+            let reference: MLXFast.MLXFastKernel
+            let pickerReference: MLXFast.MLXFastKernel
+
+            init(_ s: Sources) {
+                let tag: String = treeSplit ? "split" : (treeSharp ? "t08" : "t1")
+                let recordInputs: [String] = ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"]
+                let probes: [String] = ["dz1", "dsc", "dq", "dfp"]
+                merger = MLXFast.metalKernel(
+                    name: "df2_tree_wide_merge", inputNames: ["cand", "unary"], outputNames: ["mtc", "mtu"],
+                    source: s.merge)
+                scorer = MLXFast.metalKernel(
+                    name: "df2_tree_wide_edges_ks\(slotsPerGroup)",
+                    inputNames: ["mtc", "mtu", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+                    outputNames: ["edges"], source: s.edges)
+                picker = MLXFast.metalKernel(
+                    name: "df2_tree_wide_pick_\(tag)", inputNames: ["mtc", "edges"], outputNames: ["tokens", "desc"],
+                    source: treeConfigured(s.pick))
+                reference = MLXFast.metalKernel(
+                    name: "df2_tree_wide_reference_\(tag)", inputNames: recordInputs,
+                    outputNames: ["tokens", "desc", "dtev", "dslot"] + probes, source: treeConfigured(s.reference))
+                pickerReference = MLXFast.metalKernel(
+                    name: "df2_tree_wide_pick_reference_\(tag)", inputNames: ["mtc", "edges"],
+                    outputNames: ["tokens", "desc"] + probes, source: treeConfigured(s.pickReference))
+            }
+
+            /// M, then W on M's arrays: `mtc`, `mtu` [P, 16] and `edges` [P * 17 * 16]. Throws when MLX
+            /// refused an application.
+            func tables(
+                top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+                predLookup: MLXArray?, succLookup: MLXArray?
+            ) throws -> (mtc: MLXArray, mtu: MLXArray, edges: MLXArray) {
+                let P: Int = top[0].dim(0)
+                let merged: [MLXArray] = try checkedOutputs(merger(
+                    [top[0], top[1]], grid: (512, 1, 1), threadGroup: (512, 1, 1),
+                    outputShapes: [[P, 16], [P, 16]], outputDTypes: [.int32, .float32]), 2, "tree wide merge")
+                let groups: Int = 1 + (P - 1) * (16 / slotsPerGroup)
+                let edges: [MLXArray] = try checkedOutputs(scorer(
+                    [merged[0], merged[1], projected.reshaped([P, -1]).asType(.float32), pred, succ,
+                     anchor.asType(.int32), predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
+                    template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
+                    grid: (groups * 512, 1, 1), threadGroup: (512, 1, 1),
+                    outputShapes: [[P * 17 * 16]], outputDTypes: [.float32]), 1, "tree wide edges")
+                return (merged[0], merged[1], edges[0])
+            }
+
+            /// M -> W -> S': `(tokens [1, 15], desc [333])`, as `recordTree`, or `recordTree` itself
+            /// when MLX refused an application.
+            func select(
+                top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+                predLookup: MLXArray?, succLookup: MLXArray?
+            ) -> (MLXArray, MLXArray) {
+                let P: Int = top[0].dim(0)
+                precondition(P == 15, "DF2 tree: block of \(P) positions")
+                if let t = try? tables(
+                    top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+                    predLookup: predLookup, succLookup: succLookup)
+                {
+                    let outs: [MLXArray] = picker(
+                        [t.mtc, t.edges], template: [("TREE_NODES", 15)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[P], [333]], outputDTypes: [.int32, .int32])
+                    if outs.count == 2 { return (outs[0].reshaped([1, P]), outs[1]) }
+                }
+                return recordTree(
+                    top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+                    predLookup: predLookup, succLookup: succLookup)
+            }
+        }
+
+        // MARK: Qualification
+
+        struct Codebooks {
+            let name: String
+            let pred: MLXArray
+            let succ: MLXArray
+            let predLookup: MLXArray?
+            let succLookup: MLXArray?
+            let rows: Int
+        }
+
+        enum Kind: String, CaseIterable {
+            case random, wide, ties, repeatedIds, flat, underflow, cancellation
+            case splitBelow, splitAt, splitAbove, chain, branching
+        }
+
+        struct Case {
+            let kind: Kind
+            let ids: [Int32]
+            let values: [Float]
+            let proj: [Float]
+            let anchor: Int32
+        }
+
+        struct Rng {
+            var state: UInt64
+            mutating func next() -> UInt64 {
+                state &+= 0x9E37_79B9_7F4A_7C15
+                var z: UInt64 = state
+                z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+                z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+                return z ^ (z >> 31)
+            }
+            mutating func unit() -> Float { Float(next() >> 40) / 16_777_216 }
+            /// Roughly standard normal (four uniforms).
+            mutating func normal() -> Float { (unit() + unit() + unit() + unit() - 2) * 1.7320508 }
+        }
+
+        /// One block of inputs. Ids in a row are distinct (`repeatedIds`: the last 8 repeat the first 8,
+        /// all 16 ranked on top), so no two lanes hold the same (value, id) pair. The split cases put the
+        /// anchor softmax at z1 = 1 + 15 exp(-d) around the 1.25 threshold (zero edges at position 0).
+        /// `gain` scales `proj` so an edge sum at scale 1 has unit RMS for the codebooks in use.
+        static func makeCase(_ kind: Kind, rows: Int, seed: UInt64, gain: Float) -> Case {
+            var rng = Rng(state: seed)
+            var ids = [Int32](repeating: 0, count: 15 * 128)
+            var values = [Float](repeating: 0, count: 15 * 128)
+            var proj = [Float](repeating: 0, count: 15 * 256)
+            let ln60: Float = 4.0943446
+            let gap: Float = kind == .splitBelow ? ln60 - 0.001 : (kind == .splitAbove ? ln60 + 0.001 : ln60)
+            for p in 0 ..< 15 {
+                let start: Int = Int(rng.next() % UInt64(rows))
+                for i in 0 ..< 128 {
+                    let source: Int = kind == .repeatedIds && i >= 120 ? i - 120 : i
+                    ids[p * 128 + i] = Int32((start + source * 7919) % rows)
+                    let n: Float = rng.normal()
+                    let v: Float
+                    switch kind {
+                    case .random, .wide, .underflow: v = 3 * n
+                    case .ties: v = (6 * n).rounded() / 2
+                    case .repeatedIds: v = i < 8 || i >= 120 ? 5 + n : n - 2
+                    case .flat: v = 1
+                    case .cancellation: v = 1000 + n
+                    case .splitBelow, .splitAt, .splitAbove:
+                        v = p > 0 ? 3 * n : (i == 0 ? 10 : (i < 16 ? 10 - gap : -100))
+                    case .chain: v = i == 0 ? 20 : n - 10
+                    case .branching: v = i == 0 ? 5 : (i == 1 ? 4.95 : n - 5)
+                    }
+                    values[p * 128 + i] = v
+                }
+                let scale: Float
+                switch kind {
+                case .random, .ties, .repeatedIds: scale = 1
+                case .wide: scale = 4
+                case .flat: scale = 0
+                case .underflow: scale = 40
+                case .cancellation: scale = 1000
+                case .splitBelow, .splitAt, .splitAbove: scale = p == 0 ? 0 : 1
+                case .chain: scale = 0.1
+                case .branching: scale = 0.05
+                }
+                for k in 0 ..< 256 { proj[p * 256 + k] = scale * gain * rng.normal() }
+            }
+            return Case(kind: kind, ids: ids, values: values, proj: proj, anchor: Int32(rng.next() % UInt64(rows)))
+        }
+
+        /// BF16 rows of magnitude 2^-4 to 2^2 (some zero). `spread` scales row r by 2^(r % 20 - 10), so
+        /// `DFlash2PackedCodebook` keeps one exponent base per row instead of one shared base.
+        static func syntheticCodebook(rows: Int, seed: UInt64, spread: Bool) -> MLXArray {
+            var rng = Rng(state: seed)
+            var v = [Float](repeating: 0, count: rows * 256)
+            for i in 0 ..< v.count {
+                let shift: Int = spread ? i / 256 % 20 - 10 : 0
+                let sign: Float = rng.unit() < 0.5 ? -1 : 1
+                let exponent: Int = Int(rng.unit() * 6) - 4 + shift
+                v[i] = i % 37 == 0 ? 0 : sign * (1 + rng.unit()) * Float(sign: .plus, exponent: exponent, significand: 1)
+            }
+            return MLXArray(v, [rows, 256]).asType(.bfloat16)
+        }
+
+        /// The drafter's own codebooks as bound, and synthetic ones covering both packings, both
+        /// lookup forms (one shared exponent base, one per row) and mixed packings.
+        static func codebookSets(_ selector: DFlash2CandidateSelector, vocabulary: Int) throws -> [Codebooks]? {
+            let rows: Int = 4096
+            let narrow: MLXArray = syntheticCodebook(rows: rows, seed: 84, spread: false)
+            let spread: MLXArray = syntheticCodebook(rows: rows, seed: 85, spread: true)
+            guard let n = try DFlash2PackedCodebook(narrow), let s = try DFlash2PackedCodebook(spread),
+                n.lookup.size == 1, s.lookup.size == rows
+            else { return nil }
+            return [
+                Codebooks(
+                    name: "drafter", pred: selector.predecessorCodebook, succ: selector.successorCodebook,
+                    predLookup: selector.predecessorLookup, succLookup: selector.successorLookup, rows: vocabulary),
+                Codebooks(
+                    name: "packed, shared/per-row bases", pred: n.packed, succ: s.packed,
+                    predLookup: n.lookup, succLookup: s.lookup, rows: rows),
+                Codebooks(
+                    name: "packed, per-row/shared bases", pred: s.packed, succ: n.packed,
+                    predLookup: s.lookup, succLookup: n.lookup, rows: rows),
+                Codebooks(name: "unpacked", pred: narrow, succ: spread, predLookup: nil, succLookup: nil, rows: rows),
+                Codebooks(
+                    name: "packed pred, unpacked succ", pred: n.packed, succ: spread,
+                    predLookup: n.lookup, succLookup: nil, rows: rows),
+                Codebooks(
+                    name: "unpacked pred, packed succ", pred: narrow, succ: s.packed,
+                    predLookup: nil, succLookup: s.lookup, rows: rows),
+            ]
+        }
+
+        static func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            MLX.all(a.reshaped([-1]).view(dtype: .uint32) .== b.reshaped([-1]).view(dtype: .uint32))
+        }
+
+        /// One case: the record kernel, its instrumented copy, M -> W -> S' and S' instrumented on the
+        /// same W table. Returns (every check equal, the block took scale 1).
+        static func check(_ k: Kernels, _ books: Codebooks, _ c: Case) throws -> (MLXArray, MLXArray) {
+            let top: [MLXArray] = [MLXArray(c.ids, [15, 128]), MLXArray(c.values, [15, 128])]
+            let projected: MLXArray = MLXArray(c.proj, [15, 256])
+            let anchor: MLXArray = MLXArray([c.anchor])
+            let record: [MLXArray] = try checkedOutputs(recordTreeOutputs(
+                top: top, projected: projected, anchor: anchor, pred: books.pred, succ: books.succ,
+                predLookup: books.predLookup, succLookup: books.succLookup), 2, "tree record")
+            let tokens: MLXArray = record[0].reshaped([1, 15]), desc: MLXArray = record[1]
+            let ref: [MLXArray] = try checkedOutputs(k.reference(
+                [top[0], top[1], projected, books.pred, books.succ, anchor,
+                 books.predLookup ?? selectorLookupSentinel, books.succLookup ?? selectorLookupSentinel],
+                template: [("PRED_PACKED", books.predLookup != nil), ("SUCC_PACKED", books.succLookup != nil),
+                    ("TREE_NODES", 15)],
+                grid: (512, 1, 1), threadGroup: (512, 1, 1),
+                outputShapes: [[15], [333], [240], [15], [1], [1], [240], [240]],
+                outputDTypes: [.int32, .int32, .float32, .int32, .float32, .float32, .float32, .float32],
+                initValue: 0), 8, "tree reference")
+            let t = try k.tables(
+                top: top, projected: projected, anchor: anchor, pred: books.pred, succ: books.succ,
+                predLookup: books.predLookup, succLookup: books.succLookup)
+            let shipped: [MLXArray] = try checkedOutputs(k.picker(
+                [t.mtc, t.edges], template: [("TREE_NODES", 15)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[15], [333]], outputDTypes: [.int32, .int32]), 2, "tree wide pick")
+            let probe: [MLXArray] = try checkedOutputs(k.pickerReference(
+                [t.mtc, t.edges], template: [("TREE_NODES", 15)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[15], [333], [1], [1], [240], [240]],
+                outputDTypes: [.int32, .int32, .float32, .float32, .float32, .float32], initValue: 0),
+                6, "tree wide pick reference")
+            let expanded: MLXArray = take(t.edges.reshaped([-1, 16]), MLX.maximum(ref[3], 0), axis: 0)
+            let equal: [MLXArray] = [
+                same(ref[0], tokens), same(ref[1], desc),
+                same(shipped[0], tokens), same(shipped[1], desc),
+                same(probe[0], tokens), same(probe[1], desc),
+                MLX.all(ref[3] .>= 0), same(expanded, ref[2]),
+                same(probe[2], ref[4]), same(probe[3], ref[5]), same(probe[4], ref[6]), same(probe[5], ref[7]),
+            ]
+            return (MLX.all(MLX.stacked(equal)), MLX.all(ref[5] .== 1))
+        }
+
+        /// 1 / RMS of W's edge sums for a `.random` case at gain 1 (the codebooks' edge scale).
+        static func edgeGain(_ k: Kernels, _ books: Codebooks) throws -> Float {
+            let c: Case = makeCase(.random, rows: books.rows, seed: 7, gain: 1)
+            let t = try k.tables(
+                top: [MLXArray(c.ids, [15, 128]), MLXArray(c.values, [15, 128])],
+                projected: MLXArray(c.proj, [15, 256]), anchor: MLXArray([c.anchor]), pred: books.pred,
+                succ: books.succ, predLookup: books.predLookup, succLookup: books.succLookup)
+            let edges: MLXArray = t.edges.reshaped([15, 17, 16])[1..., 0 ..< 16, 0...]
+            let sums: MLXArray = edges - t.mtu[1...].reshaped([14, 1, 16])
+            let rms: Float = MLX.sqrt(MLX.mean(sums * sums)).item(Float.self)
+            return rms.isFinite && rms > 0 ? 1 / rms : 1
+        }
+
+        static func qualify(_ k: Kernels, selector: DFlash2CandidateSelector, vocabulary: Int) throws -> (Bool, String) {
+            guard let sets = try codebookSets(selector, vocabulary: vocabulary) else {
+                return (false, "synthetic codebooks did not pack as intended")
+            }
+            var names: [String] = []
+            var equal: [MLXArray] = []
+            var scaleOne: [MLXArray] = []
+            for (n, books) in sets.enumerated() {
+                let gain: Float = try edgeGain(k, books)
+                for (m, kind) in Kind.allCases.enumerated() {
+                    for seed in kind == .random ? [0, 1, 2] : [0] {
+                        let c: Case = makeCase(
+                            kind, rows: books.rows, seed: UInt64(1000 * n + 10 * m + seed), gain: gain)
+                        let (ok, one) = try check(k, books, c)
+                        names.append("\(books.name)/\(kind.rawValue)/\(seed)")
+                        equal.append(ok)
+                        scaleOne.append(one)
+                    }
+                }
+            }
+            let oks: [Bool] = MLX.stacked(equal).asArray(Bool.self)
+            let ones: Int = scaleOne.map { $0.item(Bool.self) ? 1 : 0 }.reduce(0, +)
+            if let bad = oks.firstIndex(of: false) {
+                return (false, "mismatch at \(names[bad]) (\(oks.filter { !$0 }.count) of \(oks.count) cases)")
+            }
+            let split: String = treeSplit ? "; block scale 1 in \(ones) of \(oks.count)" : ""
+            return (true, "\(oks.count) cases over \(sets.count) codebook sets bitwise equal to the record kernel"
+                + " (tokens, descriptor, every expanded edge, z1, scale, probabilities, fprob)\(split)")
+        }
+
+        /// Runs once at drafter bind, before any proposal or measured window. Calls the kernels
+        /// directly, never `selectTree`, and sets `passed` only after every check evaluated equal;
+        /// any mismatch or MLX error keeps the record kernel.
+        static func prepare(selector: DFlash2CandidateSelector, vocabulary: Int) {
+            guard !prepared else { return }
+            prepared = true
+            var note: String = "off (DARKBLOOM_BONSAI_TREE_WIDE=0)"
+            if enabled && !treeOn {
+                note = "off (tree selector off)"
+            } else if enabled, let kernels {
+                let start: Date = Date()
+                do {
+                    let (ok, detail) = try withError { try qualify(kernels, selector: selector, vocabulary: vocabulary) }
+                    let seconds: String = String(format: "%.1f", Date().timeIntervalSince(start))
+                    passed = ok
+                    note = (ok ? "on (" : "off (") + detail + ", \(seconds) s)"
+                } catch {
+                    note = "off (error: \(error))"
+                }
+            } else if enabled {
+                note = "off (a cut of the record source did not match once)"
+            }
+            FileHandle.standardError.write(Data("DF2 tree wide: \(note)\n".utf8))
+        }
     }
 }
 

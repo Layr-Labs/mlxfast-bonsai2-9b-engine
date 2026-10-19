@@ -6465,12 +6465,176 @@ enum VerifyInt8Matmul {
         inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
         source: headGatherSource, ensureRowContiguous: true)
 
+    /// `headGatherSource` with each lane's integer group sum taken in FP16 pairs. An activation
+    /// byte and a 2-bit code each become an exact half through the 1024 exponent
+    /// (`0x6400 | byte`), and each half lane sums the four products of two `u` steps, at most
+    /// 4 x 128 x 3 = 1536 < 2048 in magnitude, so every FP16 result is an exact integer and `d`
+    /// is the record's integer. A lane's 16 activation bytes load as one `packed_uint4`, which
+    /// needs only the 4-byte alignment of the record's `char4` loads. The FP32 steps per group,
+    /// the four chains and their final order are the record text. Nil unless the cut matches once.
+    static let headGatherFastSource: String? = {
+        let dot = """
+              int d = 0;
+              #pragma clang loop unroll(full)
+              for (int u = 0; u < 4; u++) {
+                const char4 a = src[u];
+                const uint c = (v >> uint(2 * u)) & 0x03030303u;
+                d += int(a.x) * int(c & 255u) + int(a.y) * int((c >> 8) & 255u)
+                  + int(a.z) * int((c >> 16) & 255u) + int(a.w) * int(c >> 24);
+              }
+            """
+        let halves = """
+              const packed_uint4 xw = *((const device packed_uint4*)src);
+              int d = 0;
+              #pragma clang loop unroll(full)
+              for (int uu = 0; uu < 4; uu += 2) {
+                half2 acc = half2(0.0h);
+                #pragma clang loop unroll(full)
+                for (int u = uu; u < uu + 2; u++) {
+                  const uint A = xw[u] ^ 0x80808080u;
+                  const half2 a02 = as_type<half2>((A & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+                  const half2 a13 = as_type<half2>(((A >> 8) & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+                  const uint c = v >> uint(2 * u);
+                  const half2 c02 = as_type<half2>((c & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+                  const half2 c13 = as_type<half2>(((c >> 8) & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+                  acc = fma(a02, c02, acc);
+                  acc = fma(a13, c13, acc);
+                }
+                d += int(acc.x) + int(acc.y);
+              }
+            """
+        guard headGatherSource.components(separatedBy: dot).count == 2 else { return nil }
+        return headGatherSource.replacingOccurrences(of: dot, with: halves)
+    }()
+
+    private static let headGatherFastKernel: MLXFast.MLXFastKernel? = headGatherFastSource.map { source in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_head_gather_h16",
+            inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
+            source: source, ensureRowContiguous: true)
+    }
+
+    /// `DARKBLOOM_BONSAI_DF2_GATHER_FAST=0` keeps the record gather.
+    static let gatherFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_GATHER_FAST"] != "0"
+    /// Written once by `prepareGatherFast` at drafter bind; read-only afterwards.
+    nonisolated(unsafe) static var gatherFastPassed = false
+    nonisolated(unsafe) private static var gatherFastPrepared = false
+
+    /// Runs once at drafter bind, before any request: `headGatherFastKernel` against
+    /// `headGatherKernel` at 32 and 16 groups, `NEG` on and off, on `gatherCheckInputs`.
+    /// `gatherFastPassed` is set only when every output bit matched; a mismatch or an MLX error
+    /// keeps the record kernel. Only gathers at `ids` take the fast kernel.
+    static func prepareGatherFast() {
+        guard !gatherFastPrepared else { return }
+        gatherFastPrepared = true
+        var note = "off (DARKBLOOM_BONSAI_DF2_GATHER_FAST=0)"
+        if gatherFastAllowed, let fast = headGatherFastKernel {
+            do {
+                let detail: String? = try withError { try gatherFastMismatch(fast) }
+                gatherFastPassed = detail == nil
+                note = detail.map { "off (\($0))" }
+                    ?? "on (bitwise equal to the record kernel at 32 and 16 groups, NEG on and off, 15 rows x 128 ids"
+                    + " with extreme codes, all-3 and all-0 rows, out-of-range and repeated ids)"
+            } catch {
+                note = "off (error: \(error))"
+            }
+        } else if gatherFastAllowed {
+            note = "off (a cut of the record source did not match once)"
+        }
+        FileHandle.standardError.write(Data("DF2 head gather fast: \(note)\n".utf8))
+    }
+
+    private static func gatherFastMismatch(_ fast: MLXFast.MLXFastKernel) throws -> String? {
+        let (activation, weight, scales, biases, ids) = gatherCheckInputs()
+        for groups in [32, 16] {
+            for negative in [true, false] {
+                // A kernel application that MLX refused returns no output: throw, never index it.
+                guard
+                    let record = gatherOutputs(
+                        activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+                        negative: negative, kernel: headGatherKernel
+                    ).first,
+                    let mine = gatherOutputs(
+                        activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+                        negative: negative, kernel: fast
+                    ).first
+                else { throw MLXError.caught("head gather check: a kernel returned no output") }
+                let same: MLXArray = MLX.all(record.view(dtype: .uint32) .== mine.view(dtype: .uint32))
+                eval(same)
+                if !same.item(Bool.self) { return "mismatch at \(groups) groups, NEG \(negative)" }
+            }
+        }
+        return nil
+    }
+
+    /// 15 rows of int8 codes (11 hashed over -128 ... 127, then all -128, all 127, alternating
+    /// -128 and 127, all 0), 512 weight rows (row 0 all codes 3, row 1 all 0, the rest hashed),
+    /// FP16 scales and biases over [-2, 2) with zeros, and 128 ids per row with -1, 512, 0, 511
+    /// and a repeated id among hashed ones.
+    private static func gatherCheckInputs() -> (PromptInt8Activation, MLXArray, MLXArray, MLXArray, MLXArray) {
+        let k = 4096, kg = k / 128, n = 512, rows = 15, p = 128
+        func hash(_ i: Int, _ salt: Int) -> Int {
+            Int(UInt32(truncatingIfNeeded: (UInt64(i) &* 2_654_435_761 &+ UInt64(salt) &* 40_503) >> 5))
+        }
+        let codes: [Int8] = (0 ..< rows * k).map { (i: Int) -> Int8 in
+            switch i / k {
+            case 11: return -128
+            case 12: return 127
+            case 13: return i % 2 == 0 ? -128 : 127
+            case 14: return 0
+            default: return Int8(truncatingIfNeeded: hash(i, 1))
+            }
+        }
+        let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+            switch i / (k / 16) {
+            case 0: return 0xFFFF_FFFF
+            case 1: return 0
+            default: return UInt32(truncatingIfNeeded: hash(i, 2) &* 2_246_822_519)
+            }
+        }
+        func constants(_ salt: Int) -> [Float16] {
+            (0 ..< n * kg).map { (i: Int) -> Float16 in
+                let h = hash(i, salt) % 4096
+                return h % 17 == 0 ? 0 : Float16(Float(h - 2048) / 1024)
+            }
+        }
+        let ascale: [Float] = (0 ..< rows * kg).map { Float(hash($0, 5) % 1000 + 1) / 1.0e5 }
+        let rsb: [Float] = (0 ..< rows * kg).map { Float(hash($0, 6) % 20001 - 10000) / 100 }
+        let ids: [Int32] = (0 ..< rows * p).map { (i: Int) -> Int32 in
+            switch i % 13 {
+            case 0: return -1
+            case 1: return Int32(n)
+            case 2: return 0
+            case 3: return Int32(n - 1)
+            case 4: return 5
+            default: return Int32(hash(i, 7) % n)
+            }
+        }
+        let activation = PromptInt8Activation(
+            codes: MLXArray(codes, [rows, k]), ascale: MLXArray(ascale), rsb: MLXArray(rsb), rows: rows, k: k)
+        return (
+            activation, MLXArray(words, [n, k / 16]), MLXArray(constants(3), [n, kg]),
+            MLXArray(constants(4), [n, kg]), MLXArray(ids, [rows, p])
+        )
+    }
+
     /// `[rows, P]` values at `ids` `[rows, P]` int32 (every row when nil, P = N)
     /// over the first `groups` 128-groups; `scales` and `biases` are `[N, Kg]`.
     static func gather(
         _ activation: PromptInt8Activation, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         ids: MLXArray?, groups: Int, negative: Bool
     ) -> MLXArray {
+        let fast: MLXFast.MLXFastKernel? = ids != nil && gatherFastPassed ? headGatherFastKernel : nil
+        return gatherOutputs(
+            activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+            negative: negative, kernel: fast ?? headGatherKernel)[0]
+    }
+
+    /// The gather's output vector `[[rows, P]]`, unchecked.
+    private static func gatherOutputs(
+        _ activation: PromptInt8Activation, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        ids: MLXArray?, groups: Int, negative: Bool, kernel: MLXFast.MLXFastKernel
+    ) -> [MLXArray] {
         let n: Int = weight.dim(0)
         let p: Int = ids?.dim(-1) ?? n
         let dims = MLXArray([Int32(activation.k), Int32(n), Int32(p)])
@@ -6480,9 +6644,9 @@ enum VerifyInt8Matmul {
             activation.codes, weight, scales, biases, activation.ascale, activation.rsb,
             ids ?? MLXArray([Int32(0)]), dims,
         ]
-        return headGatherKernel(
+        return kernel(
             inputs, template: template, grid: (activation.rows * p * 32, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[activation.rows, p]], outputDTypes: [.float32])[0]
+            outputShapes: [[activation.rows, p]], outputDTypes: [.float32])
     }
 }
 
@@ -8046,6 +8210,9 @@ extension HadamardQuantizedLinear {
 // MARK: - The DFlash 2 draft-head screen
 
 extension HadamardQuantizedLinear {
+    /// Resolves the fast head gather once (drafter bind, before any request) and logs its state.
+    public static func prepareDraftGather() { VerifyInt8Matmul.prepareGatherFast() }
+
     /// The leading 128-groups (K 2048 of 4096) the screen scores every row on.
     public static let draftScreenGroups = 16
 
