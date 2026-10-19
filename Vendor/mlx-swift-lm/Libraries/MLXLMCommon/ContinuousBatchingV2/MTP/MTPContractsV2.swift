@@ -478,6 +478,10 @@ extension CBv2MTPRequestStatefulDrafter {
 /// engine fills both from `blockContextHidden()` rather than from the
 /// target's pre-norm last hidden.
 public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
+    func tree16Layout(requestState: any CBv2MTPRequestState) -> CBv2Tree16Layout?
+    func observeTree16(requestState: any CBv2MTPRequestState, parents: [Int], drafts: [Int],
+        targets: [Int], probabilities: [Float], statistics: [Float])
+
     /// Turn the target's context tap on or off. The engine calls this exactly
     /// once per engine build, so a leg that does not speculate pays nothing
     /// for a drafter that is merely resident.
@@ -547,6 +551,10 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
 }
 
 extension CBv2MTPBlockDrafter {
+    public func tree16Layout(requestState: any CBv2MTPRequestState) -> CBv2Tree16Layout? { nil }
+    public func observeTree16(requestState: any CBv2MTPRequestState, parents: [Int], drafts: [Int],
+        targets: [Int], probabilities: [Float], statistics: [Float]) {}
+
     public func prepareDraft(
         history: [Int], depth: Int, requestState: any CBv2MTPRequestState
     ) {}
@@ -850,8 +858,12 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
     /// The 1+k target argmaxes (verify outputs; `targets[i]` is the
     /// authoritative next token after input column i).
     public var targetTokens: [Int]
-    /// Accept-walk result: number of leading drafts with
-    /// `drafts[i] == targets[i]`.
+    /// Nil denotes a chain. A tree retains physical input/output row order above,
+    /// and records the actual topology and confirmed input-row path here.
+    public var treeParents: [Int]?
+    public var treeAcceptedRows: [Int]?
+    /// Accept-walk result: matching leading drafts for a chain, matching path
+    /// depth for a tree. No counter is inferred from the drained output tape.
     public var accepted: Int
     /// Tokens actually committed this round (`kept.count`): the accepted
     /// prefix plus the correction/bonus, clamped by the cross-row common
@@ -875,7 +887,7 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         requestID: UInt64, k: Int, draftTokens: [Int], targetTokens: [Int],
         accepted: Int, confirmed: Int, rejected: Int,
         tokensCountAfter: Int, numComputedAfter: Int, generatedAfter: Int,
-        finishReason: String?
+        finishReason: String?, treeParents: [Int]? = nil, treeAcceptedRows: [Int]? = nil
     ) {
         self.requestID = requestID
         self.k = k
@@ -888,5 +900,7 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.numComputedAfter = numComputedAfter
         self.generatedAfter = generatedAfter
         self.finishReason = finishReason
+        self.treeParents = treeParents
+        self.treeAcceptedRows = treeAcceptedRows
     }
 }

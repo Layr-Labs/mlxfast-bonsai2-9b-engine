@@ -1581,6 +1581,28 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 }
             }
         }
+        if CBv2Tree16Layout.enabled, config.dflash.blockSize == 16 {
+            let context = MLXArray.zeros([1, 16, config.targetHiddenSize], dtype: dtype)
+            let tokens = try propose(anchor: [0], targetHidden: context, cache: cache,
+                blockSize: 16, tree16: { eval($0.evaluationTargets) },
+                tree16Policy: CBv2Tree16Layout.adaptive ? CBv2Tree16Policy() : nil)
+            eval(tokens)
+            // Warm only fixed synthetic projection gathers, never request features.
+            if let projected = projectContext(targetHidden: context,
+                anchors: MLXArray.zeros([16], dtype: .int32))
+            {
+                for count in [1,2,5,8,11,15,16] {
+                    var indices: [Int32] = []
+                    for index in 0 ..< count {
+                        let tripled = 3 * index
+                        let row = tripled % 16
+                        indices.append(Int32(row))
+                    }
+                    let ids = MLXArray(indices)
+                    eval(projected.gatheredRows(ids).evaluationTargets)
+                }
+            }
+        }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
     }
 
@@ -2091,11 +2113,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray,
         cache: [KVCache],
         blockSize: Int,
-        projection: DFlash2ContextProjection? = nil
+        projection: DFlash2ContextProjection? = nil,
+        tree16: ((CBv2Tree16Layout) -> Void)? = nil,
+        tree16Policy: CBv2Tree16Policy? = nil
     ) throws -> MLXArray {
         try proposeWithHidden(
             anchor: anchor, targetHidden: targetHidden, cache: cache, blockSize: blockSize,
-            projection: projection
+            projection: projection, tree16: tree16, tree16Policy: tree16Policy
         ).tokens
     }
 
@@ -2105,7 +2129,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray,
         cache: [KVCache],
         blockSize: Int,
-        projection: DFlash2ContextProjection?
+        projection: DFlash2ContextProjection?,
+        tree16: ((CBv2Tree16Layout) -> Void)? = nil,
+        tree16Policy: CBv2Tree16Policy? = nil
     ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?) {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
@@ -2124,12 +2150,30 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
-            let tokens = DF2Fast.select(
-                logits: try logits(hidden), projected: projected,
+            let draftLogits = try logits(hidden)
+            if let tree16, blockSize == 16 {
+                let inputs = DF2Fast.treeInputs(
+                    logits: draftLogits, projected: projected,
+                    anchor: MLXArray(anchor.map { Int32($0) }),
+                    pred: sel.predecessorCodebook, succ: sel.successorCodebook,
+                    predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
+                let arrays = tree16Policy.map { inputs.adaptiveLayout(policy: $0) } ?? inputs.layout()
+                let layout = CBv2Tree16Layout(arrays: arrays)
+                tree16(layout)
+                return (layout.drafts, hidden, finalCodes)
+            }
+            let path = DF2Fast.select(
+                logits: draftLogits, projected: projected,
                 anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                 succ: sel.successorCodebook,
                 predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
-            return (tokens, hidden, finalCodes)
+            if CBv2Tree16Layout.captureFile != nil {
+                DF2Fast.captureTree(logits: draftLogits, projected: projected,
+                    anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
+                    succ: sel.successorCodebook, predLookup: sel.predecessorLookup,
+                    succLookup: sel.successorLookup, path: path)
+            }
+            return (path, hidden, finalCodes)
         }
         let tokens = candidateSelector.selectGreedy(
             hidden: hidden,
@@ -3416,8 +3460,16 @@ enum DF2Fast {
             form: form, narrow: narrow, split: split) {
             let coldStart = DispatchTime.now().uptimeNanoseconds
             let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
-            let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
-            let x = MLXArray((0 ..< 16 * G).map { Float($0 % 17 - 8) / 64 }, [16 * G])
+            let scaleValues: [Float] = (0 ..< 16 * G).map { (index: Int) -> Float in
+                let numerator = Float(1 + index % 11)
+                return numerator / 256
+            }
+            let a = MLXArray(scaleValues, [16 * G])
+            let sumValues: [Float] = (0 ..< 16 * G).map { (index: Int) -> Float in
+                let numerator = Float(index % 17 - 8)
+                return numerator / 64
+            }
+            let x = MLXArray(sumValues, [16 * G])
             let sizes = MLXArray([Int32(K), Int32(16)] + ns.map { Int32($0) })
             func build(_ index: Int) -> [MLXArray] {
                 w4Pair24Output(W4Pair24Method(rawValue: index)!, form: form, narrow: narrow,
@@ -5514,6 +5566,19 @@ public final class DFlash2ContextProjection {
         return arrays
     }
 
+    func gatheredRows(_ ids: MLXArray) -> DFlash2ContextProjection {
+        let kv = contextKV.map { pair in
+            (take(pair.0, ids, axis: 1), take(pair.1, ids, axis: 1))
+        }
+        // The base reuses this FC prefix on lookup rounds. Compact it in
+        // exactly the same accepted-path order as the other projection rows.
+        let lookupFC = lookupFCOutput.map { take($0, ids, axis: 1) }
+        return DFlash2ContextProjection(
+            anchorEmbeddings: take(anchorEmbeddings, ids, axis: 1),
+            context: take(context, ids, axis: 1), contextKV: kv,
+            lookupFCOutput: lookupFC)
+    }
+
     /// The first `rows` context rows, and the anchor at column `rows - 1`.
     struct Use {
         let anchorEmbedding: MLXArray
@@ -6386,5 +6451,527 @@ private enum DraftSDPA {
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
                outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+    }
+}
+
+// Best-first 15 draft nodes plus the anchor, entirely on device. The edge
+// arithmetic/codebook decode matches the record selector. Only proposals are
+// changed; the diagnostic never emits a token or bypasses target verification.
+extension DF2Fast {
+    private static let treeMerge = MLXFast.metalKernel(
+        name: "df2_tree16_merge", inputNames: ["cand", "unary"], outputNames: ["ids", "vals"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+            const int P = int(cand_shape[0]);
+            const float NEG = -INFINITY;
+
+
+            for (int p = int(sg); p < P; p += 16) {
+              float cv[4]; int ci[4];
+              const size_t base = (size_t)p * 128u + lane * 4u;
+              for (int k = 0; k < 4; k++) {
+                cv[k] = float(unary[base + k]);
+                ci[k] = cand[base + k];
+              }
+              for (int r = 0; r < 16; r++) {
+                float bv = NEG; int bi = 0x7fffffff; int bk = 0;
+                for (int k = 0; k < 4; k++) {
+                  const float v = cv[k];
+                  const int id = ci[k];
+                  if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; bk = k; }
+                }
+                const float m = simd_max(bv);
+                const int best_id = simd_min(bv == m ? bi : 0x7fffffff);
+                if (bv == m && bi == best_id) {
+                  ids[p * 16 + r] = best_id;
+                  vals[p * 16 + r] = m;
+                  cv[bk] = NEG;
+                }
+              }
+            }
+
+        """)
+    private static let treeEdges = MLXFast.metalKernel(
+        name: "df2_tree16_edges", inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+        outputNames: ["scores"], source: """
+            const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+            const int p = int(threadgroup_position_in_grid.z);
+            const int parent = int(threadgroup_position_in_grid.y);
+            const int pr = p == 0 ? anchor[0] : cand[(p-1)*16 + parent];
+            const int c = cand[p*16 + sg];
+              uint predBase = 0u, succBase = 0u;
+              if constexpr (PRED_PACKED) { predBase = predLookup[predLookup_shape[0] == 1 ? 0 : pr]; }
+              if constexpr (SUCC_PACKED) { succBase = succLookup[succLookup_shape[0] == 1 ? 0 : c]; }
+              float acc = 0.0f;
+              for (int r = int(lane); r < 256; r += 64) {
+                const uint pair = uint(r >> 6) * 32u + lane;
+                const uint bit = (pair & 3u) * 24u;
+                const size_t offset = (pair >> 2u) * 3u + (bit >> 5u);
+                const uint shift = bit & 31u;
+                uint predCodes = 0u, succCodes = 0u;
+                if constexpr (PRED_PACKED) {
+                  const size_t word = (size_t)pr * 96u + offset;
+                  predCodes = uint(pred[word]) >> shift;
+                  if (shift > 8u) predCodes |= uint(pred[word + 1u]) << (32u - shift);
+                }
+                if constexpr (SUCC_PACKED) {
+                  const size_t word = (size_t)c * 96u + offset;
+                  succCodes = uint(succ[word]) >> shift;
+                  if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
+                }
+                for (int part = 0; part < 2; part++) {
+                  const int component = r + part * 32;
+                  float pv, sv;
+                  if constexpr (PRED_PACKED) {
+                    const uint code = (predCodes >> (part * 12)) & 4095u;
+                    const uint exponent = (code >> 7u) & 15u;
+                    const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                        | ((exponent == 0u ? 0u : predBase + exponent - 1u) << 7u));
+                    pv = cast_to<float>(uint16_to_bfloat16(value));
+                  } else { pv = float(pred[(size_t)pr * 256 + component]); }
+                  if constexpr (SUCC_PACKED) {
+                    const uint code = (succCodes >> (part * 12)) & 4095u;
+                    const uint exponent = (code >> 7u) & 15u;
+                    const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                        | ((exponent == 0u ? 0u : succBase + exponent - 1u) << 7u));
+                    sv = cast_to<float>(uint16_to_bfloat16(value));
+                  } else { sv = float(succ[(size_t)c * 256 + component]); }
+                  acc += pv * float(proj[p * 256 + component]) * sv;
+                }
+              }
+              acc = simd_sum(acc);
+
+            if (lane == 0) scores[(p*16 + parent)*16 + sg] = float(unary[p*16 + sg]) + acc;
+        """)
+    private static let treeWalk = MLXFast.metalKernel(
+        name: "df2_tree16_best_first", inputNames: ["cand", "unary", "scores", "lse", "anchor"],
+        outputNames: ["nodes", "paths", "lengths", "owners", "node_paths", "depths", "leaf_count"], source: """
+            if (thread_position_in_threadgroup.x != 0) return;
+            const int P = cand_shape[0];
+            // Frontier has at most 4 + 3 * 14 = 46 entries.
+            int fp[64], fc[64], fd[64]; float fl[64]; int nf = 0;
+            nodes[0] = anchor[0]; nodes[1] = -1; nodes[2] = 0; nodes[3] = -1; nodes[4] = 1;
+            int parentNode = 0, parentCandidate = 0, depth = 0;
+            float pathLog = 0;
+            for (int next = 1; next <= 16; ++next) {
+              if (depth < P) {
+                float sc[16], mx = -INFINITY, um = -INFINITY;
+                for (int b = 0; b < 16; ++b) {
+                  const int slot = (depth*16 + parentCandidate)*16 + b;
+                  sc[b] = scores[slot]; mx = max(mx, sc[b]);
+                  um = max(um, float(unary[depth*16 + b]));
+                }
+                float den = 0, mass = 0;
+                for (int b = 0; b < 16; ++b) {
+                  den += metal::precise::exp(sc[b]-mx);
+                  mass += metal::precise::exp(float(unary[depth*16 + b])-um);
+                }
+                const float offset = um + metal::precise::log(mass) - lse[depth]
+                    - mx - metal::precise::log(den);
+                for (int r = 0; r < 4; ++r) {
+                  int best = 0;
+                  for (int b = 1; b < 16; ++b) if (sc[b] > sc[best]) best = b;
+                  fp[nf] = parentNode; fc[nf] = best; fd[nf] = depth;
+                  fl[nf] = pathLog + sc[best] + offset; nf++;
+                  sc[best] = -INFINITY;
+                }
+              }
+              if (next == 16) break;
+              int best = 0;
+              for (int f = 1; f < nf; ++f) if (fl[f] > fl[best]) best = f;
+              const int b = fc[best], d = fd[best], par = fp[best];
+              pathLog = fl[best];
+              nodes[next*5] = cand[d*16 + b]; nodes[next*5+1] = par;
+              nodes[next*5+2] = d+1; nodes[next*5+3] = b;
+              nodes[next*5+4] = nodes[par*5+4] | (1 << next);
+              --nf; fp[best] = fp[nf]; fc[best] = fc[nf]; fd[best] = fd[nf]; fl[best] = fl[nf];
+              parentNode = next; parentCandidate = b; depth = d+1;
+            }
+            for (int i = 0; i < 240; ++i) paths[i] = 0;
+            for (int i = 0; i < 15; ++i) lengths[i] = 0;
+            for (int i = 0; i < 16; ++i) {
+              owners[i] = -1; depths[i] = nodes[i*5+2];
+              for (int j = 0; j < 16; ++j) node_paths[i*16+j] = 0;
+              int parent = i;
+              for (int j = depths[i]; j >= 0; --j) {
+                node_paths[i*16+j] = parent; parent = nodes[parent*5+1];
+              }
+            }
+            int leaves = 0;
+            for (int i = 0; i < 16; ++i) {
+              bool leaf = true;
+              for (int j = i+1; j < 16; ++j) if (nodes[j*5+1] == i) leaf = false;
+              if (!leaf) continue;
+              const int len = depths[i]+1;
+              lengths[leaves] = len;
+              for (int j = 0; j < len; ++j) {
+                const int node = node_paths[i*16+j];
+                paths[leaves*16+j] = node;
+                if (owners[node] == -1) owners[node] = leaves;
+              }
+              ++leaves;
+            }
+            leaf_count[0] = leaves;
+        """)
+
+    private static let treeAccept = MLXFast.metalKernel(
+        name: "df2_tree16_accept", inputNames: ["nodes", "targets"], outputNames: ["packet"],
+        source: """
+            if (thread_position_in_threadgroup.x != 0) return;
+            for (int i = 0; i < 34; ++i) packet[i] = 0;
+            int node = 0, length = 0;
+            for (int d = 0; d < 16; ++d) {
+              const int token = targets[node];
+              packet[2+length] = token;
+              packet[18+length] = node;
+              ++length;
+              int child = -1;
+              for (int i = 1; i < 16; ++i) {
+                if (nodes[i*5+1] == node && nodes[i*5] == token) { child = i; break; }
+              }
+              if (child == -1) break;
+              node = child;
+            }
+            packet[0] = length; packet[1] = length-1;
+        """)
+    static func checkTreeAcceptance(_ nodes: MLXArray) {
+        let host = nodes.asArray(Int32.self)
+        for endpoint in 0..<16 {
+            var path = [endpoint]
+            while path.last! > 0 { path.append(Int(host[path.last!*5+1])) }
+            path.reverse()
+            var miss = Int32(0)
+            while (1..<16).contains(where: { host[$0*5+1] == Int32(endpoint) && host[$0*5] == miss }) { miss += 1 }
+            var targets = Array(repeating: miss, count: 16)
+            if path.count > 1 {
+                for i in 0..<(path.count-1) { targets[path[i]] = host[path[i+1]*5] }
+            }
+            let expected = path.dropFirst().map { host[$0*5] } + [miss]
+            let packet = treeAccept([nodes,MLXArray(targets)],grid:(32,1,1),threadGroup:(32,1,1),
+                outputShapes:[[34]],outputDTypes:[.int32])[0].asArray(Int32.self)
+            precondition(Int(packet[0]) == path.count && Int(packet[1]) == path.count-1)
+            precondition(Array(packet[2..<(2+path.count)]) == expected)
+            precondition(Array(packet[18..<(18+path.count)]) == path.map { Int32($0) })
+        }
+        FileHandle.standardError.write(Data("TREE16 acceptance 16/16 endpoints PASS\n".utf8))
+    }
+
+    struct TreeProbeInputs {
+        let candidates: MLXArray, unary: MLXArray, scores: MLXArray, lse: MLXArray, anchor: MLXArray
+        func layout() -> [MLXArray] {
+            treeWalk([candidates, unary, scores, lse, anchor], grid: (32,1,1), threadGroup: (32,1,1),
+                outputShapes: [[16,5],[15,16],[15],[16],[16,16],[16],[1]],
+                outputDTypes: [.int32,.int32,.int32,.int32,.int32,.int32,.int32])
+        }
+        func walk() -> MLXArray { layout()[0] }
+    }
+    static func treeInputs(logits: MLXArray, projected: MLXArray, anchor: MLXArray,
+        pred: MLXArray, succ: MLXArray, predLookup: MLXArray?, succLookup: MLXArray?) -> TreeProbeInputs {
+        let V = logits.dim(-1), P = logits.size / V
+        precondition(P == 15)
+        let top = topk([logits.reshaped([P,V]).asType(.float32)],
+            grid: (P*256,8,1), threadGroup: (256,1,1),
+            outputShapes: [[P,128],[P,128]], outputDTypes: [.int32,.float32])
+        let merged = treeMerge(top, grid: (512,1,1), threadGroup: (512,1,1),
+            outputShapes: [[P,16],[P,16]], outputDTypes: [.int32,.float32])
+        let scores = treeEdges([merged[0],merged[1],projected.reshaped([P,256]).asType(.float32),
+            pred,succ,anchor,predLookup ?? selectorLookupSentinel,succLookup ?? selectorLookupSentinel],
+            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
+            grid: (512,16,P),threadGroup: (512,1,1),
+            outputShapes: [[P,16,16]],outputDTypes: [.float32])[0]
+        let lse = logSumExp(logits.reshaped([P,V]).asType(.float32), axis: -1)
+        return TreeProbeInputs(candidates: merged[0],unary: merged[1],scores: scores,lse: lse,anchor: anchor)
+    }
+    static func captureTree(logits: MLXArray, projected: MLXArray, anchor: MLXArray,
+        pred: MLXArray, succ: MLXArray, predLookup: MLXArray?, succLookup: MLXArray?, path: MLXArray) {
+        guard let file = CBv2Tree16Layout.captureFile, logits.size / logits.dim(-1) == 15 else { return }
+        let inputs = treeInputs(logits: logits,projected: projected,anchor: anchor,
+            pred: pred,succ: succ,predLookup: predLookup,succLookup: succLookup)
+        let layout = inputs.layout()
+        let nodes = layout[0]
+        eval(layout + [path])
+        var object: [String: Any] = [:]
+        object["k"] = "draft"
+        object["anchor"] = anchor.asArray(Int32.self)
+        object["path"] = path.asArray(Int32.self)
+        object["tree"] = nodes.asArray(Int32.self)
+        object["paths"] = layout[1].asArray(Int32.self)
+        object["lengths"] = layout[2].asArray(Int32.self)
+        object["owners"] = layout[3].asArray(Int32.self)
+        object["node_paths"] = layout[4].asArray(Int32.self)
+        object["depths"] = layout[5].asArray(Int32.self)
+        object["leaf_count"] = layout[6].asArray(Int32.self)
+        object["cand"] = inputs.candidates.asArray(Int32.self)
+        object["unary"] = inputs.unary.asArray(Float.self)
+        object["scores"] = inputs.scores.asArray(Float.self)
+        object["lse"] = inputs.lse.asArray(Float.self)
+        if let data = try? JSONSerialization.data(withJSONObject: object) {
+            if !FileManager.default.fileExists(atPath: file) { FileManager.default.createFile(atPath:file,contents:nil) }
+            if let h = FileHandle(forWritingAtPath:file) {
+                h.seekToEndOfFile(); h.write(data); h.write(Data([10])); try? h.close()
+            }
+        }
+        if ProcessInfo.processInfo.environment["TREE16_SELECTOR_BENCH"] == "1" {
+            checkTreeAcceptance(nodes)
+            var samples: [[Double]] = [[],[],[]]
+            for r in 0..<13 {
+                for arm in (r % 2 == 0 ? [0,1,2] : [2,1,0]) {
+                    let start = Date.timeIntervalSinceReferenceDate
+                    var roots: [MLXArray] = []
+                    for _ in 0..<24 {
+                        if arm == 0 {
+                            roots.append(select(logits:logits,projected:projected,anchor:anchor,
+                                pred:pred,succ:succ,predLookup:predLookup,succLookup:succLookup))
+                        } else if arm == 1 {
+                            roots.append(treeInputs(logits:logits,projected:projected,anchor:anchor,
+                                pred:pred,succ:succ,predLookup:predLookup,succLookup:succLookup).walk())
+                        } else { roots.append(inputs.walk()) }
+                    }
+                    eval(roots)
+                    if r >= 3 { samples[arm].append((Date.timeIntervalSinceReferenceDate-start)*1000/24) }
+                }
+            }
+            for arm in 0..<3 {
+                let sorted = samples[arm].sorted()
+                let log = String(format:"TREE16 selector arm%d median=%.6f min=%.6f ms/call\n",arm,sorted[sorted.count/2],sorted[0])
+                FileHandle.standardError.write(Data(log.utf8))
+            }
+            exit(0)
+        }
+    }
+}
+
+// Calibrated, cost-aware two-choice policy inside the fixed 16-row envelope.
+extension DF2Fast {
+    private static let adaptiveTreeWalkSource = """
+            if (thread_position_in_threadgroup.x != 0) return;
+            const int P = cand_shape[0];
+            float nodeLogs[16], nodeRaw[16], frontierRaw[64];
+            nodeLogs[0] = 0; nodeRaw[0] = 0;
+            // Frontier has at most 4 + 3 * 14 = 46 entries.
+            int fp[64], fc[64], fd[64]; float fl[64]; int nf = 0;
+            nodes[0] = anchor[0]; nodes[1] = -1; nodes[2] = 0; nodes[3] = -1; nodes[4] = 1;
+            int parentNode = 0, parentCandidate = 0, depth = 0;
+            float pathLog = 0;
+            for (int next = 1; next <= 16; ++next) {
+              if (depth < P) {
+                float sc[16], mx = -INFINITY, um = -INFINITY;
+                for (int b = 0; b < 16; ++b) {
+                  const int slot = (depth*16 + parentCandidate)*16 + b;
+                  sc[b] = scores[slot]; mx = max(mx, sc[b]);
+                  um = max(um, float(unary[depth*16 + b]));
+                }
+                float den = 0, mass = 0;
+                for (int b = 0; b < 16; ++b) {
+                  den += metal::precise::exp(sc[b]-mx);
+                  mass += metal::precise::exp(float(unary[depth*16 + b])-um);
+                }
+                const float offset = um + metal::precise::log(mass) - lse[depth]
+                    - mx - metal::precise::log(den);
+                for (int r = 0; r < 4; ++r) {
+                  int best = 0;
+                  for (int b = 1; b < 16; ++b) if (sc[b] > sc[best]) best = b;
+                  fp[nf] = parentNode; fc[nf] = best; fd[nf] = depth;
+                  fl[nf] = pathLog + sc[best] + offset;
+                  frontierRaw[nf] = clamp(metal::precise::exp(sc[best] + offset), 0.0f, 1.0f); nf++;
+                  sc[best] = -INFINITY;
+                }
+              }
+              if (next == 16) break;
+              int best = 0;
+              for (int f = 1; f < nf; ++f) if (fl[f] > fl[best]) best = f;
+              const int b = fc[best], d = fd[best], par = fp[best];
+              pathLog = fl[best]; nodeLogs[next] = pathLog; nodeRaw[next] = frontierRaw[best];
+              nodes[next*5] = cand[d*16 + b]; nodes[next*5+1] = par;
+              nodes[next*5+2] = d+1; nodes[next*5+3] = b;
+              nodes[next*5+4] = nodes[par*5+4] | (1 << next);
+              --nf; fp[best] = fp[nf]; fc[best] = fc[nf]; fd[best] = fd[nf]; fl[best] = fl[nf]; frontierRaw[best] = frontierRaw[nf];
+              parentNode = next; parentCandidate = b; depth = d+1;
+            }
+            float treeExpected = 1.0f, chainExpected = 1.0f, chainPrefix = 1.0f;
+            float calibratedPrefix[16]; calibratedPrefix[0] = 1.0f;
+            for (int i = 1; i < 16; ++i) {
+              const float raw = nodeRaw[i];
+              const int bin = min(9, int(raw * 10.0f));
+              const float calibrated = (8.0f * raw + calibration[10 + bin]) / (8.0f + calibration[bin]);
+              calibratedPrefix[i] = calibratedPrefix[nodes[i*5+1]] * calibrated;
+              treeExpected += calibratedPrefix[i];
+            }
+            int chainTokens[15], chainCandidates[15]; float chainProbability[15];
+            int pc = 0;
+            for (int d = 0; d < 15; ++d) {
+              float mx = -INFINITY, um = -INFINITY; int best = 0;
+              for (int b = 0; b < 16; ++b) {
+                const float value = scores[(d*16 + pc)*16 + b];
+                mx = max(mx, value); um = max(um, unary[d*16 + b]);
+                if (value > scores[(d*16 + pc)*16 + best]) best = b;
+              }
+              float den = 0, mass = 0;
+              for (int b = 0; b < 16; ++b) {
+                den += metal::precise::exp(scores[(d*16 + pc)*16 + b] - mx);
+                mass += metal::precise::exp(unary[d*16 + b] - um);
+              }
+              const float logp = scores[(d*16 + pc)*16 + best] - mx - metal::precise::log(den)
+                  + um + metal::precise::log(mass) - lse[d];
+              const float raw = clamp(metal::precise::exp(logp), 0.0f, 1.0f);
+              const int bin = min(9, int(raw * 10.0f));
+              const float calibrated = (8.0f * raw + calibration[10 + bin]) / (8.0f + calibration[bin]);
+              chainPrefix *= calibrated; chainExpected += chainPrefix;
+              chainTokens[d] = cand[d*16 + best]; chainCandidates[d] = best; chainProbability[d] = raw;
+              pc = best;
+            }
+            int replayRows = 0, shapeLeaves = 0;
+            for (int i = 0; i < 16; ++i) {
+              bool leaf = true;
+              for (int j = i+1; j < 16; ++j) if (nodes[j*5+1] == i) leaf = false;
+              if (leaf) { replayRows += nodes[i*5+2] + 1; ++shapeLeaves; }
+            }
+            const float extra = costs[1] + costs[2] * float(max(0, replayRows - 16))
+                + costs[3] * float(max(0, shapeLeaves - 4));
+            const bool useTree = treeExpected - chainExpected > chainExpected * extra / costs[0];
+            statistics[0] = chainExpected; statistics[1] = treeExpected;
+            statistics[2] = extra; statistics[3] = useTree ? 1.0f : 0.0f;
+            if (!useTree) {
+              for (int i = 1; i < 16; ++i) {
+                nodes[i*5] = chainTokens[i-1]; nodes[i*5+1] = i-1; nodes[i*5+2] = i;
+                nodes[i*5+3] = chainCandidates[i-1]; nodes[i*5+4] = (1 << (i+1)) - 1;
+                nodeRaw[i] = chainProbability[i-1];
+              }
+            }
+            for (int i = 0; i < 16; ++i) probabilities[i] = nodeRaw[i];
+            for (int i = 0; i < 240; ++i) paths[i] = 0;
+            for (int i = 0; i < 15; ++i) lengths[i] = 0;
+            for (int i = 0; i < 16; ++i) {
+              owners[i] = -1; depths[i] = nodes[i*5+2];
+              for (int j = 0; j < 16; ++j) node_paths[i*16+j] = 0;
+              int parent = i;
+              for (int j = depths[i]; j >= 0; --j) {
+                node_paths[i*16+j] = parent; parent = nodes[parent*5+1];
+              }
+            }
+            int leaves = 0;
+            for (int i = 0; i < 16; ++i) {
+              bool leaf = true;
+              for (int j = i+1; j < 16; ++j) if (nodes[j*5+1] == i) leaf = false;
+              if (!leaf) continue;
+              const int len = depths[i]+1;
+              lengths[leaves] = len;
+              for (int j = 0; j < len; ++j) {
+                const int node = node_paths[i*16+j];
+                paths[leaves*16+j] = node;
+                if (owners[node] == -1) owners[node] = leaves;
+              }
+              ++leaves;
+            }
+            leaf_count[0] = leaves;
+        """
+    static let adaptiveTreeWalk = MLXFast.metalKernel(
+        name: "df2_tree16_calibrated_cost_walk",
+        inputNames: ["cand", "unary", "scores", "lse", "anchor", "calibration", "costs"],
+        outputNames: ["nodes", "paths", "lengths", "owners", "node_paths", "depths", "leaf_count", "probabilities", "statistics"],
+        source: adaptiveTreeWalkSource)
+    private static func sharedTreeWalkSource() -> String {
+        var source = adaptiveTreeWalkSource
+        let costLeaf = "if (leaf) { replayRows += nodes[i*5+2] + 1; ++shapeLeaves; }"
+        let savedLeaf = "if (leaf) { leaf_nodes_shared[shapeLeaves] = i; replayRows += nodes[i*5+2] + 1; ++shapeLeaves; }"
+        precondition(source.contains(costLeaf), "tree16 leaf-list splice")
+        source = source.replacingOccurrences(of: costLeaf, with: savedLeaf)
+        let publish = "for (int i = 0; i < 16; ++i) probabilities[i] = nodeRaw[i];"
+        let publishLeaves = "leaf_count_shared = useTree ? shapeLeaves : 1; if (!useTree) leaf_nodes_shared[0] = 15;\n" + publish
+        precondition(source.contains(publish), "tree16 leaf-count splice")
+        source = source.replacingOccurrences(of: publish, with: publishLeaves)
+        let metadataBegin = "    for (int i = 0; i < 240; ++i) paths[i] = 0;"
+        guard let metadata = source.range(of: metadataBegin) else {
+            preconditionFailure("tree16 parallel metadata splice")
+        }
+        source = String(source[..<metadata.lowerBound]) + """
+            }
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+            if (statistics[3] == 0.0f) {
+                for (int i = int(tid); i < 256; i += 32) {
+                    const int row = i / 16, column = i % 16;
+                    node_paths[i] = column <= row ? column : 0;
+                }
+                for (int i = int(tid); i < 240; i += 32) paths[i] = i < 16 ? i : 0;
+                if (tid < 16) { depths[tid] = int(tid); owners[tid] = 0; }
+                if (tid < 15) lengths[tid] = tid == 0 ? 16 : 0;
+                if (tid == 0) leaf_count[0] = 1;
+                return;
+            }
+            if (tid < 16) {
+                const int i = int(tid), depth = nodes[i*5+2];
+                depths[i] = depth;
+                for (int j = 0; j < 16; ++j) node_paths[i*16+j] = 0;
+                int parent = i;
+                for (int j = depth; j >= 0; --j) {
+                    node_paths[i*16+j] = parent; parent = nodes[parent*5+1];
+                }
+                int owner = -1;
+                for (int leaf = 0; leaf < leaf_count_shared; ++leaf) {
+                    const int endpoint = leaf_nodes_shared[leaf];
+                    if (nodes[endpoint*5+4] & (1 << i)) { owner = leaf; break; }
+                }
+                owners[i] = owner;
+                if (i == 0) leaf_count[0] = leaf_count_shared;
+            }
+            if (tid < 15) {
+                const int slot = int(tid);
+                const int endpoint = slot < leaf_count_shared ? leaf_nodes_shared[slot] : -1;
+                for (int j = 0; j < 16; ++j) paths[slot*16+j] = 0;
+                lengths[slot] = 0;
+                if (endpoint >= 0) {
+                    const int depth = nodes[endpoint*5+2];
+                    lengths[slot] = depth + 1;
+                    int parent = endpoint;
+                    for (int j = depth; j >= 0; --j) {
+                        paths[slot*16+j] = parent; parent = nodes[parent*5+1];
+                    }
+                }
+            }
+        """
+        var header = "const uint tid = thread_position_in_threadgroup.x;\n"
+            + "threadgroup int leaf_nodes_shared[15]; threadgroup int leaf_count_shared;\n"
+        do {
+            let raw = "float nodeLogs[16], nodeRaw[16], frontierRaw[64];"
+            let frontier = "int fp[64], fc[64], fd[64]; float fl[64]; int nf = 0;"
+            precondition(source.contains(raw) && source.contains(frontier), "tree16 shared frontier splice")
+            source = source.replacingOccurrences(of: raw, with: "float nodeLogs[16], nodeRaw[16];")
+            source = source.replacingOccurrences(of: frontier, with: "int nf = 0;")
+            header += "threadgroup int fp[64], fc[64], fd[64]; threadgroup float fl[64], frontierRaw[64];\n"
+        }
+        header += "if (tid == 0) {"
+        source = source.replacingOccurrences(
+            of: "if (thread_position_in_threadgroup.x != 0) return;", with: header)
+        return source
+    }
+    static let sharedAdaptiveTreeWalk = MLXFast.metalKernel(
+        name: "df2_tree16_shared_frontier_walk",
+        inputNames: ["cand", "unary", "scores", "lse", "anchor", "calibration", "costs"],
+        outputNames: ["nodes", "paths", "lengths", "owners", "node_paths", "depths", "leaf_count",
+            "probabilities", "statistics"], source: sharedTreeWalkSource())
+
+}
+extension DF2Fast.TreeProbeInputs {
+    func adaptiveLayout(policy: CBv2Tree16Policy) -> [MLXArray] {
+        let inputs = [candidates, unary, scores, lse, anchor, policy.table, policy.costs]
+        let shapes = [[16,5],[15,16],[15],[16],[16,16],[16],[1],[16],[4]]
+        let types: [DType] = [.int32,.int32,.int32,.int32,.int32,.int32,.int32,.float32,.float32]
+        let kernel = CBv2Tree16Layout.fastDecision
+            ? DF2Fast.sharedAdaptiveTreeWalk : DF2Fast.adaptiveTreeWalk
+        let result = kernel(inputs, grid: (32,1,1), threadGroup: (32,1,1),
+            outputShapes: shapes, outputDTypes: types)
+        if CBv2Tree16Layout.checkDecision {
+            let reference = DF2Fast.adaptiveTreeWalk(inputs, grid: (32,1,1), threadGroup: (32,1,1),
+                outputShapes: shapes, outputDTypes: types)
+            eval(reference + result)
+            for i in result.indices {
+                let expected = reference[i].view(dtype: .int32).asArray(Int32.self)
+                let actual = result[i].view(dtype: .int32).asArray(Int32.self)
+                precondition(expected == actual, "tree16 shared decision bits array \(i)")
+            }
+            FileHandle.standardError.write(Data("TREE16 TUNE decision bitwise PASS\n".utf8))
+        }
+        return result
     }
 }

@@ -51,6 +51,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
     public var mtpSerializesRectangularAttention = false
     public var mtpBatchesRectangularAttention = false
+    public var tree16Layout: CBv2Tree16Layout?
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
@@ -142,6 +143,16 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         } else {
             attentionMetadata?.state.refuse("keep_masked_attention_not_replayable")
             attentionPacket?.state.refuse("keep_masked_attention_not_replayable")
+        }
+        if let layout = tree16Layout {
+            precondition(rows.count == 1 && queries.dim(2) == 16)
+            precondition(kind.attention == .full && !kind.hasSinks && keepMask == nil)
+            let cached = rows[0].update(keys: keys, values: values)
+            let output = CBv2VerifyVectorAttention.tree(
+                queries: queries, keys: cached.0, values: cached.1,
+                paths: layout.nodePaths, depths: layout.depths)
+            cachedPositionOffsets = cachedPositionOffsets + Int32(16)
+            return output
         }
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,

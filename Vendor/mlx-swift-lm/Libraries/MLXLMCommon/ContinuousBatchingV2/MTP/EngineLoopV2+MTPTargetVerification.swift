@@ -29,7 +29,7 @@ extension EngineLoopV2 {
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        tokens presetTokens: MLXArray? = nil
+        tokens presetTokens: MLXArray? = nil, tree16: CBv2Tree16Layout? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -41,6 +41,16 @@ extension EngineLoopV2 {
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+        if let tree16 {
+            precondition(rows.count == 1 && columns.count == 16)
+            precondition(caches.allSatisfy { $0 is CBv2LayerCache })
+            for cache in caches { (cache as! CBv2LayerCache).tree16Layout = tree16 }
+        }
+        defer {
+            if tree16 != nil {
+                for cache in caches { (cache as! CBv2LayerCache).tree16Layout = nil }
+            }
+        }
         let scores: MLXArray
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
@@ -255,7 +265,11 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 recurrent MTP state missing for \(row.rec.id)")
                     }
-                    do { return try state.bind() } catch {
+                    do {
+                        let evaluation = try state.bind()
+                        evaluation.tree16Layout = tree16
+                        return evaluation
+                    } catch {
                         preconditionFailure(
                             "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
                     }

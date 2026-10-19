@@ -170,6 +170,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// block over that many plus one rows.
         var frontAccepted: Int?
         var lookupFC: (output: MLXArray, rows: Int)?
+        var tree16: CBv2Tree16Layout?
+        lazy var tree16Policy = CBv2Tree16Policy()
+        var tree16Eligible = false
+        var tree16SeedPrestage = false
+        var tree16FinalizedRounds = 0
         /// A lookup round's absorption of the pending rows, not yet built:
         /// the engine submits it behind that round's verify
         /// (`submitDeferredContext`); every other entry point runs it first.
@@ -232,6 +237,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             projectionRows = 0
             frontAccepted = nil
             lookupFC = nil
+            tree16 = nil
             absorbDeferred = false
             lastProposalLookup = false
             caches.removeAll(keepingCapacity: false)
@@ -297,6 +303,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         {
             return
         }
+        state.tree16Eligible = CBv2Tree16Layout.enabled && depth == 15
+            && history.count - 1 + 16 < 1024
         state.promptDraft = DFlash2PromptLookup.continuation(history: history, depth: depth)
         state.preparedLookup = (history, depth)
     }
@@ -313,7 +321,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
                 return p.tokens
             }
         }
+        state.tree16 = nil
         runDeferredAbsorption(state)
+        let wasLookup = state.lastProposalLookup
         state.lastProposalLookup = false
         guard !state.pending.isEmpty || state.contextAbsorbed else {
             throw DFlash2Error.emptyBlockContext
@@ -371,9 +381,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             }
             state.cacheSeeded = true
         }
+        if wasLookup && CBv2Tree16Layout.adaptive { state.tree16Policy.invalidateFastGate() }
+        let eligible = state.tree16Eligible && !state.tree16SeedPrestage
+        let offer = eligible && (!CBv2Tree16Layout.adaptive || state.tree16Policy.shouldBuildTree())
+        let receiveTree: ((CBv2Tree16Layout) -> Void)?
+        if offer { receiveTree = { state.tree16 = $0 } } else { receiveTree = nil }
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1, projection: projection)
+            blockSize: depth + 1, projection: projection, tree16: receiveTree,
+            tree16Policy: offer && CBv2Tree16Layout.adaptive ? state.tree16Policy : nil)
         state.absorbPending()
         state.contextAbsorbed = false
         state.roots.append(tokens)
@@ -386,6 +402,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         let state = self.state(requestState)
         guard state.prestaged == nil else { return }
         let preparedLookup = state.preparedLookup
+        // Preserve the base's first chain prestage, without adding tree work to begin.
+        state.tree16SeedPrestage = state.tree16FinalizedRounds == 0
+        defer { state.tree16SeedPrestage = false }
         guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
         else { return }
         state.prestaged = (anchor: anchor, depth: depth, tokens: tokens)
@@ -445,6 +464,16 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.contextAbsorbed = true
         let evalTargets = state.caches.flatMap { $0.innerState() }
         return evalTargets
+    }
+
+    public func tree16Layout(requestState: any CBv2MTPRequestState) -> CBv2Tree16Layout? {
+        state(requestState).tree16
+    }
+
+    public func observeTree16(requestState: any CBv2MTPRequestState, parents: [Int], drafts: [Int],
+        targets: [Int], probabilities: [Float], statistics: [Float]) {
+        state(requestState).tree16Policy.observe(parents: parents, drafts: drafts, targets: targets,
+            probabilities: probabilities, statistics: statistics)
     }
 
     public func trimBlockState(
@@ -582,7 +611,16 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
         // Armed by this round's `projectRoundContext` (no rows committed yet).
-        let projection = state.projectionRows == 0 ? state.projection : nil
+        let originalProjection = state.projectionRows == 0 ? state.projection : nil
+        let projection: DFlash2ContextProjection?
+        if let tree = state.tree16, !tree.acceptedChain, let ids = tree.acceptedRows {
+            // A branched path cannot reuse the base front built from a leading chain match.
+            projection = originalProjection?.gatheredRows(ids)
+        } else {
+            projection = originalProjection
+        }
+        state.tree16 = nil
+        state.tree16FinalizedRounds += 1
         let pendingWasEmpty = state.pending.isEmpty
         state.projection = nil
         state.projectionRows = 0
@@ -612,6 +650,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.projectionRows = 0
         state.frontAccepted = nil
         state.lookupFC = nil
+        state.tree16 = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
     }

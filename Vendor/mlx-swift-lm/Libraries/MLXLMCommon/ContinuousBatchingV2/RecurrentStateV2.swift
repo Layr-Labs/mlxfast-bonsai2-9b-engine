@@ -609,6 +609,7 @@ public final class CBv2RecurrentRequestState {
 /// then calls `evaluate()` before submitting the arrays to MLX and later
 /// chooses exactly one of `commit()` or `rollback()` at finalization.
 public final class CBv2RecurrentStateEvaluation {
+    public var tree16Layout: CBv2Tree16Layout?
     private unowned let owner: CBv2RecurrentRequestState
     private let generation: UInt64
     private let input: [Int: CBv2RecurrentLayerState]

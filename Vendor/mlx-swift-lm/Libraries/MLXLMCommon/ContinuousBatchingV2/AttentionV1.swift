@@ -1244,3 +1244,164 @@ enum CBv2VerifyVectorAttention {
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
 }
+
+extension CBv2VerifyVectorAttention {
+    private static let treePartial = MLXFast.metalKernel(
+        name: "cbv2_tree16_sdpa_partial",
+        inputNames: ["queries", "keys", "values", "scale_in", "n_keys", "paths", "depths"],
+        outputNames: ["part_o", "part_m", "part_s"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int D = 256;
+            constexpr int G = 4;
+            const uint L = uint(N_QUERIES);
+            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint kvh = threadgroup_position_in_grid.z;
+            const uint h0 = kvh * G;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int c = int(threadgroup_position_in_grid.x * uint(CPT)
+                + simdgroup_index_in_threadgroup % uint(CPT));
+            const int N = n_keys[0];
+            const float scale = scale_in[0];
+            const int prefix = N - int(L);
+            const int limit = prefix + depths[t];
+            float q[G][8];
+            float o[G][8];
+            float max_score[G];
+            float sum_exp_score[G];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const device float* qp = queries + (h0 + h) * queries_strides[1]
+                  + t * queries_strides[2] + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                q[h][j] = static_cast<float>(scale) * qp[j];
+                o[h][j] = 0;
+              }
+              max_score[h] = -metal::numeric_limits<float>::max();
+              sum_exp_score[h] = 0;
+            }
+            const device float* kp = keys + kvh * keys_strides[1] + simd_lid * 8;
+            const device float* vp = values + kvh * values_strides[1] + simd_lid * 8;
+            const int64_t ks = keys_strides[2];
+            const int64_t vs = values_strides[2];
+            for (int i = c; i <= limit; i += 32) {
+              const int physical = i < prefix ? i : prefix + paths[t * 16u + uint(i - prefix)];
+              float k[8];
+              float v[8];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                k[j] = kp[physical * ks + j];
+                v[j] = vp[physical * vs + j];
+              }
+              #pragma clang loop unroll(full)
+              for (int h = 0; h < G; h++) {
+                float score = 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  score = metal::fma(q[h][j], k[j], score);
+                }
+                score = simd_sum(score);
+                float new_max = max(max_score[h], score);
+                float factor = fast::exp(max_score[h] - new_max);
+                float exp_score = fast::exp(score - new_max);
+                max_score[h] = new_max;
+                sum_exp_score[h] = metal::fma(sum_exp_score[h], factor, exp_score);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  o[h][j] = metal::fma(o[h][j], factor, exp_score * v[j]);
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
+              device float* op = part_o + slot * D + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) op[j] = o[h][j];
+              if (simd_lid == 0) {
+                part_m[slot] = max_score[h];
+                part_s[slot] = sum_exp_score[h];
+              }
+            }
+            """,
+        ensureRowContiguous: false)
+
+
+    static func tree(queries: MLXArray, keys: MLXArray, values: MLXArray,
+        paths: MLXArray, depths: MLXArray) -> MLXArray {
+        precondition(queries.shape == [1,16,16,256] && keys.dim(2) >= 16 && keys.dim(2) < 1024)
+        let inputs = [queries, keys, values, MLXArray([Float(0.0625)]),
+            MLXArray([Int32(keys.dim(2))]), paths, depths]
+        let parts = treePartial(inputs,
+            template: [("N_QUERIES", 16), ("CPT", classesPerGroup)],
+            grid: (32 * 32 * 16, 1, 4), threadGroup: (32 * classesPerGroup * 16, 1, 1),
+            outputShapes: [[16 * 16 * 32, 256], [16 * 16 * 32], [16 * 16 * 32]],
+            outputDTypes: [.float32, .float32, .float32])
+        return combine(parts, grid: (32 * 256,16,1), threadGroup: (256,1,1),
+            outputShapes: [[1,16,16,256]], outputDTypes: [.float32])[0]
+    }
+}
+
+public enum CBv2Tree16AttentionProbe {
+    public static func run(reps: Int, measure: Bool = true) -> String {
+        let parents = [-1,0,1,2,3,4,5,3,7,8,3,10,11,3,13,14]
+        var paths: [[Int32]] = []
+        for i in 0..<16 { paths.append(i == 0 ? [0] : paths[parents[i]] + [Int32(i)]) }
+        let padded = paths.flatMap { $0 + Array(repeating: Int32(0), count: 16 - $0.count) }
+        let pathArray = MLXArray(padded, [16,16])
+        let depths = MLXArray(paths.map { Int32($0.count - 1) })
+        var log = ""
+        for prefix in [0, 127, 512, 999] {
+            let q = MLXRandom.normal([1,16,16,256], key: MLXRandom.key(0x718))
+            let k = MLXRandom.normal([1,4,prefix+16,256], key: MLXRandom.key(0x719))
+            let v = MLXRandom.normal(k.shape, key: MLXRandom.key(0x720))
+            eval(q,k,v,pathArray,depths)
+            let actual = CBv2VerifyVectorAttention.tree(queries: q, keys: k, values: v, paths: pathArray, depths: depths)
+            var bad = 0
+            for i in 0..<16 {
+                let path = paths[i]
+                let paddedPath = path.count == 1 ? path + path : path
+                let qi = MLXArray(paddedPath)
+                let ki = MLXArray((0..<prefix).map { Int32($0) } + paddedPath.map { $0 + Int32(prefix) })
+                let oracle = CBv2VerifyVectorAttention.attend(queries: take(q, qi, axis: 2),
+                    keys: take(k, ki, axis: 2), values: take(v, ki, axis: 2), scale: 0.0625)!
+                let wanted = oracle[0...,0..., (path.count-1)..<path.count,0...]
+                let got = actual[0...,0...,i..<(i+1),0...]
+                let count = (wanted.view(dtype: .uint32) .!= got.view(dtype: .uint32)).asType(.int32).sum()
+                eval(count)
+                bad += count.item(Int.self)
+            }
+            log += "attn prefix=\(prefix) bit_mismatches=\(bad)\n"
+            FileHandle.standardError.write(Data(("attn prefix=\(prefix) mismatch=\(bad)\n").utf8))
+            precondition(bad == 0, "TREE16 attention bit mismatch")
+            if !measure { continue }
+            var samples = [[Double](),[Double]()]
+            for r in 0..<(reps + 3) {
+                for arm in (r % 2 == 0 ? [0,1] : [1,0]) {
+                    let marker = ProcessInfo.processInfo.systemUptime
+                    let start = Date.timeIntervalSinceReferenceDate
+                    var outputs: [MLXArray] = []
+                    for _ in 0..<8 {
+                        let out = arm == 0 ? CBv2VerifyVectorAttention.attend(queries: q,keys: k,values: v,scale: 0.0625)!
+                            : CBv2VerifyVectorAttention.tree(queries: q,keys: k,values: v,paths: pathArray,depths: depths)
+                        outputs.append(out)
+                    }
+                    eval(outputs)
+                    if r >= 3 {
+                        samples[arm].append((Date.timeIntervalSinceReferenceDate-start)*1000)
+                        log += String(format: "TREE16_SAMPLE attn %d %d %.7f %.7f\n", prefix, arm,
+                            marker, ProcessInfo.processInfo.systemUptime)
+                    }
+                }
+            }
+            for arm in 0..<2 {
+                let sorted = samples[arm].sorted()
+                log += String(format: "attn prefix%d %@ 8-layer wall median=%.6f min=%.6f ms\n", prefix,
+                    arm == 0 ? "record" : "tree", sorted[sorted.count/2], sorted[0])
+            }
+        }
+        return log
+    }
+}

@@ -610,6 +610,7 @@ extension EngineLoopV2 {
         // stacked draft row: the verify tokens and draft ids then take it
         // whole instead of re-joining k one-token slices (one copy each).
         var blockDraftIDs: MLXArray?
+        var tree16: CBv2Tree16Layout?
         var assistantEvalTargets: [MLXArray] = []
         if let lookupDrafts {
             // Host ids in the drafted chain's [B] int32 per-position shape.
@@ -643,6 +644,12 @@ extension EngineLoopV2 {
                 let proposal = try block.proposeBlock(
                     anchor: row.carry!.token, depth: k, requestState: requestState)
                 proposals.append(proposal)
+                if let layout = block.tree16Layout(requestState: requestState) {
+                    precondition(batch == 1 && k == 15)
+                    precondition(rowMetadata[index].storageRows.allSatisfy { $0 is CBv2FullSequenceKV })
+                    tree16 = layout
+                    assistantEvalTargets.append(contentsOf: layout.evaluationTargets)
+                }
                 // Align the drafter's context cache with the TARGET's
                 // committed length, exactly where the reference does it:
                 // after the proposal absorbed this round's context rows.
@@ -752,7 +759,7 @@ extension EngineLoopV2 {
 
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp,
-            tokens: blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) })
+            tokens: blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) }, tree16: tree16)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -762,6 +769,10 @@ extension EngineLoopV2 {
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        if let tree16 {
+            packetParts.append(tree16.nodes.reshaped([-1]))
+            if let policyPacket = tree16.policyPacket { packetParts.append(policyPacket) }
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -775,6 +786,7 @@ extension EngineLoopV2 {
             recurrentEvaluations: target.recurrent,
             policyTopTwoValues: target.policyTopTwo?.values,
             blockContext: target.blockContext)
+        result.tree16 = tree16
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result

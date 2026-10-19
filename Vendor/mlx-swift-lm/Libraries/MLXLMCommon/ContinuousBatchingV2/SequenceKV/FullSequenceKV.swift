@@ -201,6 +201,17 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         absoluteOffset -= n
     }
 
+    /// Gather into separate scratch before slice-update can reuse the original buffer.
+    public func tree16Compact(rows ids: MLXArray) {
+        precondition(absoluteOffset >= 16 && ids.size >= 1 && ids.size <= 16)
+        let start = absoluteOffset - 16
+        let source = ids + Int32(start)
+        let gatheredKeys = take(keys!, source, axis: 2)
+        let gatheredValues = take(values!, source, axis: 2)
+        keys = Self.sliceUpdate(keys!, gatheredKeys, start ..< start + ids.size)
+        values = Self.sliceUpdate(values!, gatheredValues, start ..< start + ids.size)
+    }
+
     func cbv2InnerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
     }

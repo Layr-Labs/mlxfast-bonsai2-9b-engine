@@ -143,6 +143,7 @@ final class CBv2MTPRoundInFlight {
         /// for this verify window. A BLOCK drafter's next block reads columns
         /// `0..<confirmed` of it; nil for every chain drafter.
         let blockContext: MLXArray?
+        var tree16: CBv2Tree16Layout?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
     }
@@ -1071,11 +1072,14 @@ final class CBv2MTPRoundDriver {
     ) {
         guard depthController.usesCommittedDecodeBaseline,
             acceptsWorkloadMeasurement(measurement) else { return }
-        let eligible = measurement.map {
-            $0.costEligible && $0.chained && !$0.seedOnly
-                && $0.actualDepth == 0 && $0.decision.depth == 0
-                && $0.decision.decodeRowBucket == CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
-        } == true && hasChainedSuccessor && sampledRows.count == finalizedPlainRowCount
+        let measurementEligible = measurement.map { value -> Bool in
+            guard value.costEligible && value.chained && !value.seedOnly else { return false }
+            guard value.actualDepth == 0 && value.decision.depth == 0 else { return false }
+            let bucket = CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
+            return value.decision.decodeRowBucket == bucket
+        } == true
+        let eligible = measurementEligible && hasChainedSuccessor
+            && sampledRows.count == finalizedPlainRowCount
         guard let elapsed = committedDecodeClock.observe(
             completedAtNanos: completedAtNanos, rowIDs: sampledRows, eligible: eligible),
             let measurement else { return }

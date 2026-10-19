@@ -158,6 +158,10 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            let path: [Int]?
+            let physicalTargets: [Int]
+            let treeParents: [Int]?
+            let policy: [Float]?
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -185,12 +189,38 @@ extension EngineLoopV2 {
             }
             let rec = scheduler.record(for: id)!
             let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
-            let targets = (0 ..< targetWidth).map {
+            var targets = (0 ..< targetWidth).map {
                 Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
+            let physicalTargets = targets
             var accepted = 0
-            while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            var treePath: [Int]?
+            var treeParents: [Int]?
+            var policy: [Float]?
+            if verify.tree16 != nil {
+                let base = draftCount + verify.rows.count * targetWidth
+                    + (verify.shortlistIDs == nil ? 0 : verify.rows.count * targetWidth)
+                let nodes = Array(host[base ..< base + 80])
+                if verify.tree16?.policyPacket != nil {
+                    policy = host[base+80 ..< base+100].map { Float(bitPattern: UInt32(bitPattern: $0)) }
+                }
+                treeParents = (0 ..< 16).map { Int(nodes[$0 * 5 + 1]) }
+                let walk = CBv2Tree16Layout.accept(nodes: nodes, targets: targets)
+                treePath = walk.rows
+                targets = walk.tokens
+                accepted = walk.rows.count - 1
+            } else {
+                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            }
+            if let file = CBv2Tree16Layout.captureFile {
+                let object: [String: Any] = ["k":"verify", "drafts":drafts,"targets":targets,
+                    "acc":accepted,"gen":rec.generatedTokenCount]
+                if let data = try? JSONSerialization.data(withJSONObject:object),
+                    let h = FileHandle(forWritingAtPath:file) {
+                    h.seekToEndOfFile(); h.write(data); h.write(Data([10])); try? h.close()
+                }
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
@@ -207,7 +237,8 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted, path: treePath, physicalTargets: physicalTargets,
+                    treeParents: treeParents, policy: policy))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -274,8 +305,37 @@ extension EngineLoopV2 {
                 packet.reconcile(
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
+            if let file = CBv2Tree16Layout.roundLogFile {
+                let object: [String: Any] = [
+                    "uptime_ns": DispatchTime.now().uptimeNanoseconds,
+                    "generated": rec.generatedTokenCount, "confirmed": confirmed,
+                    "accepted": accepted, "drafted": k,
+                    "tree": outcome.path != nil,
+                    "policy": outcome.policy ?? [],
+                    "rows": outcome.path.map { Array($0.prefix(confirmed)) } ?? Array(0 ..< confirmed),
+                    "parents": outcome.treeParents ?? [-1] + Array(0 ..< k)]
+                if let data = try? JSONSerialization.data(withJSONObject: object),
+                    let handle = FileHandle(forWritingAtPath: file)
+                {
+                    handle.seekToEndOfFile(); handle.write(data); handle.write(Data([10]))
+                    try? handle.close()
+                }
+            }
             let rejected = (1 + k) - confirmed
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            let acceptedRows = outcome.path.map { MLXArray($0.prefix(confirmed).map { Int32($0) }) }
+            if let tree = verify.tree16, let acceptedRows {
+                tree.acceptedRows = acceptedRows
+                tree.acceptedChain = outcome.treeParents == [-1] + Array(0 ..< k)
+                if let policy = outcome.policy, let parents = outcome.treeParents,
+                    let state = metadata.assistantState, let block = mtp.blockDrafter
+                {
+                    let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
+                    block.observeTree16(requestState: state, parents: parents, drafts: drafts,
+                        targets: outcome.physicalTargets,
+                        probabilities: Array(policy.prefix(16)), statistics: Array(policy.suffix(4)))
+                }
+            }
             // The next round's drafter block is built and submitted only
             // after this round's tokens are handed to the stream and the
             // round is journaled (below): the host's graph build no longer
@@ -287,20 +347,30 @@ extension EngineLoopV2 {
             {
                 let committedHidden: MLXArray
                 if let blockContext = verify.blockContext {
+                    if let acceptedRows {
+                        let rowContext = blockContext[batchIndex ..< batchIndex + 1]
+                        committedHidden = take(rowContext, acceptedRows, axis: 1)
+                    } else {
                     committedHidden = blockContext[
                         batchIndex ..< batchIndex + 1,
                         CBv2MTPBlockContextIndex.confirmedColumns(
                             confirmed: confirmed, verifyWidth: targetWidth),
                         0...]
+                    }
                 } else {
                     committedHidden = verify.lastHidden[
                         batchIndex ..< batchIndex + 1,
                         0 ..< committedDraftCount,
                         0...]
                 }
-                let committedDraftTokens = verify.draftIDs[
-                    batchIndex ..< batchIndex + 1,
-                    0 ..< committedDraftCount]
+                let committedDraftTokens: MLXArray
+                if let path = outcome.path {
+                    let ids = MLXArray(path.dropFirst().prefix(committedDraftCount).map { Int32($0 - 1) })
+                    committedDraftTokens = take(verify.draftIDs, ids, axis: 1)
+                } else {
+                    committedDraftTokens = verify.draftIDs[
+                        batchIndex ..< batchIndex + 1, 0 ..< committedDraftCount]
+                }
                 if let carry = metadata.lookupCarry {
                     stateful.commitLookupRound(
                         requestState: state,
@@ -364,6 +434,11 @@ extension EngineLoopV2 {
                     }
                 }
             }
+            if let acceptedRows {
+                for sequence in metadata.storageRows {
+                    (sequence as! CBv2FullSequenceKV).tree16Compact(rows: acceptedRows)
+                }
+            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -421,14 +496,16 @@ extension EngineLoopV2 {
                     k: k,
                     draftTokens: Array(
                         host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
-                    targetTokens: outcome.targets,
+                    targetTokens: outcome.physicalTargets,
                     accepted: accepted,
                     confirmed: confirmed,
                     rejected: rejected,
                     tokensCountAfter: rec.tokens.count,
                     numComputedAfter: rec.numComputedTokens,
                     generatedAfter: rec.generatedTokenCount,
-                    finishReason: finishReason.map { String(describing: $0) }))
+                    finishReason: finishReason.map { String(describing: $0) },
+                    treeParents: outcome.treeParents,
+                    treeAcceptedRows: outcome.path.map { Array($0.prefix(confirmed)) }))
             let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
@@ -458,7 +535,7 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+                let hiddenColumn = outcome.path?[confirmed - 1] ?? CBv2MTPHiddenIndex.carryColumn(
                     targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their

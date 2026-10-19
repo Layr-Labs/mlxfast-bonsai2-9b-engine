@@ -2700,16 +2700,23 @@ final class Qwen35GatedDeltaNet: Module {
     private func canUsePromptMiddle(_ inputs: MLXArray, ssmState: MLXArray) -> Bool {
         guard inputs.ndim == 3 else { return false }
         let S = inputs.dim(1)
-        return inputs.dim(0) == 1 && (64 ... 1365).contains(S) &&
-            S <= Qwen35PromptGatedGDN.maximumSteps && inputs.dtype == .float32 &&
-            headKDim == 128 && headVDim == 128 && convKernelSize == 4 &&
-            !(inProjB is QuantizedLinear) && !(inProjA is QuantizedLinear) &&
-            inProjB.bias == nil && inProjA.bias == nil &&
-            inProjB.weight.dtype == .float32 && inProjA.weight.dtype == .float32 &&
-            inProjB.weight.shape == [numVHeads, inputs.dim(2)] && inProjA.weight.shape == inProjB.weight.shape &&
-            conv1d.bias == nil && conv1d.weight.dtype == .float32 &&
-            aLog.dtype == .float32 && dtBias.dtype == .float32 && aLog.size == numVHeads && dtBias.size == numVHeads &&
-            ssmState.dtype == .float32 && ssmState.shape == [1, numVHeads, headVDim, headKDim]
+        guard inputs.dim(0) == 1, (64 ... 1365).contains(S),
+            S <= Qwen35PromptGatedGDN.maximumSteps, inputs.dtype == .float32
+        else { return false }
+        guard headKDim == 128, headVDim == 128, convKernelSize == 4,
+            !(inProjB is QuantizedLinear), !(inProjA is QuantizedLinear),
+            inProjB.bias == nil, inProjA.bias == nil
+        else { return false }
+        guard inProjB.weight.dtype == .float32, inProjA.weight.dtype == .float32,
+            inProjB.weight.shape == [numVHeads, inputs.dim(2)],
+            inProjA.weight.shape == inProjB.weight.shape
+        else { return false }
+        guard conv1d.bias == nil, conv1d.weight.dtype == .float32,
+            aLog.dtype == .float32, dtBias.dtype == .float32,
+            aLog.size == numVHeads, dtBias.size == numVHeads
+        else { return false }
+        return ssmState.dtype == .float32
+            && ssmState.shape == [1, numVHeads, headVDim, headKDim]
     }
 
     /// The prompt-width (S >= 64, one row) middle of `cbv2Forward`: the
@@ -2795,10 +2802,20 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = retainedConvTail(of: convInput, keeping: nKeep, chunkWidth: S)
-        let foldValue = mask == nil && S >= 64 && headKDim == 128 && headVDim == 128
-            && convKernelSize == 4 && convInput.dtype == .float32
-            && conv1d.weight.dtype == .float32 && conv1d.weight.shape == [convDim, 4, 1]
-            && conv1d.bias == nil && aLog.dtype == .float32 && dtBias.dtype == .float32
+        let foldValue: Bool = {
+            guard mask == nil else { return false }
+            guard S >= 64 else { return false }
+            guard self.headKDim == 128 else { return false }
+            guard self.headVDim == 128 else { return false }
+            guard self.convKernelSize == 4 else { return false }
+            guard convInput.dtype == .float32 else { return false }
+            guard self.conv1d.weight.dtype == .float32 else { return false }
+            guard self.conv1d.weight.shape == [self.convDim, 4, 1] else { return false }
+            guard self.conv1d.bias == nil else { return false }
+            guard self.aLog.dtype == .float32 else { return false }
+            guard self.dtBias.dtype == .float32 else { return false }
+            return true
+        }()
         let convOut = foldValue
             ? silu(MLX.conv1d(
                 convInput[0..., 0..., 0 ..< (2 * keyDim)],
@@ -3154,6 +3171,49 @@ final class Qwen35GatedDeltaNet: Module {
     /// recurrence once over the whole window and retain compact transformed
     /// inputs, allowing a strict accepted prefix to be replayed lazily without
     /// another target-model forward or a per-position fp32 SSM stack.
+    private func capturedTree16(
+        _ layout: CBv2Tree16Layout, evaluation: CBv2RecurrentStateEvaluation,
+        modelLayerIndex: Int, convState: MLXArray, ssmState: MLXArray,
+        qkv: MLXArray, a: MLXArray, b: MLXArray
+    ) -> MLXArray {
+        precondition(convKernelSize == 4 && conv1d.bias == nil)
+        precondition(numKHeads == 16 && numVHeads == 32 && headKDim == 128 && headVDim == 128)
+        let outputs = Qwen35Tree16Probe.forward(
+            conv: convState, qkv: qkv, weight: conv1d.weight, a: a, b: b,
+            alog: aLog, bias: dtBias, state: ssmState, layout: layout)
+        let v = outputs[0], q = outputs[1], k = outputs[2]
+        let finalSSM = outputs[4]
+        let finalConv = qkv[0..., 13 ..< 16, 0...]
+        let roots = [convState, qkv, q, k, v, a, b, ssmState]
+        let retainedBytes = roots.reduce(0) { $0 + $1.size * $1.dtype.size }
+        do {
+            try evaluation.stagePrefixReplay(
+                modelLayerIndex: modelLayerIndex, positions: 16,
+                finalConv: finalConv, finalSSM: finalSSM,
+                materializedByteCount: retainedBytes + finalSSM.size * finalSSM.dtype.size,
+                evaluationRoots: roots,
+                strictReplayRetainedByteCount: retainedBytes,
+                strictReplayRetainedRoots: roots,
+                fullAcceptanceRetainedByteCount: qkv.size * qkv.dtype.size,
+                fullAcceptanceRetainedRoots: [qkv],
+                fullAcceptance: {
+                    // Sixteen consumed rows prove that this layout is one full chain.
+                    let tail = finalConv + MLXArray.zeros(finalConv.shape, dtype: finalConv.dtype)
+                    return CBv2RecurrentLayerState(conv: tail, ssm: finalSSM)
+                },
+                replay: { [unowned self] keep in
+                    guard let ids = layout.acceptedRows, ids.size == keep else {
+                        preconditionFailure("tree16 accepted path was not published")
+                    }
+                    let boundary = Qwen35RegisterGatedSIMD.runTree16Replay(
+                        q: q, k: k, v: v, a: a, b: b, aLog: self.aLog, dtBias: self.dtBias,
+                        state: ssmState, convState: convState, qkv: qkv, rows: ids)
+                    return CBv2RecurrentLayerState(conv: boundary.1, ssm: boundary.0)
+                })
+        } catch { preconditionFailure("tree16 recurrent stage: \(error)") }
+        return outputs[3]
+    }
+
     func cbv2ForwardCaptured(
         _ inputs: MLXArray,
         modelLayerIndex: Int,
@@ -3199,6 +3259,17 @@ final class Qwen35GatedDeltaNet: Module {
         }
         let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
         let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        if let tree = recurrentState.first?.tree16Layout {
+            precondition(B == 1 && S == 16 && !exactTargetVerify)
+            let out = capturedTree16(
+                tree, evaluation: recurrentState[0], modelLayerIndex: modelLayerIndex,
+                convState: convState, ssmState: ssmState, qkv: qkv, a: a, b: b)
+            if let packed = outProj as? HadamardQuantizedLinear,
+                let gated = packed.callAfterGatedNorm(out, gate: z, normWeight: norm.weight, eps: norm.eps)
+            { return gated }
+            return outProj(norm(out, gate: z).reshaped(B, S, -1))
+        }
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -3584,6 +3655,13 @@ enum Qwen35VerifyQKNormRoPE {
         return text.replacingOccurrences(of: old, with: new)
     }
 
+    // Tree coordinates retain the already bit-checked original source. The
+    // plain-chain route continues to use the frontier's hoist switch below.
+    private static let treeKernel = MLXFast.metalKernel(
+        name: "qwen35_tree16_qk_norm_rope",
+        inputNames: inputNames + ["depths"], outputNames: outputNames,
+        source: source.replacingOccurrences(of: "int(t) + offset[0]", with: "depths[t] + offset[0]"))
+
     private static let hoistKernel = MLXFast.metalKernel(
         name: "qwen35_verify_qk_norm_rope_h",
         inputNames: inputNames, outputNames: outputNames,
@@ -3596,7 +3674,7 @@ enum Qwen35VerifyQKNormRoPE {
     static func apply(
         queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
         keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
-        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, lastQueryOnly: Bool = false
+        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, lastQueryOnly: Bool = false, treeDepths: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard queryProjection.ndim == 3, queryProjection.dim(0) == 1,
             keyProjection.ndim == 3,
@@ -3614,9 +3692,13 @@ enum Qwen35VerifyQKNormRoPE {
         else { return nil }
         let L = keyProjection.dim(1)
         let queryRows = lastQueryOnly ? 1 : L
-        let outputs = (hoisted ? hoistKernel : kernel)(
-            [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
+        var kernelInputs = [queryProjection, keyProjection, queryWeight, keyWeight,
+            MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])]
+        if let treeDepths { kernelInputs.append(treeDepths) }
+        let chainKernel = hoisted ? hoistKernel : kernel
+        let selectedKernel = treeDepths == nil ? chainKernel : treeKernel
+        let outputs = selectedKernel(
+            kernelInputs,
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", lastQueryOnly)],
             grid: lastQueryOnly ? (32, 1, queryHeads + keyHeads * L) : (32, queryHeads + keyHeads, L),
@@ -3790,7 +3872,8 @@ final class Qwen35Attention: Module {
                 queryWeight: qNorm.weight, keyWeight: kNorm.weight,
                 queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
                 queryHeads: attentionHeads, keyHeads: kvHeads,
-                ropeDims: plainRope.dims, ropeBase: plainRope.base, lastQueryOnly: narrowsToLastQuery)
+                ropeDims: plainRope.dims, ropeBase: plainRope.base, lastQueryOnly: narrowsToLastQuery,
+                treeDepths: (cache as? CBv2LayerCache)?.tree16Layout?.depths)
         {
             // Verify window: q/k RMSNorm and RoPE in one kernel, same bits.
             (queries, keys) = fused
@@ -5434,6 +5517,20 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
+        if CBv2Tree16Layout.enabled {
+            Qwen35RegisterGatedSIMD.prepareTree16Replay()
+            Qwen35Tree16Probe.prepareLiveKernels()
+        }
+        if let raw = ProcessInfo.processInfo.environment["TREE16_BENCH"], let reps = Int(raw) {
+            let log: String
+            if let file = ProcessInfo.processInfo.environment["TREE16_LAYOUT_FILE"] {
+                log = Qwen35Tree16Probe.runLayouts(path: file, reps: max(3, reps))
+            } else {
+                log = Qwen35Tree16Probe.run(reps: max(3, reps))
+            }
+            FileHandle.standardError.write(Data(log.utf8))
+            exit(0)
+        }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }
@@ -5786,5 +5883,729 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+}
+
+// TREE16 component prototype. Does not alter production decode. Every leaf
+// replays the shared prefix with the record arithmetic and owns each node once.
+// State is held in registers; no 16 x 2 MiB recurrent-state stack is required.
+enum Qwen35Tree16Probe {
+    static let kernel = MLXFast.metalKernel(
+        name: "qwen35_tree16_gdn_leaf_replay",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "paths", "lengths", "owners"],
+        outputNames: ["v_out", "q_out", "k_out", "y", "state_out"],
+        source: """
+        const uint leaf = threadgroup_position_in_grid.z / Hv;
+        const uint T = lengths[leaf];
+        if (T == 0u) return;
+        constexpr int R = 16;
+        constexpr int DVPL = 2;
+        constexpr int LPD = Dk / R;
+        constexpr int DVPS = (32 / LPD) * DVPL;
+        constexpr int DVPT = DVPS * 8;
+        constexpr uint C = uint(CONV_DIM);
+        threadgroup float qk_raw[2 * MAX_T * Dk];
+        threadgroup float v_tile[MAX_T * DVPT];
+        const uint n = threadgroup_position_in_grid.z;
+        const uint b_idx = 0;
+        const uint hv_idx = n % Hv;
+        const uint hk_idx = hv_idx / (Hv / Hk);
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint tid = thread_index_in_threadgroup;
+        const uint dvblock = threadgroup_position_in_grid.y;
+        const bool owns_qk = (hv_idx % (Hv / Hk)) == 0 && dvblock == 0;
+        const uint dk0 = (lane % LPD) * R;
+        const uint dvlocal = sg * DVPS + (lane / LPD) * DVPL;
+        const uint dvbase = dvblock * DVPT + dvlocal;
+        // Form every row's gates concurrently, before the existing conv/norm
+        // barrier. All four simdgroups reuse the same bits in the scan.
+        threadgroup float gate_g[MAX_T];
+        threadgroup float gate_beta[MAX_T];
+        if (tid < T) {
+          const float negative_a = -metal::precise::exp(a_log[hv_idx]);
+          const float bias = dt_bias[hv_idx];
+          const uint gate_idx = uint(paths[leaf * 16u + tid]) * Hv + hv_idx;
+          gate_g[tid] = qwen35_simd_gate_decay(a[gate_idx], bias, negative_a);
+          gate_beta[tid] = qwen35_simd_gate_beta(b[gate_idx]);
+        }
+        // The scan state loads first, so they overlap the conv and norm below.
+        float state[DVPL][R];
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          const device float4* s_in4 = (const device float4*)(state_in + (hv_idx * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 s4 = s_in4[j];
+            state[d][4 * j + 0] = s4.x;
+            state[d][4 * j + 1] = s4.y;
+            state[d][4 * j + 2] = s4.z;
+            state[d][4 * j + 3] = s4.w;
+          }
+        }
+        {
+          #pragma clang fp reassociate(off)
+          // Conv + SiLU (Qwen35FusedConvSilu) of the q/k channels of key head hk.
+          #pragma clang loop unroll(full)
+          for (uint part = 0; part < (tid < 128u ? 2u : 0u); ++part) {
+            const uint c = part * uint(Hk * Dk) + hk_idx * uint(Dk) + tid;
+            // All loads first; the taps then run in Qwen35FusedConvSilu's order.
+            float xin[3 + MAX_T];
+            #pragma clang loop unroll(full)
+            for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+              if (t < 3u + T) xin[t] = t < 3u ? conv_state[t * C + c] : qkv[uint(paths[leaf * 16u + t - 3u]) * C + c];
+            }
+            const float4 w4 = ((const device float4*)conv_weight)[c];
+            const float w[4] = {w4.x, w4.y, w4.z, w4.w};
+            #pragma clang loop unroll(full)
+            for (uint p = 0; p < uint(MAX_T); ++p) {
+              if (p < T) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint tap = 0; tap < 4u; ++tap) {
+                  acc = fma(xin[p + tap], w[tap], acc);
+                }
+                const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+                const float sig = acc < 0.0f ? e : 1.0f - e;
+                const float out = acc * sig;
+                qk_raw[(part * MAX_T + p) * Dk + tid] = out;
+              }
+            }
+          }
+          // The same for this threadgroup's 32 value channels.
+          {
+            const uint col = tid % uint(DVPT);
+            const uint c = 2u * uint(Hk * Dk) + hv_idx * uint(Dv) + dvblock * uint(DVPT) + col;
+            for (uint p = tid / uint(DVPT); p < T; p += 256u / uint(DVPT)) {
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = p + tap;
+                const float v = r < 3u ? conv_state[r * C + c] : qkv[uint(paths[leaf * 16u + r - 3u]) * C + c];
+                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              const float out = acc * sig;
+              v_tile[p * DVPT + col] = out;
+              const uint node = paths[leaf * 16u + p];
+              if (owners[node] == int(leaf)) v_out[(node * uint(Hv) + hv_idx) * uint(Dv) + dvblock * uint(DVPT) + col] = out;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+          #pragma clang fp reassociate(off)
+          // q/k RMSNorm (Qwen35FusedQKNorm): one simdgroup per (row, q or k).
+          for (uint job = sg; job < 2u * T; job += 8u) {
+            const uint part = job % 2u;
+            const uint t = job / 2u;
+            threadgroup float* row = qk_raw + (part * MAX_T + t) * Dk;
+            const float4 x4 = ((threadgroup const float4*)(row + lane * 4u))[0];
+            const float x[4] = {x4.x, x4.y, x4.z, x4.w};
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              sum += x[i] * x[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+            const float scale = as_type<float>(uint(part == 0u ? Q_SCALE_BITS : K_SCALE_BITS));
+            const float4 normed = float4(
+              scale * (x[0] * inv),
+              scale * (x[1] * inv),
+              scale * (x[2] * inv),
+              scale * (x[3] * inv)
+            );
+            ((threadgroup float4*)(row + lane * 4u))[0] = normed;
+            const uint node = paths[leaf * 16u + t];
+            if (owns_qk && owners[node] == int(leaf)) {
+              device float* dst = (part == 0u ? q_out : k_out) + (node * uint(Hk) + hk_idx) * uint(Dk) + lane * 4u;
+              ((device float4*)dst)[0] = normed;
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Qwen35RegisterGatedSIMD with q/k/v read from threadgroup memory.
+        threadgroup const float* q_ = qk_raw + dk0;
+        threadgroup const float* k_ = qk_raw + MAX_T * Dk + dk0;
+        threadgroup const float* v_ = v_tile + dvlocal;
+        device float* y_ = y + hv_idx * Dv + dvbase;
+        float kr[R];
+        float qr[R];
+        for (int t = 0; t < int(T); ++t) {
+          const float gt = gate_g[t];
+          const float bt = gate_beta[t];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            const float4 k4 = ((threadgroup const float4*)k_)[j];
+            kr[4 * j] = k4.x; kr[4 * j + 1] = k4.y; kr[4 * j + 2] = k4.z; kr[4 * j + 3] = k4.w;
+            const float4 q4 = ((threadgroup const float4*)q_)[j];
+            qr[4 * j] = q4.x; qr[4 * j + 1] = q4.y; qr[4 * j + 2] = q4.z; qr[4 * j + 3] = q4.w;
+          }
+          float kv[DVPL];
+          float vt[DVPL];
+          const float2 v2 = *((threadgroup const float2*)v_);
+          vt[0] = v2.x; vt[1] = v2.y;
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] *= gt; state[d][4 * j + 1] *= gt;
+              state[d][4 * j + 2] *= gt; state[d][4 * j + 3] *= gt;
+              a0 = fma(state[d][4 * j], kr[4 * j], a0);
+              a1 = fma(state[d][4 * j + 1], kr[4 * j + 1], a1);
+              a2 = fma(state[d][4 * j + 2], kr[4 * j + 2], a2);
+              a3 = fma(state[d][4 * j + 3], kr[4 * j + 3], a3);
+            }
+            kv[d] = (a0 + a1) + (a2 + a3);
+          }
+          kv[0] += simd_shuffle_xor(kv[0], 4);
+          kv[1] += simd_shuffle_xor(kv[1], 4);
+          kv[0] += simd_shuffle_xor(kv[0], 2);
+          kv[1] += simd_shuffle_xor(kv[1], 2);
+          kv[0] += simd_shuffle_xor(kv[0], 1);
+          kv[1] += simd_shuffle_xor(kv[1], 1);
+          float out[DVPL];
+          #pragma clang loop unroll(full)
+          for (int d = 0; d < DVPL; ++d) {
+            const float delta = (vt[d] - kv[d]) * bt;
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < R / 4; ++j) {
+              state[d][4 * j] = fma(kr[4 * j], delta, state[d][4 * j]);
+              state[d][4 * j + 1] = fma(kr[4 * j + 1], delta, state[d][4 * j + 1]);
+              state[d][4 * j + 2] = fma(kr[4 * j + 2], delta, state[d][4 * j + 2]);
+              state[d][4 * j + 3] = fma(kr[4 * j + 3], delta, state[d][4 * j + 3]);
+              o0 = fma(state[d][4 * j], qr[4 * j], o0);
+              o1 = fma(state[d][4 * j + 1], qr[4 * j + 1], o1);
+              o2 = fma(state[d][4 * j + 2], qr[4 * j + 2], o2);
+              o3 = fma(state[d][4 * j + 3], qr[4 * j + 3], o3);
+            }
+            out[d] = (o0 + o1) + (o2 + o3);
+          }
+          out[0] += simd_shuffle_xor(out[0], 4);
+          out[1] += simd_shuffle_xor(out[1], 4);
+          out[0] += simd_shuffle_xor(out[0], 2);
+          out[1] += simd_shuffle_xor(out[1], 2);
+          out[0] += simd_shuffle_xor(out[0], 1);
+          out[1] += simd_shuffle_xor(out[1], 1);
+          const uint node = paths[leaf * 16u + uint(t)];
+          if (owners[node] == int(leaf) && lane % LPD == 0) {
+            *((device float2*)(y_ + node * Hv * Dv)) = float2(out[0], out[1]);
+          }
+          q_ += Dk;
+          k_ += Dk; v_ += DVPT;
+        }
+        if (SAVE_STATES || (SAVE_CHAIN && T == 16u)) {
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < DVPL; ++d) {
+          device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < R / 4; ++j) {
+            s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+          }
+        }
+
+        }
+        """, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    static func forward(
+        conv: MLXArray, qkv: MLXArray, weight: MLXArray, a: MLXArray, b: MLXArray,
+        alog: MLXArray, bias: MLXArray, state: MLXArray, layout: CBv2Tree16Layout
+    ) -> [MLXArray] {
+        let inputs = [conv, qkv, weight, a, b, alog, bias, state,
+            layout.leafPaths, layout.leafLengths, layout.owners]
+        let inv = pow(Float(128), -0.5)
+        return kernel(inputs,
+            template: [("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32),
+                ("CONV_DIM", 8192), ("MAX_T", 16), ("LEAVES", 15),
+                ("SAVE_STATES", false), ("SAVE_CHAIN", true),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(inv, 2).bitPattern)), ("K_SCALE_BITS", Int(inv.bitPattern))],
+            grid: (256, 2, 32 * 15), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 16, 32, 128], [1, 16, 16, 128], [1, 16, 16, 128],
+                [1, 16, 32, 128], [1, 32, 128, 128]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32])
+    }
+
+    struct Layout {
+        let paths: MLXArray
+        let lengths: MLXArray
+        let owners: MLXArray
+        let nodePaths: MLXArray
+        let depths: MLXArray
+        let leaves: [[Int]]
+        init(_ parents: [Int], fixedGrid: Bool = false) {
+            precondition(parents.count == 16 && parents[0] == -1)
+            var paths: [[Int]] = []
+            for i in parents.indices {
+                precondition(i == 0 || (parents[i] >= 0 && parents[i] < i))
+                paths.append(i == 0 ? [0] : paths[parents[i]] + [i])
+            }
+            let internalNodes = Set(parents.dropFirst())
+            leaves = parents.indices.filter { !internalNodes.contains($0) }.map { paths[$0] }
+            var owner = Array(repeating: Int32(-1), count: 16)
+            for (i, path) in leaves.enumerated() {
+                for p in path where owner[p] == -1 { owner[p] = Int32(i) }
+            }
+            func padded(_ path: [Int]) -> [Int32] {
+                path.map { Int32($0) } + Array(repeating: Int32(0), count: 16 - path.count)
+            }
+            let slots = fixedGrid ? 15 : leaves.count
+            let emptyPaths = Array(repeating: Int32(0), count: (slots-leaves.count)*16)
+            self.paths = MLXArray(leaves.flatMap { padded($0) } + emptyPaths, [slots, 16])
+            let emptyLengths = Array(repeating: Int32(0), count: slots-leaves.count)
+            lengths = MLXArray(leaves.map { Int32($0.count) } + emptyLengths)
+            owners = MLXArray(owner)
+            nodePaths = MLXArray(paths.flatMap { padded($0) }, [16, 16])
+            depths = MLXArray(paths.map { Int32($0.count - 1) })
+            eval(self.paths, lengths, owners, nodePaths, depths)
+        }
+    }
+
+    struct Inputs {
+        let conv: MLXArray, qkv: MLXArray, weight: MLXArray
+        let a: MLXArray, b: MLXArray, alog: MLXArray, bias: MLXArray, state: MLXArray
+        init(seed: UInt64) {
+            func normal(_ shape: [Int], _ offset: UInt64, _ scale: Float = 1) -> MLXArray {
+                MLXRandom.normal(shape, key: MLXRandom.key(seed + offset)) * scale
+            }
+            conv = normal([1, 3, 8192], 0, 0.2)
+            qkv = normal([1, 16, 8192], 1, 0.2)
+            weight = normal([8192, 4, 1], 2, 0.3)
+            a = normal([1, 16, 32], 3)
+            b = normal([1, 16, 32], 4)
+            alog = normal([32], 5, 0.2)
+            bias = normal([32], 6, 0.2)
+            state = normal([1, 32, 128, 128], 7, 0.1)
+            eval(conv, qkv, weight, a, b, alog, bias, state)
+        }
+        func record(path: [Int]? = nil, state override: MLXArray? = nil) -> [MLXArray] {
+            let ids = path.map { MLXArray($0.map { Int32($0) }) }
+            let q = ids.map { take(qkv, $0, axis: 1) } ?? qkv
+            let aa = ids.map { take(a, $0, axis: 1) } ?? a
+            let bb = ids.map { take(b, $0, axis: 1) } ?? b
+            let out = Qwen35FusedGDNVerify.apply(
+                convState: conv, qkv: q, convWeight: weight, a: aa, b: bb,
+                aLog: alog, dtBias: bias, state: override ?? state, keyHeads: 16, valueHeads: 32)!
+            return [out.1, out.2, out.3, out.4, out.5, out.6]
+        }
+        func tree(_ layout: Layout, state override: MLXArray? = nil, saveStates: Bool = true, preserveFullChain: Bool = false) -> [MLXArray] {
+            let inputs = [conv, qkv, weight, a, b, alog, bias, override ?? state,
+                layout.paths, layout.lengths, layout.owners]
+            let inv = pow(Float(128), -0.5)
+            // The optional full state is valid when all 16 nodes form one path.
+            let stateShape: [Int]
+            if saveStates { stateShape = [layout.lengths.size,32,128,128] }
+            else if preserveFullChain { stateShape = [1,32,128,128] }
+            else { stateShape = [1] }
+            return kernel(inputs,
+                template: [("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32),
+                    ("CONV_DIM", 8192), ("MAX_T", 16), ("LEAVES", layout.lengths.size), ("SAVE_STATES", saveStates), ("SAVE_CHAIN", preserveFullChain),
+                    ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                    ("Q_SCALE_BITS", Int(pow(inv, 2).bitPattern)), ("K_SCALE_BITS", Int(inv.bitPattern))],
+                grid: (256, 2, 32 * layout.lengths.size), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, 32, 128], [1, 16, 16, 128], [1, 16, 16, 128],
+                    [1, 16, 32, 128], stateShape],
+                outputDTypes: [.float32, .float32, .float32, .float32, .float32])
+        }
+    }
+    static func mismatch(_ x: MLXArray, _ y: MLXArray) -> Int {
+        let bad = (x.view(dtype: .uint32) .!= y.view(dtype: .uint32)).asType(.int32).sum()
+        eval(bad)
+        return bad.item(Int.self)
+    }
+    static func run(reps: Int) -> String {
+        var log = "TREE16 probe: real GDN Hk16 Hv32 D128, 16 rows; exact uint32 comparisons\n"
+        let shapes: [(String, [Int])] = [
+            ("chain", [-1] + Array(0..<15)),
+            ("fork2", [-1,0,1,2,3,4,5,6,3,8,9,10,11,12,13,14]),
+            ("fork3", [-1,0,1,2,3,4,5,6,3,8,9,10,3,12,13,14]),
+            ("fork4", [-1,0,1,2,3,4,5,3,7,8,3,10,11,3,13,14]),
+            ("star", [-1] + Array(repeating: 0, count: 15))]
+        let input = Inputs(seed: 0x716)
+        let zeroWords: [UInt32] = (0..<(19*8192)).map { $0 % 2 == 0 ? 0x80000000 : 0 }
+        let rawZero = MLXArray(zeroWords).view(dtype: .float32).reshaped([1,19,8192])
+        eval(rawZero)
+        for (name, parents) in shapes {
+            let layout = Layout(parents)
+            let candidate = input.tree(layout)
+            eval(candidate)
+            let outputOnly = input.tree(layout, saveStates: false)
+            let fixedLayout = Layout(parents, fixedGrid: true)
+            let fixedOutput = input.tree(fixedLayout, saveStates: false, preserveFullChain: true)
+            var bad = 0
+            for i in 0..<4 {
+                bad += mismatch(candidate[i], outputOnly[i])
+                bad += mismatch(candidate[i], fixedOutput[i])
+            }
+            if layout.leaves.count == 1 { bad += mismatch(candidate[4], fixedOutput[4]) }
+
+            for (leaf, path) in layout.leaves.enumerated() {
+                let padded = path.count < 3 ? path + Array(repeating: path.last!, count: 3 - path.count) : path
+                let oracle = input.record(path: padded)
+                let ids = MLXArray(path.map { Int32($0) })
+                for i in 0..<4 {
+                    let actual = take(candidate[i], ids, axis: 1)
+                    let expected = oracle[i][0..., 0..<path.count, 0..., 0...]
+                    bad += mismatch(actual, expected)
+                }
+                if path.count >= 3 {
+                    bad += mismatch(candidate[4][leaf..<(leaf+1)], oracle[4])
+                }
+            }
+            // Compact every possible accepted root-to-node path. Replay only
+            // transformed rows, as the existing lazy prefix commit does.
+            for node in 0..<16 {
+                let allPaths = layout.nodePaths.asArray(Int32.self)
+                let depths = layout.depths.asArray(Int32.self)
+                let count = Int(depths[node]) + 1
+                let path = Array(allPaths[(node*16)..<(node*16+count)])
+                let ids = MLXArray(path)
+                let compactQ = take(candidate[1], ids, axis: 1)
+                let compactK = take(candidate[2], ids, axis: 1)
+                let compactV = take(candidate[0], ids, axis: 1)
+                let compactA = take(input.a, ids, axis: 1)
+                let compactB = take(input.b, ids, axis: 1)
+                let compactState = Qwen35RegisterGatedSIMD.runStateOnly(
+                    q: compactQ,k: compactK,v: compactV,a: compactA,b: compactB,
+                    aLog: input.alog,dtBias: input.bias,state: input.state)
+                let raw = concatenated([input.conv,take(input.qkv,ids,axis:1)],axis:1)
+                let tailBits = raw[0...,count..<(count+3),0...].view(dtype: .uint32)
+                let compactConv = (tailBits + MLXArray.zeros(tailBits.shape,dtype: .uint32)).view(dtype: .float32)
+                let replay = Qwen35RegisterGatedSIMD.runReplay(
+                    q:compactQ,k:compactK,v:compactV,a:compactA,b:compactB,
+                    aLog:input.alog,dtBias:input.bias,state:input.state,convInput:raw)
+                bad += mismatch(compactState,replay.0)
+                bad += mismatch(compactConv,replay.1)
+                let zeroTailBits = rawZero[0...,count..<(count+3),0...].view(dtype: .uint32)
+                let copiedZeros = (zeroTailBits + MLXArray.zeros(zeroTailBits.shape,dtype: .uint32)).view(dtype: .float32)
+                let zeroReplay = Qwen35RegisterGatedSIMD.runReplay(
+                    q:compactQ,k:compactK,v:compactV,a:compactA,b:compactB,
+                    aLog:input.alog,dtBias:input.bias,state:input.state,convInput:rawZero)
+                bad += mismatch(copiedZeros,zeroReplay.1)
+                if count >= 3 {
+                    let oracle = input.record(path: path.map { Int($0) })
+                    bad += mismatch(compactState,oracle[4])
+                } else {
+                    let padded = path + Array(repeating:path.last!,count:3-count)
+                    let oracle = input.record(path:padded.map { Int($0) })
+                    let s = Qwen35RegisterGatedSIMD.runStateOnly(
+                        q:oracle[1][0...,0..<count,0...,0...],
+                        k:oracle[2][0...,0..<count,0...,0...],
+                        v:oracle[0][0...,0..<count,0...,0...],a:compactA,b:compactB,
+                        aLog:input.alog,dtBias:input.bias,state:input.state)
+                    bad += mismatch(compactState,s)
+                }
+            }
+            log += "gdn \(name) leaves=\(layout.leaves.count) replay_rows=\(layout.leaves.reduce(0) { $0 + $1.count }) bit_mismatches=\(bad)\n"
+            FileHandle.standardError.write(Data(("gdn \(name) mismatch=\(bad)\n").utf8))
+            precondition(bad == 0, "TREE16 GDN bit mismatch")
+            var samples = [[Double](), [Double](), [Double](), [Double]()]
+            for r in 0..<(reps + 3) {
+                for arm in (r % 2 == 0 ? [0,1,2,3] : [3,2,1,0]) {
+                    let marker = ProcessInfo.processInfo.systemUptime
+                    let start = Date.timeIntervalSinceReferenceDate
+                    var state = input.state
+                    var roots: [MLXArray] = []
+                    for _ in 0..<24 {
+                        let out = arm == 0 ? input.record(state: state)
+                            : input.tree(arm == 3 ? fixedLayout : layout, state: state, saveStates: arm == 1, preserveFullChain: arm == 3)
+                        roots.append(out[3])
+                        // GDN states of distinct model layers are independent.
+                        state = input.state
+                    }
+                    roots.append(state)
+                    eval(roots)
+                    if r >= 3 {
+                        samples[arm].append((Date.timeIntervalSinceReferenceDate - start) * 1000)
+                        log += String(format: "TREE16_SAMPLE gdn %@ %d %.7f %.7f\n", name, arm,
+                            marker, ProcessInfo.processInfo.systemUptime)
+                    }
+                }
+            }
+            for arm in 0..<4 {
+                let sorted = samples[arm].sorted()
+                log += String(format: "gdn %@ %@ 24-layer wall median=%.6f min=%.6f ms\n",
+                    name, arm == 0 ? "record" : (arm == 1 ? "tree-states" : (arm == 2 ? "tree-output" : "tree-fixed15")), sorted[sorted.count/2], sorted[0])
+            }
+        }
+        log += CBv2Tree16AttentionProbe.run(reps: reps)
+        return log
+    }
+}
+
+extension Qwen35Tree16Probe {
+    // Geometry-only profiling of captured drafter layouts, using fixed random
+    // FP32 operands. No prompt, token ids or target labels enter this probe.
+    static func runLayouts(path: String, reps: Int) -> String {
+        let url = URL(fileURLWithPath: path)
+        let data = try! Data(contentsOf: url)
+        let json = try! JSONSerialization.jsonObject(with: data)
+        let object = json as! [String: Any]
+        let records = object["patterns"] as! [[String: Any]]
+        let input = Inputs(seed: 0x716)
+        var log = "TREE16 captured-layout component profile; fixed 15-slot grid\n"
+        for record in records {
+            let name = record["name"] as! String
+            let parents = record["parents"] as! [Int]
+            let layout = Layout(parents, fixedGrid: true)
+            let candidate = input.tree(layout, saveStates: false, preserveFullChain: true)
+            eval(candidate[3])
+            var bad = 0
+            for path in layout.leaves {
+                let padded = path.count < 3 ? path + Array(repeating: path.last!, count: 3-path.count) : path
+                let oracle = input.record(path: padded)
+                let ids = MLXArray(path.map { Int32($0) })
+                for i in 0..<4 {
+                    let actual = take(candidate[i], ids, axis: 1)
+                    let expected = oracle[i][0...,0..<path.count,0...,0...]
+                    bad += mismatch(actual, expected)
+                }
+            }
+            log += "layout \(name) leaves=\(layout.leaves.count) bit_mismatches=\(bad)\n"
+            precondition(bad == 0, "TREE16 captured-layout bit mismatch")
+            var samples = [[Double](),[Double]()]
+            for r in 0..<(reps+3) {
+                for arm in (r % 2 == 0 ? [0,3] : [3,0]) {
+                    let marker = ProcessInfo.processInfo.systemUptime
+                    let start = Date.timeIntervalSinceReferenceDate
+                    var roots: [MLXArray] = []
+                    for _ in 0..<24 {
+                        let out = arm == 0 ? input.record() : input.tree(layout, saveStates: false, preserveFullChain: true)
+                        roots.append(out[3])
+                    }
+                    eval(roots)
+                    if r >= 3 {
+                        samples[arm == 0 ? 0 : 1].append((Date.timeIntervalSinceReferenceDate-start)*1000)
+                        log += String(format: "TREE16_SAMPLE gdn %@ %d %.7f %.7f\n", name, arm,
+                            marker, ProcessInfo.processInfo.systemUptime)
+                    }
+                }
+            }
+            for arm in 0..<2 {
+                let values = samples[arm].sorted()
+                log += String(format: "layout %@ %@ wall median=%.6f min=%.6f ms/24layers\n", name,
+                    arm == 0 ? "record" : "fixed15", values[values.count/2], values[0])
+            }
+        }
+        return log
+    }
+}
+
+// Tree-only indexed reads. The record replay generator and its arithmetic are unchanged.
+extension Qwen35RegisterGatedSIMD {
+    private static func tree16ReplaySource(hoisted: Bool) -> String {
+        var text = replaySource(hoistedGates: hoisted)
+        func swap(_ from: String, _ to: String) {
+            precondition(text.components(separatedBy: from).count == 2,
+                "tree16 indexed replay source: \(from)")
+            text = text.replacingOccurrences(of: from, with: to)
+        }
+        swap("const uint T = q_shape[1];", "const uint T = rows_shape[0];")
+        for name in ["k", "v", "a", "bb"] {
+            let pointer = name == "bb" ? "b" : name
+            let marker = "const device float* \(name)_ = \(pointer) +"
+            swap(marker, "const device float* \(name)_base = \(pointer) +")
+        }
+        swap("for (int t = 0; t < T; ++t) {", """
+        for (int t = 0; t < T; ++t) {
+          const uint node = uint(rows[t]);
+          const device float* k_ = k_base + node * k_strides[1];
+          const device float* v_ = v_base + node * v_strides[1];
+          const device float* a_ = a_base + node * a_strides[1];
+          const device float* bb_ = bb_base + node * b_strides[1];
+        """)
+        swap("k_ += k_strides[1]; v_ += v_strides[1]; a_ += a_strides[1]; bb_ += b_strides[1];", "")
+        if hoisted {
+            swap("a_[gt_row * a_strides[1]]", "a_base[uint(rows[gt_row]) * a_strides[1]]")
+            swap("bb_[gt_row * b_strides[1]]", "bb_base[uint(rows[gt_row]) * b_strides[1]]")
+        }
+        let marker = "// Boundary conv rows T ..< T + 3 of conv_in, copied as raw bits."
+        guard let tail = text.range(of: marker) else { preconditionFailure("tree16 replay conv marker") }
+        text = String(text[..<tail.lowerBound]) + """
+          // Last three logical inputs: prefix conv for T < 3, otherwise accepted node qkv.
+          const uint C = uint(conv_in_shape[2]);
+          const uint total = 3u * C;
+          const uint nthreads = threads_per_grid.x * threads_per_grid.y * threads_per_grid.z;
+          const uint gid = (thread_position_in_grid.z * threads_per_grid.y + thread_position_in_grid.y)
+              * threads_per_grid.x + thread_position_in_grid.x;
+          const device uint* prefix = (const device uint*)conv_in;
+          const device uint* nodes = (const device uint*)node_qkv;
+          device uint* dst = (device uint*)conv_tail;
+          for (uint i = gid; i < total; i += nthreads) {
+            const uint logical = T + i / C;
+            const uint col = i % C;
+            dst[i] = logical < 3u
+                ? prefix[logical * conv_in_strides[1] + col * conv_in_strides[2]]
+                : nodes[uint(rows[logical - 3u]) * node_qkv_strides[1] + col * node_qkv_strides[2]];
+          }
+        }
+        """
+        return text
+    }
+    private static let tree16ReplayKernel = MLXFast.metalKernel(
+        name: "qwen35_tree16_indexed_replay",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in", "node_qkv", "rows"],
+        outputNames: ["state_out", "conv_tail"],
+        source: tree16ReplaySource(hoisted: false), header: gateHeader, ensureRowContiguous: false)
+    private static let tree16HoistedReplayKernel = MLXFast.metalKernel(
+        name: "qwen35_tree16_indexed_replay_hg",
+        inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in", "node_qkv", "rows"],
+        outputNames: ["state_out", "conv_tail"],
+        source: tree16ReplaySource(hoisted: true), header: gateHeader, ensureRowContiguous: false)
+
+    private static let tree16IndexedReplayEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_TREE16_INDEXED_REPLAY"] != "0"
+    nonisolated(unsafe) static var tree16ReplayPassed = false
+
+    static func runTree16Replay(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray,
+        convState: MLXArray, qkv: MLXArray, rows: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        precondition(k.dim(0) == 1 && (1 ... 15).contains(rows.size))
+        if !tree16IndexedReplayEnabled || !tree16ReplayPassed {
+            let raw = concatenated([convState, take(qkv, rows, axis: 1)], axis: 1)
+            return runReplay(q: take(q, rows, axis: 1), k: take(k, rows, axis: 1),
+                v: take(v, rows, axis: 1), a: take(a, rows, axis: 1), b: take(b, rows, axis: 1),
+                aLog: aLog, dtBias: dtBias, state: state, convInput: raw)
+        }
+        return tree16IndexedReplay(q: q, k: k, v: v, a: a, b: b,
+            aLog: aLog, dtBias: dtBias, state: state, convState: convState, qkv: qkv, rows: rows)
+    }
+
+    private static func tree16IndexedReplay(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray,
+        convState: MLXArray, qkv: MLXArray, rows: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let kernel = hoistedReplayPassed ? tree16HoistedReplayKernel : tree16ReplayKernel
+        let inputs = [q, k, v, a, b, aLog, dtBias, state, convState, qkv, rows]
+        let outputs = kernel(inputs,
+            template: [("Dk", k.dim(3)), ("Dv", v.dim(3)), ("Hk", k.dim(2)), ("Hv", v.dim(2)), ("STATE_ONLY", 1)],
+            grid: (128, v.dim(3) / 32, v.dim(2)), threadGroup: (128, 1, 1),
+            outputShapes: [state.shape, [1, 3, convState.dim(2)]], outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+}
+
+extension Qwen35RegisterGatedSIMD {
+    static func prepareTree16Replay() {
+        guard tree16IndexedReplayEnabled else { return }
+        var passed = false
+        do { passed = try withError { tree16ReplayCheck() } }
+        catch { FileHandle.standardError.write(Data("tree16 indexed replay error: \(error)\n".utf8)) }
+        tree16ReplayPassed = passed
+        FileHandle.standardError.write(Data("tree16 indexed replay: \(passed ? "bitwise PASS" : "fallback")\n".utf8))
+    }
+    private static func tree16ReplayCheck() -> Bool {
+        let q = checkRows([1,16,16,128], seed: 0.21, scale: 0.1)
+        let k = checkRows([1,16,16,128], seed: 0.22, scale: 0.1)
+        let v = checkRows([1,16,32,128], seed: 0.23, scale: 0.3)
+        let a = checkRows([1,16,32], seed: 0.24, scale: 30)
+        let b = checkRows([1,16,32], seed: 0.25, scale: 8)
+        let alog = checkRows([32], seed: 0.26, scale: 2)
+        let bias = checkRows([32], seed: 0.27, scale: 3)
+        let state = checkRows([1,32,128,128], seed: 0.28, scale: 0.5)
+        let wordCount = 19 * 8192
+        var words = Array(repeating: UInt32(0), count: wordCount)
+        for i in 0 ..< wordCount {
+            if i % 7 == 0 { words[i] = 0x80000000 }
+            else {
+                let signedValue = i % 173 - 86
+                let value = Float(signedValue)
+                words[i] = value.bitPattern
+            }
+        }
+        let raw = MLXArray(words, [1,19,8192]).view(dtype: .float32)
+        let prefix = raw[0..., 0 ..< 3, 0...]
+        let qkv = raw[0..., 3..., 0...]
+        let shapes = [[-1] + Array(0 ..< 15),
+            [-1,0,1,2,3,4,5,6,3,8,9,10,11,12,13,14],
+            [-1,0,1,2,3,4,5,6,3,8,9,10,3,12,13,14],
+            [-1,0,1,2,3,4,5,3,7,8,3,10,11,3,13,14],
+            [-1] + Array(repeating: 0, count: 15)]
+        for parents in shapes {
+            var paths = [[0]]
+            for i in 1 ..< 16 { paths.append(paths[parents[i]] + [i]) }
+            for path in paths where path.count < 16 {
+                let ids = MLXArray(path.map { Int32($0) })
+                let conv = concatenated([prefix, take(qkv, ids, axis: 1)], axis: 1)
+                let oracle = runReplay(q: take(q, ids, axis: 1), k: take(k, ids, axis: 1),
+                    v: take(v, ids, axis: 1), a: take(a, ids, axis: 1), b: take(b, ids, axis: 1),
+                    aLog: alog, dtBias: bias, state: state, convInput: conv)
+                let indexed = tree16IndexedReplay(q: q, k: k, v: v, a: a, b: b,
+                    aLog: alog, dtBias: bias, state: state, convState: prefix, qkv: qkv, rows: ids)
+                let eqState = MLX.all(oracle.0.view(dtype: .uint32) .== indexed.0.view(dtype: .uint32))
+                let eqConv = MLX.all(oracle.1.view(dtype: .uint32) .== indexed.1.view(dtype: .uint32))
+                if !(eqState .&& eqConv).item(Bool.self) { return false }
+            }
+        }
+        return true
+    }
+}
+
+extension Qwen35Tree16Probe {
+    static func prepareLiveKernels() {
+        // Input-independent load checks and compilation; no request/cache is borrowed.
+        let input = Inputs(seed: 0x716)
+        let layout = Layout([-1,0,1,2,3,4,5,3,7,8,3,10,11,3,13,14], fixedGrid: true)
+        let nodes: [Int32] = (0 ..< 16).flatMap { i in [Int32(i), -1, 0, 0, 0] }
+        let metadata = CBv2Tree16Layout(arrays: [
+            MLXArray(nodes, [16,5]), layout.paths, layout.lengths, layout.owners,
+            layout.nodePaths, layout.depths, MLXArray([Int32(layout.leaves.count)])])
+        let out = forward(conv: input.conv, qkv: input.qkv, weight: input.weight,
+            a: input.a, b: input.b, alog: input.alog, bias: input.bias, state: input.state, layout: metadata)
+        eval(out)
+        var bad = 0
+        for path in layout.leaves {
+            let oracle = input.record(path: path)
+            let ids = MLXArray(path.map { Int32($0) })
+            for i in 0 ..< 4 {
+                bad += mismatch(take(out[i], ids, axis: 1), oracle[i])
+            }
+        }
+        precondition(bad == 0, "tree16 live GDN bits")
+        // Depth positioning is checked against independently gathered chain calls.
+        let qp = MLXRandom.normal([1,16,16*512], key: MLXRandom.key(0x7161))
+        let kp = MLXRandom.normal([1,16,4*256], key: MLXRandom.key(0x7162))
+        let qw = MLXRandom.normal([256], key: MLXRandom.key(0x7163))
+        let kw = MLXRandom.normal([256], key: MLXRandom.key(0x7164))
+        let paths = (0 ..< 16).map { row -> [Int] in
+            var path = [row], node = row
+            let parents = [-1,0,1,2,3,4,5,3,7,8,3,10,11,3,13,14]
+            while node > 0 { node = parents[node]; path.append(node) }
+            return Array(path.reversed())
+        }
+        for prefix in [0,512,1008,4096] {
+            let offset = MLXArray([Int32(prefix)])
+            let actual = Qwen35VerifyQKNormRoPE.apply(queryProjection: qp, keyProjection: kp,
+                queryWeight: qw, keyWeight: kw, queryEps: 1e-6, keyEps: 1e-6, offsets: offset,
+                queryHeads: 16, keyHeads: 4, ropeDims: 64, ropeBase: 10000000,
+                treeDepths: layout.depths)!
+            for row in 0 ..< 16 {
+                let path = paths[row]
+                let padded = path.count == 1 ? path + path : path
+                let ids = MLXArray(padded.map { Int32($0) })
+                let oracle = Qwen35VerifyQKNormRoPE.apply(
+                    queryProjection: take(qp, ids, axis: 1), keyProjection: take(kp, ids, axis: 1),
+                    queryWeight: qw, keyWeight: kw, queryEps: 1e-6, keyEps: 1e-6, offsets: offset,
+                    queryHeads: 16, keyHeads: 4, ropeDims: 64, ropeBase: 10000000)!
+                let t = path.count - 1
+                bad += mismatch(actual.0[0...,0...,row ..< row+1,0...], oracle.0[0...,0...,t ..< t+1,0...])
+                bad += mismatch(actual.1[0...,0...,row ..< row+1,0...], oracle.1[0...,0...,t ..< t+1,0...])
+            }
+        }
+        precondition(bad == 0, "tree16 depth RoPE bits")
+        // Scratch KV compaction uses the same allocated row shape as a 512-token seed.
+        let row = CBv2FullSequenceKV(promptLength: 512, maxLength: 1024, kvHeads: 4, headDim: 256)
+        let zeros = MLXArray.zeros([1,4,528,256], dtype: .float32)
+        _ = row.update(keys: zeros, values: zeros)
+        row.tree16Compact(rows: MLXArray([Int32(0),1,3,7,12]))
+        let scratch = row.snapshot()
+        eval(scratch.keys, scratch.values)
+        let log = CBv2Tree16AttentionProbe.run(reps: 1, measure: false)
+        FileHandle.standardError.write(Data(("tree16 load GDN/depth-RoPE: bitwise PASS\n" + log).utf8))
     }
 }
