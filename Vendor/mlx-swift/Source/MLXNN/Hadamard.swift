@@ -6537,12 +6537,176 @@ enum VerifyInt8Matmul {
         inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
         source: headGatherSource, ensureRowContiguous: true)
 
+    /// `headGatherSource` with each lane's integer group sum taken in FP16 pairs. An activation
+    /// byte and a 2-bit code each become an exact half through the 1024 exponent
+    /// (`0x6400 | byte`), and each half lane sums the four products of two `u` steps, at most
+    /// 4 x 128 x 3 = 1536 < 2048 in magnitude, so every FP16 result is an exact integer and `d`
+    /// is the record's integer. A lane's 16 activation bytes load as one `packed_uint4`, which
+    /// needs only the 4-byte alignment of the record's `char4` loads. The FP32 steps per group,
+    /// the four chains and their final order are the record text. Nil unless the cut matches once.
+    static let headGatherFastSource: String? = {
+        let dot = """
+              int d = 0;
+              #pragma clang loop unroll(full)
+              for (int u = 0; u < 4; u++) {
+                const char4 a = src[u];
+                const uint c = (v >> uint(2 * u)) & 0x03030303u;
+                d += int(a.x) * int(c & 255u) + int(a.y) * int((c >> 8) & 255u)
+                  + int(a.z) * int((c >> 16) & 255u) + int(a.w) * int(c >> 24);
+              }
+            """
+        let halves = """
+              const packed_uint4 xw = *((const device packed_uint4*)src);
+              int d = 0;
+              #pragma clang loop unroll(full)
+              for (int uu = 0; uu < 4; uu += 2) {
+                half2 acc = half2(0.0h);
+                #pragma clang loop unroll(full)
+                for (int u = uu; u < uu + 2; u++) {
+                  const uint A = xw[u] ^ 0x80808080u;
+                  const half2 a02 = as_type<half2>((A & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+                  const half2 a13 = as_type<half2>(((A >> 8) & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+                  const uint c = v >> uint(2 * u);
+                  const half2 c02 = as_type<half2>((c & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+                  const half2 c13 = as_type<half2>(((c >> 8) & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+                  acc = fma(a02, c02, acc);
+                  acc = fma(a13, c13, acc);
+                }
+                d += int(acc.x) + int(acc.y);
+              }
+            """
+        guard headGatherSource.components(separatedBy: dot).count == 2 else { return nil }
+        return headGatherSource.replacingOccurrences(of: dot, with: halves)
+    }()
+
+    private static let headGatherFastKernel: MLXFast.MLXFastKernel? = headGatherFastSource.map { source in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_head_gather_h16",
+            inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
+            source: source, ensureRowContiguous: true)
+    }
+
+    /// `DARKBLOOM_BONSAI_DF2_GATHER_FAST=0` keeps the record gather.
+    static let gatherFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_GATHER_FAST"] != "0"
+    /// Written once by `prepareGatherFast` at drafter bind; read-only afterwards.
+    nonisolated(unsafe) static var gatherFastPassed = false
+    nonisolated(unsafe) private static var gatherFastPrepared = false
+
+    /// Runs once at drafter bind, before any request: `headGatherFastKernel` against
+    /// `headGatherKernel` at 32 and 16 groups, `NEG` on and off, on `gatherCheckInputs`.
+    /// `gatherFastPassed` is set only when every output bit matched; a mismatch or an MLX error
+    /// keeps the record kernel. Only gathers at `ids` take the fast kernel.
+    static func prepareGatherFast() {
+        guard !gatherFastPrepared else { return }
+        gatherFastPrepared = true
+        var note = "off (DARKBLOOM_BONSAI_DF2_GATHER_FAST=0)"
+        if gatherFastAllowed, let fast = headGatherFastKernel {
+            do {
+                let detail: String? = try withError { try gatherFastMismatch(fast) }
+                gatherFastPassed = detail == nil
+                note = detail.map { "off (\($0))" }
+                    ?? "on (bitwise equal to the record kernel at 32 and 16 groups, NEG on and off, 15 rows x 128 ids"
+                    + " with extreme codes, all-3 and all-0 rows, out-of-range and repeated ids)"
+            } catch {
+                note = "off (error: \(error))"
+            }
+        } else if gatherFastAllowed {
+            note = "off (a cut of the record source did not match once)"
+        }
+        FileHandle.standardError.write(Data("DF2 head gather fast: \(note)\n".utf8))
+    }
+
+    private static func gatherFastMismatch(_ fast: MLXFast.MLXFastKernel) throws -> String? {
+        let (activation, weight, scales, biases, ids) = gatherCheckInputs()
+        for groups in [32, 16] {
+            for negative in [true, false] {
+                // A kernel application that MLX refused returns no output: throw, never index it.
+                guard
+                    let record = gatherOutputs(
+                        activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+                        negative: negative, kernel: headGatherKernel
+                    ).first,
+                    let mine = gatherOutputs(
+                        activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+                        negative: negative, kernel: fast
+                    ).first
+                else { throw MLXError.caught("head gather check: a kernel returned no output") }
+                let same: MLXArray = MLX.all(record.view(dtype: .uint32) .== mine.view(dtype: .uint32))
+                eval(same)
+                if !same.item(Bool.self) { return "mismatch at \(groups) groups, NEG \(negative)" }
+            }
+        }
+        return nil
+    }
+
+    /// 15 rows of int8 codes (11 hashed over -128 ... 127, then all -128, all 127, alternating
+    /// -128 and 127, all 0), 512 weight rows (row 0 all codes 3, row 1 all 0, the rest hashed),
+    /// FP16 scales and biases over [-2, 2) with zeros, and 128 ids per row with -1, 512, 0, 511
+    /// and a repeated id among hashed ones.
+    private static func gatherCheckInputs() -> (PromptInt8Activation, MLXArray, MLXArray, MLXArray, MLXArray) {
+        let k = 4096, kg = k / 128, n = 512, rows = 15, p = 128
+        func hash(_ i: Int, _ salt: Int) -> Int {
+            Int(UInt32(truncatingIfNeeded: (UInt64(i) &* 2_654_435_761 &+ UInt64(salt) &* 40_503) >> 5))
+        }
+        let codes: [Int8] = (0 ..< rows * k).map { (i: Int) -> Int8 in
+            switch i / k {
+            case 11: return -128
+            case 12: return 127
+            case 13: return i % 2 == 0 ? -128 : 127
+            case 14: return 0
+            default: return Int8(truncatingIfNeeded: hash(i, 1))
+            }
+        }
+        let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+            switch i / (k / 16) {
+            case 0: return 0xFFFF_FFFF
+            case 1: return 0
+            default: return UInt32(truncatingIfNeeded: hash(i, 2) &* 2_246_822_519)
+            }
+        }
+        func constants(_ salt: Int) -> [Float16] {
+            (0 ..< n * kg).map { (i: Int) -> Float16 in
+                let h = hash(i, salt) % 4096
+                return h % 17 == 0 ? 0 : Float16(Float(h - 2048) / 1024)
+            }
+        }
+        let ascale: [Float] = (0 ..< rows * kg).map { Float(hash($0, 5) % 1000 + 1) / 1.0e5 }
+        let rsb: [Float] = (0 ..< rows * kg).map { Float(hash($0, 6) % 20001 - 10000) / 100 }
+        let ids: [Int32] = (0 ..< rows * p).map { (i: Int) -> Int32 in
+            switch i % 13 {
+            case 0: return -1
+            case 1: return Int32(n)
+            case 2: return 0
+            case 3: return Int32(n - 1)
+            case 4: return 5
+            default: return Int32(hash(i, 7) % n)
+            }
+        }
+        let activation = PromptInt8Activation(
+            codes: MLXArray(codes, [rows, k]), ascale: MLXArray(ascale), rsb: MLXArray(rsb), rows: rows, k: k)
+        return (
+            activation, MLXArray(words, [n, k / 16]), MLXArray(constants(3), [n, kg]),
+            MLXArray(constants(4), [n, kg]), MLXArray(ids, [rows, p])
+        )
+    }
+
     /// `[rows, P]` values at `ids` `[rows, P]` int32 (every row when nil, P = N)
     /// over the first `groups` 128-groups; `scales` and `biases` are `[N, Kg]`.
     static func gather(
         _ activation: PromptInt8Activation, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         ids: MLXArray?, groups: Int, negative: Bool
     ) -> MLXArray {
+        let fast: MLXFast.MLXFastKernel? = ids != nil && gatherFastPassed ? headGatherFastKernel : nil
+        return gatherOutputs(
+            activation, weight: weight, scales: scales, biases: biases, ids: ids, groups: groups,
+            negative: negative, kernel: fast ?? headGatherKernel)[0]
+    }
+
+    /// The gather's output vector `[[rows, P]]`, unchecked.
+    private static func gatherOutputs(
+        _ activation: PromptInt8Activation, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        ids: MLXArray?, groups: Int, negative: Bool, kernel: MLXFast.MLXFastKernel
+    ) -> [MLXArray] {
         let n: Int = weight.dim(0)
         let p: Int = ids?.dim(-1) ?? n
         let dims = HostConstants.int32([Int32(activation.k), Int32(n), Int32(p)])
@@ -6552,9 +6716,9 @@ enum VerifyInt8Matmul {
             activation.codes, weight, scales, biases, activation.ascale, activation.rsb,
             ids ?? HostConstants.int32([Int32(0)]), dims,
         ]
-        return headGatherKernel(
+        return kernel(
             inputs, template: template, grid: (activation.rows * p * 32, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[activation.rows, p]], outputDTypes: [.float32])[0]
+            outputShapes: [[activation.rows, p]], outputDTypes: [.float32])
     }
 }
 
@@ -6603,11 +6767,12 @@ public enum VerifyDenseBA {
 
         """ + columnBody
 
-    /// `naxFormsSource(layers: 2)` with `BAG` leading 128-thread threadgroups
+    /// `naxFormsSource(layers:)` with `BAG` leading 128-thread threadgroups
     /// that each run four b/a columns and return; every later threadgroup
-    /// runs the two-layer body unchanged, `BAG` threadgroups later.
-    static func fusedSource(streamed: Bool = false) -> String {
-        let forms = streamed ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2)
+    /// runs the layers' body unchanged, `BAG` threadgroups later.
+    static func fusedSource(streamed: Bool = false, layers: Int = 2) -> String {
+        let forms = streamed
+            ? VerifyInt8Matmul.streamedFormsSource(layers: layers) : VerifyInt8Matmul.naxFormsSource(layers: layers)
         let anchor = "int bx = int(threadgroup_position_in_grid.x);"
         guard forms.components(separatedBy: anchor).count == 2 else { return "" }
         return forms.replacingOccurrences(
@@ -6642,6 +6807,42 @@ public enum VerifyDenseBA {
         inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz", "x", "wb", "wa"],
         outputNames: ["out0", "out1", "ob", "oa"], source: fusedSource(streamed: true),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+
+    /// The one-layer forms of `fusedKernel` and `streamedKernel`, for the
+    /// qkv projection when z leaves its launch (`VerifySplitZ`); nil when
+    /// the one-layer source lacks the anchor.
+    static let fusedOneKernels: [MLXFast.MLXFastKernel?] = [false, true].map { streamed in
+        let source = fusedSource(streamed: streamed, layers: 1)
+        guard !source.isEmpty else { return nil }
+        return MLXFast.metalKernel(
+            name: streamed ? "bonsai_q8_verify_streamed_col1_dense_ba" : "bonsai_q8_verify_matmul_nax_forms1_dense_ba",
+            inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz", "x", "wb", "wa"],
+            outputNames: ["out0", "ob", "oa"], source: source,
+            header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+    }
+
+    /// `fused` for one layer: `[out0, ob, oa]`; nil when its kernel is missing.
+    static func fusedOne(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layer: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray),
+        m: Int, k: Int, negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray, streamedWeight: MLXArray? = nil
+    ) -> [MLXArray]? {
+        guard let kernel = fusedOneKernels[streamedWeight == nil ? 0 : 1] else { return nil }
+        let n0 = layer.weight.dim(0)
+        let N = wb.dim(0)
+        let inputs: [MLXArray] = [
+            codes, streamedWeight ?? layer.weight, layer.scalesT, layer.biasesT, ascale, rsb,
+            HostConstants.int32([Int32(k), Int32(m), Int32(n0)]), x, wb, wa,
+        ]
+        let template = [
+            ("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k), ("BAG", N / 2), ("BAN", N),
+        ] as [(String, any KernelTemplateArg)]
+        return kernel(
+            inputs, template: template,
+            grid: ((N / 2 + n0 / 32) * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n0], [m, N], [m, N]],
+            outputDTypes: [.float32, .float32, .float32])
+    }
 
     /// The standalone kernel: `x` `[rows, K]` FP32, `wb` and `wa` `[N, K]` FP32.
     public static func standalone(_ x: MLXArray, wb: MLXArray, wa: MLXArray) -> (MLXArray, MLXArray) {
@@ -6817,6 +7018,192 @@ extension VerifyInt8Matmul {
             negative: negativeForms && layers.allSatisfy { $0.negative }, x: x, wb: wb, wa: wa, streamedWeights: streamedWeights)
         return ([outputs[0], outputs[1]], outputs[2], outputs[3])
     }
+
+    /// The qkv/z pair as the record's boundary route returns it, `[qkv, z,
+    /// b, a]`: the fused dense b/a form where it applies, else the shared form
+    /// and the standalone b/a. `VerifySplitZ.check` compares against it.
+    static func splitReference(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        x: MLXArray, wb: MLXArray, wa: MLXArray, streamedWeights: [MLXArray]?
+    ) -> [MLXArray]? {
+        if let fused = matmulWithDenseBA(
+            activation, layers: layers, x: x, wb: wb, wa: wa, streamedWeights: streamedWeights)
+        {
+            return fused.outputs + [fused.b, fused.a]
+        }
+        guard let outputs = matmul(activation, layers: layers, streamedWeights: streamedWeights) else { return nil }
+        let ba = VerifyDenseBA.standalone(x, wb: wb, wa: wa)
+        return outputs + [ba.0, ba.1]
+    }
+
+    /// The record runs the qkv/z pair in one launch whose offset form is the
+    /// pair's (`NEG` only when both layers take it); elsewhere each layer
+    /// runs alone with its own.
+    static var pairSharesOffsetForm: Bool { route == .nax && naxFast && naxShared }
+
+    /// The first launch of the split: the qkv projection, with the dense b/a
+    /// in the same dispatch on the tensor route (`b`, `a` nil elsewhere: the
+    /// caller then runs the record's standalone b/a). `negative` is the
+    /// offset form the record's launch gives this layer.
+    static func splitLead(
+        _ activation: PromptInt8Activation,
+        layer: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray),
+        negative: Bool, x: MLXArray, wb: MLXArray, wa: MLXArray, streamedWeight: MLXArray?
+    ) -> (out: MLXArray, b: MLXArray?, a: MLXArray?)? {
+        guard route != .off, rowRange.contains(activation.rows) else { return nil }
+        guard route == .nax else {
+            guard let out = matmul(
+                activation, weight: layer.weight, scalesT: layer.scalesT, biasesT: layer.biasesT,
+                negative: negative)
+            else { return nil }
+            return (out, nil, nil)
+        }
+        guard activation.k == 4096, naxFast, usesForms(k: activation.k, layers: [layer]),
+            x.ndim == 2, x.dim(0) == activation.rows, x.dim(1) == activation.k, x.dtype == .float32,
+            wb.ndim == 2, wb.shape2 == wa.shape2, wb.dim(1) == activation.k, wb.dim(0) % 2 == 0,
+            wb.dtype == .float32, wa.dtype == .float32,
+            let outputs = VerifyDenseBA.fusedOne(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, layer: layer,
+                m: activation.rows, k: activation.k, negative: negativeForms && negative,
+                x: x, wb: wb, wa: wa, streamedWeight: streamedWeight)
+        else { return nil }
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// The second launch of the split: the z projection alone, through the
+    /// record's one-layer route (the narrow kernel the GDN out projection
+    /// takes at the same shape).
+    static func splitDeferred(
+        _ activation: PromptInt8Activation,
+        layer: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray),
+        negative: Bool, streamedWeight: MLXArray?
+    ) -> MLXArray? {
+        matmul(
+            activation, weight: layer.weight, scalesT: layer.scalesT, biasesT: layer.biasesT,
+            negative: negative, streamedWeight: streamedWeight)
+    }
+}
+
+/// The GDN z projection out of the qkv/z verify launch. z feeds only the
+/// gated norm after the recurrence, but in the record it shares the launch
+/// the recurrence waits on. Split, qkv (with the dense b/a) runs first and z
+/// runs after the recurrence kernel is encoded, with no barrier between
+/// them, so z's weight stream overlaps the latency-bound recurrence. The
+/// split serves only after `check` found every output equal, bit for bit,
+/// to the record route's on synthetic operands at every verify row count,
+/// both offset forms and both weight layouts; otherwise the record launch
+/// stays. `DARKBLOOM_BONSAI_VERIFY_Z_SPLIT=0` keeps the record launch.
+enum VerifySplitZ {
+    static let offered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_Z_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    nonisolated(unsafe) private static var failed = false
+
+    /// Resolved once, at the first packed module's init, after
+    /// `VerifyInt8Matmul.route` and before any timed work.
+    static let ready: Bool = {
+        let (passed, note) = check()
+        FileHandle.standardError.write(Data("int8 verify z split: \(note)\n".utf8))
+        return passed
+    }()
+
+    /// `ordered` with its codes made after `dependency` in the graph: the
+    /// same buffer, so the launch that reads them waits on no barrier for it.
+    static func ordered(_ activation: PromptInt8Activation, after dependency: MLXArray) -> PromptInt8Activation {
+        PromptInt8Activation(
+            codes: depends(input: activation.codes, dependencies: [dependency]),
+            ascale: activation.ascale, rsb: activation.rsb, rows: activation.rows, k: activation.k)
+    }
+
+    private static func check() -> (Bool, String) {
+        guard offered else { return (false, "off (DARKBLOOM_BONSAI_VERIFY_Z_SPLIT=0)") }
+        guard VerifyInt8Matmul.route != .off else { return (false, "off (int8 verify off)") }
+        let k = 4096, n = 32, N = 32, kg = k / 128
+        let maxRows = VerifyInt8Matmul.tileRows
+        func pattern(_ count: Int, _ mul: Int, _ add: Int, _ mod: Int, _ center: Int, _ scale: Float) -> [Float] {
+            var values: [Float] = []
+            values.reserveCapacity(count)
+            for i in 0 ..< count {
+                let v: Int = (i * mul + add) % mod - center
+                values.append(Float(v) / scale)
+            }
+            return values
+        }
+        let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
+            let centered: Int = (i * 37 + 11) % 255 - 127
+            return Int8(truncatingIfNeeded: centered)
+        }
+        let codes = MLXArray(codeValues, [maxRows, k])
+        let words: [UInt32] = (0 ..< 2 * n * k / 16).map { (i: Int) -> UInt32 in
+            let value: UInt64 = UInt64(i + 1) &* 2_654_435_761
+            return UInt32(truncatingIfNeeded: value)
+        }
+        let weight = MLXArray(words, [2 * n, k / 16])
+        let scaleValues: [Float16] = (0 ..< kg * 2 * n).map { (i: Int) -> Float16 in
+            let value: Float = Float(1 + i % 13) / 1024
+            return Float16(value)
+        }
+        let scalesT = MLXArray(scaleValues, [kg, 2 * n])
+        let biasValues: [Float16] = (0 ..< kg * 2 * n).map { (i: Int) -> Float16 in
+            let value: Float = -Float(i % 7) / 512
+            return Float16(value)
+        }
+        let biasesT = MLXArray(biasValues, [kg, 2 * n])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        let ascale = MLXArray(pattern(maxRows * kg, 1, 11, 11, -1, 256))
+        let rsb = MLXArray(pattern(maxRows * kg, 1, 0, 17, 8, 64))
+        let wb = MLXArray(pattern(N * k, 29, 3, 97, 48, 3072), [N, k])
+        let wa = MLXArray(pattern(N * k, 53, 7, 89, 44, 2048), [N, k])
+        let xAll = MLXArray(pattern(maxRows * k, 41, 5, 211, 105, 64), [maxRows, k])
+        let halves = [0 ..< n, n ..< 2 * n]
+        let packed: [MLXArray]? = VerifyInt8Matmul.streamReady
+            ? halves.map { VerifyInt8Matmul.streamPack(weight[$0], k: k, columns: 16) } : nil
+        if let packed { eval(packed) }
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        var matched = true
+        var cases = 0
+        failed = false
+        withErrorHandler({ _ in VerifySplitZ.failed = true }) {
+            for m in VerifyInt8Matmul.rowRange.reversed() where matched {
+                let x = xAll[0 ..< m]
+                for negative in [false, true] where matched {
+                    let offsets = negative ? negatedT : biasesT
+                    let layers = halves.map {
+                        (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0], negative: negative)
+                    }
+                    for streamed in packed == nil ? [nil] : [nil, packed] where matched {
+                        let activation = PromptInt8Activation(codes: codes, ascale: ascale, rsb: rsb, rows: m, k: k)
+                        guard let reference = VerifyInt8Matmul.splitReference(
+                                activation, layers: layers, x: x, wb: wb, wa: wa, streamedWeights: streamed),
+                            let lead = VerifyInt8Matmul.splitLead(
+                                activation, layer: (layers[0].weight, layers[0].scalesT, layers[0].biasesT),
+                                negative: negative, x: x, wb: wb, wa: wa, streamedWeight: streamed?[0]),
+                            let z = VerifyInt8Matmul.splitDeferred(
+                                ordered(activation, after: lead.out),
+                                layer: (layers[1].weight, layers[1].scalesT, layers[1].biasesT),
+                                negative: negative, streamedWeight: streamed?[1])
+                        else { matched = false; break }
+                        let ba = lead.b.flatMap { b in lead.a.map { (b, $0) } } ?? VerifyDenseBA.standalone(x, wb: wb, wa: wa)
+                        let split = [lead.out, z, ba.0, ba.1]
+                        let checks = zip(split, reference).map { MLX.all(u($0) .== u($1)) }
+                        eval(checks)
+                        matched = !failed && reference.count == 4 && checks.allSatisfy { $0.item(Bool.self) }
+                        cases += 1
+                    }
+                }
+            }
+        }
+        if failed { matched = false }
+        failed = false
+        let rows = VerifyInt8Matmul.rowRange
+        return matched
+            ? (true, "on (\(VerifyInt8Matmul.route), rows \(rows.lowerBound)...\(rows.upperBound), \(cases) cases bit-identical)")
+            : (false, "off (a case differed or failed to compile)")
+    }
 }
 
 /// Group-major copies of a packed module's F16 scales and offsets for
@@ -6935,6 +7322,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if readsFloat16ConstantsInPlace && transform.blockSize == 4096 {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
+            _ = VerifySplitZ.ready
             if weight.dim(0) % 32 == 0, VerifyInt8Matmul.formsK.contains(transform.width) {
                 if let copied = promptConstants.streamWeight(weight, k: transform.width, columns: 16),
                     VerifyInt8Matmul.checkRealStreams, let biases
@@ -7275,6 +7663,49 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 output.reshaped(lead + [layer.weight.dim(0)])
             },
             fused.b.reshaped(lead + [wb.dim(0)]), fused.a.reshaped(lead + [wb.dim(0)]))
+    }
+
+    /// The qkv/z pair of the boundary route in two launches (`VerifySplitZ`):
+    /// `lead` now, with the dense b/a of `x` on the tensor route (`b`, `a`
+    /// nil elsewhere), and `deferred(dependency)`, the z launch ordered after
+    /// `dependency` without reading it. Each output is the record route's,
+    /// bit for bit. Nil when the split did not qualify at load or the shapes
+    /// do not take it; the caller then runs the record route.
+    public static func boundarySplitProjections(
+        _ boundary: VerifyBoundary, lead: Linear, deferred: Linear, x: MLXArray, wb: MLXArray, wa: MLXArray
+    ) -> (lead: MLXArray, b: MLXArray?, a: MLXArray?, deferred: (MLXArray) -> MLXArray?)? {
+        guard VerifySplitZ.ready, let first = lead as? HadamardQuantizedLinear,
+            let second = deferred as? HadamardQuantizedLinear,
+            [first, second].allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.isIdentical(to: boundary.transform)
+            })
+        else { return nil }
+        let rows = boundary.activation.rows
+        let streamed = Self.streamedWeights([first, second])
+        let operands = (first.verifyOperands, second.verifyOperands)
+        let pair = operands.0.negative && operands.1.negative
+        let shared = VerifyInt8Matmul.pairSharesOffsetForm
+        guard boundary.normalized.dim(-1) == 4096, boundary.normalized.size == rows * 4096,
+            x.shape == boundary.normalized.shape,
+            let out = VerifyInt8Matmul.splitLead(
+                boundary.activation, layer: (operands.0.weight, operands.0.scalesT, operands.0.biasesT),
+                negative: shared ? pair : operands.0.negative, x: x.reshaped([rows, 4096]), wb: wb, wa: wa,
+                streamedWeight: streamed?[0])
+        else { return nil }
+        let shape = Array(boundary.normalized.shape.dropLast())
+        let activation = boundary.activation
+        return (
+            out.out.reshaped(shape + [first.weight.dim(0)]),
+            out.b?.reshaped(shape + [wb.dim(0)]), out.a?.reshaped(shape + [wb.dim(0)]),
+            { dependency in
+                VerifyInt8Matmul.splitDeferred(
+                    VerifySplitZ.ordered(activation, after: dependency),
+                    layer: (operands.1.weight, operands.1.scalesT, operands.1.biasesT),
+                    negative: shared ? pair : operands.1.negative, streamedWeight: streamed?[1]
+                )?.reshaped(shape + [second.weight.dim(0)])
+            })
     }
 
     public static func sharedShortProjections(
@@ -8118,6 +8549,9 @@ extension HadamardQuantizedLinear {
 // MARK: - The DFlash 2 draft-head screen
 
 extension HadamardQuantizedLinear {
+    /// Resolves the fast head gather once (drafter bind, before any request) and logs its state.
+    public static func prepareDraftGather() { VerifyInt8Matmul.prepareGatherFast() }
+
     /// The leading 128-groups (K 2048 of 4096) the screen scores every row on.
     public static let draftScreenGroups = 16
 

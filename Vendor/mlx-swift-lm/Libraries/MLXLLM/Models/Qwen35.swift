@@ -3400,6 +3400,27 @@ final class Qwen35GatedDeltaNet: Module {
         )
     }
 
+    /// `projectInputs` on the verify boundary with z out of the qkv launch
+    /// (`VerifySplitZ`): z feeds only the gated norm, so `z(dependency)`
+    /// makes it after `dependency` (the recurrence) and its launch runs beside
+    /// the recurrence instead of before it. The same values, bit for bit; nil
+    /// wherever `projectInputs` would not take the boundary route with the
+    /// dense b/a.
+    private func projectInputsSplittingZ(
+        _ inputs: MLXArray, B: Int, S: Int, boundary: HadamardQuantizedLinear.VerifyBoundary?
+    ) -> (qkv: MLXArray, b: MLXArray, a: MLXArray, z: (MLXArray) -> MLXArray?)? {
+        guard let boundary, !prepareFusedInputProjection(),
+            Qwen35DenseGateProjection.eligibleRows(inputs, b: inProjB, a: inProjA) != nil,
+            let split = HadamardQuantizedLinear.boundarySplitProjections(
+                boundary, lead: inProjQKV, deferred: inProjZ, x: inputs,
+                wb: inProjB.weight, wa: inProjA.weight),
+            let ba = split.b.flatMap({ b in split.a.map { (b, $0) } })
+                ?? Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA)
+        else { return nil }
+        let heads = numVHeads, width = headVDim
+        return (split.lead, ba.0, ba.1, { split.deferred($0)?.reshaped(B, S, heads, width) })
+    }
+
     /// The retained convolution tail is three rows, but a slice aliases the
     /// whole chunk. A packed checkpoint carries that parent into every
     /// recurrent transaction, which costs gigabytes over a prefill. Copying
@@ -3998,19 +4019,26 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(S >= 1, "Qwen35 capture-verify window must be non-empty")
 
         let qkv: MLXArray
-        let z: MLXArray
+        let projectedZ: MLXArray?
+        var deferredZ: ((MLXArray) -> MLXArray?)?
         let b: MLXArray
         let a: MLXArray
         if exactTargetVerify {
             let exact = qwen35A3BExactW4G64ProjectionQuad(
                 inProjQKV, inProjZ, inProjB, inProjA, inputs)
             qkv = exact.0
-            z = exact.1.reshaped(B, S, numVHeads, headVDim)
+            projectedZ = exact.1.reshaped(B, S, numVHeads, headVDim)
             b = exact.2
             a = exact.3
+        } else if let split = projectInputsSplittingZ(inputs, B: B, S: S, boundary: boundary) {
+            (qkv, b, a) = (split.qkv, split.b, split.a)
+            projectedZ = nil
+            deferredZ = split.z
         } else {
             // Preserve main's fused GDN projection construction and graph.
-            (qkv, z, b, a) = projectInputs(inputs, B: B, S: S, boundary: boundary)
+            let projected = projectInputs(inputs, B: B, S: S, boundary: boundary)
+            (qkv, b, a) = (projected.qkv, projected.b, projected.a)
+            projectedZ = projected.z
         }
 
         var convRows: [MLXArray] = []
@@ -4241,6 +4269,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
             out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
         }
+        let z = projectedZ ?? deferredZ.flatMap { $0(out) } ?? projectInputs(
+            inputs, B: B, S: S, boundary: boundary).z
         if !exactTargetVerify, out.ndim == 4, out.dim(-1) == 128,
             let packed = outProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterGatedNorm(
