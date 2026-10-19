@@ -3457,8 +3457,10 @@ enum Qwen35VerifyQKNormRoPE {
             const uint outL = LAST_QUERY && is_q ? 1u : L;
             const uint outT = LAST_QUERY && is_q ? 0u : t;
             device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;
+            #pragma clang loop unroll(full)
             for (uint part = 0; part < 2u; ++part) {
-              for (uint j = 0; j < 4u; ++j) dst[part * 128u + lane * 4u + j] = y[part][j];
+              *((device float4*)(dst + part * 128u + lane * 4u)) =
+                  float4(y[part][0], y[part][1], y[part][2], y[part][3]);
             }
             """
 
@@ -3509,19 +3511,28 @@ enum Qwen35VerifyQKNormRoPE {
         }
         """
 
-    /// The same norm and rotation with the position-only work first: the
-    /// angle's cos and sin and the norm weight are issued before the row
-    /// loads, so they overlap the loads and the reduction. Every expression
-    /// is the parent's text, so every output bit is the parent's.
+    /// The same norm and rotation with 128-bit vector loads issued first and
+    /// the position-only RoPE trig overlapping the memory fetches and reduction.
+    /// Every arithmetic expression is the parent's text, so every output bit is
+    /// the parent's.
     private static let normRopeHoisted = """
+        float x[2][4];
+        float wv[2][4];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 2u; ++part) {
+          const float4 x4 = *((const device float4*)(src + part * 128u + lane * 4u));
+          const float4 w4 = *((const device float4*)(w + part * 128u + lane * 4u));
+          x[part][0] = x4.x; x[part][1] = x4.y; x[part][2] = x4.z; x[part][3] = x4.w;
+          wv[part][0] = w4.x; wv[part][1] = w4.y; wv[part][2] = w4.z; wv[part][3] = w4.w;
+        }
         const float position = 1.0f * static_cast<float>(int(t) + offset[0]);
         const float base = rope_base[0];
         float cos_j[4];
         float sin_j[4];
-        #pragma clang loop unroll(full)
-        for (uint j = 0; j < 4u; ++j) {
-          const uint dim = lane * 4u + j;
-          if (dim < uint(ROPE_DIMS)) {
+        if (lane * 4u < uint(ROPE_DIMS)) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < 4u; ++j) {
+            const uint dim = lane * 4u + j;
             const uint p = dim < HALF_ROT ? dim : dim - HALF_ROT;
             const float d = static_cast<float>(p) / static_cast<float>(HALF_ROT);
             const float inv_freq = metal::exp2(-d * base);
@@ -3530,19 +3541,11 @@ enum Qwen35VerifyQKNormRoPE {
             sin_j[j] = metal::fast::sin(theta);
           }
         }
-        float wv[2][4];
-        #pragma clang loop unroll(full)
-        for (uint part = 0; part < 2u; ++part) {
-          #pragma clang loop unroll(full)
-          for (uint j = 0; j < 4u; ++j) wv[part][j] = w[part * 128u + lane * 4u + j];
-        }
-        float x[2][4];
         float acc[2] = {0.0f, 0.0f};
         #pragma clang loop unroll(full)
         for (uint part = 0; part < 2u; ++part) {
           #pragma clang loop unroll(full)
           for (uint j = 0; j < 4u; ++j) {
-            x[part][j] = src[part * 128u + lane * 4u + j];
             acc[part] = metal::fma(x[part][j], x[part][j], acc[part]);
           }
         }
@@ -3584,6 +3587,8 @@ enum Qwen35VerifyQKNormRoPE {
 
     /// `DARKBLOOM_BONSAI_ROPE_HOIST=0` keeps the parent kernel.
     static let hoisted = Qwen35MTPFusedDraftStep.environmentFlag("DARKBLOOM_BONSAI_ROPE_HOIST")
+    nonisolated(unsafe) private static var cachedConstants:
+        (qEps: Float, kEps: Float, base: Float, eps: MLXArray, log2Base: MLXArray)?
 
     /// `(queries [1, qHeads, L, 256], keys [1, kvHeads, L, 256])` or nil.
     static func apply(
@@ -3607,9 +3612,19 @@ enum Qwen35VerifyQKNormRoPE {
         else { return nil }
         let L = keyProjection.dim(1)
         let queryRows = lastQueryOnly ? 1 : L
+        let epsIn: MLXArray
+        let baseIn: MLXArray
+        if let c = cachedConstants, c.qEps == queryEps, c.kEps == keyEps, c.base == ropeBase {
+            epsIn = c.eps
+            baseIn = c.log2Base
+        } else {
+            epsIn = MLXArray([queryEps, keyEps])
+            baseIn = MLXArray([log2(ropeBase)])
+            cachedConstants = (queryEps, keyEps, ropeBase, epsIn, baseIn)
+        }
         let outputs = (hoisted ? hoistKernel : kernel)(
             [queryProjection, keyProjection, queryWeight, keyWeight,
-                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)])],
+                epsIn, offsets, baseIn],
             template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
                 ("LAST_QUERY", lastQueryOnly)],
             grid: lastQueryOnly ? (32, 1, queryHeads + keyHeads * L) : (32, queryHeads + keyHeads, L),
@@ -3758,8 +3773,6 @@ final class Qwen35Attention: Module {
             qProjOutput = exactTargetVerify
                 ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         }
-        let qSplit = qProjOutput.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)
-        let gate = qSplit[1].reshaped(B, queryRows, -1)
         let keyIndex = narrowsToLastQuery && promptProjections == nil ? 0 : 1
         let valueIndex = narrowsToLastQuery && promptProjections == nil ? 1 : 2
         let kProjection = exactTargetVerify
@@ -3768,6 +3781,14 @@ final class Qwen35Attention: Module {
             ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[valueIndex] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
+
+        var cachedQSplit: [MLXArray]? = nil
+        func qSplitParts() -> [MLXArray] {
+            if let cachedQSplit { return cachedQSplit }
+            let parts = qProjOutput.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)
+            cachedQSplit = parts
+            return parts
+        }
 
         var queries: MLXArray
         var keys: MLXArray
@@ -3782,7 +3803,7 @@ final class Qwen35Attention: Module {
             // Verify window: q/k RMSNorm and RoPE in one kernel, same bits.
             (queries, keys) = fused
         } else {
-            queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+            queries = qNorm(qSplitParts()[0]).transposed(0, 2, 1, 3)
             keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
                 .transposed(0, 2, 1, 3)
 
@@ -3817,6 +3838,7 @@ final class Qwen35Attention: Module {
         {
             return gated
         }
+        let gate = qSplitParts()[1].reshaped(B, queryRows, -1)
         let output = attended
             .transposed(0, 2, 1, 3)
             .reshaped(B, queryRows, -1)
@@ -4910,8 +4932,9 @@ public class Qwen35TextModelInner: Module {
                 unpacked[0].dim(2) == 4096, unpacked.allSatisfy({ $0.dtype == .float32 })
             {
                 let s = unpacked[0].dim(1)
+                let sArg = (0 ... 512).contains(s) ? Self.packTapsSArrays[s] : MLXArray([Int32(s)])
                 dFlash2Tap.tappedHidden = Self.packTapsBF16Kernel(
-                    unpacked + [MLXArray([Int32(s)])],
+                    unpacked + [sArg],
                     grid: (8192, s, 1),
                     threadGroup: (256, 1, 1),
                     outputShapes: [[1, s, 32768]],
@@ -4922,6 +4945,10 @@ public class Qwen35TextModelInner: Module {
             }
         }
         return (hiddenStates, pendingDelta)
+    }
+
+    nonisolated(unsafe) private static let packTapsSArrays: [MLXArray] = (0 ... 512).map {
+        MLXArray([Int32($0)])
     }
 
     private static let packTapsBF16Kernel = MLXFast.metalKernel(

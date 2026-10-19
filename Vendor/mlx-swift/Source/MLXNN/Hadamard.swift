@@ -592,6 +592,15 @@ public struct SignedBlockHadamard {
     /// output gate, its norm and the out-projection rotation in one kernel.
     /// The values entering the rotation are bit-identical to MLX `rmsNorm`,
     /// `silu` and the multiply. Nil when the shape is not a verify-width
+    nonisolated(unsafe) private static let eps1e6 = MLXArray([Float(1e-6)])
+    nonisolated(unsafe) private static let eps1e5 = MLXArray([Float(1e-5)])
+    @inline(__always)
+    private static func epsArray(_ eps: Float) -> MLXArray {
+        if eps == Float(1e-6) { return eps1e6 }
+        if eps == Float(1e-5) { return eps1e5 }
+        return MLXArray([eps])
+    }
+
     /// FP32 4096-wide input.
     func quantizedForVerifyGatedNorm(
         _ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
@@ -604,7 +613,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let outputs = Self.wideRowVerify(
             .gatedNorm,
-            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, Self.epsArray(eps), signs],
             rows: rows)
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
@@ -625,7 +634,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let groups = rows * (width / 128)
         let outputs = Self.gatedNormQuantized4096Kernel(
-            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, Self.epsArray(eps), signs],
             template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
             grid: (256, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
@@ -657,7 +666,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
         return Self.wideRowVerify(
-            .residualNormNormed, [x, residual, weight, MLXArray([eps]), signs], rows: rows)
+            .residualNormNormed, [x, residual, weight, Self.epsArray(eps), signs], rows: rows)
     }
 
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
@@ -713,7 +722,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
         let outputs = Self.wideRowVerify(
-            .residualNormRot, [x, residual, weight, MLXArray([eps]), signs], rows: rows, headError2: headError2 && rows == 16)
+            .residualNormRot, [x, residual, weight, Self.epsArray(eps), signs], rows: rows, headError2: headError2 && rows == 16)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
@@ -729,7 +738,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        return Self.wideRowVerify(.normNormed, [x, weight, MLXArray([eps]), signs], rows: rows)
+        return Self.wideRowVerify(.normNormed, [x, weight, Self.epsArray(eps), signs], rows: rows)
     }
 
     /// `quantizedForPrompt(rmsNorm(x + residual, weight))` at prompt width in one kernel:
@@ -746,7 +755,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / 4096
         Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
-        let inputs = [x, residual, weight, MLXArray([eps]), signs]
+        let inputs = [x, residual, weight, Self.epsArray(eps), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
         if normalized {
             return Self.residualNormNormedQuantized4096Kernel(
@@ -773,7 +782,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / 4096
         Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
-        let inputs = [x, weight, MLXArray([eps]), signs]
+        let inputs = [x, weight, Self.epsArray(eps), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
         if normalized {
             return Self.normNormedQuantized4096Kernel(
@@ -797,7 +806,7 @@ public struct SignedBlockHadamard {
             x.size <= Int(UInt32.max), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / width
-        let inputs = [x, residual, weight, MLXArray([eps]), signs]
+        let inputs = [x, residual, weight, Self.epsArray(eps), signs]
         if verifyRows > 0 {
             guard verifyRows == rows, VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
             return Self.wideRowVerify(.residualNorm, inputs, rows: rows)
@@ -1502,6 +1511,10 @@ extension SignedBlockHadamard {
         return MLX.all(MLX.stacked(same)).item(Bool.self)
     }
 
+    nonisolated(unsafe) private static let verifyRowsArrays: [MLXArray] = (0 ... 16).map {
+        MLXArray([Int32($0)])
+    }
+
     /// One verify-width launch of `kind` over `inputs` (`x` first, `[rows,
     /// 4096 * blocks]` in any leading shape): `[codes [16, 4096 * blocks],
     /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
@@ -1516,8 +1529,9 @@ extension SignedBlockHadamard {
         if headError2 { shapes.append([rows * 32 * blocks]) }
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         if lanes > 0, let kernel = (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind] {
+            let rowsArg = (0 ... 16).contains(rows) ? verifyRowsArrays[rows] : MLXArray([Int32(rows)])
             return kernel(
-                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
+                inputs + [rowsArg], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
         }
