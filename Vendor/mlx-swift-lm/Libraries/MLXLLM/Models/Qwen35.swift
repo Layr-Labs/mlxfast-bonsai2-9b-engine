@@ -1897,6 +1897,70 @@ enum Qwen35RegisterGatedSIMD {
         header: gateHeader,
         ensureRowContiguous: false)
 
+    /// Row-list twin of a replay source: step `t` replays tape row `rows[t]` (`T` = rows' length)
+    /// and the boundary conv rows are the path's (logical row `L` of `conv_in` is `L` below 3,
+    /// else `3 + rows[L - 3]`). `rows = 0 ..< T` is the record replay.
+    static func treeReplaySource(_ record: String) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let ok = swap("const uint T = q_shape[1];", "const uint T = uint(tree_rows_shape[0]);")
+            && swap(
+                "for (int t = 0; t < T; ++t) {",
+                """
+                for (int t = 0; t < T; ++t) {
+                const int tr_row = tree_rows[t];
+                q_ = q + b_idx * q_strides[0] + hk_idx * q_strides[2] + dk0 + tr_row * q_strides[1];
+                k_ = k + b_idx * k_strides[0] + hk_idx * k_strides[2] + dk0 + tr_row * k_strides[1];
+                v_ = v + b_idx * v_strides[0] + hv_idx * v_strides[2] + dvbase + tr_row * v_strides[1];
+                a_ = a + b_idx * a_strides[0] + hv_idx * a_strides[2] + tr_row * a_strides[1];
+                bb_ = b + b_idx * b_strides[0] + hv_idx * b_strides[2] + tr_row * b_strides[1];
+                """)
+            && swap("q_ += Hk * Dk;", "")
+            && swap("k_ += k_strides[1]; v_ += v_strides[1]; a_ += a_strides[1]; bb_ += b_strides[1];", "")
+            && swap(
+                "(T + r) * conv_in_strides[1]",
+                "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * conv_in_strides[1]")
+        guard ok else { return nil }
+        if s.contains("a_[gt_row * a_strides[1]]") {
+            guard swap("a_[gt_row * a_strides[1]]", "a_[tree_rows[gt_row] * a_strides[1]]"),
+                swap("bb_[gt_row * b_strides[1]]", "bb_[tree_rows[gt_row] * b_strides[1]]")
+            else { return nil }
+        }
+        return s
+    }
+
+    private static let treeReplayKernels: [MLXFast.MLXFastKernel?] = [false, true].map { hoisted in
+        treeReplaySource(replaySource(hoistedGates: hoisted)).map {
+            MLXFast.metalKernel(
+                name: hoisted ? "qwen35_gdn_register_gate_simd_replay_hg_tree" : "qwen35_gdn_register_gate_simd_replay_tree",
+                inputNames: ["q", "k", "v", "a", "b", "a_log", "dt_bias", "state_in", "conv_in", "tree_rows"],
+                outputNames: ["state_out", "conv_tail"],
+                source: $0,
+                header: gateHeader,
+                ensureRowContiguous: false)
+        }
+    }
+
+    /// `runReplay` along tape rows `rows` (int32 [m]); nil when the twin was not derived.
+    static func runTreeReplay(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray,
+                              b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                              state: MLXArray, convInput: MLXArray, rows: MLXArray) -> (MLXArray, MLXArray)? {
+        guard let kernel = treeReplayKernels[hoistedReplayPassed ? 1 : 0] else { return nil }
+        let B = k.dim(0), Hk = k.dim(2), Dk = k.dim(3)
+        let Hv = v.dim(2), Dv = v.dim(3)
+        let result = kernel(
+            [q, k, v, a, b, aLog, dtBias, state, convInput, rows],
+            template: [("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("STATE_ONLY", 1)],
+            grid: (128, Dv / 32, B * Hv), threadGroup: (128, 1, 1),
+            outputShapes: [state.shape, [B, 3, convInput.dim(2)]],
+            outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
     /// `DARKBLOOM_BONSAI_REPLAY_GATE_HOIST=0` keeps the record replay kernel.
     static let hoistedReplayOffered =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_REPLAY_GATE_HOIST"] != "0"
@@ -2024,11 +2088,7 @@ enum Qwen35RegisterGatedSIMD {
 enum Qwen35FusedGDNVerify {
     static let maximumRows = 16
     private static let invScale = pow(Float(128), -0.5)
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_verify_fused",
-        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-        source: """
+    static let source = """
         const uint T = qkv_shape[1];
         constexpr int R = 16;
         constexpr int DVPL = 2;
@@ -2260,8 +2320,248 @@ enum Qwen35FusedGDNVerify {
             s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
           }
         }
-        """,
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_verify_fused",
+        inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+        outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+        source: source,
         header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// Tree twin of `source`. `tree` is the draft tree descriptor (int32, at least 288):
+    /// parent row [16], depth [16] (row 0 = anchor, depth 0), ancestor row by depth [16][16].
+    /// Each row's conv window reads its own path (taps past the anchor read `conv_state`), and a
+    /// row whose parent is not the previous row restarts the scan from `state_in` and re-runs
+    /// its ancestors in path order (no output for them), so every row is the bits of a chain
+    /// verify of its path. `conv_in` is the physical window (the replay tape); `state_out` and
+    /// `conv_tail` follow the last physical row, which is the full acceptance of a chain.
+    static func treeSource(_ record: String) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let reload = """
+            if (tb_back) {
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                const device float4* s_re4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  const float4 s4 = s_re4[j];
+                  state[d][4 * j + 0] = s4.x;
+                  state[d][4 * j + 1] = s4.y;
+                  state[d][4 * j + 2] = s4.z;
+                  state[d][4 * j + 3] = s4.w;
+                }
+              }
+            }
+            """
+        let ok = swap(
+            "acc = fma(xin[p + tap], w[tap], acc);",
+            """
+            const uint tb_l = uint(tree[16 + p]) + tap;
+            acc = fma(xin[tb_l < 3u ? tb_l : 3u + uint(tree[32 + 16 * p + tb_l - 3u])], w[tap], acc);
+            """)
+            && swap(
+                "const uint r = p + tap;",
+                """
+                const uint tb_l = uint(tree[16 + p]) + tap;
+                const uint r = tb_l < 3u ? tb_l : 3u + uint(tree[32 + 16 * p + tb_l - 3u]);
+                """)
+            && swap(
+                "for (int t = 0; t < int(T); ++t) {",
+                """
+                for (int t = 0; t < int(T); ++t) {
+                const bool tb_back = t > 0 && tree[t] != t - 1;
+                \(reload)
+                const int tb_d = tree[16 + t];
+                for (int tb_i = tb_back ? 0 : tb_d; tb_i <= tb_d; ++tb_i) {
+                const int u = tb_i == tb_d ? t : tree[32 + 16 * t + tb_i];
+                q_ = qk_raw + dk0 + u * Dk;
+                k_ = qk_raw + MAX_T * Dk + dk0 + u * Dk;
+                v_ = v_tile + dvlocal + u * DVPT;
+                y_ = y + (b_idx * T * Hv + hv_idx) * Dv + dvbase + uint(u) * Hv * Dv;
+                """)
+            && swap("const float gt = gate_g[t];", "const float gt = gate_g[u];")
+            && swap("const float bt = gate_beta[t];", "const float bt = gate_beta[u];")
+            && swap("if (lane % LPD == 0) {", "if (lane % LPD == 0 && u == t) {")
+            && swap("q_ += Dk;", "}")
+            && swap("y_ += Hv * Dv;", "")
+            && swap("k_ += Dk; v_ += DVPT;", "")
+        return ok ? s : nil
+    }
+
+    /// `treeSource`'s outputs, cheaper. The descriptor and each row's four conv tap rows
+    /// (`tb_tab`, physical `conv_in` rows) are read into threadgroup memory once. Each q/k
+    /// column thread stages its rows' raw inputs in its own `qk_raw` slots and convolves the
+    /// rows in descending order, so a row's ancestors (always lower rows) are still raw when it
+    /// reads them: tap 3 is the row itself, tap 2 its parent, taps 0 and 1 come from the table.
+    /// A row whose parent is not the previous row reloads `state_in` and re-runs only the
+    /// state update of its ancestors. Same values in the same fma order as `treeSource`.
+    /// `DARKBLOOM_BONSAI_TREE_FAST=0` keeps `treeSource`.
+    static func fastTreeSource(_ record: String) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let table = """
+            threadgroup float gate_g[MAX_T];
+            threadgroup int tb_desc[288];
+            threadgroup uint tb_tab[MAX_T * 4];
+            for (uint tb_i = thread_index_in_threadgroup; tb_i < 288u; tb_i += 256u) { tb_desc[tb_i] = tree[tb_i]; }
+            if (thread_index_in_threadgroup < MAX_T * 4u) {
+              const uint tb_p = thread_index_in_threadgroup / 4u, tb_t = thread_index_in_threadgroup % 4u;
+              const uint tb_l = uint(tree[16 + tb_p]) + tb_t;
+              tb_tab[tb_p * 4u + tb_t] = tb_l < 3u ? tb_l : 3u + uint(tree[32 + 16 * tb_p + tb_l - 3u]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+        let descending = """
+            for (uint tb_s = 0; tb_s < uint(MAX_T); ++tb_s) {
+              if (tb_s < T) { qk_raw[(part * MAX_T + tb_s) * Dk + qk_col] = xin[3u + tb_s]; }
+            }
+            #pragma clang loop unroll(full)
+            for (uint tb_q = 0; tb_q < uint(MAX_T); ++tb_q) {
+            const uint p = uint(MAX_T) - 1u - tb_q;
+            """
+        let tap = """
+            float tb_v;
+            if (p == 0u || tap == 3u) {
+              tb_v = xin[p + tap];
+            } else if (tap == 2u) {
+              tb_v = qk_raw[(part * MAX_T + uint(tb_desc[p])) * Dk + qk_col];
+            } else {
+              const uint tb_r = tb_tab[p * 4u + tap];
+              const float tb_cs = tb_r == 0u ? xin[0] : (tb_r == 1u ? xin[1] : xin[2]);
+              const float tb_qv = qk_raw[(part * MAX_T + (tb_r < 3u ? 0u : tb_r - 3u)) * Dk + qk_col];
+              tb_v = tb_r < 3u ? tb_cs : tb_qv;
+            }
+            acc = fma(tb_v, w[tap], acc);
+            """
+        let restart = """
+            for (int t = 0; t < int(T); ++t) {
+            if (t > 0 && tb_desc[t] != t - 1) {
+              const int sp_d = tb_desc[16 + t];
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                const device float4* s_re4 = (const device float4*)(state_in + (n * Dv + dvbase + d) * Dk + dk0);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  const float4 s4 = s_re4[j];
+                  state[d][4 * j + 0] = s4.x;
+                  state[d][4 * j + 1] = s4.y;
+                  state[d][4 * j + 2] = s4.z;
+                  state[d][4 * j + 3] = s4.w;
+                }
+              }
+              for (int sp_i = 0; sp_i < sp_d; ++sp_i) {
+                const int u = tb_desc[32 + 16 * t + sp_i];
+                const float gu = gate_g[u];
+                const float bu = gate_beta[u];
+                threadgroup const float* ku = qk_raw + MAX_T * Dk + dk0 + u * Dk;
+                float kq[R];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  const float4 k4 = ((threadgroup const float4*)ku)[j];
+                  kq[4 * j] = k4.x; kq[4 * j + 1] = k4.y; kq[4 * j + 2] = k4.z; kq[4 * j + 3] = k4.w;
+                }
+                const float2 vu = *((threadgroup const float2*)(v_tile + dvlocal + u * DVPT));
+                const float vq[DVPL] = {vu.x, vu.y};
+                float kvq[DVPL];
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < R / 4; ++j) {
+                    state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
+                    state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
+                    a0 = fma(state[d][4 * j], kq[4 * j], a0);
+                    a1 = fma(state[d][4 * j + 1], kq[4 * j + 1], a1);
+                    a2 = fma(state[d][4 * j + 2], kq[4 * j + 2], a2);
+                    a3 = fma(state[d][4 * j + 3], kq[4 * j + 3], a3);
+                  }
+                  kvq[d] = (a0 + a1) + (a2 + a3);
+                }
+                kvq[0] += simd_shuffle_xor(kvq[0], 4);
+                kvq[1] += simd_shuffle_xor(kvq[1], 4);
+                kvq[0] += simd_shuffle_xor(kvq[0], 2);
+                kvq[1] += simd_shuffle_xor(kvq[1], 2);
+                kvq[0] += simd_shuffle_xor(kvq[0], 1);
+                kvq[1] += simd_shuffle_xor(kvq[1], 1);
+                #pragma clang loop unroll(full)
+                for (int d = 0; d < DVPL; ++d) {
+                  const float delta = (vq[d] - kvq[d]) * bu;
+                  #pragma clang loop unroll(full)
+                  for (int j = 0; j < R / 4; ++j) {
+                    state[d][4 * j] = fma(kq[4 * j], delta, state[d][4 * j]);
+                    state[d][4 * j + 1] = fma(kq[4 * j + 1], delta, state[d][4 * j + 1]);
+                    state[d][4 * j + 2] = fma(kq[4 * j + 2], delta, state[d][4 * j + 2]);
+                    state[d][4 * j + 3] = fma(kq[4 * j + 3], delta, state[d][4 * j + 3]);
+                  }
+                }
+              }
+            }
+            """
+        let ok = swap("threadgroup float gate_g[MAX_T];", table)
+            && swap("for (uint p = 0; p < uint(MAX_T); ++p) {", descending)
+            && swap("acc = fma(xin[p + tap], w[tap], acc);", tap)
+            && swap("const uint r = p + tap;", "const uint r = tb_tab[p * 4u + tap];")
+            && swap("for (int t = 0; t < int(T); ++t) {", restart)
+        return ok ? s : nil
+    }
+
+    static let fastTreeOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_FAST"] != "0"
+
+    private static let treeKernel: MLXFast.MLXFastKernel? = {
+        let fast = fastTreeOffered ? fastTreeSource(source) : nil
+        guard let text = fast ?? treeSource(source) else { return nil }
+        return MLXFast.metalKernel(
+            name: fast != nil ? "qwen35_gdn_verify_fused_tree_fast" : "qwen35_gdn_verify_fused_tree",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
+            outputNames: ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+            source: text,
+            header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
+    static func applyTree(
+        convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, tree: MLXArray,
+        keyHeads: Int, valueHeads: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray)? {
+        let C = qkv.dim(-1)
+        guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
+            convState.ndim == 3, convState.dim(0) == 1, convState.dim(1) == 3,
+            qkv.ndim == 3, qkv.dim(0) == 1, (3 ... maximumRows).contains(qkv.dim(1)),
+            convState.dim(2) == C, C == 2 * keyHeads * 128 + valueHeads * 128,
+            valueHeads % keyHeads == 0, convState.dtype == .float32, qkv.dtype == .float32,
+            convWeight.dtype == .float32, convWeight.shape == [C, 4, 1],
+            a.dtype == .float32, b.dtype == .float32, aLog.dtype == .float32,
+            dtBias.dtype == .float32, state.dtype == .float32,
+            a.shape == [1, qkv.dim(1), valueHeads], b.shape == a.shape,
+            state.shape == [1, valueHeads, 128, 128],
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let S = qkv.dim(1)
+        let o = treeKernel(
+            [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree],
+            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (256, 2, valueHeads), threadGroup: (256, 1, 1),
+            outputShapes: [[1, S + 3, C], [1, S, valueHeads, 128], [1, S, keyHeads, 128], [1, S, keyHeads, 128],
+                [1, S, valueHeads, 128], state.shape, [1, 3, C]],
+            outputDTypes: Array(repeating: .float32, count: 7))
+        return (o[0], o[1], o[2], o[3], o[4], o[5], o[6])
+    }
 
     /// `(convIn, v, q, k, y, finalState, convTail)` of the verify
     /// window, or nil when the shapes do not take the fused path. `convTail`
@@ -2925,6 +3225,21 @@ final class Qwen35GatedDeltaNet: Module {
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
         let rows = 0 ..< committedRows
+        if let path = CBv2BranchVerify.committedRows, path.count == committedRows,
+            CBv2BranchVerify.isBranch(path)
+        {
+            guard tape.mask == nil, headKDim == 128, headVDim == 128, tape.rowCount == 16,
+                tape.convStateRows == 3, tape.convInput.dtype == .float32,
+                tape.q.dtype == .float32, tape.k.dtype == .float32, tape.v.dtype == .float32,
+                tape.a.dtype == .float32, tape.b.dtype == .float32,
+                aLog.dtype == .float32, dtBias.dtype == .float32, let ssmPre = tape.ssmPre,
+                let replayed = Qwen35RegisterGatedSIMD.runTreeReplay(
+                    q: tape.q, k: tape.k, v: tape.v, a: tape.a, b: tape.b, aLog: aLog, dtBias: dtBias,
+                    state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
+                    convInput: tape.convInput, rows: MLXArray(path))
+            else { preconditionFailure("Qwen35 tree commit: path replay unavailable") }
+            return CBv2RecurrentLayerState(conv: replayed.1, ssm: replayed.0)
+        }
         // One kernel reads the tape in place (no copy of the strided value
         // slice) and writes the boundary conv rows: the bits of the path below.
         if tape.mask == nil, headKDim == 128, headVDim == 128, committedRows <= 16,
@@ -3207,12 +3522,19 @@ final class Qwen35GatedDeltaNet: Module {
         let nKeep = convKernelSize - 1
         // Verify windows of 3 ... 8 rows: conv, SiLU, q/k norm and the scan
         // in one kernel (`Qwen35FusedGDNVerify`), the same bits.
+        let tree = S == 16 && B == 1 ? CBv2BranchVerify.tree : nil
         let fusedMiddle = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
             || headKDim != 128 || headVDim != 128
-            ? nil : Qwen35FusedGDNVerify.apply(
+            ? nil : (tree.map {
+                Qwen35FusedGDNVerify.applyTree(
+                    convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, state: ssmState, tree: $0,
+                    keyHeads: numKHeads, valueHeads: numVHeads)
+            } ?? Qwen35FusedGDNVerify.apply(
                 convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState,
-                keyHeads: numKHeads, valueHeads: numVHeads)
+                keyHeads: numKHeads, valueHeads: numVHeads))
+        precondition(tree == nil || fusedMiddle != nil, "Qwen35 tree verify: fused GDN tree kernel unavailable")
         let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
             || convKernelSize != 4
             ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
@@ -3592,6 +3914,60 @@ enum Qwen35VerifyQKNormRoPE {
     /// `DARKBLOOM_BONSAI_ROPE_HOIST=0` keeps the parent kernel.
     static let hoisted = Qwen35MTPFusedDraftStep.environmentFlag("DARKBLOOM_BONSAI_ROPE_HOIST")
 
+    /// Tree twin of a kernel text (`source` or its hoisted form; `tree`: the draft tree
+    /// descriptor, see `Qwen35FusedGDNVerify.treeSource`): row `t` takes the position
+    /// `offset + depth[t]` of its path. Nil when the line is not found.
+    static func treeSource(_ record: String) -> String? {
+        let line = "const float position = 1.0f * static_cast<float>(int(t) + offset[0]);"
+        guard record.components(separatedBy: line).count == 2 else { return nil }
+        return record.replacingOccurrences(
+            of: line,
+            with: "const float position = 1.0f * static_cast<float>(tree[16 + t] + offset[0]);")
+    }
+
+    /// Built from the text `apply` launches (`hoisted` picks it), so a path row's
+    /// q/k bits are the chain verify's bits under either kernel.
+    private static let treeKernel: MLXFast.MLXFastKernel? = treeSource(
+        hoisted ? replacingOnce(source, normRopeParent, normRopeHoisted) : source
+    ).map {
+        MLXFast.metalKernel(
+            name: "qwen35_verify_qk_norm_rope_tree",
+            inputNames: ["q_proj", "k_proj", "q_weight", "k_weight", "eps", "offset", "rope_base", "tree"],
+            outputNames: ["q_out", "k_out"],
+            source: $0)
+    }
+
+    /// `apply` (all query rows) for a draft tree window.
+    static func applyTree(
+        queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
+        keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
+        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, tree: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
+            queryProjection.ndim == 3, queryProjection.dim(0) == 1, keyProjection.ndim == 3,
+            (2 ... 16).contains(queryProjection.dim(1)),
+            queryProjection.dim(2) == queryHeads * 512,
+            keyProjection.shape == [1, queryProjection.dim(1), keyHeads * 256],
+            queryProjection.dtype == .float32, keyProjection.dtype == .float32,
+            queryWeight.dtype == .float32, keyWeight.dtype == .float32,
+            queryWeight.shape == [256], keyWeight.shape == [256],
+            offsets.size == 1, offsets.dtype == .int32,
+            ropeDims % 8 == 0, (8 ... 128).contains(ropeDims),
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let L = keyProjection.dim(1)
+        let outputs = treeKernel(
+            [queryProjection, keyProjection, queryWeight, keyWeight,
+                MLXArray([queryEps, keyEps]), offsets, MLXArray([log2(ropeBase)]), tree],
+            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
+                ("LAST_QUERY", false)],
+            grid: (32, queryHeads + keyHeads, L),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[1, queryHeads, L, 256], [1, keyHeads, L, 256]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
+    }
+
     /// `(queries [1, qHeads, L, 256], keys [1, kvHeads, L, 256])` or nil.
     static func apply(
         queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
@@ -3784,7 +4160,18 @@ final class Qwen35Attention: Module {
 
         var queries: MLXArray
         var keys: MLXArray
-        if !exactTargetVerify, positionIds == nil, let plainRope,
+        let tree = L == 16 && !narrowsToLastQuery ? CBv2BranchVerify.tree : nil
+        if let tree {
+            guard !exactTargetVerify, positionIds == nil, let plainRope,
+                let fused = Qwen35VerifyQKNormRoPE.applyTree(
+                    queryProjection: qProjOutput, keyProjection: kProjection,
+                    queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                    queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
+                    queryHeads: attentionHeads, keyHeads: kvHeads,
+                    ropeDims: plainRope.dims, ropeBase: plainRope.base, tree: tree)
+            else { preconditionFailure("Qwen35 tree verify: tree q/k RoPE unavailable") }
+            (queries, keys) = fused
+        } else if !exactTargetVerify, positionIds == nil, let plainRope,
             let fused = Qwen35VerifyQKNormRoPE.apply(
                 queryProjection: qProjOutput, keyProjection: kProjection,
                 queryWeight: qNorm.weight, keyWeight: kNorm.weight,

@@ -382,6 +382,7 @@ enum CBv2AttentionV1 {
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
+        precondition(CBv2BranchVerify.tree == nil || L != 16, "CBv2 tree verify: attention took the chain path")
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if let keepMask {
             precondition(
@@ -417,6 +418,21 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if let tree = CBv2BranchVerify.tree, L == 16 {
+            precondition(keepMask == nil && allowNativeVectorBatch, "CBv2 tree verify: unsupported attention form")
+            if canBatchSerialQueriesWithNativeVector(
+                kind: kind, queries: queries, keys: cachedKeys, values: cachedValues,
+                sinks: sinks, softcap: softcap, keepMask: nil)
+            {
+                guard let shared = CBv2VerifyVectorAttention.attendTree(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale, tree: tree)
+                else { preconditionFailure("CBv2 tree verify: tree attention kernel unavailable") }
+                return shared
+            }
+            return attendTreeSerialQueries(
+                queries: queries, keys: cachedKeys, values: cachedValues, tree: tree,
+                window: window(of: kind), scale: scale, sinks: sinks, softcap: softcap)
+        }
         if let keepMask {
             precondition(
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
@@ -738,6 +754,35 @@ enum CBv2AttentionV1 {
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
+    /// `attendSerialQueries` for a draft tree window: query `t` attends to the history and its
+    /// own path's keys in path order (the keys a chain verify of that path shows its row).
+    private static func attendTreeSerialQueries(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, tree: MLXArray,
+        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        precondition(window == nil, "CBv2 tree verify: windowed attention")
+        let L = queries.dim(2)
+        let history = keys.dim(2) - L
+        let host = CBv2BranchVerify.host(tree)
+        var outputs: [MLXArray] = []
+        for t in 0 ..< L {
+            let depth = Int(host[16 + t])
+            let rowBase = 32 + 16 * t
+            let path = (0 ... depth).map { (d: Int) -> Int32 in
+                let ancestor: Int32 = host[rowBase + d]
+                return Int32(history) + ancestor
+            }
+            let index = MLXArray(Array(0 ..< Int32(history)) + path)
+            outputs.append(
+                attend(
+                    queries: queries[0..., 0..., t ..< (t + 1), 0...],
+                    keys: keys.take(index, axis: 2), values: values.take(index, axis: 2),
+                    scale: scale, L: 1, kL: history + depth + 1, window: nil, sinks: sinks,
+                    softcap: softcap, keepMask: nil))
+        }
+        return concatenated(outputs, axis: 2)
+    }
+
     /// One query at a time — the pinned MTP serial-verification path.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -987,7 +1032,46 @@ enum CBv2VerifyVectorAttention {
         name: "cbv2_verify_sdpa_partial",
         inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
         outputNames: ["part_o", "part_m", "part_s"],
-        source: """
+        source: partialSource,
+        ensureRowContiguous: false)
+
+    /// Tree twin of a partial source. `tree` is the draft tree descriptor (int32: parent row
+    /// [16], depth [16], ancestor row by depth [16][16]; see `DF2Fast.treeSource`). Query row
+    /// `t` visits logical keys `0 ... base + depth[t]` (`base` = keys before the window) in the
+    /// record's class and order, reading in-window key `base + i` from its path's row
+    /// `base + ancestor[t][i]`, so each (class, query) state is the bits of a chain verify of
+    /// its path.
+    static func treeSource(_ record: String) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String, count: Int = 1) -> Bool {
+            guard s.components(separatedBy: from).count == count + 1 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let ok = swap(
+            "const int limit = N - int(L) + int(t);",
+            """
+            const int tv_base = N - int(L);
+            const int limit = tv_base + tree[16 + t];
+            """)
+            && swap(
+                "for (int i = c; i <= limit; i += 32) {",
+                "for (int i = c; i <= limit; i += 32) {\nconst int pi = i < tv_base ? i : tv_base + tree[32 + 16 * t + (i - tv_base)];")
+            && swap("(kp + i * ks + ", "(kp + pi * ks + ", count: 2)
+            && swap("(vp + i * vs + ", "(vp + pi * vs + ", count: 2)
+        return ok ? s : nil
+    }
+
+    private static let partialTree: MLXFast.MLXFastKernel? = treeSource(partialSource).map {
+        MLXFast.metalKernel(
+            name: "cbv2_verify_sdpa_partial_tree",
+            inputNames: ["queries", "keys", "values", "scale_in", "n_keys", "tree"],
+            outputNames: ["part_o", "part_m", "part_s"],
+            source: $0,
+            ensureRowContiguous: false)
+    }
+
+    private static let partialSource = """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             constexpr int D = 256;
@@ -1068,8 +1152,7 @@ enum CBv2VerifyVectorAttention {
                 part_s[slot] = sum_exp_score[h];
               }
             }
-            """,
-        ensureRowContiguous: false)
+            """
 
     /// One threadgroup per (head, query, half of the output dims); the 32
     /// partials pass through threadgroup memory so lane l holds partial l.
@@ -1122,7 +1205,19 @@ enum CBv2VerifyVectorAttention {
         name: "cbv2_verify_sdpa_paired",
         inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
         outputNames: ["part_o", "part_m", "part_s"],
-        source: """
+        source: pairedSource,
+        ensureRowContiguous: false)
+
+    private static let pairedTree: MLXFast.MLXFastKernel? = treeSource(pairedSource).map {
+        MLXFast.metalKernel(
+            name: "cbv2_verify_sdpa_paired_tree",
+            inputNames: ["queries", "keys", "values", "scale_in", "n_keys", "tree"],
+            outputNames: ["part_o", "part_m", "part_s"],
+            source: $0,
+            ensureRowContiguous: false)
+    }
+
+    private static let pairedSource = """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             constexpr int D = 256;
@@ -1203,8 +1298,7 @@ enum CBv2VerifyVectorAttention {
                 part_s[slot] = sum_exp_score[h];
               }
             }
-            """,
-        ensureRowContiguous: false)
+            """
 
     /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
     static func attend(
@@ -1242,5 +1336,82 @@ enum CBv2VerifyVectorAttention {
         return combine(
             parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+    }
+
+    /// `attend` for a draft tree window (`tree`: see `treeSource`).
+    static func attendTree(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, tree: MLXArray
+    ) -> MLXArray? {
+        guard tree.dtype == .int32, tree.size >= 288,
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            queries.dim(0) == 1, queries.dim(1) == 16, queries.dim(3) == 256,
+            (2 ... 16).contains(queries.dim(2)),
+            keys.dim(0) == 1, keys.dim(1) == 4, keys.dim(3) == 256, values.shape == keys.shape,
+            keys.dim(2) >= queries.dim(2), keys.dim(2) < 1024,
+            queries.strides[3] == 1, keys.strides[3] == 1, values.strides[3] == 1,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let L = queries.dim(2)
+        let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))]), tree]
+        if L > 8 && classesPerGroup == 2 {
+            guard let pairedTree else { return nil }
+            let states = pairedTree(
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
+                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+                outputDTypes: [.float32, .float32, .float32])
+            return combine(
+                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+        }
+        guard let partialTree else { return nil }
+        let parts = partialTree(
+            inputs,
+            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
+            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+            outputDTypes: [.float32, .float32, .float32])
+        return combine(
+            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+    }
+}
+
+/// Draft tree verify: the round's tree descriptor (int32 [333], `DF2Fast.treeSource`) for
+/// the target verify, set by the engine around the verify forward and read by the attention,
+/// RoPE and GDN layers; nil keeps every record kernel.
+public enum CBv2BranchVerify {
+    nonisolated(unsafe) public static var tree: MLXArray?
+    /// The accepted path's verify rows (anchor first) while a tree round commits; nil or the
+    /// prefix 0 ..< n keeps the record replay.
+    nonisolated(unsafe) public static var committedRows: [Int32]?
+
+    /// Recent tree proposals: the drafter registers each tree's tokens with its descriptor,
+    /// and the engine finds the descriptor of the block it verifies by identity.
+    nonisolated(unsafe) private static var proposals: [(tokens: MLXArray, desc: MLXArray)] = []
+
+    public static func register(tokens: MLXArray, desc: MLXArray) {
+        proposals.append((tokens, desc))
+        if proposals.count > 4 { proposals.removeFirst() }
+    }
+
+    public static func desc(for tokens: MLXArray) -> MLXArray? {
+        proposals.last(where: { $0.tokens === tokens })?.desc
+    }
+
+    /// True when `rows` is not `0 ..< rows.count`.
+    public static func isBranch(_ rows: [Int32]) -> Bool {
+        rows.enumerated().contains { $0.offset != Int($0.element) }
+    }
+
+    /// Host copy of the descriptor, read once per tree (a sync; only the serial attention
+    /// fallback past 1024 keys needs it).
+    nonisolated(unsafe) private static var hostDesc: (desc: MLXArray, host: [Int32])?
+    static func host(_ desc: MLXArray) -> [Int32] {
+        if let h = hostDesc, h.desc === desc { return h.host }
+        let host = desc.asArray(Int32.self)
+        hostDesc = (desc, host)
+        return host
     }
 }

@@ -140,8 +140,14 @@ extension EngineLoopV2 {
         else { return }
         // Packet layout for one row: k draft ids, then the 1 + k target ids.
         let k = verify.k
-        let draftTokens = verify.acceptancePacket[0 ..< k]
+        var draftTokens = verify.acceptancePacket[0 ..< k]
         let targetTokens = verify.acceptancePacket[k ..< (2 * k + 1)]
+        if let treeDesc = verify.treeDesc, k == 15 {
+            // A draft tree's rows are in DFS order: the front's acceptance count runs only
+            // while row r's parent is row r - 1 (a branch path drops the front on the host).
+            let chainRows = treeDesc[1 ..< 16] .== MLXArray(Array(Int32(0) ..< Int32(15)))
+            draftTokens = which(chainRows, draftTokens, MLXArray(Int32(-1)))
+        }
         var arrays = block.submitDeferredContext(requestState: state, after: targetTokens)
         let row = verify.rows[0]
         if Self.mtpRoundContextProjectionEnabled, mtp.lookupNgram == nil,

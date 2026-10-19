@@ -201,6 +201,16 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         absoluteOffset -= n
     }
 
+    public func compactTree(base: Int, rows: [Int32]) {
+        guard let k = keys, let v = values, k.ndim == 4, v.ndim == 4 else {
+            preconditionFailure("CBv2FullSequenceKV.compactTree: no 4-D storage")
+        }
+        let index = MLXArray(rows.map { Int32(base) + $0 })
+        let range = base ..< (base + rows.count)
+        keys = Self.sliceUpdate(k, k.take(index, axis: 2), range)
+        values = Self.sliceUpdate(v, v.take(index, axis: 2), range)
+    }
+
     func cbv2InnerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
     }
