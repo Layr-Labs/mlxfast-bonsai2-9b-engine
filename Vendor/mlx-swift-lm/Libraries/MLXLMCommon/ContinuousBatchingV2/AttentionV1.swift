@@ -1176,8 +1176,8 @@ enum CBv2VerifyVectorAttention {
             #pragma clang loop unroll(full)
             for (uint idx = tid; idx < 32u * 32u; idx += 256u) {
               const uint c = idx / 32u, x = (idx % 32u) * 4u;
-              const packed_float4 packet = *((const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x));
-              *((threadgroup packed_float4*)(staged + c * 129u + x)) = packet;
+              const packed_float4 packet = *(const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x);
+              *(threadgroup packed_float4*)(staged + c * 129u + x) = packet;
             }
             float max_score = part_m[base + simd_lid];
             float new_max = simd_max(max_score);
