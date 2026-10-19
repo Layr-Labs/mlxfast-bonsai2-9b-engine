@@ -1564,9 +1564,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
         let cache = try makeCache()
+        DF2Fast.w4Recording = !DF2Fast.w4TilesOn
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
             eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
+        }
+        if DF2Fast.w4Recording {
+            DF2Fast.w4Recording = false
+            DF2Fast.w4AdoptTiles()
+            if DF2Fast.w4TilesOn {
+                // Compile the tiled kernels here, not in the first measured round.
+                let warm = try makeCache()
+                for rows in [32, 16] {
+                    let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
+                    eval(try propose(anchor: [0], targetHidden: context, cache: warm, blockSize: config.dflash.blockSize))
+                }
+            }
         }
         target.prepareDFlash2Verify(rows: config.dflash.blockSize)
     }
@@ -2552,8 +2565,12 @@ enum DF2Fast {
     }()
 
     final class W4Operands {
-        let w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int
+        var w: MLXArray, sT: MLXArray, bT: MLXArray
+        let n: Int, k: Int
         var pair24: W4Pair24? = nil
+        /// The same codes, scales and offsets in `w4Tile` order once `w4AdoptTiles` admitted them;
+        /// `w`, `sT` and `bT` are then released.
+        var tiles: MLXArray? = nil
         private let sizeLock = NSLock()
         private var cachedSizes: (words: [Int32], array: MLXArray)?
         init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
@@ -2629,8 +2646,179 @@ enum DF2Fast {
         {
             o.pair24 = W4Pair24(sT, bT)
         }
+        if w4TilesOn {
+            // A linear first used after adoption: same layout function as the checked ones.
+            o.tiles = w4Tile(packed, sT: sT, bT: bT, n: N, k: K, group: group)
+            eval(o.tiles!)
+            w4Release(o)
+        }
         w4Cache[ObjectIdentifier(layer)] = o
         return o
+    }
+
+    // MARK: 4-bit codes in load-time tiles
+
+    /// uint4 words per tile: one 32-column block of one group, codes then FP16 scales then FP16 offsets.
+    static func w4TileU4(group: Int) -> Int { 32 * (group / 32) + 8 }
+
+    /// The record operands of one linear as tiles `[N / 32, G, w4TileU4]` (uint4 words; stored as
+    /// uint32): per 32-column block and group, the block's 32 rows of `group / 2` code bytes in row
+    /// order (the bytes the record kernel reads, unchanged), then the block's 32 FP16 scales, then its
+    /// 32 FP16 offsets. A pure reordering of the same bits: no value is converted.
+    static func w4Tile(_ w: MLXArray, sT: MLXArray, bT: MLXArray, n N: Int, k K: Int, group: Int) -> MLXArray {
+        let G = K / group
+        let words = group / 8
+        let codes = w.reshaped([N / 32, 32, G, words]).transposed(0, 2, 1, 3).reshaped([N / 32, G, 32 * words])
+        func cols(_ a: MLXArray) -> MLXArray {
+            contiguous(a.reshaped([G, N / 32, 32]).transposed(1, 0, 2)).view(dtype: .uint32)
+        }
+        return contiguous(concatenated([codes, cols(sT), cols(bT)], axis: 2))
+    }
+
+    /// Drop the record-layout arrays of an operand that reads tiles (the tiles hold the same bits).
+    static func w4Release(_ o: W4Operands) {
+        let none = MLXArray.zeros([1], dtype: .uint32)
+        o.w = none
+        o.sT = none
+        o.bT = none
+    }
+
+    /// True once every recorded launch passed `w4AdoptTiles`; later linears are built tiled at once.
+    nonisolated(unsafe) static var w4TilesOn = false
+    /// While true, `w4LinearsFromCodes` records each distinct launch (its linears, K, form, narrow).
+    nonisolated(unsafe) static var w4Recording = false
+    nonisolated(unsafe) static var w4Launches: [[ObjectIdentifier]] = []
+    nonisolated(unsafe) static var w4LaunchSeen: Set<[ObjectIdentifier]> = []
+
+    /// Load time, after the warm-up proposals built every 4-bit operand: build each linear's tiles,
+    /// run every recorded launch through the record kernel (record layout) and the tiled kernel (tiles)
+    /// on a fixed probe at rows 16 and 15, and compare the outputs bit for bit. All equal: every operand
+    /// switches to its tiles and its record arrays are released. Any difference, compile or run error,
+    /// or an operand that cannot be tiled: nothing changes and the record kernels keep running.
+    /// `DF2_W4_TILES=0` skips this. One stderr line either way.
+    static func w4AdoptTiles() {
+        let value = ProcessInfo.processInfo.environment["DF2_W4_TILES"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let launches = w4Launches
+        w4Launches = []
+        w4LaunchSeen = []
+        guard !w4TilesOn, let group = w4Group else { return }
+        let note: String
+        if ["0", "false", "no", "off"].contains(value ?? "") {
+            note = "off (DF2_W4_TILES=0)"
+        } else if launches.isEmpty {
+            note = "off (no 4-bit launch recorded)"
+        } else {
+            var ops: [ObjectIdentifier: W4Operands] = [:]
+            for launch in launches {
+                for id in launch { ops[id] = w4Cache[id] }
+            }
+            var failure: String? = nil
+            var tiles: [ObjectIdentifier: MLXArray] = [:]
+            for (id, o) in ops where o.tiles == nil {
+                guard o.n % 32 == 0, o.k % group == 0 else {
+                    failure = "linear N \(o.n) K \(o.k) not tileable"
+                    break
+                }
+                tiles[id] = w4Tile(o.w, sT: o.sT, bT: o.bT, n: o.n, k: o.k, group: group)
+            }
+            if failure == nil {
+                eval(Array(tiles.values))
+                failure = w4TilesCheck(launches, ops: ops, tiles: tiles, group: group)
+            }
+            if let failure {
+                note = "off, record layout kept (\(failure))"
+            } else {
+                for (id, t) in tiles {
+                    ops[id]!.tiles = t
+                    w4Release(ops[id]!)
+                }
+                w4TilesOn = true
+                note = "on (\(launches.count) launches, \(ops.count) linears; bit-identical to the record kernel at rows 16 and 15)"
+            }
+        }
+        FileHandle.standardError.write(Data("DF2 w4 tiles: \(note)\n".utf8))
+    }
+
+    /// Nil when every launch's tiled output equals its record output bit for bit, else why not.
+    static func w4TilesCheck(
+        _ launches: [[ObjectIdentifier]], ops: [ObjectIdentifier: W4Operands],
+        tiles: [ObjectIdentifier: MLXArray], group: Int
+    ) -> String? {
+        var failure: String? = nil
+        w4CheckFailed = false
+        w4CheckNote = ""
+        withErrorHandler({ message in
+            if !DF2Fast.w4CheckFailed { DF2Fast.w4CheckNote = String(message.prefix(160)) }
+            DF2Fast.w4CheckFailed = true
+        }) {
+            for launch in launches {
+                let lops = launch.map { ops[$0]! }
+                let K = lops[0].k
+                let G = K / group
+                let ns = lops.map(\.n)
+                let (form, narrow) = w4LaunchForm(ns)
+                let xq = (arange(16 * K, dtype: .int32) * MLXArray(Int32(37)) + MLXArray(Int32(11 + K)))
+                    % MLXArray(Int32(255)) - MLXArray(Int32(127))
+                let j = arange(16 * G, dtype: .int32)
+                let ascale = ((j % MLXArray(Int32(11))).asType(.float32) + 1) / 256
+                let xs = ((j % MLXArray(Int32(17))).asType(.float32) - 8) / 64
+                let xq8 = xq.asType(.int8)
+                // The same operands reading tiles; the record objects keep their arrays until adoption.
+                let none = MLXArray.zeros([1], dtype: .uint32)
+                let tops = zip(launch, lops).map { (id, o) -> W4Operands in
+                    let t = W4Operands(w: none, sT: none, bT: none, n: o.n, k: o.k)
+                    t.tiles = tiles[id] ?? o.tiles
+                    t.pair24 = o.pair24
+                    return t
+                }
+                for rows in [16, 15] {
+                    let outputs: (record: [MLXArray], candidate: [MLXArray])
+                    var method = "plain"
+                    if let metadata = w4LaunchMetadata(lops, K: K, rows: rows, group: group) {
+                        // The kernel this launch runs at these rows: the record's cached choice.
+                        let m = w4Pair24Selected(lops, ns: ns, metadata: metadata, form: form, narrow: narrow)
+                            .method(rows: rows)
+                        method = "\(m)"
+                        func run(_ o: [W4Operands]) -> [MLXArray] {
+                            w4Pair24Output(
+                                m, form: form, narrow: narrow, xq: xq8, ascale: ascale, xs: xs, rows: rows,
+                                ops: o, ns: ns, metadata: metadata)
+                        }
+                        outputs = (run(lops), run(tops))
+                    } else {
+                        outputs = (
+                            w4Run(
+                                form: form, narrow: narrow, xq: xq8, ascale: ascale, xs: xs, rows: rows, K: K,
+                                ws: lops.map(\.w), sTs: lops.map(\.sT), bTs: lops.map(\.bT), ns: ns),
+                            w4Run(
+                                form: form, narrow: narrow, tiled: true, xq: xq8, ascale: ascale, xs: xs,
+                                rows: rows, K: K, ws: w4CodeArrays(tops), sTs: [], bTs: [], ns: ns)
+                        )
+                    }
+                    let record = concatenated(outputs.record, axis: 1).view(dtype: .uint32)
+                    let candidate = concatenated(outputs.candidate, axis: 1).view(dtype: .uint32)
+                    let differ = (record .!= candidate).asType(.int32).sum()
+                    let nan = (record .== MLXArray(UInt32(0x7fc0_0000))).asType(.int32).sum()
+                    eval(differ, nan)
+                    if w4CheckFailed {
+                        failure = "compile or run error: \(w4CheckNote)"
+                        return
+                    }
+                    let d = differ.item(Int32.self)
+                    if d != 0 {
+                        failure = "\(d) words differ at K \(K), N \(ns), rows \(rows), form \(form), narrow \(narrow), \(method)"
+                        return
+                    }
+                    if nan.item(Int32.self) != 0 {
+                        failure = "record output NaN at K \(K), N \(ns), rows \(rows)"
+                        return
+                    }
+                }
+            }
+        }
+        if failure == nil && w4CheckFailed { failure = "compile or run error: \(w4CheckNote)" }
+        return failure
     }
 
     /// x [R, K] (or silu(x) * x2, or head-major [1, 32, R, 128]) -> int8 codes per row and per KG-column group.
@@ -2814,8 +3002,9 @@ enum DF2Fast {
         """
 
     /// Only metadata loads change. The original raw generator and FP32 arithmetic stay intact.
-    static func w4Pair24Source(form: Int, narrow: Bool) -> String {
-        var source = w4Source(layers: 1, group: 64, form: form, narrow: narrow)
+    /// `tiled`: the codes come from `w4Tile` tiles (`w4Source(tiled:recordMetadata:)`).
+    static func w4Pair24Source(form: Int, narrow: Bool, tiled: Bool = false) -> String {
+        var source = w4Source(layers: 1, group: 64, form: form, narrow: narrow, tiled: tiled, recordMetadata: true)
         func change(_ before: String, _ after: String) {
             precondition(source.contains(before))
             source = source.replacingOccurrences(of: before, with: after)
@@ -2882,8 +3071,16 @@ enum DF2Fast {
     ) -> [MLXArray] {
         let columns = narrow ? 16 : 32
         let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(rows), Int32(4096)])
-        return w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!(
-            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+        let kernel = op.tiles == nil
+            ? w4Pair24Kernels[form * 2 + (narrow ? 1 : 0)]!
+            : w4TiledVariant("df2_w4tg64_pair24f\(form)_n\(columns)") { name in
+                MLXFast.metalKernel(
+                    name: name, inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+                    source: w4Pair24Source(form: form, narrow: narrow, tiled: true), header: header + pair24Header,
+                    ensureRowContiguous: true)
+            }
+        return kernel(
+            [xq, op.tiles ?? op.w, metadata.words, metadata.bases, ascale, xs, sizes],
             template: [("SPLIT", split)], grid: (4096 / columns * split * 32, 1, 1),
             threadGroup: (split * 32, 1, 1), outputShapes: [[rows, 4096]], outputDTypes: [.float32])
     }
@@ -2903,9 +3100,9 @@ enum DF2Fast {
     }
 
     /// Keep the FC bodies exact; the MLP adds sibling selection and the accepted static-K form.
-    static func w4Pair24MLPSource(layers: Int, form: Int, narrow: Bool) -> String {
+    static func w4Pair24MLPSource(layers: Int, form: Int, narrow: Bool, tiled: Bool = false) -> String {
         precondition(layers == 1 || (layers == 2 && !narrow))
-        var source = w4Pair24Source(form: form, narrow: narrow)
+        var source = w4Pair24Source(form: form, narrow: narrow, tiled: tiled)
         let pointer = "const device uint* metadata = s0; const uint metadataBases = b0[0];"
         precondition(source.contains(pointer))
         source = source.replacingOccurrences(of: pointer, with: "int li = 0;")
@@ -2963,8 +3160,20 @@ enum DF2Fast {
         precondition(w4FormsFit(K: K, rows: rows, ns: ns) && ops.count == metadata.count)
         let key = (ops.count - 1) * 6 + form * 2 + (narrow ? 1 : 0)
         let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
-        return w4Pair24MLPKernels[key]!(
-            [xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata)
+        let layers = ops.count
+        let kernel = !w4Tiled(ops)
+            ? w4Pair24MLPKernels[key]!
+            : w4TiledVariant("df2_w4tg64_pair24_mlp_f\(form)_n\(narrow ? 16 : 32)_forms_\(layers)") { name in
+                MLXFast.metalKernel(
+                    name: name,
+                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "xs", "ksz"],
+                    outputNames: (0 ..< layers).map { "out\($0)" },
+                    source: w4Pair24MLPSource(layers: layers, form: form, narrow: narrow, tiled: true),
+                    header: header + pair24Header, ensureRowContiguous: true)
+            }
+        return kernel(
+            [xq] + w4CodeArrays(ops) + w4Pair24MLPMetadataInputs(metadata)
                 + [ascale, xs, sizes],
             template: [("SPLIT", split), ("KC", K)],
             grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
@@ -3114,6 +3323,13 @@ enum DF2Fast {
         xq: MLXArray, ascale: MLXArray, xs: MLXArray, op: W4Operands, sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
         let sizes = sizeDescriptor ?? MLXArray([Int32(32768), Int32(16), Int32(4096)])
+        if let tiles = op.tiles {
+            return w4TiledKernel(form: 2, narrow: true, specialized: true, layers: 1)(
+                [xq, tiles, ascale, xs, sizes],
+                template: [("SPLIT", split), ("KC", 32768)],
+                grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
+                outputShapes: [[16, 4096]], outputDTypes: [.float32])
+        }
         return w4Form2NarrowFormsKernels[0](
             [xq, op.w, op.sT, op.bT, ascale, xs, sizes],
             template: [("SPLIT", split), ("KC", 32768)],
@@ -3156,8 +3372,8 @@ enum DF2Fast {
     ) -> [MLXArray] {
         switch method {
         case .raw:
-            return w4Run(form: form, narrow: narrow, xq: xq, ascale: ascale, xs: xs, rows: rows,
-                K: ops[0].k, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+            return w4Run(form: form, narrow: narrow, tiled: w4Tiled(ops), xq: xq, ascale: ascale, xs: xs, rows: rows,
+                K: ops[0].k, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
                 ns: ns, sizeDescriptor: sizeDescriptor)
         case .compact:
             if ops[0].k == 32768 {
@@ -3180,8 +3396,8 @@ enum DF2Fast {
         case .rawWide:
             precondition(w4Pair24DownWideEligible(ops, rows: rows, ns: ns, group: 64,
                 form: form, narrow: narrow, split: split))
-            return w4Run(form: form, narrow: false, xq: xq, ascale: ascale, xs: xs, rows: rows,
-                K: ops[0].k, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+            return w4Run(form: form, narrow: false, tiled: w4Tiled(ops), xq: xq, ascale: ascale, xs: xs, rows: rows,
+                K: ops[0].k, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
                 ns: ns, sizeDescriptor: sizeDescriptor)
         case .fcStatic:
             precondition(w4FCStaticEligible(ops, rows: rows, ns: ns, group: 64,
@@ -3294,8 +3510,8 @@ enum DF2Fast {
         
         """
 
-    static func w4Pair24QuartetSource() -> String {
-        let source = w4Pair24MLPSource(layers: 1, form: 2, narrow: true)
+    static func w4Pair24QuartetSource(tiled: Bool = false) -> String {
+        let source = w4Pair24MLPSource(layers: 1, form: 2, narrow: true, tiled: tiled)
         let call = "df2_pair24_load(metadata, metadataBases, "
         precondition(source.components(separatedBy: call).count == 3)
         return source.replacingOccurrences(of: call,
@@ -3314,16 +3530,24 @@ enum DF2Fast {
     ) -> [MLXArray] {
         precondition(op.k == 12288 && op.n == 4096)
         let sizes = sizeDescriptor ?? MLXArray([Int32(12288), Int32(16), Int32(4096)])
-        return w4Pair24QuartetKernel(
-            [xq, op.w, metadata.words, metadata.bases, ascale, xs, sizes],
+        let kernel = op.tiles == nil
+            ? w4Pair24QuartetKernel
+            : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n16_forms_1") { name in
+                MLXFast.metalKernel(
+                    name: name, inputNames: ["xq", "w0", "s0", "b0", "ascale", "xs", "ksz"], outputNames: ["out0"],
+                    source: w4Pair24QuartetSource(tiled: true), header: header + pair24Header + pair24QuartetHeader,
+                    ensureRowContiguous: true)
+            }
+        return kernel(
+            [xq, op.tiles ?? op.w, metadata.words, metadata.bases, ascale, xs, sizes],
             template: [("SPLIT", split), ("KC", 12288)],
             grid: (4096 / 16 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: [[16, 4096]], outputDTypes: [.float32])
     }
 
     /// Form2 wide gate/up only. The existing selector checks and measures this alternative.
-    static func w4Pair24QuartetWideSource() -> String {
-        let source = w4Pair24MLPSource(layers: 2, form: 2, narrow: false)
+    static func w4Pair24QuartetWideSource(tiled: Bool = false) -> String {
+        let source = w4Pair24MLPSource(layers: 2, form: 2, narrow: false, tiled: tiled)
         let call = "df2_pair24_load(metadata, metadataBases, "
         precondition(source.components(separatedBy: call).count == 5)
         return source.replacingOccurrences(of: call,
@@ -3344,8 +3568,17 @@ enum DF2Fast {
         precondition(ops.count == 2 && metadata.count == 2
             && ops.allSatisfy { $0.k == 4096 && $0.n == 12288 })
         let sizes = sizeDescriptor ?? MLXArray([Int32(4096), Int32(16), Int32(12288), Int32(12288)])
-        return w4Pair24QuartetWideKernel(
-            [xq] + ops.map(\.w) + w4Pair24MLPMetadataInputs(metadata) + [ascale, xs, sizes],
+        let kernel = !w4Tiled(ops)
+            ? w4Pair24QuartetWideKernel
+            : w4TiledVariant("df2_w4tg64_pair24_quartet_xor_mlp_f2_n32_forms_2") { name in
+                MLXFast.metalKernel(
+                    name: name, inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "xs", "ksz"],
+                    outputNames: ["out0", "out1"],
+                    source: w4Pair24QuartetWideSource(tiled: true),
+                    header: header + pair24Header + pair24QuartetHeader, ensureRowContiguous: true)
+            }
+        return kernel(
+            [xq] + w4CodeArrays(ops) + w4Pair24MLPMetadataInputs(metadata) + [ascale, xs, sizes],
             template: [("SPLIT", split), ("KC", 4096)],
             grid: (24576 / 32 * split * 32, 1, 1), threadGroup: (split * 32, 1, 1),
             outputShapes: [[16, 12288], [16, 12288]], outputDTypes: [.float32, .float32])
@@ -3363,14 +3596,32 @@ enum DF2Fast {
     /// `narrow` (form 1 only): 16 output columns per threadgroup instead of 32, so a call launches
     /// twice the threadgroups. The op, its layout guard, the group loop and the FP32 steps per output
     /// are form 1's; columns 16-31 of the staged tile and their destination elements (8-15) are dead.
-    static func w4Source(layers: Int, group: Int, form: Int = 0, narrow: Bool = false) -> String {
+    /// `tiled`: the operands are `w4Tile` tiles (input `w<l>` only, no `s<l>` / `b<l>`). Lane `lane`'s
+    /// load p of group g is uint4 `p * 32 + lane` of the tile (the record reads the same 16 bytes from
+    /// row `lane / ru + p * 32 / ru`, uint4 `lane % ru`), so each load is 512 contiguous bytes; scales
+    /// and offsets are read from the tile's tail at the record's columns. Staging, op, epilogue and
+    /// reduction text are the record's. `recordMetadata` (with `tiled`): only the codes come from the
+    /// tiles; inputs `s<l>` / `b<l>` and every scale and offset read stay the record's text.
+    static func w4Source(
+        layers: Int, group: Int, form: Int = 0, narrow: Bool = false, tiled: Bool = false,
+        recordMetadata: Bool = false
+    ) -> String {
         precondition(!narrow || form == 1 || form == 2)
         let ru = group / 32  // packed uint4 per row and group
         let tw = group / 16  // unpacked uint4 per row and group
         let cols = narrow ? 16 : 32  // output columns per threadgroup
         let pr = narrow ? ru / 2 : ru  // packed uint4 rows each lane stages per group
         let ne = narrow ? 8 : 16  // live destination elements per lane
-        var pick = """
+        let tileMetadata = tiled && !recordMetadata
+        var pick = tileMetadata
+            ? """
+            const int K = ksz[0];
+            int bx = int(threadgroup_position_in_grid.x);
+            const device uint32_t* w = w0;
+            device float* out = out0; int N = ksz[2];
+
+            """
+            : """
             const int K = ksz[0];
             int bx = int(threadgroup_position_in_grid.x);
             const device uint32_t* w = w0; const device half* sT = s0; const device half* bT = b0;
@@ -3378,7 +3629,9 @@ enum DF2Fast {
 
             """
         for l in 1 ..< layers {
-            pick += "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+            pick += tileMetadata
+                ? "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
+                : "if (bx >= N / \(cols)) { bx -= N / \(cols); w = w\(l); sT = s\(l); bT = b\(l); out = out\(l); N = ksz[\(2 + l)]; }\n"
         }
         let operandB =
             """
@@ -3388,8 +3641,18 @@ enum DF2Fast {
             auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
 
             """
-        let codeSetup =
+        let tileU4 = w4TileU4(group: group)
+        let codeSetup = tiled
+            ? """
+            const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
+            const device uint4* tb = (const device uint4*)w + (size_t)(n0 >> 5) * (size_t)G * \(tileU4);
+            const device uint4* wsrc = tb + \(narrow ? "(n0 & 16) * \(ru) + " : "")int(lane);
+            \(tileMetadata ? "const device half* tsc = (const device half*)(tb + \(32 * ru)) + (n0 & 31) + nb;" : "")
+            uint4 wv[\(pr)];
+            for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)sg * \(tileU4) + p * 32]; }
+
             """
+            : """
             const int lr = int(lane) / \(ru), lc = int(lane) % \(ru);
             const size_t rowU4 = (size_t)K / 32;
             const device uint4* wsrc = (const device uint4*)w + (size_t)(n0 + lr) * rowU4 + lc;
@@ -3407,8 +3670,9 @@ enum DF2Fast {
               }
 
             """
-        let prefetchCodes =
-            "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; }"
+        let prefetchCodes = tiled
+            ? "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(g + SPLIT) * \(tileU4) + p * 32]; }"
+            : "for (int p = 0; p < \(pr); p++) { wv[p] = wsrc[(size_t)(p * \(32 / ru)) * rowU4 + (g + SPLIT) * \(ru)]; }"
         let pickS = narrow ? "s0v[j]" : "(i >> 3) ? s1v[j] : s0v[j]"
         let pickB = narrow ? "b0v[j]" : "(i >> 3) ? b1v[j] : b0v[j]"
         let epilogue = """
@@ -3440,7 +3704,7 @@ enum DF2Fast {
                 }
 
             """
-        let loop: String
+        var loop: String
         if form == 0 {
             loop = """
                 for (int g = int(sg); g < G; g += SPLIT) {
@@ -3580,6 +3844,21 @@ enum DF2Fast {
 
                 """
         }
+        if tileMetadata {
+            // Scale and offset rows of group g: the tile's tail, one tile (8 * tileU4 halves) per group.
+            let tileH = 8 * tileU4
+            for (from, to) in [
+                ("sT + (size_t)g * N + n0 + nb", "tsc + (size_t)g * \(tileH)"),
+                ("bT + (size_t)g * N + n0 + nb", "tsc + 32 + (size_t)g * \(tileH)"),
+                ("sT + n0 + nb", "tsc"),
+                ("bT + n0 + nb", "tsc + 32"),
+                ("(size_t)sg * N", "(size_t)sg * \(tileH)"),
+                ("(size_t)(g + SPLIT) * N", "(size_t)(g + SPLIT) * \(tileH)"),
+            ] {
+                loop = loop.replacingOccurrences(of: from, with: to)
+            }
+            precondition(!loop.contains("sT") && !loop.contains("bT") && !loop.contains("* N"))
+        }
         let reduce =
             """
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3642,12 +3921,20 @@ enum DF2Fast {
     }
 
     static func w4Run(
-        form: Int, narrow: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray, rows: Int,
-        K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
+        form: Int, narrow: Bool = false, tiled: Bool = false, xq: MLXArray, ascale: MLXArray, xs: MLXArray,
+        rows: Int, K: Int, ws: [MLXArray], sTs: [MLXArray], bTs: [MLXArray], ns: [Int],
         sizeDescriptor: MLXArray? = nil
     ) -> [MLXArray] {
         let sizes = sizeDescriptor ?? MLXArray([Int32(K), Int32(rows)] + ns.map { Int32($0) })
         let formsFit = w4FormsFit(K: K, rows: rows, ns: ns)
+        if tiled {
+            return w4TiledKernel(form: form, narrow: narrow, specialized: formsFit, layers: ws.count)(
+                [xq] + ws + [ascale, xs, sizes],
+                template: formsFit ? [("SPLIT", split), ("KC", K)] : [("SPLIT", split)],
+                grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
+                threadGroup: (split * 32, 1, 1),
+                outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+        }
         let kernels =
             narrow
             ? (form == 2
@@ -3660,6 +3947,45 @@ enum DF2Fast {
             grid: (ns.reduce(0, +) / (narrow ? 16 : 32) * split * 32, 1, 1),
             threadGroup: (split * 32, 1, 1),
             outputShapes: ns.map { [rows, $0] }, outputDTypes: ns.map { _ in .float32 })
+    }
+
+    nonisolated(unsafe) private static var w4TiledKernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// The tiled twin of the w4 kernel `w4Run` picks for (form, narrow, specialized, layers): the same
+    /// source with the code, scale and offset reads taken from `w4Tile` tiles (`w4Source(tiled: true)`).
+    static func w4TiledKernel(form: Int, narrow: Bool, specialized: Bool, layers: Int) -> MLXFast.MLXFastKernel {
+        let group = w4Group ?? 64
+        let name = "df2_w4tg\(group)f\(form)\(narrow ? "n" : "")\(specialized ? "_forms" : "")_\(layers)"
+        if let k = w4TiledKernels[name] { return k }
+        let raw = w4Source(layers: layers, group: group, form: form, narrow: narrow, tiled: true)
+        let k = MLXFast.metalKernel(
+            name: name,
+            inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + ["ascale", "xs", "ksz"],
+            outputNames: (0 ..< layers).map { "out\($0)" },
+            source: specialized ? w4Specialize(raw) : raw, header: header,
+            ensureRowContiguous: true)
+        w4TiledKernels[name] = k
+        return k
+    }
+
+    /// A tiled twin built on first use and kept by name (the pair24 kernel families).
+    static func w4TiledVariant(_ name: String, _ make: (String) -> MLXFast.MLXFastKernel) -> MLXFast.MLXFastKernel {
+        if let k = w4TiledKernels[name] { return k }
+        let k = make(name)
+        w4TiledKernels[name] = k
+        return k
+    }
+
+    /// True when these operands read tiles (adoption is all or nothing, so never a mix).
+    static func w4Tiled(_ ops: [W4Operands]) -> Bool {
+        let tiled = !ops.isEmpty && ops.allSatisfy { $0.tiles != nil }
+        precondition(tiled || ops.allSatisfy { $0.tiles == nil })
+        return tiled
+    }
+
+    /// The code input of each operand: its tiles once adopted, else the record codes.
+    static func w4CodeArrays(_ ops: [W4Operands]) -> [MLXArray] {
+        w4Tiled(ops) ? ops.map { $0.tiles! } : ops.map(\.w)
     }
 
     nonisolated(unsafe) private static var w4CheckFailed = false
@@ -4038,18 +4364,13 @@ enum DF2Fast {
         let ops = layers.compactMap { w4Operands($0, group: codes.group) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == codes.K }) else { return nil }
         let ns = ops.map(\.n)
-        let preferredForm = w4SelectedForm
-        let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
-        let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
-        let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
-        let metadata: [W4Pair24]?
-        if codes.group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
-            metadata = ops[0].pair24.map { [$0] }
-        } else if codes.group == 64, w4FormsFit(K: codes.K, rows: codes.rows, ns: ns) {
-            metadata = w4Pair24MLPMetadata(ops)
-        } else {
-            metadata = nil
+        let (form, narrow) = w4LaunchForm(ns)
+        if w4Recording {
+            let ids = layers.map { ObjectIdentifier($0) }
+            if w4LaunchSeen.insert(ids).inserted { w4Launches.append(ids) }
         }
+        let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
+        let metadata = w4LaunchMetadata(ops, K: codes.K, rows: codes.rows, group: codes.group)
         let outs: [MLXArray]
         if let metadata {
             let method = w4Pair24Selected(ops, ns: ns, metadata: metadata, form: form, narrow: narrow).method(rows: codes.rows)
@@ -4057,11 +4378,29 @@ enum DF2Fast {
                 xs: codes.xs, rows: codes.rows, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizeDescriptor)
         } else {
             outs = w4Run(
-                form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
-                rows: codes.rows, K: codes.K, ws: ops.map(\.w), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
+                form: form, narrow: narrow, tiled: w4Tiled(ops), xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                rows: codes.rows, K: codes.K, ws: w4CodeArrays(ops), sTs: ops.map(\.sT), bTs: ops.map(\.bT),
                 ns: ns, sizeDescriptor: sizeDescriptor)
         }
         return zip(outs, ns).map { $0.reshaped(leadShape + [$1]) }
+    }
+
+    /// The compact metadata a launch reads (the record's choice), or nil for the plain kernels.
+    static func w4LaunchMetadata(_ ops: [W4Operands], K: Int, rows: Int, group: Int) -> [W4Pair24]? {
+        if group == 64, ops.count == 1, ops[0].k == 32768, ops[0].n == 4096 {
+            return ops[0].pair24.map { [$0] }
+        } else if group == 64, w4FormsFit(K: K, rows: rows, ns: ops.map(\.n)) {
+            return w4Pair24MLPMetadata(ops)
+        }
+        return nil
+    }
+
+    /// The kernel form and width a launch of these output widths takes (the record's choice).
+    static func w4LaunchForm(_ ns: [Int]) -> (form: Int, narrow: Bool) {
+        let preferredForm = w4SelectedForm
+        let narrow = preferredForm != 0 && ns.reduce(0, +) <= w4NarrowColumns && w4Narrow
+        let form = preferredForm == 2 && narrow && !w4Form2Narrow ? 1 : preferredForm
+        return (form, narrow)
     }
 
     /// `layers(x)` (or of silu(x) * up) through the 4-bit copies, rows <= 16; nil when not eligible.
