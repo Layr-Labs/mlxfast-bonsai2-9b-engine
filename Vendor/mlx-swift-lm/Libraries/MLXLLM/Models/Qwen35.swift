@@ -5388,7 +5388,7 @@ public class Qwen35TextModelInner: Module {
             {
                 let s = unpacked[0].dim(1)
                 dFlash2Tap.tappedHidden = Self.packTapsBF16Kernel(
-                    unpacked + [MLXArray([Int32(s)])],
+                    unpacked,
                     grid: (8192, s, 1),
                     threadGroup: (256, 1, 1),
                     outputShapes: [[1, s, 32768]],
@@ -5403,13 +5403,11 @@ public class Qwen35TextModelInner: Module {
 
     private static let packTapsBF16Kernel = MLXFast.metalKernel(
         name: "qwen35_pack_taps8_bf16",
-        inputNames: ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "params"],
+        inputNames: ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"],
         outputNames: ["out"],
         source: """
-            const int S = params[0];
             const uint col4 = thread_position_in_grid.x;
             const uint s = thread_position_in_grid.y;
-            if (col4 >= 8192u || int(s) >= S) return;
             const uint slot = col4 >> 10;
             const uint c4 = col4 & 1023u;
             const size_t srcIdx = (size_t)s * 1024u + c4;

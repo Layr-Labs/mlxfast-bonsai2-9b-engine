@@ -1291,6 +1291,28 @@ extension SignedBlockHadamard {
         /// 4096-wide blocks per row in the load check (the SwiGLU input is
         /// the 12288-wide down-projection input).
         var checkBlocks: Int { self == .swiglu ? 3 : 1 }
+
+        var index: Int {
+            switch self {
+            case .residualNorm: return 0
+            case .residualNormNormed: return 1
+            case .residualNormRot: return 2
+            case .normNormed: return 3
+            case .gatedNorm: return 4
+            case .plain: return 5
+            case .plainRot: return 6
+            case .swiglu: return 7
+            case .attentionGate: return 8
+            }
+        }
+
+        var sideOutputCount: Int {
+            switch self {
+            case .residualNorm, .normNormed, .plainRot: return 1
+            case .residualNormNormed, .residualNormRot: return 2
+            case .gatedNorm, .plain, .swiglu, .attentionGate: return 0
+            }
+        }
     }
 
     /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel.
@@ -1408,7 +1430,11 @@ extension SignedBlockHadamard {
 
     /// The lane count each form serves (absent: the record kernel).
     nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Int] = [:]
+    nonisolated(unsafe) private static var wideRowResolvedLanes: [Int] = [Int](repeating: 0, count: 9)
+    nonisolated(unsafe) private static var wideRowResolvedKernels: [MLXFast.MLXFastKernel?] = [MLXFast.MLXFastKernel?](repeating: nil, count: 9)
+    nonisolated(unsafe) private static var wideRowResolvedHeadKernels: [MLXFast.MLXFastKernel?] = [MLXFast.MLXFastKernel?](repeating: nil, count: 9)
     nonisolated(unsafe) private static var wideRowChecked = false
+    nonisolated(unsafe) private static var wideRowReady = false
     private static let wideRowLock = NSLock()
 
     /// Runs the load check once, from the first prompt-width call of at
@@ -1417,7 +1443,7 @@ extension SignedBlockHadamard {
     /// 512 tokens). Until then, and without it, every form keeps the record
     /// kernel.
     static func wideRowPrepareIfBoot(rows: Int) {
-        guard rows >= 1024, wideRowEnabled else { return }
+        guard rows >= 1024, wideRowEnabled, !wideRowReady else { return }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         guard !wideRowChecked else { return }
@@ -1433,6 +1459,9 @@ extension SignedBlockHadamard {
                 do {
                     if try withError({ wideRowCheck(kind, threads: threads) }) {
                         wideRowVerdict[kind] = threads
+                        wideRowResolvedLanes[kind.index] = threads
+                        wideRowResolvedKernels[kind.index] = wideRowWideKernels[threads]?[kind]
+                        wideRowResolvedHeadKernels[kind.index] = wideRowHeadKernels[threads]?[kind]
                         note = "passed"
                     }
                 } catch {
@@ -1444,6 +1473,7 @@ extension SignedBlockHadamard {
                 if wideRowVerdict[kind] != nil { break }
             }
         }
+        wideRowReady = true
     }
 
     private static func wideRowUsesWide(_ kind: WideRowKind) -> Bool {
@@ -1452,6 +1482,7 @@ extension SignedBlockHadamard {
 
     private static func wideRowLanes(_ kind: WideRowKind) -> Int {
         guard wideRowKindEnabled(kind) else { return 0 }
+        if wideRowReady { return wideRowResolvedLanes[kind.index] }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         return wideRowVerdict[kind] ?? 0
@@ -1513,10 +1544,13 @@ extension SignedBlockHadamard {
         let tile = VerifyInt8Matmul.tileRows
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
             + Array(
-                repeating: sideShape ?? inputs[0].shape, count: wideRowOutputNames(kind).count - 3)
+                repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
         if headError2 { shapes.append([rows * 32 * blocks]) }
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
-        if lanes > 0, let kernel = (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind] {
+        let resolvedKernel: MLXFast.MLXFastKernel? = wideRowReady
+            ? (headError2 ? wideRowResolvedHeadKernels[kind.index] : wideRowResolvedKernels[kind.index])
+            : (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind]
+        if lanes > 0, let kernel = resolvedKernel {
             return kernel(
                 inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
@@ -3731,9 +3765,10 @@ enum PromptInt8Matmul {
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto aT = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         auto tA0 = A.template slice<128, 32>(0, ms);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(aT)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
         const int nb = ns + fn;
         const int mb = ms + fm;
         // The operand words are written straight into bT's storage, so the
@@ -3743,7 +3778,7 @@ enum PromptInt8Matmul {
         // NaN (failing the load check) and touches no tensor.
         thread int8_t* b0p = &bT[0];
         bool ok = int(bT.get_capacity()) == 128 && int(cT.get_capacity()) == 32
-            && (reinterpret_cast<ulong>(b0p) & 3ul) == 0;
+            && ((uintptr_t)(b0p) & 3ul) == 0;
         if (ok) {
           for (int i = 1; i < 128; i++) { ok = ok && &bT[i] == b0p + i; }
           #pragma clang loop unroll(full)
@@ -5292,7 +5327,7 @@ enum VerifyInt8Matmul {
 
     static func compactHeadAvailable(rows: Int, k: Int, n: Int) -> Bool {
         route == .nax && naxFast && rows == 16 && k == 4096 && n % 64 == 0
-            && formsAllowed && formsMatched.contains("\(k) 1") && formsFit(k: k, n: n)
+            && formsAllowed && hasMatchedForm(k: k, layers: 1) && formsFit(k: k, n: n)
     }
 
     static func compactHead(
@@ -5528,6 +5563,22 @@ enum VerifyInt8Matmul {
     /// `"\(k) \(layers)"` for each form that matched the record kernel at
     /// load, both offset forms included.
     nonisolated(unsafe) private static var formsMatched: Set<String> = []
+    /// Bitmask for fast hot-path lookup without string formatting:
+    /// bit `(layers - 1)` for `k == 4096`, bit `(layers + 3)` for `k == 12288`.
+    nonisolated(unsafe) private static var formsMatchedMask: UInt32 = 0
+    @inline(__always)
+    private static func formBit(k: Int, layers: Int) -> UInt32 {
+        guard (1 ... 3).contains(layers) else { return 0 }
+        if k == 4096 { return 1 << UInt32(layers - 1) }
+        if k == 12288 { return 1 << UInt32(layers + 3) }
+        return 0
+    }
+    @inline(__always)
+    private static func hasMatchedForm(k: Int, layers: Int) -> Bool {
+        let bit = formBit(k: k, layers: layers)
+        if bit != 0 { return (formsMatchedMask & bit) != 0 }
+        return formsMatched.contains("\(k) \(layers)")
+    }
     /// `DARKBLOOM_BONSAI_VERIFY_FORMS=0` keeps the record kernel everywhere.
     static let formsAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_FORMS"]?
@@ -5543,7 +5594,7 @@ enum VerifyInt8Matmul {
     }
 
     private static func usesForms(k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]) -> Bool {
-        formsAllowed && formsMatched.contains("\(k) \(layers.count)")
+        formsAllowed && hasMatchedForm(k: k, layers: layers.count)
             && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
     }
 
@@ -5603,6 +5654,33 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var narrowFormsK = Set<Int>()
     nonisolated(unsafe) private static var narrow16K = Set<Int>()
     nonisolated(unsafe) private static var narrow16FormsK = Set<Int>()
+    /// Bitmask for O(1) hot-path narrow kernel checks without Set<Int> hashing:
+    /// bits 0..3 for k == 4096 (narrow, narrowForms, narrow16, narrow16Forms),
+    /// bits 4..7 for k == 12288 (narrow, narrowForms, narrow16, narrow16Forms).
+    nonisolated(unsafe) private static var narrowMask: UInt32 = 0
+    @inline(__always)
+    private static func narrowShift(k: Int) -> UInt32? {
+        if k == 4096 { return 0 }
+        if k == 12288 { return 4 }
+        return nil
+    }
+    @inline(__always)
+    private static func hasNarrow(k: Int) -> Bool {
+        if let s = narrowShift(k: k) { return (narrowMask & (1 << s)) != 0 }
+        return narrowK.contains(k)
+    }
+    @inline(__always)
+    private static func hasNarrow16(k: Int) -> Bool {
+        if let s = narrowShift(k: k) { return (narrowMask & (1 << (s + 2))) != 0 }
+        return narrow16K.contains(k)
+    }
+    @inline(__always)
+    private static func hasNarrowForms(k: Int, compact: Bool) -> Bool {
+        if let s = narrowShift(k: k) {
+            return (narrowMask & (1 << (s + (compact ? 3 : 1)))) != 0
+        }
+        return (compact ? narrow16FormsK : narrowFormsK).contains(k)
+    }
 
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the
     /// plain kernel at load, and the `NEG = 1` forms when they match theirs.
@@ -5667,7 +5745,7 @@ enum VerifyInt8Matmul {
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
-        if forms ?? (formsAllowed && (compact ? narrow16FormsK : narrowFormsK).contains(k) && formsFit(k: k, n: n)) {
+        if forms ?? (formsAllowed && hasNarrowForms(k: k, compact: compact) && formsFit(k: k, n: n)) {
             let stream = compact && streamedWeight != nil
             let kernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             let kernelWeight = stream ? streamedWeight! : weight
@@ -5887,6 +5965,7 @@ enum VerifyInt8Matmul {
     /// or any differing bit keeps the record kernel there.
     private static func checkForms() -> String {
         formsMatched = []
+        formsMatchedMask = 0
         guard formsAllowed else { return "off (DARKBLOOM_BONSAI_VERIFY_FORMS=0)" }
         let m = tileRows, n = 64
         for k in formsK {
@@ -5941,14 +6020,23 @@ enum VerifyInt8Matmul {
                 return !formsFailed
             }
             withErrorHandler({ _ in VerifyInt8Matmul.formsFailed = true }) {
-                if matches([0 ..< n]) { formsMatched.insert("\(k) 1") }
-                if naxShared, matches([0 ..< 32, 32 ..< 64]) { formsMatched.insert("\(k) 2") }
-                if naxShared, matches([0 ..< 32, 32 ..< 64, 0 ..< 32]) { formsMatched.insert("\(k) 3") }
+                if matches([0 ..< n]) {
+                    formsMatched.insert("\(k) 1")
+                    formsMatchedMask |= formBit(k: k, layers: 1)
+                }
+                if naxShared, matches([0 ..< 32, 32 ..< 64]) {
+                    formsMatched.insert("\(k) 2")
+                    formsMatchedMask |= formBit(k: k, layers: 2)
+                }
+                if naxShared, matches([0 ..< 32, 32 ..< 64, 0 ..< 32]) {
+                    formsMatched.insert("\(k) 3")
+                    formsMatchedMask |= formBit(k: k, layers: 3)
+                }
             }
         }
         formsFailed = false
         return "matched " + formsK.map { k in
-            let layers = (1 ... 3).filter { formsMatched.contains("\(k) \($0)") }.map { String($0) }
+            let layers = (1 ... 3).filter { hasMatchedForm(k: k, layers: $0) }.map { String($0) }
             return "K \(k): layers " + (layers.isEmpty ? "none" : layers.joined(separator: ","))
         }.joined(separator: "; ")
     }
@@ -5974,7 +6062,7 @@ enum VerifyInt8Matmul {
         }
         let forms = chosen == .nax && naxFast ? "; compile-time K forms: \(checkForms())" : ""
         if chosen == .nax && naxFast {
-            let eligible = naxShared && formsAllowed && formsMatched.contains("4096 2")
+            let eligible = naxShared && formsAllowed && hasMatchedForm(k: 4096, layers: 2)
             FileHandle.standardError.write(
                 "int8 verify dense b/a fold: \(VerifyDenseBA.check(eligible: eligible, negativeForms: negativeForms))\n"
                     .data(using: .utf8)!)
@@ -5987,6 +6075,16 @@ enum VerifyInt8Matmul {
         if chosen == .nax, naxFast, !["0", "false", "no", "off"].contains(narrowValue ?? "") {
             (narrowK, narrowFormsK) = checkNarrow()
             (narrow16K, narrow16FormsK) = checkNarrow(compact: true)
+            var mask: UInt32 = 0
+            for k in narrowDepths {
+                if let s = narrowShift(k: k) {
+                    if narrowK.contains(k) { mask |= (1 << s) }
+                    if narrowFormsK.contains(k) { mask |= (1 << (s + 1)) }
+                    if narrow16K.contains(k) { mask |= (1 << (s + 2)) }
+                    if narrow16FormsK.contains(k) { mask |= (1 << (s + 3)) }
+                }
+            }
+            narrowMask = mask
             FileHandle.standardError.write(
                 "int8 verify narrow: K \(narrowK.sorted()) of \(narrowDepths); compile-time K forms: K \(narrowFormsK.sorted())\n"
                     .data(using: .utf8)!)
@@ -6005,11 +6103,11 @@ enum VerifyInt8Matmul {
         negative: Bool, streamedWeight: MLXArray? = nil
     ) -> MLXArray? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
-        if route == .nax, naxFast, weight.dim(0) <= narrowColumns, narrowK.contains(activation.k) {
+        if route == .nax, naxFast, weight.dim(0) <= narrowColumns, hasNarrow(k: activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
                 scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, compact: narrow16K.contains(activation.k), streamedWeight: streamedWeight)
+                negative: negative && negativeForms, compact: hasNarrow16(k: activation.k), streamedWeight: streamedWeight)
         }
         if route == .nax && naxFast {
             return runFast(
@@ -6402,7 +6500,7 @@ public enum VerifyDenseBA {
 extension VerifyInt8Matmul {
     /// The two-layer compile-time form is what the qkv/z pair takes at `k`.
     static func denseBAEligible(k: Int) -> Bool {
-        route == .nax && naxFast && naxShared && formsAllowed && formsMatched.contains("\(k) 2")
+        route == .nax && naxFast && naxShared && formsAllowed && hasMatchedForm(k: k, layers: 2)
     }
 
     static func denseBAForms(

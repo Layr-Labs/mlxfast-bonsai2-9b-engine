@@ -4924,9 +4924,10 @@ enum DF2Fast {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
             float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
             for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if (step > 0) {
+                seq_sum = simd_shuffle_up(seq_sum, 1);
+              }
               if ((int(lane) & ((KG / 16) - 1)) == step) {
                 for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
               }
@@ -5024,9 +5025,10 @@ enum DF2Fast {
               local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
             }
             float seq_sum = 0.0f;
-            const uint grpBase = lane & ~uint((KG / 16) - 1);
             for (int step = 0; step < (KG / 16); step++) {
-              seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+              if (step > 0) {
+                seq_sum = simd_shuffle_up(seq_sum, 1);
+              }
               if ((int(lane) & ((KG / 16) - 1)) == step) {
                 for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
               }
@@ -5310,9 +5312,10 @@ enum DF2Fast {
                 local_amax = max(local_amax, simd_shuffle_xor(local_amax, 4));
               }
               float seq_sum = 0.0f;
-              const uint grpBase = lane & ~uint((KG / 16) - 1);
               for (int step = 0; step < (KG / 16); step++) {
-                seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+                if (step > 0) {
+                  seq_sum = simd_shuffle_up(seq_sum, 1);
+                }
                 if ((int(lane) & ((KG / 16) - 1)) == step) {
                   for (int u = 0; u < 16; u++) { seq_sum += nv[u]; }
                 }
@@ -6200,9 +6203,10 @@ enum DF2WideLaneSource {
           local_amax = max(local_amax, simd_shuffle_xor(local_amax, ushort(s)));
         }
         float seq_sum = 0.0f;
-        const uint grpBase = lane & ~uint((KG / \(e)) - 1);
         for (int step = 0; step < (KG / \(e)); step++) {
-          seq_sum = simd_shuffle(seq_sum, ushort(grpBase | uint(step > 0 ? step - 1 : 0)));
+          if (step > 0) {
+            seq_sum = simd_shuffle_up(seq_sum, 1);
+          }
           if ((int(lane) & ((KG / \(e)) - 1)) == step) {
             for (int u = 0; u < \(e); u++) { seq_sum += nv[u]; }
           }
