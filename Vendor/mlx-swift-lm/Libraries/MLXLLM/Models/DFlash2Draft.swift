@@ -584,7 +584,8 @@ private final class DFlash2Attention: Module {
         conv0: (n: MLXArray, dyn: MLXArray, base: MLXArray)? = nil,
         ropeSpec: DF2Fast.RopeSpec? = nil,
         contextCodes: DF2Fast.W4Codes? = nil,
-        precomputedContextKV: (MLXArray, MLXArray)? = nil
+        precomputedContextKV: (MLXArray, MLXArray)? = nil,
+        submitProjections: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -617,6 +618,9 @@ private final class DFlash2Attention: Module {
                 conv0.n, dyn: conv0.dyn, base: conv0.base, [qProj, kProj, vProj])
         {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
+            // The block's projections need nothing built after them: start
+            // them on the GPU while the host builds the attention.
+            if submitProjections { asyncEval(queries, blockKeys, blockValues) }
         } else if let qkv = DF2Fast.linears(x, [qProj, kProj, vProj]) {
             (queries, blockKeys, blockValues) = (qkv[0], qkv[1], qkv[2])
         } else {
@@ -1196,7 +1200,8 @@ private final class DFlash2DecoderLayer: Module {
                 n1, context: context, rope: rope, cache: cache,
                 conv0: (n: n1, dyn: p1, base: base1),
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
+                precomputedContextKV: precomputedContextKV,
+                submitProjections: submitAttention && DF2Fast.earlyFront)
         } else {
             let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
             attnOut = selfAttn(
@@ -2094,6 +2099,9 @@ enum DF2Fast {
     /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
     static let tokenMajorOProj =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_FRONT=0` keeps layer 0's projections in the attention-half submit.
+    static let earlyFront =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_FRONT"] != "0"
     static let split = Int(ProcessInfo.processInfo.environment["DF2_SPLIT"] ?? "8") ?? 8
     static let header = """
         #include <metal_tensor>

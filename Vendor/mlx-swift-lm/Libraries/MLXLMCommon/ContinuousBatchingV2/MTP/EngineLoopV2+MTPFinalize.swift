@@ -276,6 +276,12 @@ extension EngineLoopV2 {
             }
             let rejected = (1 + k) - confirmed
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            // The next round's drafter block is built and submitted only
+            // after this round's tokens are handed to the stream and the
+            // round is journaled (below): the host's graph build no longer
+            // delays the emission, and the GPU sees the same submissions in
+            // the same order.
+            var prestage: (() -> Void)?
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
@@ -313,10 +319,12 @@ extension EngineLoopV2 {
                         rec.request.maxTokens - rec.generatedTokenCount > k,
                         let block = mtp.blockDrafter
                     {
-                        block.prepareDraft(
-                            history: rec.tokens, depth: k, requestState: state)
-                        block.prestageBlock(
-                            anchor: kept[confirmed - 1], depth: k, requestState: state)
+                        let history = rec.tokens
+                        let anchor = kept[confirmed - 1]
+                        prestage = {
+                            block.prepareDraft(history: history, depth: k, requestState: state)
+                            block.prestageBlock(anchor: anchor, depth: k, requestState: state)
+                        }
                     }
                 }
             }
@@ -427,6 +435,10 @@ extension EngineLoopV2 {
                 acceptedDepth: observedAccepted,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
+            // After the emission and this round's journal entry, so the
+            // gap between them stays the record's (the stream's reader
+            // snapshots the journal after draining).
+            prestage?()
 
             if let finishReason {
                 if let state = metadata.assistantState {
