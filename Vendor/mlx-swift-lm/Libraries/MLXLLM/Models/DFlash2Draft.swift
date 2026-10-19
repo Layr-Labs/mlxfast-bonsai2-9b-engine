@@ -3374,7 +3374,7 @@ enum DF2Fast {
         inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
         outputNames: ["q_out", "k_out", "v_out"],
         source: """
-            const int L = params[0];
+            const int L = STATIC_L > 0 ? STATIC_L : params[0];
             const int C = params[1];
             const int offset = params[2];
             const int CL = C + L;
@@ -3483,7 +3483,7 @@ enum DF2Fast {
                 MLXArray([Int32(L), Int32(C), Int32(ctxOffset)]),
                 MLXArray([qNorm.eps, ropeSpec.mscale]),
             ],
-            template: [("PHASES", phases != nil)],
+            template: [("PHASES", phases != nil), ("STATIC_L", L == 16 ? 16 : 0)],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
             outputDTypes: [.float32, .float32, .float32])
