@@ -3730,9 +3730,9 @@ enum PromptInt8Matmul {
         constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(32, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
         mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
         tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
+        auto aT = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
         auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-        auto tA0 = A.template slice<128, 32>(0, ms);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(aT)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
         const int nb = ns + fn;
         const int mb = ms + fm;
         // The operand words are written straight into bT's storage, so the
@@ -3741,8 +3741,7 @@ enum PromptInt8Matmul {
         // element layout the stores assume. Otherwise the simdgroup stores
         // NaN (failing the load check) and touches no tensor.
         thread int8_t* b0p = &bT[0];
-        bool ok = int(bT.get_capacity()) == 128 && int(cT.get_capacity()) == 32
-            && (reinterpret_cast<ulong>(b0p) & 3ul) == 0;
+        bool ok = int(bT.get_capacity()) == 128 && int(cT.get_capacity()) == 32;
         if (ok) {
           for (int i = 1; i < 128; i++) { ok = ok && &bT[i] == b0p + i; }
           #pragma clang loop unroll(full)
