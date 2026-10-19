@@ -19,6 +19,7 @@
 import Cmlx
 import Foundation
 import MLX
+import MLXNN
 
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
@@ -1318,7 +1319,7 @@ enum CBv2VerifyVectorAttention {
         else { return nil }
         let L = qShape.2
         let nKeys = kShape.2
-        let params = MLXArray([Int32(nKeys), Int32(bitPattern: scale.bitPattern)])
+        let params = HostConstants.recentInt32([Int32(nKeys), Int32(bitPattern: scale.bitPattern)])
 
         if L > 8 && classesPerGroup == 2 {
             let inputs = [queries, keys, values, params]
@@ -1360,7 +1361,7 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = qShape.2
-        let params = MLXArray([Int32(kShape.2), Int32(bitPattern: scale.bitPattern)])
+        let params = HostConstants.recentInt32([Int32(kShape.2), Int32(bitPattern: scale.bitPattern)])
         let inputs = [queries, keys, values, params, tree]
         if L > 8 && classesPerGroup == 2 {
             guard let pairedTree else { return nil }

@@ -6272,6 +6272,18 @@ extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
 }
 
 extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
+    /// `MLXFAST_MTP_DIAGNOSTICS` unset, read once at first use instead of
+    /// copying the process environment on every verify forward
+    /// (`DARKBLOOM_BONSAI_HOSTCUT=0` reads it per call again).
+    private static let mtpDiagnosticsUnset: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+
+    fileprivate static func mtpDiagnosticsOff() -> Bool {
+        HostConstants.enabled
+            ? mtpDiagnosticsUnset
+            : ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+    }
+
     /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
     /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
     /// finalize can commit the accepted position on device. Attention and
@@ -6296,7 +6308,7 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             !model.exactTargetVerify,
             let head = lmHead as? HadamardQuantizedLinear,
             Qwen35InlineMTPAssistant.shortlistSize == nil,
-            ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil,
+            Qwen35TextModel.mtpDiagnosticsOff(),
             let fusedTopTwo = head.topTwoRowsAfterResidualNorm(
                 hiddenRaw, delta: delta, weight: model.norm.weight, eps: model.norm.eps)
         {
@@ -6317,7 +6329,7 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             {
                 verifyHeadTopTwo.value = topTwo
                 if Qwen35InlineMTPAssistant.shortlistSize == nil,
-                    ProcessInfo.processInfo.environment["MLXFAST_MTP_DIAGNOSTICS"] == nil
+                    Qwen35TextModel.mtpDiagnosticsOff()
                 {
                     logits = broadcast(
                         normalized[0..., 0..., 0 ..< 1],

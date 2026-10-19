@@ -14,6 +14,78 @@ public enum HadamardError: Error {
     case missingSignWidth(Int)
 }
 
+/// Small kernel inputs (problem dimensions, epsilons, scales, per-round key
+/// counts and offsets), made once per distinct value instead of once per call.
+/// Each call used to allocate a fresh device buffer and copy the same few bytes
+/// into it; the kernels read identical values of the same shape and dtype
+/// either way, so the GPU work is unchanged. Load-time constants live in a
+/// value table; values that move with the round (key counts, cache offsets)
+/// live in a small recent-value list, so the layers of one round share one
+/// array. `DARKBLOOM_BONSAI_HOSTCUT=0` restores per-call arrays everywhere.
+public enum HostConstants {
+    public static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_HOSTCUT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    /// Entries per table before new values fall back to per-call arrays.
+    private static let capacity = 4096
+    /// Entries in the recent-value list (oldest replaced first).
+    private static let recentCapacity = 8
+    nonisolated(unsafe) private static var int32Arrays: [[Int32]: MLXArray] = [:]
+    nonisolated(unsafe) private static var float32Arrays: [[UInt32]: MLXArray] = [:]
+    nonisolated(unsafe) private static var recentValues: [[Int32]] = []
+    nonisolated(unsafe) private static var recentArrays: [MLXArray] = []
+    nonisolated(unsafe) private static var recentNext = 0
+    nonisolated(unsafe) private static var lock = os_unfair_lock()
+
+    /// `MLXArray(values)`, int32 `[values.count]`, for values fixed at load.
+    public static func int32(_ values: [Int32]) -> MLXArray {
+        guard enabled else { return MLXArray(values) }
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        if let array = int32Arrays[values] { return array }
+        let array = MLXArray(values)
+        if int32Arrays.count < capacity { int32Arrays[values] = array }
+        return array
+    }
+
+    /// `MLXArray(values)`, float32 `[values.count]`, keyed by bit pattern.
+    public static func float32(_ values: [Float]) -> MLXArray {
+        guard enabled else { return MLXArray(values) }
+        var key = [UInt32]()
+        key.reserveCapacity(values.count)
+        for value in values { key.append(value.bitPattern) }
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        if let array = float32Arrays[key] { return array }
+        let array = MLXArray(values)
+        if float32Arrays.count < capacity { float32Arrays[key] = array }
+        return array
+    }
+
+    /// `MLXArray(values)`, int32 `[values.count]`, for values that change with
+    /// the round but repeat across the layers of one round.
+    public static func recentInt32(_ values: [Int32]) -> MLXArray {
+        guard enabled else { return MLXArray(values) }
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        for index in 0 ..< recentValues.count where recentValues[index] == values {
+            return recentArrays[index]
+        }
+        let array = MLXArray(values)
+        if recentValues.count < recentCapacity {
+            recentValues.append(values)
+            recentArrays.append(array)
+        } else {
+            recentValues[recentNext] = values
+            recentArrays[recentNext] = array
+            recentNext = (recentNext + 1) % recentCapacity
+        }
+        return array
+    }
+}
+
 /// A normalized block Walsh-Hadamard transform with explicit input signs.
 ///
 /// Forward evaluation computes `(x * signs) H`; inverse evaluation computes
@@ -605,7 +677,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let outputs = Self.wideRowVerify(
             .gatedNorm,
-            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, HostConstants.float32([eps]), signs],
             rows: rows)
         return PromptInt8Activation(
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
@@ -626,7 +698,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let groups = rows * (width / 128)
         let outputs = Self.gatedNormQuantized4096Kernel(
-            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, MLXArray([eps]), signs],
+            [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, HostConstants.float32([eps]), signs],
             template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)],
             grid: (256, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
@@ -658,7 +730,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
         return Self.wideRowVerify(
-            .residualNormNormed, [x, residual, weight, MLXArray([eps]), signs], rows: rows)
+            .residualNormNormed, [x, residual, weight, HostConstants.float32([eps]), signs], rows: rows)
     }
 
     private static let residualNormQuantized4096Kernel = MLXFast.metalKernel(
@@ -714,7 +786,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
         let outputs = Self.wideRowVerify(
-            .residualNormRot, [x, residual, weight, MLXArray([eps]), signs], rows: rows, headError2: headError2 && rows == 16)
+            .residualNormRot, [x, residual, weight, HostConstants.float32([eps]), signs], rows: rows, headError2: headError2 && rows == 16)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
@@ -730,7 +802,7 @@ public struct SignedBlockHadamard {
         else { return nil }
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
-        return Self.wideRowVerify(.normNormed, [x, weight, MLXArray([eps]), signs], rows: rows)
+        return Self.wideRowVerify(.normNormed, [x, weight, HostConstants.float32([eps]), signs], rows: rows)
     }
 
     /// `quantizedForPrompt(rmsNorm(x + residual, weight))` at prompt width in one kernel:
@@ -747,7 +819,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / 4096
         Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
-        let inputs = [x, residual, weight, MLXArray([eps]), signs]
+        let inputs = [x, residual, weight, HostConstants.float32([eps]), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
         if normalized {
             return Self.residualNormNormedQuantized4096Kernel(
@@ -774,7 +846,7 @@ public struct SignedBlockHadamard {
         let rows = x.size / 4096
         Self.wideRowPrepareIfBoot(rows: rows)
         let groups = rows * 32
-        let inputs = [x, weight, MLXArray([eps]), signs]
+        let inputs = [x, weight, HostConstants.float32([eps]), signs]
         let template: [(String, any KernelTemplateArg)] = [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0)]
         if normalized {
             return Self.normNormedQuantized4096Kernel(
@@ -798,7 +870,7 @@ public struct SignedBlockHadamard {
             x.size <= Int(UInt32.max), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let rows = x.size / width
-        let inputs = [x, residual, weight, MLXArray([eps]), signs]
+        let inputs = [x, residual, weight, HostConstants.float32([eps]), signs]
         if verifyRows > 0 {
             guard verifyRows == rows, VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
             return Self.wideRowVerify(.residualNorm, inputs, rows: rows)
@@ -1552,7 +1624,7 @@ extension SignedBlockHadamard {
             : (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind]
         if lanes > 0, let kernel = resolvedKernel {
             return kernel(
-                inputs + [MLXArray([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
+                inputs + [HostConstants.int32([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
                 outputShapes: shapes, outputDTypes: dtypes)
         }
@@ -4206,7 +4278,7 @@ enum PromptInt8Matmul {
             let n0 = l0.weight.dim(0)
             totalN = n0
             allNValid = n0 > 0 && n0 % 64 == 0 && n0 <= limit / (k / 16) && m <= limit / n0
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0)])
             inputs = [codes, l0.weight, l0.scalesT, l0.biasesT, ascale, rsb, dims]
             outputShapes = [[m, n0]]
             outputDTypes = [.float32]
@@ -4217,7 +4289,7 @@ enum PromptInt8Matmul {
             let maxN = limit / (k / 16)
             allNValid = n0 > 0 && n0 % 64 == 0 && n0 <= maxN && m <= limit / n0
                 && n1 > 0 && n1 % 64 == 0 && n1 <= maxN && m <= limit / n1
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0), Int32(n1)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1)])
             inputs = [codes, l0.weight, l1.weight, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims]
             outputShapes = [[m, n0], [m, n1]]
             outputDTypes = [.float32, .float32]
@@ -4229,7 +4301,7 @@ enum PromptInt8Matmul {
             allNValid = n0 > 0 && n0 % 64 == 0 && n0 <= maxN && m <= limit / n0
                 && n1 > 0 && n1 % 64 == 0 && n1 <= maxN && m <= limit / n1
                 && n2 > 0 && n2 % 64 == 0 && n2 <= maxN && m <= limit / n2
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0), Int32(n1), Int32(n2)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1), Int32(n2)])
             inputs = [
                 codes, l0.weight, l1.weight, l2.weight,
                 l0.scalesT, l1.scalesT, l2.scalesT,
@@ -4244,7 +4316,7 @@ enum PromptInt8Matmul {
             allNValid = ns.allSatisfy { n in
                 n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
             }
-            dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
+            dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
             inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
                 + [ascale, rsb, dims]
             outputShapes = ns.map { [m, $0] }
@@ -4276,7 +4348,7 @@ enum PromptInt8Matmul {
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int,
         vector: Bool, negative: Bool
     ) -> MLXArray {
-        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
         let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
         let neg = [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
         if route == .nax {
@@ -4564,7 +4636,7 @@ enum PromptInt8Matmul {
         guard route != .off, activation.rows == 1 || applies(rows: activation.rows),
             weight.dim(0) % 32 == 0 else { return nil }
         let n = weight.dim(0)
-        let dims = MLXArray([Int32(activation.k), 1, Int32(n), Int32(activation.rows - 1)])
+        let dims = HostConstants.int32([Int32(activation.k), 1, Int32(n), Int32(activation.rows - 1)])
         return lastRowKernel(
             [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb, dims],
             template: [("NEG", negative && negativeForms ? 1 : 0)],
@@ -5509,7 +5581,7 @@ enum VerifyInt8Matmul {
         let tiles = weight.dim(0) / 32
         let result = compactHeadKernel(
             [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb,
-             MLXArray([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
+             HostConstants.int32([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
             template: [("ROWS", 16), ("NEG", negative && negativeForms ? 1 : 0), ("KC", activation.k)],
             grid: (tiles * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[16, tiles, 4], [16, tiles, 4], [16, tiles], [16, tiles]],
@@ -5866,7 +5938,7 @@ enum VerifyInt8Matmul {
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int,
         vector: Bool, negative: Bool
     ) -> MLXArray {
-        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
         let inputs = [codes, weight, scalesT, biasesT, ascale, rsb, dims]
         let rows = [("ROWS", m)] as [(String, any KernelTemplateArg)]
         let neg = rows + [("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)]
@@ -5894,7 +5966,7 @@ enum VerifyInt8Matmul {
             let l0 = layers[0]
             let n0 = l0.weight.dim(0)
             totalN = n0
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0)])
             let w0 = (useForms ? streamedWeights?[0] : nil) ?? l0.weight
             inputs = [codes, w0, l0.scalesT, l0.biasesT, ascale, rsb, dims]
             outputShapes = [[m, n0]]
@@ -5903,7 +5975,7 @@ enum VerifyInt8Matmul {
             let l0 = layers[0], l1 = layers[1]
             let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0)
             totalN = n0 + n1
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0), Int32(n1)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1)])
             let w0 = (useForms ? streamedWeights?[0] : nil) ?? l0.weight
             let w1 = (useForms ? streamedWeights?[1] : nil) ?? l1.weight
             inputs = [codes, w0, w1, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims]
@@ -5913,7 +5985,7 @@ enum VerifyInt8Matmul {
             let l0 = layers[0], l1 = layers[1], l2 = layers[2]
             let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0), n2 = l2.weight.dim(0)
             totalN = n0 + n1 + n2
-            dims = MLXArray([Int32(k), Int32(m), Int32(n0), Int32(n1), Int32(n2)])
+            dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1), Int32(n2)])
             let w0 = (useForms ? streamedWeights?[0] : nil) ?? l0.weight
             let w1 = (useForms ? streamedWeights?[1] : nil) ?? l1.weight
             let w2 = (useForms ? streamedWeights?[2] : nil) ?? l2.weight
@@ -5928,7 +6000,7 @@ enum VerifyInt8Matmul {
         default:
             let ns = layers.map { $0.weight.dim(0) }
             totalN = ns.reduce(0, +)
-            dims = MLXArray([Int32(k), Int32(m)] + ns.map { Int32($0) })
+            dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
             let ws = (useForms ? streamedWeights : nil) ?? layers.map { $0.weight }
             inputs = [codes] + ws + layers.map { $0.scalesT } + layers.map { $0.biasesT } + [ascale, rsb, dims]
             outputShapes = ns.map { [m, $0] }
@@ -5954,7 +6026,7 @@ enum VerifyInt8Matmul {
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil
     ) -> MLXArray {
         let n = weight.dim(0)
-        let dims = MLXArray([Int32(k), Int32(m), Int32(n)])
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && hasNarrowForms(k: k, compact: compact) && formsFit(k: k, n: n)) {
             let stream = compact && streamedWeight != nil
             let kernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
@@ -6397,7 +6469,7 @@ enum VerifyInt8Matmul {
     ) -> MLXArray? {
         guard let kernel = screenKernels[streamed ? 1 : 0] else { return nil }
         let n: Int = weight.dim(0)
-        let dims = MLXArray([Int32(activation.k), Int32(activation.rows), Int32(n)])
+        let dims = HostConstants.int32([Int32(activation.k), Int32(activation.rows), Int32(n)])
         let template = [("ROWS", activation.rows), ("NEG", 1), ("KC", activation.k), ("SG", groups)]
             as [(String, any KernelTemplateArg)]
         let inputs: [MLXArray] = [
@@ -6473,12 +6545,12 @@ enum VerifyInt8Matmul {
     ) -> MLXArray {
         let n: Int = weight.dim(0)
         let p: Int = ids?.dim(-1) ?? n
-        let dims = MLXArray([Int32(activation.k), Int32(n), Int32(p)])
+        let dims = HostConstants.int32([Int32(activation.k), Int32(n), Int32(p)])
         let template = [("ROWS", activation.rows), ("NEG", negative), ("GL", groups), ("ALL", ids == nil)]
             as [(String, any KernelTemplateArg)]
         let inputs: [MLXArray] = [
             activation.codes, weight, scales, biases, activation.ascale, activation.rsb,
-            ids ?? MLXArray([Int32(0)]), dims,
+            ids ?? HostConstants.int32([Int32(0)]), dims,
         ]
         return headGatherKernel(
             inputs, template: template, grid: (activation.rows * p * 32, 1, 1), threadGroup: (256, 1, 1),
@@ -6590,7 +6662,7 @@ public enum VerifyDenseBA {
         let l0 = layers[0], l1 = layers[1]
         let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0)
         let N = wb.dim(0)
-        let dims = MLXArray([Int32(k), Int32(m), Int32(n0), Int32(n1)])
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1)])
         let w0 = streamedWeights?[0] ?? l0.weight
         let w1 = streamedWeights?[1] ?? l1.weight
         let inputs: [MLXArray] = [
