@@ -1103,6 +1103,87 @@ enum CBv2VerifyVectorAttention {
             }
             """)
 
+
+    private static let pairedPartial = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_paired",
+        inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
+        outputNames: ["part_o", "part_m", "part_s"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int D = 256;
+            constexpr int G = GH;
+            const uint L = uint(N_QUERIES);
+            const uint t = simdgroup_index_in_threadgroup / uint(CPT);
+            const uint kvh = threadgroup_position_in_grid.z;
+            const uint h0 = kvh * 4u + threadgroup_position_in_grid.y * G;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int c = int(threadgroup_position_in_grid.x * uint(CPT)
+                + simdgroup_index_in_threadgroup % uint(CPT));
+            const int N = n_keys[0];
+            const float scale = scale_in[0];
+            const int limit = N - int(L) + int(t);
+            float q[G][8];
+            float o[G][8];
+            float max_score[G];
+            float sum_exp_score[G];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const device float* qp = queries + (h0 + h) * queries_strides[1]
+                  + t * queries_strides[2] + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                q[h][j] = static_cast<float>(scale) * qp[j];
+                o[h][j] = 0;
+              }
+              max_score[h] = -metal::numeric_limits<float>::max();
+              sum_exp_score[h] = 0;
+            }
+            const device float* kp = keys + kvh * keys_strides[1] + simd_lid * 8;
+            const device float* vp = values + kvh * values_strides[1] + simd_lid * 8;
+            const int64_t ks = keys_strides[2];
+            const int64_t vs = values_strides[2];
+            for (int i = c; i <= limit; i += 32) {
+              float k[8];
+              float v[8];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                k[j] = kp[i * ks + j];
+                v[j] = vp[i * vs + j];
+              }
+              #pragma clang loop unroll(full)
+              for (int h = 0; h < G; h++) {
+                float score = 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  score = metal::fma(q[h][j], k[j], score);
+                }
+                score = simd_sum(score);
+                float new_max = max(max_score[h], score);
+                float factor = fast::exp(max_score[h] - new_max);
+                float exp_score = fast::exp(score - new_max);
+                max_score[h] = new_max;
+                sum_exp_score[h] = metal::fma(sum_exp_score[h], factor, exp_score);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; j++) {
+                  o[h][j] = metal::fma(o[h][j], factor, exp_score * v[j]);
+                }
+              }
+            }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < G; h++) {
+              const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
+              device float* op = part_o + slot * D + simd_lid * 8;
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) op[j] = o[h][j];
+              if (simd_lid == 0) {
+                part_m[slot] = max_score[h];
+                part_s[slot] = sum_exp_score[h];
+              }
+            }
+            """,
+        ensureRowContiguous: false)
+
     /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
@@ -1117,6 +1198,18 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
+
+        if L > 8 && classesPerGroup == 2 {
+            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])]
+            let states = pairedPartial(
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
+                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+                outputDTypes: [.float32, .float32, .float32])
+            return combine(
+                states, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+        }
         let parts = partial(
             [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],

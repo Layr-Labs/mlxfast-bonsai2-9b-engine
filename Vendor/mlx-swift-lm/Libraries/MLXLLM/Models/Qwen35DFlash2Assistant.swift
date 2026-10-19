@@ -164,6 +164,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// and how many of its columns the round committed (0 until then).
         var projection: DFlash2ContextProjection?
         var projectionRows = 0
+        var lookupFC: (output: MLXArray, rows: Int)?
         /// A lookup round's absorption of the pending rows, not yet built:
         /// the engine submits it behind that round's verify
         /// (`submitDeferredContext`); every other entry point runs it first.
@@ -183,7 +184,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var stagedInputCount: Int { 0 }
 
         var materializedBytes: Int {
-            let arrays = caches.flatMap { $0.innerState() } + pending + roots
+            var arrays = caches.flatMap { $0.innerState() } + pending + roots
+            if let retainedFC = lookupFC?.output ?? projection?.lookupFCOutput { arrays.append(retainedFC) }
             return arrays.reduce(0) { total, array in
                 let (next, overflow) = total.addingReportingOverflow(array.nbytes)
                 return overflow ? Int.max : next
@@ -193,6 +195,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         func append(_ rows: MLXArray, limit: Int?) {
             let count = rows.dim(1)
             guard count > 0 else { return }
+            lookupFC = nil
             pending.append(rows)
             pendingRows += count
             observedRows += count
@@ -212,6 +215,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
 
         func absorbPending() {
+            lookupFC = nil
             pending.removeAll(keepingCapacity: true)
             pendingRows = 0
         }
@@ -221,6 +225,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             preparedLookup = nil
             projection = nil
             projectionRows = 0
+            lookupFC = nil
             absorbDeferred = false
             lastProposalLookup = false
             caches.removeAll(keepingCapacity: false)
@@ -316,6 +321,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.projection = nil
         state.projectionRows = 0
         if let ids = state.promptDraft, ids.count == depth {
+            if let output = projection?.lookupFCOutput {
+                state.lookupFC = (output: output, rows: state.pendingRows)
+            }
             // A lookup skips the block, but still advances committed context KV.
             // Nothing in this round reads that KV, so the absorption is built
             // after the round's verify (`submitDeferredContext`): the same
@@ -385,6 +393,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func absorbPendingContext(requestState: any CBv2MTPRequestState) -> [MLXArray] {
         let state = self.state(requestState)
         state.absorbDeferred = false
+        let lookupFC = state.lookupFC
+        state.lookupFC = nil
         // EVERY pending row is absorbed, in the one pass the first block would
         // have run over them: the same rows through the same projections, so
         // the caches hold the bits the lazy path would have put there, and
@@ -407,8 +417,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             }
             state.cacheSeeded = true
         }
+        let fcPrefix = lookupFC.flatMap { retained -> MLXArray? in
+            guard retained.rows == state.pendingRows, state.pending.count == 1,
+                retained.output.ndim == 3, retained.output.dim(1) >= retained.rows
+            else { return nil }
+            return retained.output[0..., 0 ..< retained.rows, 0...]
+        }
         do {
-            try drafter.absorbContext(targetHidden: context, cache: state.caches)
+            try drafter.absorbContext(targetHidden: context, cache: state.caches, lookupFC: fcPrefix)
         } catch {
             // Fail open: the rows stay pending and the next proposal absorbs
             // them lazily, exactly the parent behavior.
@@ -460,6 +476,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         // run beside the verify and slow it down.
         let gate = after[0 ..< 1] .== after[0 ..< 1]
         state.pending = state.pending.map { which(gate, $0, $0) }
+        if let retained = state.lookupFC {
+            state.lookupFC = (output: which(gate, retained.output, retained.output), rows: retained.rows)
+        }
         return absorbPendingContext(requestState: requestState)
     }
 
@@ -546,6 +565,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.preparedLookup = nil
         state.projection = nil
         state.projectionRows = 0
+        state.lookupFC = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
     }
