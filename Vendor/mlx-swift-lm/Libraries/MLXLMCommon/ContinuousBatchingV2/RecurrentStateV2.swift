@@ -535,15 +535,7 @@ public final class CBv2RecurrentRequestState {
                     replay.mapValues { stage in stage.fullAcceptance?() ?? stage.finalState }
                 }
             } else {
-                // A draft tree commit replays its accepted path: the rows are read now, the
-                // lazy replay may run after the round.
-                let treePath = CBv2BranchVerify.committedRows
-                deferredCommitted = {
-                    let outer = CBv2BranchVerify.committedRows
-                    CBv2BranchVerify.committedRows = treePath
-                    defer { CBv2BranchVerify.committedRows = outer }
-                    return replay.mapValues { $0.replay(keep) }
-                }
+                deferredCommitted = { replay.mapValues { $0.replay(keep) } }
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []

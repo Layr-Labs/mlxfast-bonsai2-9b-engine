@@ -382,7 +382,6 @@ enum CBv2AttentionV1 {
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
-        precondition(CBv2BranchVerify.tree == nil || L != 16, "CBv2 tree verify: attention took the chain path")
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if let keepMask {
             precondition(
@@ -418,21 +417,6 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let tree = CBv2BranchVerify.tree, L == 16 {
-            precondition(keepMask == nil && allowNativeVectorBatch, "CBv2 tree verify: unsupported attention form")
-            if canBatchSerialQueriesWithNativeVector(
-                kind: kind, queries: queries, keys: cachedKeys, values: cachedValues,
-                sinks: sinks, softcap: softcap, keepMask: nil)
-            {
-                guard let shared = CBv2VerifyVectorAttention.attendTree(
-                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale, tree: tree)
-                else { preconditionFailure("CBv2 tree verify: tree attention kernel unavailable") }
-                return shared
-            }
-            return attendTreeSerialQueries(
-                queries: queries, keys: cachedKeys, values: cachedValues, tree: tree,
-                window: window(of: kind), scale: scale, sinks: sinks, softcap: softcap)
-        }
         if let keepMask {
             precondition(
                 keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
@@ -754,35 +738,6 @@ enum CBv2AttentionV1 {
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
-    /// `attendSerialQueries` for a draft tree window: query `t` attends to the history and its
-    /// own path's keys in path order (the keys a chain verify of that path shows its row).
-    private static func attendTreeSerialQueries(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, tree: MLXArray,
-        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> MLXArray {
-        precondition(window == nil, "CBv2 tree verify: windowed attention")
-        let L = queries.dim(2)
-        let history = keys.dim(2) - L
-        let host = CBv2BranchVerify.host(tree)
-        var outputs: [MLXArray] = []
-        for t in 0 ..< L {
-            let depth = Int(host[16 + t])
-            let rowBase = 32 + 16 * t
-            let path = (0 ... depth).map { (d: Int) -> Int32 in
-                let ancestor: Int32 = host[rowBase + d]
-                return Int32(history) + ancestor
-            }
-            let index = MLXArray(Array(0 ..< Int32(history)) + path)
-            outputs.append(
-                attend(
-                    queries: queries[0..., 0..., t ..< (t + 1), 0...],
-                    keys: keys.take(index, axis: 2), values: values.take(index, axis: 2),
-                    scale: scale, L: 1, kL: history + depth + 1, window: nil, sinks: sinks,
-                    softcap: softcap, keepMask: nil))
-        }
-        return concatenated(outputs, axis: 2)
-    }
-
     /// One query at a time — the pinned MTP serial-verification path.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -1032,46 +987,7 @@ enum CBv2VerifyVectorAttention {
         name: "cbv2_verify_sdpa_partial",
         inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
         outputNames: ["part_o", "part_m", "part_s"],
-        source: partialSource,
-        ensureRowContiguous: false)
-
-    /// Tree twin of a partial source. `tree` is the draft tree descriptor (int32: parent row
-    /// [16], depth [16], ancestor row by depth [16][16]; see `DF2Fast.treeSource`). Query row
-    /// `t` visits logical keys `0 ... base + depth[t]` (`base` = keys before the window) in the
-    /// record's class and order, reading in-window key `base + i` from its path's row
-    /// `base + ancestor[t][i]`, so each (class, query) state is the bits of a chain verify of
-    /// its path.
-    static func treeSource(_ record: String) -> String? {
-        var s = record
-        func swap(_ from: String, _ to: String, count: Int = 1) -> Bool {
-            guard s.components(separatedBy: from).count == count + 1 else { return false }
-            s = s.replacingOccurrences(of: from, with: to)
-            return true
-        }
-        let ok = swap(
-            "const int limit = N - int(L) + int(t);",
-            """
-            const int tv_base = N - int(L);
-            const int limit = tv_base + tree[16 + t];
-            """)
-            && swap(
-                "for (int i = c; i <= limit; i += 32) {",
-                "for (int i = c; i <= limit; i += 32) {\nconst int pi = i < tv_base ? i : tv_base + tree[32 + 16 * t + (i - tv_base)];")
-            && swap("(kp + i * ks + ", "(kp + pi * ks + ", count: 2)
-            && swap("(vp + i * vs + ", "(vp + pi * vs + ", count: 2)
-        return ok ? s : nil
-    }
-
-    private static let partialTree: MLXFast.MLXFastKernel? = treeSource(partialSource).map {
-        MLXFast.metalKernel(
-            name: "cbv2_verify_sdpa_partial_tree",
-            inputNames: ["queries", "keys", "values", "scale_in", "n_keys", "tree"],
-            outputNames: ["part_o", "part_m", "part_s"],
-            source: $0,
-            ensureRowContiguous: false)
-    }
-
-    private static let partialSource = """
+        source: """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             constexpr int D = 256;
@@ -1094,18 +1010,9 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const device float* qp = queries + (h0 + h) * queries_strides[1]
                   + t * queries_strides[2] + simd_lid * 8;
-              const packed_float4 q0 = *((const device packed_float4*)(qp + 0));
-              const packed_float4 q1 = *((const device packed_float4*)(qp + 4));
-              q[h][0] = static_cast<float>(scale) * q0.x;
-              q[h][1] = static_cast<float>(scale) * q0.y;
-              q[h][2] = static_cast<float>(scale) * q0.z;
-              q[h][3] = static_cast<float>(scale) * q0.w;
-              q[h][4] = static_cast<float>(scale) * q1.x;
-              q[h][5] = static_cast<float>(scale) * q1.y;
-              q[h][6] = static_cast<float>(scale) * q1.z;
-              q[h][7] = static_cast<float>(scale) * q1.w;
               #pragma clang loop unroll(full)
               for (int j = 0; j < 8; j++) {
+                q[h][j] = static_cast<float>(scale) * qp[j];
                 o[h][j] = 0;
               }
               max_score[h] = -metal::numeric_limits<float>::max();
@@ -1116,12 +1023,13 @@ enum CBv2VerifyVectorAttention {
             const int64_t ks = keys_strides[2];
             const int64_t vs = values_strides[2];
             for (int i = c; i <= limit; i += 32) {
-              const packed_float4 k0 = *((const device packed_float4*)(kp + i * ks + 0));
-              const packed_float4 k1 = *((const device packed_float4*)(kp + i * ks + 4));
-              const packed_float4 v0 = *((const device packed_float4*)(vp + i * vs + 0));
-              const packed_float4 v1 = *((const device packed_float4*)(vp + i * vs + 4));
-              const float k[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
-              const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+              float k[8];
+              float v[8];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                k[j] = kp[i * ks + j];
+                v[j] = vp[i * vs + j];
+              }
               #pragma clang loop unroll(full)
               for (int h = 0; h < G; h++) {
                 float score = 0;
@@ -1145,14 +1053,15 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
               device float* op = part_o + slot * D + simd_lid * 8;
-              *((device packed_float4*)(op + 0)) = packed_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
-              *((device packed_float4*)(op + 4)) = packed_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) op[j] = o[h][j];
               if (simd_lid == 0) {
                 part_m[slot] = max_score[h];
                 part_s[slot] = sum_exp_score[h];
               }
             }
-            """
+            """,
+        ensureRowContiguous: false)
 
     /// One threadgroup per (head, query, half of the output dims); the 32
     /// partials pass through threadgroup memory so lane l holds partial l.
@@ -1163,7 +1072,7 @@ enum CBv2VerifyVectorAttention {
         source: """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
-            constexpr int v_per_thread = 16;
+            constexpr int v_per_thread = 8;
             threadgroup float staged[32 * 129];
             const uint head = threadgroup_position_in_grid.x / 2u;
             const uint half_ = threadgroup_position_in_grid.x % 2u;
@@ -1173,11 +1082,10 @@ enum CBv2VerifyVectorAttention {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint base = (head * L + t) * 32u;
-            #pragma clang loop unroll(full)
-            for (uint idx = tid; idx < 32u * 32u; idx += 256u) {
+            for (uint idx = tid; idx < 32u * 32u; idx += 512u) {
               const uint c = idx / 32u, x = (idx % 32u) * 4u;
-              const packed_float4 packet = *((const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x));
-              *((threadgroup packed_float4*)(staged + c * 129u + x)) = packet;
+              const packed_float4 packet = *(const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x);
+              *(threadgroup packed_float4*)(staged + c * 129u + x) = packet;
             }
             float max_score = part_m[base + simd_lid];
             float new_max = simd_max(max_score);
@@ -1185,7 +1093,6 @@ enum CBv2VerifyVectorAttention {
             float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             float o[v_per_thread];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < v_per_thread; i++) {
               o[i] = simd_sum(staged[simd_lid * 129u + simd_gid * v_per_thread + i] * factor);
               o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
@@ -1193,10 +1100,7 @@ enum CBv2VerifyVectorAttention {
             if (simd_lid == 0) {
               device float* op = out + (head * L + t) * 256u + half_ * 128u
                   + simd_gid * v_per_thread;
-              *((device packed_float4*)(op + 0)) = packed_float4(o[0], o[1], o[2], o[3]);
-              *((device packed_float4*)(op + 4)) = packed_float4(o[4], o[5], o[6], o[7]);
-              *((device packed_float4*)(op + 8)) = packed_float4(o[8], o[9], o[10], o[11]);
-              *((device packed_float4*)(op + 12)) = packed_float4(o[12], o[13], o[14], o[15]);
+              for (int i = 0; i < v_per_thread; i++) op[i] = o[i];
             }
             """)
 
@@ -1205,19 +1109,7 @@ enum CBv2VerifyVectorAttention {
         name: "cbv2_verify_sdpa_paired",
         inputNames: ["queries", "keys", "values", "scale_in", "n_keys"],
         outputNames: ["part_o", "part_m", "part_s"],
-        source: pairedSource,
-        ensureRowContiguous: false)
-
-    private static let pairedTree: MLXFast.MLXFastKernel? = treeSource(pairedSource).map {
-        MLXFast.metalKernel(
-            name: "cbv2_verify_sdpa_paired_tree",
-            inputNames: ["queries", "keys", "values", "scale_in", "n_keys", "tree"],
-            outputNames: ["part_o", "part_m", "part_s"],
-            source: $0,
-            ensureRowContiguous: false)
-    }
-
-    private static let pairedSource = """
+        source: """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             constexpr int D = 256;
@@ -1240,18 +1132,9 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const device float* qp = queries + (h0 + h) * queries_strides[1]
                   + t * queries_strides[2] + simd_lid * 8;
-              const packed_float4 q0 = *((const device packed_float4*)(qp + 0));
-              const packed_float4 q1 = *((const device packed_float4*)(qp + 4));
-              q[h][0] = static_cast<float>(scale) * q0.x;
-              q[h][1] = static_cast<float>(scale) * q0.y;
-              q[h][2] = static_cast<float>(scale) * q0.z;
-              q[h][3] = static_cast<float>(scale) * q0.w;
-              q[h][4] = static_cast<float>(scale) * q1.x;
-              q[h][5] = static_cast<float>(scale) * q1.y;
-              q[h][6] = static_cast<float>(scale) * q1.z;
-              q[h][7] = static_cast<float>(scale) * q1.w;
               #pragma clang loop unroll(full)
               for (int j = 0; j < 8; j++) {
+                q[h][j] = static_cast<float>(scale) * qp[j];
                 o[h][j] = 0;
               }
               max_score[h] = -metal::numeric_limits<float>::max();
@@ -1262,12 +1145,13 @@ enum CBv2VerifyVectorAttention {
             const int64_t ks = keys_strides[2];
             const int64_t vs = values_strides[2];
             for (int i = c; i <= limit; i += 32) {
-              const packed_float4 k0 = *((const device packed_float4*)(kp + i * ks + 0));
-              const packed_float4 k1 = *((const device packed_float4*)(kp + i * ks + 4));
-              const packed_float4 v0 = *((const device packed_float4*)(vp + i * vs + 0));
-              const packed_float4 v1 = *((const device packed_float4*)(vp + i * vs + 4));
-              const float k[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
-              const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+              float k[8];
+              float v[8];
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) {
+                k[j] = kp[i * ks + j];
+                v[j] = vp[i * vs + j];
+              }
               #pragma clang loop unroll(full)
               for (int h = 0; h < G; h++) {
                 float score = 0;
@@ -1291,14 +1175,15 @@ enum CBv2VerifyVectorAttention {
             for (int h = 0; h < G; h++) {
               const uint slot = ((h0 + h) * L + t) * 32u + uint(c);
               device float* op = part_o + slot * D + simd_lid * 8;
-              *((device packed_float4*)(op + 0)) = packed_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
-              *((device packed_float4*)(op + 4)) = packed_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < 8; j++) op[j] = o[h][j];
               if (simd_lid == 0) {
                 part_m[slot] = max_score[h];
                 part_s[slot] = sum_exp_score[h];
               }
             }
-            """
+            """,
+        ensureRowContiguous: false)
 
     /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
     static func attend(
@@ -1314,104 +1199,26 @@ enum CBv2VerifyVectorAttention {
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
         let L = queries.dim(2)
-        let nKeys = keys.dim(2)
 
         if L > 8 && classesPerGroup == 2 {
-            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])]
+            let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])]
             let states = pairedPartial(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
                 outputDTypes: [.float32, .float32, .float32])
             return combine(
-                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                states, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
         let parts = partial(
-            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(nKeys)])],
+            [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))])],
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
             outputDTypes: [.float32, .float32, .float32])
         return combine(
-            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+            parts, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-    }
-
-    /// `attend` for a draft tree window (`tree`: see `treeSource`).
-    static func attendTree(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, tree: MLXArray
-    ) -> MLXArray? {
-        guard tree.dtype == .int32, tree.size >= 288,
-            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
-            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
-            queries.dim(0) == 1, queries.dim(1) == 16, queries.dim(3) == 256,
-            (2 ... 16).contains(queries.dim(2)),
-            keys.dim(0) == 1, keys.dim(1) == 4, keys.dim(3) == 256, values.shape == keys.shape,
-            keys.dim(2) >= queries.dim(2), keys.dim(2) < 1024,
-            queries.strides[3] == 1, keys.strides[3] == 1, values.strides[3] == 1,
-            StreamOrDevice.default == StreamOrDevice.gpu
-        else { return nil }
-        let L = queries.dim(2)
-        let inputs = [queries, keys, values, MLXArray([scale]), MLXArray([Int32(keys.dim(2))]), tree]
-        if L > 8 && classesPerGroup == 2 {
-            guard let pairedTree else { return nil }
-            let states = pairedTree(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
-                outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-                outputDTypes: [.float32, .float32, .float32])
-            return combine(
-                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-        }
-        guard let partialTree else { return nil }
-        let parts = partialTree(
-            inputs,
-            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
-            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
-            outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-            outputDTypes: [.float32, .float32, .float32])
-        return combine(
-            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-    }
-}
-
-/// Draft tree verify: the round's tree descriptor (int32 [333], `DF2Fast.treeSource`) for
-/// the target verify, set by the engine around the verify forward and read by the attention,
-/// RoPE and GDN layers; nil keeps every record kernel.
-public enum CBv2BranchVerify {
-    nonisolated(unsafe) public static var tree: MLXArray?
-    /// The accepted path's verify rows (anchor first) while a tree round commits; nil or the
-    /// prefix 0 ..< n keeps the record replay.
-    nonisolated(unsafe) public static var committedRows: [Int32]?
-
-    /// Recent tree proposals: the drafter registers each tree's tokens with its descriptor,
-    /// and the engine finds the descriptor of the block it verifies by identity.
-    nonisolated(unsafe) private static var proposals: [(tokens: MLXArray, desc: MLXArray)] = []
-
-    public static func register(tokens: MLXArray, desc: MLXArray) {
-        proposals.append((tokens, desc))
-        if proposals.count > 4 { proposals.removeFirst() }
-    }
-
-    public static func desc(for tokens: MLXArray) -> MLXArray? {
-        proposals.last(where: { $0.tokens === tokens })?.desc
-    }
-
-    /// True when `rows` is not `0 ..< rows.count`.
-    public static func isBranch(_ rows: [Int32]) -> Bool {
-        rows.enumerated().contains { $0.offset != Int($0.element) }
-    }
-
-    /// Host copy of the descriptor, read once per tree (a sync; only the serial attention
-    /// fallback past 1024 keys needs it).
-    nonisolated(unsafe) private static var hostDesc: (desc: MLXArray, host: [Int32])?
-    static func host(_ desc: MLXArray) -> [Int32] {
-        if let h = hostDesc, h.desc === desc { return h.host }
-        let host = desc.asArray(Int32.self)
-        hostDesc = (desc, host)
-        return host
     }
 }

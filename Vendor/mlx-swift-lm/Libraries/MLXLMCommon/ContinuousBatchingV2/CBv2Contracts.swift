@@ -394,9 +394,6 @@ public protocol CBv2SequenceKV: AnyObject {
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
-    /// Draft tree commit: move the accepted path's verify rows (`rows`, anchor first, each
-    /// at slot `base + row`) to slots `base ..< base + rows.count`, before the rollback.
-    func compactTree(base: Int, rows: [Int32])
 
     // MARK: Speculative (MTP) writes
 
@@ -1530,11 +1527,5 @@ extension CBv2Engine {
     public func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest {
         throw CBv2PrefillLogitDigestError.unsupported(
             engine: String(describing: type(of: self)))
-    }
-}
-
-extension CBv2SequenceKV {
-    public func compactTree(base: Int, rows: [Int32]) {
-        preconditionFailure("CBv2 tree verify: \(type(of: self)) cannot compact a tree commit")
     }
 }

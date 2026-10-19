@@ -610,7 +610,6 @@ extension EngineLoopV2 {
         // stacked draft row: the verify tokens and draft ids then take it
         // whole instead of re-joining k one-token slices (one copy each).
         var blockDraftIDs: MLXArray?
-        var treeDesc: MLXArray?
         var assistantEvalTargets: [MLXArray] = []
         if let lookupDrafts {
             // Host ids in the drafted chain's [B] int32 per-position shape.
@@ -655,7 +654,6 @@ extension EngineLoopV2 {
                 assistantEvalTargets.append(
                     contentsOf: block.evaluationTargets(for: requestState))
             }
-            if batch == 1, k == 15 { treeDesc = CBv2BranchVerify.desc(for: proposals[0]) }
             let batched =
                 proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 0)
             // The whole block is known before target construction starts, so
@@ -752,13 +750,9 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try {
-            CBv2BranchVerify.tree = treeDesc
-            defer { CBv2BranchVerify.tree = nil }
-            return try mtpBuildTargetVerification(
-                columns: targetColumns, rows: verifyRows, driver: mtp,
-                tokens: blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) })
-        }()
+        let target = try mtpBuildTargetVerification(
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            tokens: blockDraftIDs.map { concatenated([seedColumn, $0], axis: 1) })
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -769,7 +763,6 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        if let treeDesc { packetParts.append(treeDesc[0 ..< 16]) }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
@@ -783,7 +776,6 @@ extension EngineLoopV2 {
             policyTopTwoValues: target.policyTopTwo?.values,
             blockContext: target.blockContext)
         result.diagnostics = target.diagnostics
-        result.treeDesc = treeDesc
         result.includesAssistantPrefill = includesAssistantPrefill
         return result
     }

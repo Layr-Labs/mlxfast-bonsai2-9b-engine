@@ -164,11 +164,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// and how many of its columns the round committed (0 until then).
         var projection: DFlash2ContextProjection?
         var projectionRows = 0
-        /// The finalized round's raw accepted count when it confirmed exactly
-        /// `accepted + 1` columns (`recordValidatedAcceptance`): the
-        /// projection's layer-0 front holds that anchor and serves only a
-        /// block over that many plus one rows.
-        var frontAccepted: Int?
         var lookupFC: (output: MLXArray, rows: Int)?
         /// A lookup round's absorption of the pending rows, not yet built:
         /// the engine submits it behind that round's verify
@@ -230,7 +225,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             preparedLookup = nil
             projection = nil
             projectionRows = 0
-            frontAccepted = nil
             lookupFC = nil
             absorbDeferred = false
             lastProposalLookup = false
@@ -324,13 +318,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             state.projectionRows > 0 && state.pending.count == 1
                 && state.pendingRows == state.projectionRows
             ? state.projection : nil
-        let frontAccepted = state.frontAccepted
         state.projection = nil
         state.projectionRows = 0
-        state.frontAccepted = nil
-        if let projection, frontAccepted.map({ $0 + 1 }) != state.pendingRows {
-            projection.front = nil
-        }
         if let ids = state.promptDraft, ids.count == depth {
             if let output = projection?.lookupFCOutput {
                 state.lookupFC = (output: output, rows: state.pendingRows)
@@ -459,13 +448,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// GPU runs it while the host reads the verify back and accepts, and the
     /// next proposal reads the committed prefix of it.
     public func projectRoundContext(
-        blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
+        blockContext: MLXArray, targetTokens: MLXArray, requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let state = self.state(requestState)
         state.projection = nil
         state.projectionRows = 0
-        state.frontAccepted = nil
         // Lookup rounds come in runs, and the next lookup round would only
         // queue unused work in front of its verify.
         guard !state.lastProposalLookup, blockContext.ndim == 3, blockContext.dim(0) == 1,
@@ -473,38 +460,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
                 targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens)
         else { return [] }
         state.projection = projection
-        var arrays = projection.evaluationTargets
-        if let offset = frontCacheOffset(state),
-            let front = drafter.projectLayerZeroFront(
-                projection, draftTokens: draftTokens, targetTokens: targetTokens,
-                cacheOffset: offset)
-        {
-            projection.front = front
-            arrays.append(contentsOf: front.evaluationTargets)
-        }
-        return arrays
-    }
-
-    /// The offset the next proposal's caches start from, when nothing can
-    /// move them before it: seeded, no absorption or pending rows waiting,
-    /// one shared offset, and the proposal's context and block inside the
-    /// sliding window.
-    private func frontCacheOffset(_ state: RequestState) -> Int? {
-        guard DF2Fast.frontEnabled, DF2Fast.frontMatched, state.cacheSeeded,
-            !state.absorbDeferred, state.pending.isEmpty, let first = state.caches.first,
-            state.caches.allSatisfy({ $0.offset == first.offset })
-        else { return nil }
-        let offset: Int = first.offset
-        if let window = drafter.config.slidingWindow, offset + 16 + 16 >= window {
-            return nil
-        }
-        return offset
-    }
-
-    public func recordValidatedAcceptance(
-        _ accepted: Int, requestState: any CBv2MTPRequestState
-    ) {
-        state(requestState).frontAccepted = accepted
+        return projection.evaluationTargets
     }
 
     /// Build and return a lookup round's deferred absorption (see
@@ -581,16 +537,11 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.preparedLookup = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil
-        // Armed by this round's `projectRoundContext` (no rows committed yet). A draft tree's
-        // accepted path keeps the projection of its own columns.
-        let treePath = CBv2BranchVerify.committedRows
-        let projection = (state.projectionRows == 0 ? state.projection : nil).map { p in
-            treePath.map { p.gathered($0) } ?? p
-        }
+        // Armed by this round's `projectRoundContext` (no rows committed yet).
+        let projection = state.projectionRows == 0 ? state.projection : nil
         let pendingWasEmpty = state.pending.isEmpty
         state.projection = nil
         state.projectionRows = 0
-        state.frontAccepted = nil
         append(committedTargetHidden, to: requestState)
         // The committed rows are the verify's leading columns, the ones the
         // projection covers; it stands in for them only if nothing else is
@@ -614,7 +565,6 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.preparedLookup = nil
         state.projection = nil
         state.projectionRows = 0
-        state.frontAccepted = nil
         state.lookupFC = nil
         state.roots.removeAll(keepingCapacity: true)
         state.prestaged = nil

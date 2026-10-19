@@ -158,8 +158,6 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
-            /// Verify rows of the accepted path, anchor first (`0 ... accepted` for a chain).
-            let path: [Int]
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -192,29 +190,12 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
-            var path = [0]
-            var pathTargets = targets
-            if verify.treeDesc != nil {
-                // Tree round: from the anchor, follow the child whose draft is the target's token
-                // at its parent (siblings hold distinct tokens); the emitted tokens are the
-                // target's along that path.
-                let parents = host.suffix(16).map(Int.init)
-                while let next = (1 ..< targetWidth).first(where: {
-                    parents[$0] == path.last! && drafts[$0 - 1] == targets[path.last!]
-                }) {
-                    path.append(next)
-                }
-                accepted = path.count - 1
-                pathTargets = path.map { targets[$0] }
-            } else {
-                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
-                path = Array(0 ... accepted)
-            }
+            while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
                 rec.request.maxTokens - rec.generatedTokenCount)
-            if let stopIndex = pathTargets[..<naturalEmitted].firstIndex(where: {
+            if let stopIndex = targets[..<naturalEmitted].firstIndex(where: {
                 rec.request.stopTokens.contains($0)
             }) {
                 naturalEmitted = stopIndex + 1
@@ -225,9 +206,8 @@ extension EngineLoopV2 {
                     batchIndex: batchIndex,
                     metadata: metadata,
                     rec: rec,
-                    targets: pathTargets,
-                    accepted: accepted,
-                    path: path))
+                    targets: targets,
+                    accepted: accepted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -296,24 +276,11 @@ extension EngineLoopV2 {
             }
             let rejected = (1 + k) - confirmed
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            // The next round's drafter block is built and submitted only
-            // after this round's tokens are handed to the stream and the
-            // round is journaled (below): the host's graph build no longer
-            // delays the emission, and the GPU sees the same submissions in
-            // the same order.
-            var prestage: (() -> Void)?
-            let committedRows = outcome.path.prefix(max(confirmed, 1)).map { Int32($0) }
-            let treeBranch = CBv2BranchVerify.isBranch(committedRows)
-            CBv2BranchVerify.committedRows = treeBranch ? committedRows : nil
-            defer { CBv2BranchVerify.committedRows = nil }
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 let committedHidden: MLXArray
-                if let blockContext = verify.blockContext, treeBranch {
-                    committedHidden = blockContext[batchIndex ..< batchIndex + 1].take(
-                        MLXArray(committedRows), axis: 1)
-                } else if let blockContext = verify.blockContext {
+                if let blockContext = verify.blockContext {
                     committedHidden = blockContext[
                         batchIndex ..< batchIndex + 1,
                         CBv2MTPBlockContextIndex.confirmedColumns(
@@ -325,12 +292,9 @@ extension EngineLoopV2 {
                         0 ..< committedDraftCount,
                         0...]
                 }
-                let committedDraftTokens = treeBranch
-                    ? verify.draftIDs[batchIndex ..< batchIndex + 1].take(
-                        MLXArray(committedRows[1 ... committedDraftCount].map { $0 - 1 }), axis: 1)
-                    : verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount]
+                let committedDraftTokens = verify.draftIDs[
+                    batchIndex ..< batchIndex + 1,
+                    0 ..< committedDraftCount]
                 if let carry = metadata.lookupCarry {
                     stateful.commitLookupRound(
                         requestState: state,
@@ -344,20 +308,15 @@ extension EngineLoopV2 {
                         confirmedInputTokens: 1 + committedDraftCount,
                         committedDraftTokens: committedDraftTokens,
                         committedTargetHidden: committedHidden)
-                    if confirmed == accepted + 1, let block = mtp.blockDrafter {
-                        block.recordValidatedAcceptance(accepted, requestState: state)
-                    }
                     if finishReason == nil, confirmed > 0, mtp.lookupNgram == nil,
                         verify.rows.count == 1,
                         rec.request.maxTokens - rec.generatedTokenCount > k,
                         let block = mtp.blockDrafter
                     {
-                        let history = rec.tokens
-                        let anchor = kept[confirmed - 1]
-                        prestage = {
-                            block.prepareDraft(history: history, depth: k, requestState: state)
-                            block.prestageBlock(anchor: anchor, depth: k, requestState: state)
-                        }
+                        block.prepareDraft(
+                            history: rec.tokens, depth: k, requestState: state)
+                        block.prestageBlock(
+                            anchor: kept[confirmed - 1], depth: k, requestState: state)
                     }
                 }
             }
@@ -392,11 +351,6 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 recurrent MTP finalization failed for \(id): \(error)")
                     }
-                }
-            }
-            if treeBranch {
-                for sequence in metadata.storageRows {
-                    sequence.compactTree(base: sequence.absoluteOffset - targetWidth, rows: committedRows)
                 }
             }
             if rejected > 0 {
@@ -473,11 +427,6 @@ extension EngineLoopV2 {
                 acceptedDepth: observedAccepted,
                 rejectionObserved: rejectionObserved,
                 endedByTruncation: acceptanceTruncated)
-            // After the emission and this round's journal entry, so the
-            // gap between them stays the record's (the stream's reader
-            // snapshots the journal after draining).
-            CBv2BranchVerify.committedRows = nil
-            prestage?()
 
             if let finishReason {
                 if let state = metadata.assistantState {
@@ -494,10 +443,8 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = verify.treeDesc != nil
-                    ? outcome.path[confirmed - 1]
-                    : CBv2MTPHiddenIndex.carryColumn(
-                        targetOutputIndex: confirmed - 1, draftDepth: k)
+                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+                    targetOutputIndex: confirmed - 1, draftDepth: k)
                 // Shortlist coverage gate: hand the accepted position's
                 // target top-K ids to the next draft only when their
                 // probability mass (packet tail, parts-per-million) clears

@@ -145,9 +145,6 @@ final class CBv2MTPRoundInFlight {
         let blockContext: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
-        /// The draft tree descriptor when this round verified a tree (`CBv2BranchVerify`);
-        /// its 16 parent rows ride the end of `acceptancePacket`.
-        var treeDesc: MLXArray?
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

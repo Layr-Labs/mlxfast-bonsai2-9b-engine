@@ -127,9 +127,8 @@ extension EngineLoopV2 {
     /// arrives. Two kinds: context work the drafter postponed while proposing
     /// this round, and the next proposal's projection of this round's context
     /// columns. The projection is queued only for a single row that cannot
-    /// finish by length this round, so another round of the same request can
-    /// follow it; a stop token or the end of the caller's drain can still
-    /// leave it unused.
+    /// finish by length this round, so another round of the same request
+    /// inside the same decode window always follows it.
     private func mtpQueueRoundContextProjection(
         _ verify: CBv2MTPRoundInFlight.Verify, driver mtp: CBv2MTPRoundDriver
     ) {
@@ -140,14 +139,7 @@ extension EngineLoopV2 {
         else { return }
         // Packet layout for one row: k draft ids, then the 1 + k target ids.
         let k = verify.k
-        var draftTokens = verify.acceptancePacket[0 ..< k]
         let targetTokens = verify.acceptancePacket[k ..< (2 * k + 1)]
-        if let treeDesc = verify.treeDesc, k == 15 {
-            // A draft tree's rows are in DFS order: the front's acceptance count runs only
-            // while row r's parent is row r - 1 (a branch path drops the front on the host).
-            let chainRows = treeDesc[1 ..< 16] .== MLXArray(Array(Int32(0) ..< Int32(15)))
-            draftTokens = which(chainRows, draftTokens, MLXArray(Int32(-1)))
-        }
         var arrays = block.submitDeferredContext(requestState: state, after: targetTokens)
         let row = verify.rows[0]
         if Self.mtpRoundContextProjectionEnabled, mtp.lookupNgram == nil,
@@ -156,7 +148,7 @@ extension EngineLoopV2 {
             arrays.append(
                 contentsOf: block.projectRoundContext(
                     blockContext: blockContext, targetTokens: targetTokens,
-                    draftTokens: draftTokens, requestState: state))
+                    requestState: state))
         }
         if !arrays.isEmpty {
             asyncEval(arrays)
