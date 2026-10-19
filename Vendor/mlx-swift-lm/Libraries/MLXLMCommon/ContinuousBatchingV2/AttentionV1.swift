@@ -1072,7 +1072,7 @@ enum CBv2VerifyVectorAttention {
         source: """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
-            constexpr int v_per_thread = 8;
+            constexpr int v_per_thread = 16;
             threadgroup float staged[32 * 129];
             const uint head = threadgroup_position_in_grid.x / 2u;
             const uint half_ = threadgroup_position_in_grid.x % 2u;
@@ -1082,7 +1082,7 @@ enum CBv2VerifyVectorAttention {
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint base = (head * L + t) * 32u;
-            for (uint idx = tid; idx < 32u * 32u; idx += 512u) {
+            for (uint idx = tid; idx < 32u * 32u; idx += 256u) {
               const uint c = idx / 32u, x = (idx % 32u) * 4u;
               const packed_float4 packet = *((const device packed_float4*)(part_o + (base + c) * 256u + half_ * 128u + x));
               *((threadgroup packed_float4*)(staged + c * 129u + x)) = packet;
@@ -1208,7 +1208,7 @@ enum CBv2VerifyVectorAttention {
                 outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
                 outputDTypes: [.float32, .float32, .float32])
             return combine(
-                states, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
+                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
         let parts = partial(
@@ -1218,7 +1218,7 @@ enum CBv2VerifyVectorAttention {
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
             outputDTypes: [.float32, .float32, .float32])
         return combine(
-            parts, grid: (32 * 512, L, 1), threadGroup: (512, 1, 1),
+            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
 }
