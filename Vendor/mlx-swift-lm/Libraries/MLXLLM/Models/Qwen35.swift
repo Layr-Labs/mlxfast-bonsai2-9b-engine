@@ -5819,6 +5819,13 @@ extension Qwen35TextModel: DFlash2TapTarget {
         return prefix(hidden)
     }
 
+    public func draftShortlistForDFlash2Hidden(
+        _ hidden: MLXArray, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let full = lmHead as? HadamardQuantizedLinear else { return nil }
+        return dFlash2DraftHead.shortlist(hidden, of: full, rows: rows)
+    }
+
     /// One exact top-2 at `rows` rows over a fixed normalized activation: the
     /// head's lazily built constants and its one-time bit-exact self-check at
     /// that row count run here, at load, instead of inside the first round.
@@ -6119,6 +6126,12 @@ extension Qwen35Model: DFlash2TapTarget {
 
     public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
         languageModel.draftLogitsForDFlash2Hidden(hidden, rows: rows)
+    }
+
+    public func draftShortlistForDFlash2Hidden(
+        _ hidden: MLXArray, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        languageModel.draftShortlistForDFlash2Hidden(hidden, rows: rows)
     }
 
     public func prepareDFlash2Verify(rows: Int) {

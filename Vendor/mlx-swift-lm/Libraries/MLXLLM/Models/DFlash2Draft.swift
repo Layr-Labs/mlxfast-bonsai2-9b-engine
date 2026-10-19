@@ -323,6 +323,11 @@ public protocol DFlash2Target: AnyObject {
     /// the target head's first `rows` output rows, through the same module type
     /// and transform. Proposals only; the target's verify head stays full.
     func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray
+    /// The fast selectors' `[15, 128]` ids and values from the same prefix head
+    /// without its full logits: every value is the head's own at that id, the
+    /// ids may differ from the logits' top-k (proposals only). Nil keeps the
+    /// logits.
+    func draftShortlistForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> (ids: MLXArray, values: MLXArray)?
     /// Build, at load, the per-process state the target's `rows`-row verify head
     /// would otherwise build inside the first measured window. Never changes a token.
     func prepareDFlash2Verify(rows: Int)
@@ -333,6 +338,9 @@ extension DFlash2Target {
     public func draftLogitsForDFlash2Hidden(_ hidden: MLXArray, rows: Int) -> MLXArray {
         logitsForDFlash2Hidden(hidden)
     }
+    public func draftShortlistForDFlash2Hidden(
+        _ hidden: MLXArray, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? { nil }
 }
 
 /// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 96k
@@ -353,14 +361,25 @@ public final class DFlash2DraftHeadSlot {
     private var source: ObjectIdentifier?
     private var rows = 0
     private var prefix: HadamardQuantizedLinear?
+    private var screened = false
 
     public init() {}
+
+    /// The prefix head's screened candidates (`HadamardQuantizedLinear.draftScreen`);
+    /// nil unless the screen qualified at bind.
+    public func shortlist(
+        _ hidden: MLXArray, of full: HadamardQuantizedLinear, rows: Int
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let prefix = head(of: full, rows: rows), screened else { return nil }
+        return prefix.draftScreen(hidden, shortlist: DF2Fast.shortlist)
+    }
 
     public func head(of full: HadamardQuantizedLinear, rows: Int) -> HadamardQuantizedLinear? {
         if source == ObjectIdentifier(full), self.rows == rows { return prefix }
         source = ObjectIdentifier(full)
         self.rows = rows
         prefix = nil
+        screened = false
         guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
             rows > 0, rows < full.weight.dim(0)
         else {
@@ -381,6 +400,13 @@ public final class DFlash2DraftHeadSlot {
             return nil
         }
         Self.report(rows, "on (bitwise equal to the full head's first \(rows) columns, 15 rows, FP32 and BF16)")
+        if DF2Fast.screenAllowed, rows == 98304 {
+            let failure: String? = candidate.qualifyDraftScreen(shortlist: DF2Fast.shortlist)
+            screened = failure == nil
+            let state: String = failure.map { "off (\($0))" }
+                ?? "on (bit-identical to its reference; rescore bit-identical to the head)"
+            Self.report(rows, "K 2048 screen \(state)")
+        }
         prefix = candidate
         return prefix
     }
@@ -1962,6 +1988,23 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         return logits
     }
 
+    /// The fast selectors' 128 (id, value) pairs per position: the target's
+    /// screened prefix head when it qualified and this block takes it (15
+    /// positions, the 98,304-row prefix, no logit transform), else the top-k
+    /// of the full draft logits.
+    private func draftTop(_ hidden: MLXArray, blockSize: Int) throws -> [MLXArray] {
+        guard let target else { throw DFlash2Error.notBound }
+        let rows: Int = DF2Vocab.rows
+        let softcap: Float = config.dflash.finalLogitSoftcapping ?? 0
+        if DF2Fast.screenAllowed, blockSize == 16, rows == 98304, rows < config.vocabularySize,
+            rows >= config.dflash.selectorTopK, config.dflash.outputMultiplier == 1, softcap <= 0,
+            let screened = target.draftShortlistForDFlash2Hidden(hidden, rows: rows)
+        {
+            return [screened.ids, screened.values]
+        }
+        return DF2Fast.top(try logits(hidden))
+    }
+
     // MARK: Context projection ahead of acceptance
 
     /// The acceptance-independent head of the next block's forward, over every
@@ -2124,9 +2167,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
+            let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize)
             if DF2Fast.treeOn, blockSize == 16 {
                 let (tokens, desc) = DF2Fast.selectTree(
-                    logits: try logits(hidden), projected: projected,
+                    top: top, projected: projected,
                     anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                     succ: sel.successorCodebook,
                     predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
@@ -2134,7 +2178,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 return (tokens, hidden, finalCodes)
             }
             let tokens = DF2Fast.select(
-                logits: try logits(hidden), projected: projected,
+                top: top, projected: projected,
                 anchor: MLXArray(anchor.map { Int32($0) }), pred: sel.predecessorCodebook,
                 succ: sel.successorCodebook,
                 predLookup: sel.predecessorLookup, succLookup: sel.successorLookup)
@@ -2223,6 +2267,9 @@ enum DF2Fast {
     /// `DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ=0` keeps the head-major o_proj input.
     static let tokenMajorOProj =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOKEN_MAJOR_OPROJ"] != "0"
+    /// `DARKBLOOM_BONSAI_DF2_SCREEN=0` keeps the full draft head (no K 2048 screen).
+    static let screenAllowed =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_SCREEN"] != "0"
     /// `DARKBLOOM_BONSAI_DF2_FRONT=0` keeps layer 0's projections in the attention-half submit.
     static let earlyFront =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_FRONT"] != "0"
@@ -5474,16 +5521,35 @@ enum DF2Fast {
 
     private static var selectorLookupSentinel: MLXArray { MLXArray([UInt16(0)]) }
 
+    /// `topk` over `[..., V]` logits: `[P, 128]` ids and values. The selectors
+    /// read only these pairs, in any order.
+    static func top(_ logits: MLXArray) -> [MLXArray] {
+        let V = logits.dim(-1), P = logits.size / V
+        return topk(
+            [logits.reshaped([P, V]).asType(.float32)],
+            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
+    }
+
+    /// The ids of `top`, for the draft-head screen's partial scores.
+    static func shortlist(_ partial: MLXArray) -> MLXArray { top(partial)[0] }
+
     /// Fused top-16 + greedy selector for `selectGreedy` (B = 1).
     static func select(
         logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> MLXArray {
-        let V = logits.dim(-1), P = logits.size / V
-        let top = topk(
-            [logits.reshaped([P, V]).asType(.float32)],
-            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
+        select(
+            top: top(logits), projected: projected, anchor: anchor, pred: pred, succ: succ,
+            predLookup: predLookup, succLookup: succLookup)
+    }
+
+    /// `select` on precomputed `top` pairs.
+    static func select(
+        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
+    ) -> MLXArray {
+        let P = top[0].dim(0)
         let path = selector(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
@@ -5656,12 +5722,18 @@ enum DF2Fast {
         logits: MLXArray, projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
-        let V = logits.dim(-1), P = logits.size / V
+        selectTree(
+            top: top(logits), projected: projected, anchor: anchor, pred: pred, succ: succ,
+            predLookup: predLookup, succLookup: succLookup)
+    }
+
+    /// `selectTree` on precomputed `top` pairs.
+    static func selectTree(
+        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
+        let P = top[0].dim(0)
         precondition(P == 15, "DF2 tree: block of \(P) positions")
-        let top = topk(
-            [logits.reshaped([P, V]).asType(.float32)],
-            grid: (P * 256, 8, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[P, 128], [P, 128]], outputDTypes: [.int32, .float32])
         let threads = 512
         let outs = treeSelector!(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),

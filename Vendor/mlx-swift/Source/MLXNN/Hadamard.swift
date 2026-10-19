@@ -5923,6 +5923,134 @@ enum VerifyInt8Matmul {
         }
         return outputs.count == layers.count ? outputs : nil
     }
+
+    // MARK: The draft-head screen
+
+    /// The fast tensor kernel takes the screen when its route and its offset
+    /// skip matched at load.
+    static var screenAvailable: Bool { route == .nax && naxFast && negativeForms }
+
+    /// The one-layer compile-time form (stored or streamed words) over the
+    /// first `SG` 128-groups only. Physical K, every stride and every operand
+    /// stay as they are; only the group loop and its next-group load stop at
+    /// `SG`. The streaming conversion runs first, since it searches for the
+    /// prefetch bound.
+    static func screenSource(streamed: Bool) -> String? {
+        var source: String = streamed ? streamedFormsSource(layers: 1) : naxFormsSource(layers: 1)
+        let swaps: [(String, String)] = [
+            ("for (int g = int(sg); g < Kg; g += 4) {", "for (int g = int(sg); g < SG; g += 4) {"),
+            ("if (g + 4 < Kg) {", "if (g + 4 < SG) {"),
+        ]
+        for (old, new) in swaps {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return source
+    }
+
+    private static let screenKernels: [MLXFast.MLXFastKernel?] = [false, true].map { streamed in
+        screenSource(streamed: streamed).map { source in
+            MLXFast.metalKernel(
+                name: streamed ? "bonsai_q8_head_screen_streamed" : "bonsai_q8_head_screen",
+                inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"], outputNames: ["out0"],
+                source: source, header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+        }
+    }
+
+    /// `[rows, N]` FP32 sums over the first `groups` 128-groups, `NEG = 1`.
+    static func screen(
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
+        streamed: Bool, groups: Int
+    ) -> MLXArray? {
+        guard let kernel = screenKernels[streamed ? 1 : 0] else { return nil }
+        let n: Int = weight.dim(0)
+        let dims = MLXArray([Int32(activation.k), Int32(activation.rows), Int32(n)])
+        let template = [("ROWS", activation.rows), ("NEG", 1), ("KC", activation.k), ("SG", groups)]
+            as [(String, any KernelTemplateArg)]
+        let inputs: [MLXArray] = [
+            activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb, dims,
+        ]
+        return kernel(
+            inputs, template: template, grid: (n / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[activation.rows, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// One simdgroup per (row, id) over canonical words, on the ALU. Lanes
+    /// 8s ..< 8s + 8 hold chain s (groups s, s + 4, ... below `GL`), lane & 7
+    /// a word of each group. The group sum is an integer (|C| < 2^16), so its
+    /// order is free; the FP32 steps per group, the four chains and their
+    /// final order are `naxFastBody`'s, so at `GL = Kg` a value is that
+    /// kernel's output bit for bit. `ALL` scores every row (`ids` unused).
+    static let headGatherSource = """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = ksz[0]; const int N = ksz[1]; const int P = ksz[2];
+        const int Kg = K / 128;
+        const int KW = K / 16;
+        const uint lane = thread_index_in_simdgroup;
+        const uint pair = thread_position_in_grid.x >> 5;
+        if (pair >= uint(ROWS * P)) return;
+        const int m = int(pair) / P;
+        const int id = ALL ? int(pair) % P : ids[pair];
+        if (id < 0 || id >= N) {
+          if (lane == 0) { out[pair] = -INFINITY; }
+          return;
+        }
+        const int s = int(lane >> 3);
+        const int j = int(lane & 7u);
+        const device uint32_t* wrow = w + (size_t)id * KW + j;
+        const device char4* xrow = (const device char4*)(xq + (size_t)m * K) + 4 * j;
+        float p = 0.0f;
+        for (int g = s; g < GL; g += 4) {
+          const uint32_t v = wrow[g * 8];
+          const device char4* src = xrow + g * 32;
+          int d = 0;
+          #pragma clang loop unroll(full)
+          for (int u = 0; u < 4; u++) {
+            const char4 a = src[u];
+            const uint c = (v >> uint(2 * u)) & 0x03030303u;
+            d += int(a.x) * int(c & 255u) + int(a.y) * int((c >> 8) & 255u)
+              + int(a.z) * int((c >> 16) & 255u) + int(a.w) * int(c >> 24);
+          }
+          d += simd_shuffle_xor(d, ushort(1));
+          d += simd_shuffle_xor(d, ushort(2));
+          d += simd_shuffle_xor(d, ushort(4));
+          const float sc = float(scales[(size_t)id * Kg + g]);
+          const float off = NEG ? -sc : float(biases[(size_t)id * Kg + g]);
+          const float t = sc * float(d);
+          p = fma(off, rsb[m * Kg + g], fma(ascale[m * Kg + g], t, p));
+        }
+        const float p0 = simd_shuffle(p, ushort(0));
+        const float p1 = simd_shuffle(p, ushort(8));
+        const float p2 = simd_shuffle(p, ushort(16));
+        const float p3 = simd_shuffle(p, ushort(24));
+        if (lane == 0) { out[pair] = ((p0 + p1) + p2) + p3; }
+        """
+
+    private static let headGatherKernel = MLXFast.metalKernel(
+        name: "bonsai_q8_head_gather",
+        inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
+        source: headGatherSource, ensureRowContiguous: true)
+
+    /// `[rows, P]` values at `ids` `[rows, P]` int32 (every row when nil, P = N)
+    /// over the first `groups` 128-groups; `scales` and `biases` are `[N, Kg]`.
+    static func gather(
+        _ activation: PromptInt8Activation, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        ids: MLXArray?, groups: Int, negative: Bool
+    ) -> MLXArray {
+        let n: Int = weight.dim(0)
+        let p: Int = ids?.dim(-1) ?? n
+        let dims = MLXArray([Int32(activation.k), Int32(n), Int32(p)])
+        let template = [("ROWS", activation.rows), ("NEG", negative), ("GL", groups), ("ALL", ids == nil)]
+            as [(String, any KernelTemplateArg)]
+        let inputs: [MLXArray] = [
+            activation.codes, weight, scales, biases, activation.ascale, activation.rsb,
+            ids ?? MLXArray([Int32(0)]), dims,
+        ]
+        return headGatherKernel(
+            inputs, template: template, grid: (activation.rows * p * 32, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[activation.rows, p]], outputDTypes: [.float32])[0]
+    }
 }
 
 // MARK: - The dense GDN b/a projection in the qkv/z verify dispatch
@@ -6221,6 +6349,13 @@ final class PromptInt8Constants {
     }
 }
 
+/// The operand form a packed module's draft-head screen qualified with at
+/// bind (`streamed` words or the stored ones); nil until it qualifies.
+final class DraftHeadScreenState {
+    var streamed: Bool?
+    nonisolated(unsafe) static var failure: String?
+}
+
 /// Affine packed linear weights with a signed Hadamard input transform.
 ///
 /// Pass weights already folded and packed in MLX format. The initializer does
@@ -6307,6 +6442,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     private let promptConstants: PromptInt8Constants
     let exactHeadBounds = ExactVerifyHeadBounds()
+    let draftScreenState = DraftHeadScreenState()
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
     /// input, the packing or the device does not take it.
@@ -7447,5 +7583,125 @@ extension HadamardQuantizedLinear {
             [rescored[0], rescored[1], ids], grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
             outputShapes: [[1], [1]], outputDTypes: [.int32, .int32])
         return (picked[0], normed[0], picked[1])
+    }
+}
+
+// MARK: - The DFlash 2 draft-head screen
+
+extension HadamardQuantizedLinear {
+    /// The leading 128-groups (K 2048 of 4096) the screen scores every row on.
+    public static let draftScreenGroups = 16
+
+    private var draftScreenPacking: Bool {
+        readsFloat16ConstantsInPlace && bits == 2 && groupSize == 128 && weight.dtype == .uint32
+            && scales.dtype == .float16 && biases?.dtype == .float16 && bias == nil && gdnLayout == nil
+            && transform.blockSize == 4096 && transform.width == 4096 && promptConstants.negative
+            && weight.dim(0) % 32 == 0 && VerifyInt8Matmul.screenAvailable
+    }
+
+    private func draftScreenActivation(_ x: MLXArray) -> PromptInt8Activation? {
+        guard draftScreenPacking, x.dtype == .float32, x.shape == [1, 15, transform.width],
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        return transform.quantizedForVerify(x)
+    }
+
+    /// The draft head's 128 candidates per row with their exact values. The
+    /// partial over `draftScreenGroups` groups picks the ids (`shortlist`:
+    /// `[15, N]` to `[15, 128]` int32), then each id is rescored over every
+    /// group, bit for bit `self(x)` at that id. Nil (the caller runs the full
+    /// head) unless `qualifyDraftScreen` passed for the operand form in use
+    /// and `x` is `[1, 15, 4096]` FP32 on the GPU.
+    public func draftScreen(
+        _ x: MLXArray, shortlist: (MLXArray) -> MLXArray
+    ) -> (ids: MLXArray, values: MLXArray)? {
+        guard let streamed = draftScreenState.streamed, let biases,
+            let activation = draftScreenActivation(x)
+        else { return nil }
+        let copy: MLXArray? = streamedVerifyWeight
+        guard (copy != nil) == streamed else { return nil }
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases)
+        guard
+            let partial = VerifyInt8Matmul.screen(
+                activation, weight: copy ?? weight, scalesT: scalesT, biasesT: biasesT,
+                streamed: streamed, groups: Self.draftScreenGroups)
+        else { return nil }
+        let ids: MLXArray = shortlist(partial)
+        let values: MLXArray = VerifyInt8Matmul.gather(
+            activation, weight: weight, scales: scales, biases: biases, ids: ids,
+            groups: transform.width / 128, negative: true)
+        return (ids, values)
+    }
+
+    /// Resolved once at bind, before any request, on a fixed FP32 15-row
+    /// strided input: (i) the screen equals the ALU gather over the same
+    /// groups on every value, all finite; (ii) `shortlist` picks the same ids
+    /// from both; (iii) the full-width gather equals `self(x)` at those ids
+    /// and at every 97th id and the last. Nil when it qualified, else why not.
+    public func qualifyDraftScreen(shortlist: (MLXArray) -> MLXArray) -> String? {
+        draftScreenState.streamed = nil
+        let k: Int = transform.width
+        let values: [Float] = (0 ..< 16 * k).map { (i: Int) -> Float in
+            let t = Double(i)
+            return Float(Foundation.sin(t * 0.6180339) * (1 + 0.5 * Foundation.cos(t * 0.0211)))
+        }
+        let x: MLXArray = MLXArray(values, [1, 16, k])[0..., 1..., 0...]
+        guard x.dtype == .float32, x.shape == [1, 15, k], let biases, draftScreenPacking else {
+            return "route, packing or shape does not qualify"
+        }
+        let streamed: Bool = streamedVerifyWeight != nil
+        DraftHeadScreenState.failure = nil
+        var reason: String? = nil
+        withErrorHandler({ message in DraftHeadScreenState.failure = String(message.prefix(160)) }) {
+            reason = draftScreenMismatch(x, biases: biases, streamed: streamed, shortlist: shortlist)
+        }
+        if let failure = DraftHeadScreenState.failure { return "error: \(failure)" }
+        if reason == nil { draftScreenState.streamed = streamed }
+        return reason
+    }
+
+    private func draftScreenMismatch(
+        _ x: MLXArray, biases: MLXArray, streamed: Bool, shortlist: (MLXArray) -> MLXArray
+    ) -> String? {
+        guard let activation = draftScreenActivation(x) else { return "no verify activation" }
+        let n: Int = weight.dim(0)
+        let rows: Int = activation.rows
+        let copy: MLXArray? = streamedVerifyWeight
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases)
+        guard (copy != nil) == streamed,
+            let partial = VerifyInt8Matmul.screen(
+                activation, weight: copy ?? weight, scalesT: scalesT, biasesT: biasesT,
+                streamed: streamed, groups: Self.draftScreenGroups)
+        else { return "screen kernel unavailable" }
+        let reference: MLXArray = VerifyInt8Matmul.gather(
+            activation, weight: weight, scales: scales, biases: biases, ids: nil,
+            groups: Self.draftScreenGroups, negative: true)
+        let full: MLXArray = self(x)
+        guard full.dtype == .float32, full.shape == [1, rows, n] else { return "full head shape or dtype" }
+        let fullRows: MLXArray = full.reshaped([rows, n])
+        let ids: MLXArray = shortlist(partial)
+        let referenceIds: MLXArray = shortlist(reference)
+        let columns: [Int32] = stride(from: 0, to: n, by: 97).map { Int32($0) } + [Int32(n - 1)]
+        let spread: MLXArray = contiguous(
+            broadcast(MLXArray(columns).reshaped([1, columns.count]), to: [rows, columns.count]))
+        let groups: Int = transform.width / 128
+        func exact(_ at: MLXArray) -> MLXArray {
+            let mine: MLXArray = VerifyInt8Matmul.gather(
+                activation, weight: weight, scales: scales, biases: biases, ids: at,
+                groups: groups, negative: true)
+            let head: MLXArray = takeAlong(fullRows, at, axis: -1)
+            return MLX.all(mine.view(dtype: .uint32) .== head.view(dtype: .uint32))
+        }
+        let samePartial: MLXArray = MLX.all(partial.view(dtype: .uint32) .== reference.view(dtype: .uint32))
+        let finite: MLXArray = MLX.all(abs(partial) .< MLXArray(Float.infinity))
+        let checks: [(String, MLXArray)] = [
+            ("screen differs from the reference partial", samePartial),
+            ("screen not finite", finite),
+            ("shortlists differ", MLX.all(ids .== referenceIds)),
+            ("rescore differs at the shortlist", exact(ids)),
+            ("rescore differs at the spread ids", exact(spread)),
+        ]
+        eval(checks.map { $0.1 })
+        return checks.first { !$0.1.item(Bool.self) }?.0
     }
 }
