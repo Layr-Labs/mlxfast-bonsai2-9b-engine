@@ -91,8 +91,6 @@ extension EngineLoopV2 {
             return sampled
         }
 
-        let verificationWidth = presetTokens?.dim(1) ?? columns.count
-
         func captureDiagnostics(
             _ logits: MLXArray, columnOffset: Int, phase: String,
             topTwo: (ids: MLXArray, values: MLXArray)? = nil
@@ -110,7 +108,7 @@ extension EngineLoopV2 {
                     logits: logits[batchIndex, localColumn], requestID: row.rec.id,
                     outputIndex: verifyStepBases[batchIndex] + column, phase: phase,
                     batchIndex: batchIndex, batchSize: rows.count, column: column,
-                    verificationWidth: verificationWidth, draftDepth: verificationWidth - 1,
+                    verificationWidth: columns.count, draftDepth: columns.count - 1,
                     seedToken: row.carry?.token, cacheOffset: diagnosticOffsets[batchIndex],
                     policyTopTwo: retainedTopTwo)
                 { diagnostics.append(packet) }
@@ -121,7 +119,7 @@ extension EngineLoopV2 {
         case .serialTarget: false
         case .rectangular, .rectangularExact: true
         case .automatic:
-            verificationWidth * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
         }
 
         // A recurrent target may only verify rectangularly through the
@@ -170,15 +168,11 @@ extension EngineLoopV2 {
         mtp.recordVerificationStrategy(rectangular: useRectangular)
 
         if !useRectangular {
-            let serialColumns =
-                columns.count == verificationWidth
-                ? columns
-                : (0 ..< verificationWidth).map { presetTokens![0..., $0 ..< ($0 + 1)] }
             var scoreColumnsAccum: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
-            scoreColumnsAccum.reserveCapacity(serialColumns.count)
-            hiddenColumns.reserveCapacity(serialColumns.count)
-            for (columnIndex, column) in serialColumns.enumerated() {
+            scoreColumnsAccum.reserveCapacity(columns.count)
+            hiddenColumns.reserveCapacity(columns.count)
+            for (columnIndex, column) in columns.enumerated() {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output: (logits: MLXArray, lastHidden: MLXArray)
                 var recurrentArrays: [MLXArray] = []

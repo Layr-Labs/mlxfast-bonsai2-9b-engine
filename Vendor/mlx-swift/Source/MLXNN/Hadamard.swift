@@ -660,26 +660,6 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
-    /// `quantizedForPromptAttentionGate` for a single last-query prefill row (`rows == 1`),
-    /// writing `ascale` and `rsb` in the 64-row tiled layout `PromptInt8Matmul.matmulLastRow` reads.
-    func quantizedForPromptLastRowAttentionGate(
-        _ attention: MLXArray, queryProjection: MLXArray
-    ) -> PromptInt8Activation? {
-        guard blockSize == 4096, width == 4096, attention.dtype == .float32,
-            queryProjection.dtype == .float32, attention.ndim == 4, attention.dim(0) == 1,
-            attention.dim(1) == 16, attention.dim(2) == 1, attention.dim(3) == 256,
-            queryProjection.size == 8192, StreamOrDevice.default == StreamOrDevice.gpu
-        else { return nil }
-        let outputs = Self.attentionGatePromptQuantized4096Kernel(
-            [attention, queryProjection.reshaped([1, 8192]), signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0), ("ATTENTION_ROWS", 1)],
-            grid: (256, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, 4096], [64 * 32], [64 * 32]],
-            outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: 1, k: 4096)
-    }
-
     /// `forward(silu(gate) * rmsNorm(x, weight))` quantized for
     /// `VerifyInt8Matmul`, with the RMSNorm over 128-wide heads: the GDN
     /// output gate, its norm and the out-projection rotation in one kernel.
@@ -4817,26 +4797,23 @@ enum VerifyInt8Matmul {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
     nonisolated(unsafe) private static var wideStore = false
-    nonisolated(unsafe) private static var wideStore16 = false
 
     private static func streamLoad(columns: Int) -> String {
         "for (int t = 0; t < \(columns / 4); t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
     }
 
     private static func streamStore(columns: Int, wide: Bool) -> String {
-        if wide && (columns == 32 || columns == 16) {
+        if wide && columns == 32 {
             return "if ((t & 1) != 0) { const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4) - 1u; const uint32_t p = wv[t - 1]; const uint4 lo = uint4(p & 0x03030303u, (p >> 2) & 0x03030303u, (p >> 4) & 0x03030303u, (p >> 6) & 0x03030303u); const uint4 hi = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u); threadgroup ulong4* target = (threadgroup ulong4*)(bs[sg] + col * 32u + word * 4u); *target = ulong4(as_type<ulong2>(lo), as_type<ulong2>(hi)); }"
         }
         return "const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4); threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + col * 32u + word * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
     }
 
-    /// The streamed staging alone (no tensor op): one simdgroup per (tile,
-    /// group) loads the copy's words and writes the `columns x 32`-word B tile
-    /// to device memory with the body's own load and store statements.
-    private static func stagingTwinSource(columns: Int, wide: Bool) -> String {
-        let words = columns / 4
-        let tileWords = columns * 32
-        let store = streamStore(columns: columns, wide: wide)
+    /// The 32-column staging alone (no tensor op): one simdgroup per (tile,
+    /// group) loads the copy's words and writes the 32 x 32-word B tile to
+    /// device memory with the body's own load and store statements.
+    private static func stagingTwinSource(wide: Bool) -> String {
+        let store = streamStore(columns: 32, wide: wide)
             .replacingOccurrences(of: "threadgroup ", with: "device ")
             .replacingOccurrences(of: "bs[sg]", with: "tile")
         return """
@@ -4844,11 +4821,11 @@ enum VerifyInt8Matmul {
             const int bx = int(threadgroup_position_in_grid.x);
             const int gl = int(threadgroup_position_in_grid.y);
             const int Kg = K / 128;
-            const device uint32_t* wcol = w + (size_t)bx * (\(columns / 16)) * Kg * 128;
-            device uint32_t* tile = out + ((size_t)bx * Kg + gl) * \(tileWords);
-            uint32_t wv[\(words)];
-            \(streamLoad(columns: columns))
-            for (int t = 0; t < \(words); t++) {
+            const device uint32_t* wcol = w + (size_t)bx * (2) * Kg * 128;
+            device uint32_t* tile = out + ((size_t)bx * Kg + gl) * 1024;
+            uint32_t wv[8];
+            \(streamLoad(columns: 32))
+            for (int t = 0; t < 8; t++) {
               const uint32_t v = wv[t];
               \(store)
             }
@@ -4858,24 +4835,15 @@ enum VerifyInt8Matmul {
     private static let stagingTwinKernels = [false, true].map { (wide: Bool) -> MLXFast.MLXFastKernel in
         MLXFast.metalKernel(
             name: wide ? "bonsai_verify_stream_staging_wide" : "bonsai_verify_stream_staging_pair",
-            inputNames: ["w"], outputNames: ["out"], source: stagingTwinSource(columns: 32, wide: wide),
-            ensureRowContiguous: true)
-    }
-
-    private static let stagingTwin16Kernels = [false, true].map { (wide: Bool) -> MLXFast.MLXFastKernel in
-        MLXFast.metalKernel(
-            name: wide ? "bonsai_verify_stream_staging_n16_wide" : "bonsai_verify_stream_staging_n16_pair",
-            inputNames: ["w"], outputNames: ["out"], source: stagingTwinSource(columns: 16, wide: wide),
+            inputNames: ["w"], outputNames: ["out"], source: stagingTwinSource(wide: wide),
             ensureRowContiguous: true)
     }
 
     /// Every word of every tile and group at each streamed K, both forms over
     /// one real copy of hashed words; 255 marks an unwritten word (a staged
     /// word holds bytes 0...3 only). A compile or run error is a mismatch.
-    private static func checkWideStore(columns: Int) -> Bool {
+    private static func checkWideStore() -> Bool {
         let n = 64
-        let tileWords = columns * 32
-        let kernels = columns == 16 ? stagingTwin16Kernels : stagingTwinKernels
         var matched = true
         let failed = OSAllocatedUnfairLock(initialState: false)
         withErrorHandler({ _ in failed.withLock { $0 = true } }) {
@@ -4886,9 +4854,9 @@ enum VerifyInt8Matmul {
                     return UInt32(truncatingIfNeeded: value)
                 }
                 let packed = streamPack(MLXArray(words, [n, k / 16]), k: k, columns: 16)
-                let tiles: [MLXArray] = kernels.map { kernel in
-                    kernel([packed], template: [("K", k)], grid: (n / columns * 32, kg, 1), threadGroup: (32, 1, 1),
-                        outputShapes: [[n / columns * kg * tileWords]], outputDTypes: [.uint32], initValue: 255)[0]
+                let tiles: [MLXArray] = stagingTwinKernels.map { kernel in
+                    kernel([packed], template: [("K", k)], grid: (n / 32 * 32, kg, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[n / 32 * kg * 1024]], outputDTypes: [.uint32], initValue: 255)[0]
                 }
                 let same = MLX.all(tiles[0] .== tiles[1])
                 let full = MLX.all(tiles[0] .!= MLXArray(UInt32(255)))
@@ -4908,9 +4876,8 @@ enum VerifyInt8Matmul {
             FileHandle.standardError.write(Data("int8 verify streamed 32-B tile stores: off (DARKBLOOM_BONSAI_VERIFY_WIDESTORE=0)\n".utf8))
             return
         }
-        wideStore = checkWideStore(columns: 32)
-        wideStore16 = checkWideStore(columns: 16)
-        FileHandle.standardError.write(Data("int8 verify streamed 32-B tile stores: N32 \(wideStore ? "passed" : "FAILED"), N16 \(wideStore16 ? "passed" : "FAILED") staging twin K 4096/12288 all tiles/groups/lanes\n".utf8))
+        wideStore = checkWideStore()
+        FileHandle.standardError.write(Data("int8 verify streamed 32-B tile stores: \(wideStore ? "passed" : "FAILED; 16-B stores kept") staging twin K 4096/12288 all tiles/groups/lanes\n".utf8))
     }
 
     /// Same staged B tile, int32 tensor result and FP32 epilogue. Only the
@@ -4922,16 +4889,15 @@ enum VerifyInt8Matmul {
         let oldLoad = "for (int t = 0; t < \(words); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
         let load = streamLoad(columns: columns)
         let oldStore = "dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
-        let useWide = columns == 16 ? wideStore16 : (columns == 32 ? wideStore : false)
-        let store = streamStore(columns: columns, wide: useWide)
+        let store = streamStore(columns: columns, wide: wideStore)
         guard body.components(separatedBy: oldPointer).count == 2,
             body.components(separatedBy: oldLoad).count == 3,
             body.components(separatedBy: oldStore).count == 2 else { return nil }
         var result = body.replacingOccurrences(of: oldPointer, with: pointer)
             .replacingOccurrences(of: oldLoad, with: load)
             .replacingOccurrences(of: oldStore, with: store)
-        if useWide {
-            let tile = "threadgroup uint32_t bs[4][\(columns) * 32];"
+        if wideStore && columns == 32 {
+            let tile = "threadgroup uint32_t bs[4][32 * 32];"
             guard result.components(separatedBy: tile).count == 2 else { return nil }
             result = result.replacingOccurrences(of: tile, with: "alignas(32) " + tile)
         }
@@ -7405,13 +7371,11 @@ extension VerifyInt8Matmul {
     }
 
     /// The record's three-layer launch takes the compile-time forms here.
-    @inline(__always)
     private static func gateSplitTakesForms(
         k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
     ) -> Bool {
-        naxFast && naxShared && formsAllowed && hasMatchedForm(k: k, layers: 1)
-            && hasMatchedForm(k: k, layers: layers.count)
-            && layers.allSatisfy { formsFit(k: k, n: $0.weight.dim(0)) }
+        naxFast && naxShared && hasMatchedForm(k: k, layers: 1)
+            && usesForms(k: k, layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) })
     }
 
     /// Layer 0 of the split on the plain route: one half of each head.
@@ -7455,23 +7419,15 @@ extension VerifyInt8Matmul {
         guard gateSplitTakesForms(k: k, layers: layers),
             let kernel = gateSplitKernels[streamedWeights == nil ? 0 : 1]
         else { return nil }
-        let l0 = layers[0], l1 = layers[1], l2 = layers[2]
-        let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0), n2 = l2.weight.dim(0)
-        let w0 = streamedWeights?[0] ?? l0.weight
-        let w1 = streamedWeights?[1] ?? l1.weight
-        let w2 = streamedWeights?[2] ?? l2.weight
-        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1), Int32(n2)])
-        let inputs: [MLXArray] = [
-            activation.codes, w0, w1, w2,
-            l0.scalesT, l1.scalesT, l2.scalesT,
-            l0.biasesT, l1.biasesT, l2.biasesT,
-            activation.ascale, activation.rsb, dims,
-        ]
-        let negative = negativeForms && l0.negative && l1.negative && l2.negative
+        let ns = layers.map { $0.weight.dim(0) }
+        let ws = streamedWeights ?? layers.map(\.weight)
+        let inputs: [MLXArray] = [activation.codes] + ws + layers.map(\.scalesT) + layers.map(\.biasesT)
+            + [activation.ascale, activation.rsb, HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })]
+        let negative = negativeForms && layers.allSatisfy(\.negative)
         return kernel(
             inputs, template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)],
-            grid: ((n0 / 2 + n1 + n2) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [[m, n0], [m, n1], [m, n2]], outputDTypes: [.float32, .float32, .float32])
+            grid: ((ns[0] / 2 + ns[1] + ns[2]) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] }, outputDTypes: [.float32, .float32, .float32])
     }
 
     /// The second launch of the split: layer 0 `[rows, N0]` with only the
@@ -7490,7 +7446,7 @@ extension VerifyInt8Matmul {
         guard gateSplitTakesForms(k: k, layers: layers),
             let kernel = gateSplitKernels[streamedWeights == nil ? 2 : 3]
         else { return nil }
-        let negative = negativeForms && layers[0].negative && layers[1].negative && layers[2].negative
+        let negative = negativeForms && layers.allSatisfy(\.negative)
         return kernel(
             [activation.codes, streamedWeights?[0] ?? layers[0].weight, layers[0].scalesT, layers[0].biasesT,
              activation.ascale, activation.rsb, HostConstants.int32([Int32(k), Int32(m), Int32(n)])],
@@ -7971,23 +7927,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     ) -> (lead: MLXArray, b: MLXArray?, a: MLXArray?, deferred: (MLXArray) -> MLXArray?)? {
         guard VerifySplitZ.ready, let first = lead as? HadamardQuantizedLinear,
             let second = deferred as? HadamardQuantizedLinear,
-            first.readsFloat16ConstantsInPlace, first.gdnLayout == nil, first.bias == nil,
-            first.transform.blockSize == 4096, first.weight.dim(0) % 32 == 0,
-            first.transform.isIdentical(to: boundary.transform),
-            second.readsFloat16ConstantsInPlace, second.gdnLayout == nil, second.bias == nil,
-            second.transform.blockSize == 4096, second.weight.dim(0) % 32 == 0,
-            second.transform.isIdentical(to: boundary.transform)
+            [first, second].allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.isIdentical(to: boundary.transform)
+            })
         else { return nil }
         let rows = boundary.activation.rows
-        let streamed: [MLXArray]?
-        if VerifyInt8Matmul.streamReady,
-            let w0 = first.promptConstants.streamWeight(first.weight, k: first.transform.width, columns: 16),
-            let w1 = second.promptConstants.streamWeight(second.weight, k: second.transform.width, columns: 16)
-        {
-            streamed = [w0, w1]
-        } else {
-            streamed = nil
-        }
+        let streamed = Self.streamedWeights([first, second])
         let operands = (first.verifyOperands, second.verifyOperands)
         let pair = operands.0.negative && operands.1.negative
         let shared = VerifyInt8Matmul.pairSharesOffsetForm
@@ -8023,44 +7970,27 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     public static func boundarySplitQueryGate(
         _ boundary: VerifyBoundary, query: Linear, key: Linear, value: Linear
     ) -> (query: MLXArray, key: MLXArray, value: MLXArray, gate: (MLXArray) -> MLXArray?)? {
-        guard VerifySplitGate.ready,
-            let q0 = query as? HadamardQuantizedLinear,
-            let k0 = key as? HadamardQuantizedLinear,
-            let v0 = value as? HadamardQuantizedLinear,
-            q0.readsFloat16ConstantsInPlace, q0.gdnLayout == nil, q0.bias == nil,
-            q0.transform.blockSize == 4096, q0.weight.dim(0) % 32 == 0,
-            q0.transform.isIdentical(to: boundary.transform),
-            k0.readsFloat16ConstantsInPlace, k0.gdnLayout == nil, k0.bias == nil,
-            k0.transform.blockSize == 4096, k0.weight.dim(0) % 32 == 0,
-            k0.transform.isIdentical(to: boundary.transform),
-            v0.readsFloat16ConstantsInPlace, v0.gdnLayout == nil, v0.bias == nil,
-            v0.transform.blockSize == 4096, v0.weight.dim(0) % 32 == 0,
-            v0.transform.isIdentical(to: boundary.transform)
+        let packed = [query, key, value].compactMap { $0 as? HadamardQuantizedLinear }
+        guard VerifySplitGate.ready, packed.count == 3,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.isIdentical(to: boundary.transform)
+            })
         else { return nil }
-        let layers = [q0.verifyOperands, k0.verifyOperands, v0.verifyOperands]
-        let streamed: [MLXArray]?
-        if VerifyInt8Matmul.streamReady,
-            let w0 = q0.promptConstants.streamWeight(q0.weight, k: q0.transform.width, columns: 16),
-            let w1 = k0.promptConstants.streamWeight(k0.weight, k: k0.transform.width, columns: 16),
-            let w2 = v0.promptConstants.streamWeight(v0.weight, k: v0.transform.width, columns: 16)
-        {
-            streamed = [w0, w1, w2]
-        } else {
-            streamed = nil
-        }
+        let layers = packed.map(\.verifyOperands)
+        let streamed = Self.streamedWeights(packed)
         let activation = boundary.activation
         guard let lead = VerifyInt8Matmul.gateSplitLead(activation, layers: layers, streamedWeights: streamed)
         else { return nil }
         let shape = Array(boundary.normalized.shape.dropLast())
-        let n0 = q0.weight.dim(0)
+        let outputs = zip(packed, lead).map { layer, output in output.reshaped(shape + [layer.weight.dim(0)]) }
         return (
-            lead[0].reshaped(shape + [n0]),
-            lead[1].reshaped(shape + [k0.weight.dim(0)]),
-            lead[2].reshaped(shape + [v0.weight.dim(0)]),
+            outputs[0], outputs[1], outputs[2],
             { dependency in
                 VerifyInt8Matmul.gateSplitGate(
                     VerifySplitZ.ordered(activation, after: dependency), layers: layers, streamedWeights: streamed
-                )?.reshaped(shape + [n0])
+                )?.reshaped(shape + [packed[0].weight.dim(0)])
             })
     }
 
@@ -8290,20 +8220,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
-    }
-
-    /// `callAfterAttentionGatePrompt` for a single last-query prefill row (`rows == 1`),
-    /// fusing the head-major attention transpose, gate slice, stable sigmoid multiply,
-    /// signed Hadamard rotation, and int8 quantization before `PromptInt8Matmul.matmulLastRow`.
-    public func callAfterAttentionGateLastRow(
-        _ attention: MLXArray, queryProjection: MLXArray
-    ) -> MLXArray? {
-        guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
-            transform.width == 4096, weight.dim(0) % 32 == 0, PromptInt8Matmul.route != .off,
-            let activation = transform.quantizedForPromptLastRowAttentionGate(
-                attention, queryProjection: queryProjection)
-        else { return nil }
-        return promptLastRow(activation)
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {

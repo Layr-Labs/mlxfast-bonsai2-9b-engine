@@ -7226,12 +7226,11 @@ private enum DraftSDPA {
           F f;
           #pragma clang loop unroll(full)
           for (short i = 0; i < 2; ++i) {
-            const int r = sc.y + i * 8;
-            const float4 v4 = r < rows ? *((const device float4*)(p + r * stride + sc.x)) : float4(0.0f);
-            f[i * 4 + 0] = v4.x;
-            f[i * 4 + 1] = v4.y;
-            f[i * 4 + 2] = v4.z;
-            f[i * 4 + 3] = v4.w;
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+              const int r = sc.y + i * 8;
+              f[i * 4 + j] = r < rows ? p[r * stride + sc.x + j] : 0.0f;
+            }
           }
           return f;
         }
@@ -7353,15 +7352,11 @@ private enum DraftSDPA {
         #pragma clang loop unroll(full)
         for (short d = 0; d < DCS / 16; ++d) {
           #pragma clang loop unroll(full)
-          for (short h = 0; h < 2; ++h) {
-            const int r = sc.y + h * 8;
+          for (short i = 0; i < 8; ++i) {
+            const int r = sc.y + (i / 4) * 8;
+            const int c = ds + d * 16 + sc.x + i % 4;
             // Match MLX full attention's token-major physical output layout.
-            if (r < Q_ROWS) {
-              const int c = ds + d * 16 + sc.x;
-              *((device float4*)(out + ((qs + r) * 32 + head) * 128 + c)) =
-                  float4(o[d][h * 4 + 0] * rcp[h], o[d][h * 4 + 1] * rcp[h],
-                         o[d][h * 4 + 2] * rcp[h], o[d][h * 4 + 3] * rcp[h]);
-            }
+            if (r < Q_ROWS) { out[((qs + r) * 32 + head) * 128 + c] = o[d][i] * rcp[i / 4]; }
           }
         }
         """

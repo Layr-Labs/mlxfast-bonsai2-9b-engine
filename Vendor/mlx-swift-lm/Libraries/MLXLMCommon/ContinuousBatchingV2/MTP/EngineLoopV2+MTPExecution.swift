@@ -663,14 +663,13 @@ extension EngineLoopV2 {
             // acceptance packet.
             asyncEval(assistantEvalTargets)
             mtp.recordEarlyDraftSubmission()
+            for position in 0 ..< k {
+                draftSteps.append(batched[0..., position])
+            }
             if CBv2MTPBlockTokenRow.enabled, batched.ndim == 2, batched.dim(0) == batch,
                 batched.dim(1) == k
             {
                 blockDraftIDs = batched
-            } else {
-                for position in 0 ..< k {
-                    draftSteps.append(batched[0..., position])
-                }
             }
         } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -751,9 +750,7 @@ extension EngineLoopV2 {
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
-        let targetColumns = blockDraftIDs != nil
-            ? [seedColumn]
-            : ([seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) })
+        let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try {
             CBv2BranchVerify.tree = treeDesc
