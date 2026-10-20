@@ -1066,6 +1066,135 @@ private enum Qwen35Fresh8PromptGDN {
         return (result[0], result[1])
     }
 
+    /// `DARKBLOOM_BONSAI_PREFILL_GDN_CUT=0` keeps the record launches (conv q/k, prep).
+    static let frontOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_GDN_CUT"] != "0"
+    /// Written once by `prepareFront` at load; read-only afterwards.
+    nonisolated(unsafe) static var frontPassed = false
+    nonisolated(unsafe) private static var frontPrepared = false
+
+    /// The fused launch's `[tp, pm, gf, q, k]`, nil where the record's two launches
+    /// (`Qwen35PromptConvQKNorm.apply` and `runConvolvedValue`) would decline.
+    private static func front(
+        convState: MLXArray, qkv: MLXArray, weight: MLXArray, ba: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray
+    ) -> [MLXArray]? {
+        guard qkv.ndim == 3, qkv.dim(0) == 1, (64 ... 1365).contains(qkv.dim(1)), qkv.dim(1) % 8 == 0,
+            convState.shape == [1, 3, 8192], qkv.dim(2) == 8192, weight.shape == [8192, 4, 1],
+            ba.shape == [1, qkv.dim(1), 64], aLog.size == 32, dtBias.size == 32,
+            convState.dtype == .float32, qkv.dtype == .float32, weight.dtype == .float32,
+            ba.dtype == .float32, aLog.dtype == .float32, dtBias.dtype == .float32,
+            qkv.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let T = qkv.dim(1)
+        let invScale = pow(Float(128), -0.5)
+        return frontKernel(
+            [convState, qkv, weight, ba.contiguous(), aLog, dtBias, MLXArray(Int32(T))],
+            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (32, T, 16), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8],
+                [1, T, 16, 128], [1, T, 16, 128]],
+            outputDTypes: Array(repeating: .float32, count: 5))
+    }
+
+    /// `runConvolvedValue` after `Qwen35PromptConvQKNorm.apply(materializeValue: false)`, with
+    /// those two launches fused. Same outputs, bit for bit, once `prepareFront` passed.
+    static func runFrontConvolvedValue(
+        convState: MLXArray, qkv: MLXArray, weight: MLXArray, ba: MLXArray,
+        aLog: MLXArray, dtBias: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard frontPassed,
+            let f = front(
+                convState: convState, qkv: qkv, weight: weight, ba: ba, aLog: aLog, dtBias: dtBias)
+        else { return nil }
+        let T = qkv.dim(1)
+        let result = convolvedValueScanKernel(
+            [f[3], f[4], convState, qkv, weight, f[0], f[1], f[2], MLXArray(Int32(T))],
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
+            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
+    /// Load-time check: the fused launch against the record's conv q/k and prep launches at 64,
+    /// 192 and 512 rows, with a zero and a nonzero conv state, every output bit; then a
+    /// perturbed conv tap that the comparison must catch. Any mismatch or error keeps the
+    /// record launches.
+    static func prepareFront() {
+        guard !frontPrepared else { return }
+        frontPrepared = true
+        guard frontOffered else {
+            FileHandle.standardError.write(Data("qwen35 prefill gdn cut: off\n".utf8))
+            return
+        }
+        var verdict = "mismatch, record kernels kept"
+        do {
+            if try withError({ frontCheck() }) {
+                frontPassed = true
+                verdict = "bitwise equal at rows 64, 192, 512"
+            }
+        } catch {
+            verdict = "error \(error), record kernels kept"
+        }
+        FileHandle.standardError.write(Data("qwen35 prefill gdn cut: \(verdict)\n".utf8))
+    }
+
+    private static func frontCheck() -> Bool {
+        let weight = Qwen35RegisterGatedSIMD.checkRows([8192, 4, 1], seed: 0.12, scale: 0.7)
+        let aLog = Qwen35RegisterGatedSIMD.checkRows([32], seed: 0.14, scale: 2)
+        let dtBias = Qwen35RegisterGatedSIMD.checkRows([32], seed: 0.15, scale: 3)
+        func bitsEqual(_ x: MLXArray, _ y: MLXArray) -> MLXArray {
+            MLX.all(x.view(dtype: .uint32) .== y.view(dtype: .uint32))
+        }
+        func record(
+            _ state: MLXArray, _ qkv: MLXArray, _ weight: MLXArray, _ ba: MLXArray
+        ) -> [MLXArray]? {
+            let T = qkv.dim(1)
+            guard let qk = Qwen35PromptConvQKNorm.apply(
+                state: state, qkv: qkv, weight: weight, keyHeads: 16, valueHeads: 32,
+                materializeValue: false)
+            else { return nil }
+            let prepared = prepKernel(
+                [qk[0], qk[1], ba, aLog, dtBias, MLXArray(Int32(T))],
+                template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
+                grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
+                outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+                outputDTypes: [.float32, .float32, .float32])
+            return prepared + [qk[0], qk[1]]
+        }
+        var eqs: [MLXArray] = []
+        var perturbed: MLXArray? = nil
+        for T in [64, 192, 512] {
+            let qkv = Qwen35RegisterGatedSIMD.checkRows([1, T, 8192], seed: 0.11, scale: 3)
+            let ba = Qwen35RegisterGatedSIMD.checkRows([1, T, 64], seed: 0.13, scale: 6)
+            let nonzero = Qwen35RegisterGatedSIMD.checkRows([1, 3, 8192], seed: 0.16, scale: 3)
+            for state in [MLXArray.zeros([1, 3, 8192], dtype: .float32), nonzero] {
+                guard let old = record(state, qkv, weight, ba),
+                    let new = front(
+                        convState: state, qkv: qkv, weight: weight, ba: ba, aLog: aLog, dtBias: dtBias)
+                else { return false }
+                for j in 0 ..< 5 { eqs.append(bitsEqual(old[j], new[j])) }
+                if T == 64, perturbed == nil {
+                    var tap = weight.reshaped([8192 * 4])
+                    tap[5] = tap[5] + MLXArray(Float(1e-3))
+                    if let moved = front(
+                        convState: state, qkv: qkv, weight: tap.reshaped([8192, 4, 1]), ba: ba,
+                        aLog: aLog, dtBias: dtBias)
+                    {
+                        perturbed = bitsEqual(old[3], moved[3])
+                    }
+                }
+            }
+        }
+        guard let perturbed else { return false }
+        let same = MLX.all(MLX.stacked(eqs)).item(Bool.self)
+        // A perturbed tap of channel 1 (a q channel) must change q: the check is live.
+        return same && !perturbed.item(Bool.self)
+    }
+
     private static let prepKernel = MLXFast.metalKernel(
         name: "qwen35_fresh8_prompt_prep",
         inputNames: ["q", "k", "ba", "a_log", "dt_bias", "T"], outputNames: ["tp", "pm", "gf"],
@@ -1196,6 +1325,193 @@ private enum Qwen35Fresh8PromptGDN {
             for (int i = 0; i < C; ++i) tp_[i * C + m] = M_[m * LD + i] * bet;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        """, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    /// `Qwen35PromptConvQKNorm`'s q/k-only kernel and the prep kernel above in one launch
+    /// (one threadgroup of 8 simdgroups per chunk and key head). Each q/k row is formed by the record's code
+    /// with the record's lane-to-channel mapping, written to device for the scan and kept in
+    /// threadgroup memory for the prep, which simdgroup 0 runs unchanged (simdgroup barriers
+    /// stand in for threadgroup barriers). Outputs are the bits of the two record launches.
+    private static let frontKernel = MLXFast.metalKernel(
+        name: "qwen35_fresh8_prompt_front",
+        inputNames: ["state", "qkv", "conv_weight", "ba", "a_log", "dt_bias", "T"],
+        outputNames: ["tp", "pm", "gf", "q_out", "k_out"],
+        source: """
+        // grid: (32, 8 * NC, B * Hk), threadgroup (32, 8, 1): one threadgroup per (b, key head,
+        // chunk). Phase 1 (all 8 simdgroups): `qwen35_gdn_prompt_conv_qk_only` for the chunk's 8 rows of this
+        // key head, simdgroup i forming row i's q and k; written to device and to threadgroup memory.
+        // Phase 2 (simdgroup 0): the record's prep below, K and Q read from threadgroup memory. K K^T and
+        // Q K^T are formed once and serve the Hv / Hk value heads of this key
+        // head, which run side by side in lane groups of C lanes (lane = head
+        // group * C + row), GP heads per pass.
+        constexpr int HR = Hv / Hk;
+        constexpr int GP = (32 / C) < HR ? (32 / C) : HR;
+        constexpr int CT = C / 8;
+        constexpr int LD = C + 1;
+        threadgroup float KK[C * LD];
+        threadgroup float QK[C * LD];
+        threadgroup float Ah[GP * C * LD];
+        threadgroup float Th[GP * C * LD];
+        const uint lane = thread_index_in_simdgroup;
+        const int T_ = T;
+        const int NC = T_ / C;
+        const int n = int(threadgroup_position_in_grid.y);
+        const int bk = int(threadgroup_position_in_grid.z);
+        const int b_idx = bk / Hk;
+        const int hk = bk % Hk;
+        const int t0 = n * C;
+        const int ks = Hk * Dk;
+
+        constexpr int LQ = Dk + 8;
+        threadgroup float4 Qs4[C * LQ / 4];
+        threadgroup float4 Ks4[C * LQ / 4];
+        threadgroup float* Qs = (threadgroup float*)Qs4;
+        threadgroup float* Ks = (threadgroup float*)Ks4;
+        {
+          #pragma clang fp reassociate(off)
+          constexpr uint CD = uint(2 * Hk * Dk + Hv * Dk);
+          const uint sgi = simdgroup_index_in_threadgroup;
+          for (int pass = 0; pass < 2; ++pass) {
+            const uint t = uint(n * C) + sgi;
+            const uint gi = pass == 0 ? uint(hk) : uint(Hk + hk);
+            const uint c0 = gi * 128u + lane * 4u;
+            float val[4];
+            for (int i = 0; i < 4; ++i) {
+              const uint c = c0 + uint(i);
+              float acc = 0.0f;
+              for (uint tap = 0; tap < 4u; ++tap) {
+                const uint r = t + tap;
+                const float v = r < 3u ? state[r * CD + c] : qkv[(r - 3u) * CD + c];
+                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              }
+              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
+              const float sig = acc < 0.0f ? e : 1.0f - e;
+              val[i] = acc * sig;
+            }
+            float sum = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+              sum += val[i] * val[i];
+            }
+            const float eps = as_type<float>(uint(EPS_BITS));
+            const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+            const float scale = as_type<float>(uint(pass == 0 ? Q_SCALE_BITS : K_SCALE_BITS));
+            const float4 out4 = float4(
+              scale * (val[0] * inv),
+              scale * (val[1] * inv),
+              scale * (val[2] * inv),
+              scale * (val[3] * inv)
+            );
+            const uint o = (t * uint(Hk) + uint(hk)) * 128u + lane * 4u;
+            ((device float4*)((pass == 0 ? q_out : k_out) + o))[0] = out4;
+            *(threadgroup float4*)((pass == 0 ? Qs : Ks) + sgi * uint(LQ) + lane * 4u) = out4;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simdgroup_index_in_threadgroup == 0) {
+        // lower tiles of K K^T and Q K^T
+        _Pragma("clang loop unroll(full)")
+        for (int ti = 0; ti < CT; ++ti) {
+          _Pragma("clang loop unroll(full)")
+          for (int tj = 0; tj <= ti; ++tj) {
+            simdgroup_float8x8 akk = simdgroup_float8x8(0);
+            simdgroup_float8x8 aqk = simdgroup_float8x8(0);
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < Dk / 8; ++d) {
+              simdgroup_float8x8 ka, qa, kb;
+              simdgroup_load(ka, Ks + (ti * 8) * LQ + d * 8, LQ);
+              simdgroup_load(qa, Qs + (ti * 8) * LQ + d * 8, LQ);
+              simdgroup_load(kb, Ks + (tj * 8) * LQ + d * 8, LQ, ulong2(0, 0), true);
+              simdgroup_multiply_accumulate(akk, ka, kb, akk);
+              simdgroup_multiply_accumulate(aqk, qa, kb, aqk);
+            }
+            simdgroup_store(akk, KK + (ti * 8) * LD + tj * 8, LD);
+            simdgroup_store(aqk, QK + (ti * 8) * LD + tj * 8, LD);
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int grp = int(lane) / C;
+        const int row = int(lane) % C;
+        const int gbase = grp * C;
+        for (int h0 = 0; h0 < HR; h0 += GP) {
+          const int h = h0 + grp;
+          const bool live = grp < GP && h < HR;
+          const int hv = hk * HR + (live ? h : 0);
+          const uint slot = ((uint)b_idx * Hv + hv) * NC + n;
+          // in-chunk inclusive prefix of log g within each lane group. A row
+          // whose g underflowed (g == 0, or subnormal) has no finite log: it
+          // zeroes every decay product spanning it, so it adds 0 to the prefix
+          // and `zr` (the group's underflowed rows, one bit per row) masks
+          // the products that span it.
+          float gam = 0.0f;
+          float bet = 0.0f;
+          bool zero = false;
+          if (live) {
+            const uint gate_row = ((uint)b_idx * T_ + t0 + row) * (2u * Hv);
+            const float negative_a = -metal::precise::exp(a_log[hv]);
+            const float gv = qwen35_simd_gate_decay(
+                ba[gate_row + Hv + hv], dt_bias[hv], negative_a);
+            zero = !(gv >= FLT_MIN);
+            gam = zero ? 0.0f : metal::precise::log(zero ? 1.0f : gv);
+            bet = qwen35_simd_gate_beta(ba[gate_row + hv]);
+          }
+          const uint zr = uint(static_cast<simd_vote::vote_t>(simd_ballot(zero)) >> gbase) & ((1u << C) - 1u);
+          _Pragma("clang loop unroll(full)")
+          for (int off = 1; off < C; off <<= 1) {
+            const float up = simd_shuffle_up(gam, ushort(off));
+            gam += row >= off ? up : 0.0f;
+          }
+          const float gam_last = simd_shuffle(gam, ushort(gbase + C - 1));
+          // rows (j, i] as a bit mask: ((2 << i) - 1) & ~((2 << j) - 1)
+          const uint upto = (2u << row) - 1u;
+          // decay factors for the scan: exp(gam_i), exp(gam_last - gam_i)
+          if (live) {
+            device float* gf_ = gf + slot * 2 * C;
+            gf_[row] = (zr & upto) == 0u ? metal::precise::exp(gam) : 0.0f;
+            gf_[C + row] = (zr & ~upto) == 0u ? metal::precise::exp(gam_last - gam) : 0.0f;
+          }
+          // P row (lower incl. diagonal) to device; A row (strict lower) to Ah
+          threadgroup float* A_ = Ah + grp * C * LD;
+          threadgroup float* M_ = Th + grp * C * LD;
+          device float* pm_ = pm + slot * C * C;
+          _Pragma("clang loop unroll(full)")
+          for (int j = 0; j < C; ++j) {
+            const float gj = simd_shuffle(gam, ushort(gbase + j));
+            if (live) {
+              float pv = 0.0f;
+              float av = 0.0f;
+              if (j <= row) {
+                const uint span = upto & ~((2u << j) - 1u);
+                const float e = (zr & span) == 0u ? metal::precise::exp(gam - gj) : 0.0f;
+                pv = QK[row * LD + j] * e;
+                if (j < row) av = bet * KK[row * LD + j] * e;
+              }
+              pm_[row * C + j] = pv;
+              A_[row * LD + j] = av;
+            }
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          // T = (I + A)^-1, column m = row per lane, stored transposed in M_[m][i]
+          if (live) {
+            const int m = row;
+            for (int i = 0; i < C; ++i) M_[m * LD + i] = (i == m) ? 1.0f : 0.0f;
+            for (int i = m + 1; i < C; ++i) {
+              float s0 = 0.0f, s1 = 0.0f;
+              int j = m;
+              for (; j + 1 < i; j += 2) {
+                s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+                s1 = metal::fma(A_[i * LD + j + 1], M_[m * LD + j + 1], s1);
+              }
+              if (j < i) s0 = metal::fma(A_[i * LD + j], M_[m * LD + j], s0);
+              M_[m * LD + i] = -(s0 + s1);
+            }
+            // T' = T diag(beta): T'[i][m] = T[i][m] * beta_m
+            device float* tp_ = tp + slot * C * C;
+            for (int i = 0; i < C; ++i) tp_[i * C + m] = M_[m * LD + i] * bet;
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
         }
         """, header: Qwen35RegisterGatedSIMD.gateHeader)
 
@@ -1990,7 +2306,7 @@ enum Qwen35RegisterGatedSIMD {
         FileHandle.standardError.write(Data("qwen35 replay gate hoist: \(verdict)\n".utf8))
     }
 
-    private static func checkRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
+    fileprivate static func checkRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
         let i = MLXArray(0 ..< n).asType(.float32)
         let firstAngle = i * (0.7548776 + seed)
@@ -3884,6 +4200,12 @@ final class Qwen35GatedDeltaNet: Module {
         if freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32 {
             let foldState = convState.contiguous(), foldQKV = qkv.contiguous()
             let foldWeight = conv1d.weight.contiguous()
+            if let folded = Qwen35Fresh8PromptGDN.runFrontConvolvedValue(
+                convState: foldState, qkv: foldQKV, weight: foldWeight,
+                ba: ba, aLog: aLog, dtBias: dtBias)
+            {
+                return (folded.0, contiguous(qkv[0..., (S - 3)...]), folded.1)
+            }
             if let qk = Qwen35PromptConvQKNorm.apply(
                     state: foldState, qkv: foldQKV, weight: foldWeight,
                     keyHeads: numKHeads, valueHeads: numVHeads, materializeValue: false),
@@ -6836,6 +7158,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
+        Qwen35Fresh8PromptGDN.prepareFront()
         if rows == 16 {
             Qwen35FusedGDNVerify.prepare()
             CBv2VerifyAttentionPartial.prepareLean()
