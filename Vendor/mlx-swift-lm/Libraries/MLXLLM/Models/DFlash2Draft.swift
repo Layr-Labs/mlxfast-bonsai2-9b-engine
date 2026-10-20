@@ -344,14 +344,14 @@ extension DFlash2Target {
 }
 
 /// Model-derived draft-head read budgets, independent of prompts or reference outputs.
-/// A request may grow from quarter to half to full vocabulary as trusted anchors
+/// A request may grow from one eighth to half to full vocabulary as trusted anchors
 /// leave its current prefix. An explicit DF2_VOCAB override supplies one tier;
 /// zero or an unsupported size keeps the full head.
 enum DF2Vocab {
     static let overrideRows = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "")
 
     static func widths(vocabularySize: Int, topK: Int) -> [Int] {
-        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 4, vocabularySize / 2]
+        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 8, vocabularySize / 2]
         // The fast selector scans eight blocks of 256 threads. Keep all blocks
         // populated, in addition to satisfying the configured candidate count.
         let minimumRows = Swift.max(topK, 8 * 256)
@@ -1855,14 +1855,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 h = step.h
                 normed = step.nextNormed
                 normedCodes = step.nextCodes
-                if let normed {
-                    if isLast {
-                        asyncEval(normed)
+                // Launch the first layer promptly, then hand off pairs and the tail.
+                if index == 0 || (index + 1) % 2 == 0 || isLast {
+                    if let normed {
+                        if isLast {
+                            asyncEval(normed)
+                        } else {
+                            asyncEval(h, normed)
+                        }
                     } else {
-                        asyncEval(h, normed)
+                        asyncEval(h)
                     }
-                } else {
-                    asyncEval(h)
                 }
             }
             if var finalNormed = normed {
