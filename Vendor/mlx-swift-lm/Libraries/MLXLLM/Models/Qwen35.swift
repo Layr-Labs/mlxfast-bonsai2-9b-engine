@@ -5861,6 +5861,7 @@ enum Qwen35Layer0FP32 {
         verifyPassed = verify.passed
         FileHandle.standardError.write(Data(
             "qwen35 layer0 fp32: prompt \(prompt.note) (rows 512), verify \(verify.note) (rows 2-16)\n".utf8))
+        Qwen35VerifyStartFusion.prepare(model)
     }
 
     private static func verdict(_ body: () -> Bool) -> (passed: Bool, note: String) {
@@ -5965,6 +5966,122 @@ enum Qwen35Layer0FP32 {
             for (o, n) in zip(old1.projections, fused1.projections) { eqs.append(bitsEqual(o, n)) }
         }
         return MLX.all(MLX.stacked(eqs)).item(Bool.self)
+    }
+}
+
+enum Qwen35VerifyStartFusion {
+    static let offered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VSTART_FUSE"] != "0"
+    static let negativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VSTART_FUSE_NEGCTL"] == "1"
+    nonisolated(unsafe) static var verified = false
+
+    static let source: String = {
+        let record = SignedBlockHadamard.fused4096Source(residualNorm: false)
+        let head = record.components(separatedBy: "if (sizeof(T) == 4) {")
+        precondition(head.count == 2)
+        let branches = head[1].components(separatedBy: "} else {")
+        precondition(branches.count == 2)
+        let read = "float val = float(x[in_offset + r]);"
+        let store = "y[batch_idx + idx] = T(val);"
+        let buffer = "threadgroup float buf[256 * 17];"
+        let offset = "const uint in_offset = batch_idx + uint(base0);"
+        let fused = head[0] + "{" + branches.dropFirst().joined(separator: "} else {")
+        precondition([read, store, buffer, offset].allSatisfy { fused.components(separatedBy: $0).count == 2 })
+        let dequant = "const uint8_t d = (uint(wb[r >> 2]) >> (2 * (r & 3))) & 0x03; const T q = scale * d + bias; float val = float(q);"
+        return fused
+            .replacingOccurrences(of: offset, with: "")
+            .replacingOccurrences(of: buffer, with: """
+                const int64_t raw = int64_t(ids[block_idx]); const int64_t tok = raw < 0 ? raw + int64_t(w_shape[0]) : raw;
+                const device uint8_t* wb = (const device uint8_t*)(w + tok * 256) + (int(i) << 2);
+                const T scale = scales[tok * 32 + (i >> 3)];
+                const T bias = biases[tok * 32 + (i >> 3)];
+                \(buffer)
+                """)
+            .replacingOccurrences(of: read, with: dequant)
+            .replacingOccurrences(of: store, with: negativeControl ? "y[batch_idx + idx] = val;" : "y[batch_idx + idx] = float(T(val));")
+    }()
+
+    static let kernel = MLXFast.metalKernel(
+        name: negativeControl ? "qwen35_verify_start_embed_negctl" : "qwen35_verify_start_embed",
+        inputNames: ["ids", "w", "scales", "biases", "signs"], outputNames: ["y"],
+        source: source, header: SignedBlockHadamard.fused4096Header)
+
+    static func packed(_ model: Qwen35TextModelInner) -> HadamardQuantizedEmbedding? {
+        guard let e = model.embedTokens as? HadamardQuantizedEmbedding, e.bits == 2, e.groupSize == 128,
+            e.transform.blockSize == 4096, e.transform.width == 4096, e.weight.dtype == .uint32,
+            e.weight.ndim == 2, e.weight.dim(1) == 256, e.scales.dtype == .float16, e.scales.dim(1) == 32,
+            let biases = e.biases, biases.dtype == .float16, biases.shape == e.scales.shape,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        return e
+    }
+
+    static func rows(_ e: HadamardQuantizedEmbedding, _ ids: MLXArray) -> MLXArray {
+        kernel(
+            [ids, e.weight, e.scales, e.biases!, e.transform.signs],
+            template: [("T", DType.float16), ("BLOCKS_PER_ROW", 1), ("INVERSE", true)],
+            grid: (256, ids.size, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[ids.size, 4096]], outputDTypes: [.float32])[0]
+    }
+
+    static func embed(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
+        guard verified, inputs.ndim == 2, inputs.dim(0) == 1, (2 ... 16).contains(inputs.dim(1)),
+            inputs.dtype == .int32, let e = packed(model)
+        else { return nil }
+        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
+    }
+
+    static func prepare(_ model: Qwen35TextModelInner) {
+        let note: String
+        if !offered {
+            note = "off"
+        } else if !Qwen35Layer0FP32.verifyPassed {
+            note = "off (layer0 fp32 verify off)"
+        } else if let e = packed(model) {
+            do {
+                let (bad, cases) = try withError { check(e) }
+                verified = bad == 0
+                note = verified
+                    ? "on (\(cases) cases bitwise equal: rows 2-16 chain and tree, negative ids, all \(e.weight.dim(0)) ids)"
+                    : "off (mismatch: \(bad) of \(cases) cases differ, record chain kept)"
+            } catch {
+                note = "off (error, record chain kept: \(error))"
+            }
+        } else {
+            note = "off (embedding not 2-bit g128 WHT-4096 F16)"
+        }
+        FileHandle.standardError.write(Data("qwen35 verify start fusion: \(note)\n".utf8))
+    }
+
+    private static func check(_ e: HadamardQuantizedEmbedding) -> (Int, Int) {
+        let vocabulary = e.weight.dim(0)
+        var batches: [[Int32]] = []
+        for count in 2 ... 16 {
+            let chain = (0 ..< count).map { Int32((11 + $0 &* 7919 &+ count &* 104_729) % vocabulary) }
+            var tree = chain
+            for j in 1 ..< count { tree[j] = chain[(j - 1) / 2] }
+            tree[count - 1] = Int32(vocabulary - 1)
+            tree[0] = 0
+            batches += [chain, tree]
+        }
+        batches.append([-1, Int32(-vocabulary), -2, -7919])
+        var start = 0
+        while start < vocabulary {
+            let n = min(2048, vocabulary - start)
+            batches.append((start ..< start + n).map { Int32($0) })
+            start += n
+        }
+        var bad = 0
+        for ids in batches {
+            let shaped = MLXArray(ids).reshaped([1, ids.count])
+            let record = e(shaped).asType(.float32)
+            let fused = rows(e, shaped.reshaped([-1])).reshaped(record.shape)
+            let same = MLX.all(
+                contiguous(record).view(dtype: .uint32) .== contiguous(fused).view(dtype: .uint32))
+            if !same.item(Bool.self) { bad += 1 }
+        }
+        return (bad, batches.count)
     }
 }
 
@@ -6161,7 +6278,10 @@ public class Qwen35TextModelInner: Module {
         let shapeCall = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
-        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        var hiddenStates = inputEmbeddings
+            ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
+                && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
+            ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds
