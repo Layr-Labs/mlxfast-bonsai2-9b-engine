@@ -1397,9 +1397,10 @@ enum CBv2VerifyVectorAttention {
         if L > 8 && classesPerGroup == 2 {
             let twin = lean ? (isTree ? pairedTreeLean : pairedLean) : nil
             guard let kernel = twin ?? (isTree ? pairedTree : pairedPartial) else { return nil }
+            let gh = twin != nil ? 4 : 2
             return kernel(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", gh)],
+                grid: (32 * 32 * L, 4 / gh, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: outputShapes, outputDTypes: outputDTypes)
         }
         let twin = lean ? (isTree ? partialTreeLean : partialLean) : nil

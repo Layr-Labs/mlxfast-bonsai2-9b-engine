@@ -351,7 +351,8 @@ enum DF2Vocab {
     static let overrideRows = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "")
 
     static func widths(vocabularySize: Int, topK: Int) -> [Int] {
-        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 8, vocabularySize / 2]
+        let requested = overrideRows.map { [$0] }
+            ?? [vocabularySize / 8, vocabularySize / 4, vocabularySize / 2]
         // The fast selector scans eight blocks of 256 threads. Keep all blocks
         // populated, in addition to satisfying the configured candidate count.
         let minimumRows = Swift.max(topK, 8 * 256)
@@ -390,8 +391,8 @@ public final class DFlash2DraftHeadSlot {
             screenedRows.removeAll()
         }
         if checkedRows.contains(rows) { return prefixes[rows] }
-        // At most two policy tiers; retain failures so requests do not repeat checks.
-        guard checkedRows.count < 2 else { return nil }
+        // At most three policy tiers; retain failures so requests do not repeat checks.
+        guard checkedRows.count < 3 else { return nil }
         checkedRows.insert(rows)
         guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
             rows > 0, rows < full.weight.dim(0)
@@ -791,20 +792,26 @@ private final class DFlash2Attention: Module {
             mask = createCausalMask(n: L, offset: cachedLength)
         }
 
-        let output: MLXArray
+        let useTokenMajor = B == 1 && heads == 32 && L > 8 && DF2Fast.tokenMajorOProj
         if mask == nil,
-            let specialized = DraftSDPA.attention(queries, keys, values, scale: scale)
+            let specialized = DraftSDPA.attention(
+                queries, keys, values, scale: scale, tokenMajor: useTokenMajor)
         {
-            output = specialized
-        } else {
-            output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+            if useTokenMajor {
+                return DF2Fast.linear(specialized, oProj)
+            }
+            if B == 1, heads == 32, let y = DF2Fast.linearHeadMajor(specialized, oProj, L: L) {
+                return y
+            }
+            return DF2Fast.linear(specialized.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
         }
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         // MLX's full-attention path (L > 8) writes the output token-major, so the
         // [1, L, 4096] view is already row-contiguous: read it in place rather than
         // have the head-major quantizer's input check copy it. Same values, same
         // column order, same bits. The vector path (L <= 8) writes head-major.
-        if B == 1, heads == 32, L > 8, DF2Fast.tokenMajorOProj {
+        if useTokenMajor {
             return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
         }
         if B == 1, heads == 32, let y = DF2Fast.linearHeadMajor(output, oProj, L: L) {
@@ -7216,7 +7223,7 @@ private enum DraftSDPA {
     static let limitedThreads = ProcessInfo.processInfo.environment["DF2_SDPA16_LIMIT"] != "0"
 
     static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
-                          scale: Float) -> MLXArray? {
+                          scale: Float, tokenMajor: Bool = false) -> MLXArray? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
             q.ndim == 4, k.ndim == 4, v.ndim == 4,
             q.shape4 == (1, 32, 16, 128)
@@ -7228,7 +7235,8 @@ private enum DraftSDPA {
             v.hasNonNegativeUnitInnerStride4
         else { return nil }
         return run(q, k, v, scale: scale, columns: columns, cacheQueries: cachedQueries,
-                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads)
+                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads,
+                   tokenMajor: tokenMajor)
     }
 
     static let header = """
@@ -7418,7 +7426,7 @@ private enum DraftSDPA {
     static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
                     columns: Int = 128, cacheQueries: Bool = false,
                     queryRows: Int = 16, headsPerGroup: Int = 1,
-                    limitThreads: Bool = false) -> MLXArray {
+                    limitThreads: Bool = false, tokenMajor: Bool = false) -> MLXArray {
         let kernel: MLXFast.MLXFastKernel
         switch (limitThreads, headsPerGroup) {
         case (false, 1): kernel = plain1
@@ -7429,10 +7437,12 @@ private enum DraftSDPA {
         case (true, _): kernel = limited4
         }
         let scaleArray = scale.bitPattern == defaultScale.bitPattern ? defaultScaleArray : MLXArray(scale)
-        return kernel([q, k, v, scaleArray],
+        let outShape = tokenMajor ? [1, 16, 4096] : [1, 16, 32, 128]
+        let out = kernel([q, k, v, scaleArray],
                template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
-               outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+               outputShapes: [outShape], outputDTypes: [.float32])[0]
+        return tokenMajor ? out : out.transposed(0, 2, 1, 3)
     }
 }
