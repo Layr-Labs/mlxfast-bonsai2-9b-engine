@@ -6857,8 +6857,8 @@ enum VerifyInt8Matmul {
             source: source, ensureRowContiguous: true)
     }
 
-    /// `DARKBLOOM_BONSAI_DF2_GATHER_FAST=0` keeps the record gather.
-    static let gatherFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_GATHER_FAST"] != "0"
+    /// Off by default (the record gather runs); `DARKBLOOM_BONSAI_DF2_GATHER_FAST=1` turns the fast gather on.
+    static let gatherFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_GATHER_FAST"] == "1"
     /// Written once by `prepareGatherFast` at drafter bind; read-only afterwards.
     nonisolated(unsafe) static var gatherFastPassed = false
     nonisolated(unsafe) private static var gatherFastPrepared = false
@@ -6870,7 +6870,7 @@ enum VerifyInt8Matmul {
     static func prepareGatherFast() {
         guard !gatherFastPrepared else { return }
         gatherFastPrepared = true
-        var note = "off (DARKBLOOM_BONSAI_DF2_GATHER_FAST=0)"
+        var note = "off (DARKBLOOM_BONSAI_DF2_GATHER_FAST is not 1)"
         if gatherFastAllowed, let fast = headGatherFastKernel {
             do {
                 let detail: String? = try withError { try gatherFastMismatch(fast) }

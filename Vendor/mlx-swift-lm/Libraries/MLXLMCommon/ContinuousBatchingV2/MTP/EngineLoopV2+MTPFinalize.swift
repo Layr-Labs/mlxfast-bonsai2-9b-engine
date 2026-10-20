@@ -41,12 +41,13 @@ extension EngineLoopV2 {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
-    /// `DARKBLOOM_BONSAI_EARLY_PRESTAGE=0` restores the parent: the next
-    /// block is submitted after the round's emission and journal entry.
+    /// Off by default: the next block is submitted after the round's emission
+    /// and journal entry. `DARKBLOOM_BONSAI_EARLY_PRESTAGE=1` submits it right
+    /// after the drafter finalize.
     static let mtpEarlyPrestageEnabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_EARLY_PRESTAGE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
+        return ["1", "true", "yes", "on"].contains(value ?? "")
     }()
 
     /// Seed boundary, called for a prompt row's FIRST sampled token before
