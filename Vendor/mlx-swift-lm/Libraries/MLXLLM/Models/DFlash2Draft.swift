@@ -5473,8 +5473,8 @@ enum DF2Fast {
             }
             """
 
-    /// Off by default (the record top-k runs); `DARKBLOOM_BONSAI_DF2_TOPK_FAST=1` turns the fast top-k on.
-    static let topkFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOPK_FAST"] == "1"
+    /// Qualified fast top-k by default; `DARKBLOOM_BONSAI_DF2_TOPK_FAST=0` keeps the reference top-k.
+    static let topkFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOPK_FAST"] != "0"
     /// Written once by `prepareTopkFast` at bind, before any proposal; read-only afterwards.
     nonisolated(unsafe) static var topkFastPassed = false
     nonisolated(unsafe) private static var topkFastPrepared = false
@@ -5534,7 +5534,7 @@ enum DF2Fast {
     static func prepareTopkFast() {
         guard !topkFastPrepared else { return }
         topkFastPrepared = true
-        var note = "off (DARKBLOOM_BONSAI_DF2_TOPK_FAST is not 1)"
+        var note = "off (DARKBLOOM_BONSAI_DF2_TOPK_FAST=0)"
         if topkFastAllowed, let fast = topkFast {
             do {
                 let detail: String? = try withError { try topkFastMismatch(fast) }
