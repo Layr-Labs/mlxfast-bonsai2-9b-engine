@@ -1602,6 +1602,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         if DF2Fast.on {
             DF2Fast.TreeWide.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
+            DraftSDPA.prepare()
             try prepareFirstRound(target)
             checkLayerZeroFront()
         }
@@ -7213,6 +7214,11 @@ private enum DraftSDPA {
     }()
     static let cachedQueries = ProcessInfo.processInfo.environment["DF2_SDPA16_CACHEQ"] != "0"
     static let limitedThreads = ProcessInfo.processInfo.environment["DF2_SDPA16_LIMIT"] != "0"
+    /// `DARKBLOOM_BONSAI_UNROLL2=0` keeps the record kernel.
+    static let scheduledOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_UNROLL2"] != "0"
+    /// Written once by `prepare` at drafter bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var scheduledPassed = false
+    nonisolated(unsafe) private static var prepared = false
 
     static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
                           scale: Float) -> MLXArray? {
@@ -7387,9 +7393,48 @@ private enum DraftSDPA {
         }
         """
 
-    static func makeKernel(heads: Int, limitThreads: Bool) -> MLXFast.MLXFastKernel {
+    /// `source` with each 32-key block's loads issued ahead of the arithmetic that waits on them: the
+    /// QK loop unrolls fully, so all 16 key fragments can issue before its first mma (the record's
+    /// `unroll_count(4)` waits on the second half after four mma), and the block's value fragments load
+    /// before the QK mma instead of after the softmax. Every mma, reduction, exp2 and rescale runs on the
+    /// same operands in the same order. nil when a cut of `source` does not match once.
+    static let scheduledSource: String? = {
+        let qkLoop = "  #pragma clang loop unroll_count(4)\n  for (short d = 0; d < 8; ++d) {"
+        let blockHead = "  F s0(0), s1(0);\n"
+        let valueLoads = """
+                const F b00 = load(V + kb * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb);
+                const F b01 = load(V + kb * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb);
+                mma<false>(o[d], o[d + 1], s0, b00, b01);
+                const F b10 = load(V + (kb + 16) * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb - 16);
+                const F b11 = load(V + (kb + 16) * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb - 16);
+                mma<false>(o[d], o[d + 1], s1, b10, b11);
+
+            """
+        let preload = blockHead + """
+              F vb[DCS / 16][2];
+              #pragma clang loop unroll(full)
+              for (short d = 0; d < DCS / 16; d += 2) {
+                vb[d][0] = load(V + kb * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb);
+                vb[d][1] = load(V + kb * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb);
+                vb[d + 1][0] = load(V + (kb + 16) * v_strides[2] + ds + d * 16, int(v_strides[2]), n - kb - 16);
+                vb[d + 1][1] = load(V + (kb + 16) * v_strides[2] + ds + (d + 1) * 16, int(v_strides[2]), n - kb - 16);
+              }
+
+            """
+        let valueMMA = """
+                mma<false>(o[d], o[d + 1], s0, vb[d][0], vb[d][1]);
+                mma<false>(o[d], o[d + 1], s1, vb[d + 1][0], vb[d + 1][1]);
+
+            """
+        return DF2Fast.TreeWide.replacingOnce(
+            source, qkLoop, "  #pragma clang loop unroll(full)\n  for (short d = 0; d < 8; ++d) {")
+            .flatMap { DF2Fast.TreeWide.replacingOnce($0, blockHead, preload) }
+            .flatMap { DF2Fast.TreeWide.replacingOnce($0, valueLoads, valueMMA) }
+    }()
+
+    static func makeKernel(heads: Int, limitThreads: Bool, scheduled: Bool = false) -> MLXFast.MLXFastKernel? {
         var h = header
-        var s = source
+        guard var s = scheduled ? scheduledSource : source else { return nil }
         if limitThreads {
             // Scope the attribute to the definition; Metal rejects it when
             // repeated on MLX's following explicit instantiation declaration.
@@ -7397,16 +7442,22 @@ private enum DraftSDPA {
             s += "\n#pragma clang attribute pop\n"
         }
         return MLXFast.metalKernel(
-            name: "df2_sdpa16_h\(heads)_t\(limitThreads ? 32 * heads : 0)",
+            name: "df2_sdpa16\(scheduled ? "_ahead" : "")_h\(heads)_t\(limitThreads ? 32 * heads : 0)",
             inputNames: ["q", "k", "v", "scale_in"], outputNames: ["out"],
             source: s, header: h, ensureRowContiguous: false)
     }
-    private static let plain1 = makeKernel(heads: 1, limitThreads: false)
-    private static let plain2 = makeKernel(heads: 2, limitThreads: false)
-    private static let plain4 = makeKernel(heads: 4, limitThreads: false)
-    private static let limited1 = makeKernel(heads: 1, limitThreads: true)
-    private static let limited2 = makeKernel(heads: 2, limitThreads: true)
-    private static let limited4 = makeKernel(heads: 4, limitThreads: true)
+    private static let plain1 = makeKernel(heads: 1, limitThreads: false)!
+    private static let plain2 = makeKernel(heads: 2, limitThreads: false)!
+    private static let plain4 = makeKernel(heads: 4, limitThreads: false)!
+    private static let limited1 = makeKernel(heads: 1, limitThreads: true)!
+    private static let limited2 = makeKernel(heads: 2, limitThreads: true)!
+    private static let limited4 = makeKernel(heads: 4, limitThreads: true)!
+    private static let aheadPlain1 = makeKernel(heads: 1, limitThreads: false, scheduled: true)
+    private static let aheadPlain2 = makeKernel(heads: 2, limitThreads: false, scheduled: true)
+    private static let aheadPlain4 = makeKernel(heads: 4, limitThreads: false, scheduled: true)
+    private static let aheadLimited1 = makeKernel(heads: 1, limitThreads: true, scheduled: true)
+    private static let aheadLimited2 = makeKernel(heads: 2, limitThreads: true, scheduled: true)
+    private static let aheadLimited4 = makeKernel(heads: 4, limitThreads: true, scheduled: true)
     private static let defaultScale: Float = Float(1.0 / Double(128).squareRoot())
     nonisolated(unsafe) private static let defaultScaleArray: MLXArray = {
         let a = MLXArray(defaultScale)
@@ -7417,21 +7468,119 @@ private enum DraftSDPA {
     static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
                     columns: Int = 128, cacheQueries: Bool = false,
                     queryRows: Int = 16, headsPerGroup: Int = 1,
-                    limitThreads: Bool = false) -> MLXArray {
-        let kernel: MLXFast.MLXFastKernel
+                    limitThreads: Bool = false, scheduled: Bool? = nil) -> MLXArray {
+        let record: MLXFast.MLXFastKernel
+        let ahead: MLXFast.MLXFastKernel?
         switch (limitThreads, headsPerGroup) {
-        case (false, 1): kernel = plain1
-        case (false, 2): kernel = plain2
-        case (false, _): kernel = plain4
-        case (true, 1): kernel = limited1
-        case (true, 2): kernel = limited2
-        case (true, _): kernel = limited4
+        case (false, 1): (record, ahead) = (plain1, aheadPlain1)
+        case (false, 2): (record, ahead) = (plain2, aheadPlain2)
+        case (false, _): (record, ahead) = (plain4, aheadPlain4)
+        case (true, 1): (record, ahead) = (limited1, aheadLimited1)
+        case (true, 2): (record, ahead) = (limited2, aheadLimited2)
+        case (true, _): (record, ahead) = (limited4, aheadLimited4)
         }
+        let kernel = (scheduled ?? scheduledPassed) ? ahead ?? record : record
         let scaleArray = scale.bitPattern == defaultScale.bitPattern ? defaultScaleArray : MLXArray(scale)
         return kernel([q, k, v, scaleArray],
                template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
                outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+    }
+
+    /// Runs once at drafter bind, before any proposal or measured window: the scheduled kernel against
+    /// the record kernel at this process's options, bitwise, at every key count from 16 through 49 (each
+    /// remainder of a 32-key block) and at 560, 661 and 1000, on packed K/V and on capacity-strided
+    /// slices starting at rows 0 and 7, with signed zeros, an infinity, a huge and a subnormal value.
+    /// Then both kernels are timed on a dependent chain, and the scheduled one is kept only when it is
+    /// at least 2 % faster on this GPU. A mismatch or an MLX error keeps the record kernel.
+    static func prepare() {
+        guard enabled, !prepared else { return }
+        prepared = true
+        var note = "off (DARKBLOOM_BONSAI_UNROLL2=0)"
+        if scheduledOffered, scheduledSource != nil {
+            do {
+                let detail: String? = try withError { scheduledMismatch() }
+                if let detail {
+                    note = "off (\(detail))"
+                } else {
+                    let (record, ahead) = try withError { chainTimes() }
+                    scheduledPassed = ahead + ahead / 50 < record
+                    note = "\(scheduledPassed ? "on" : "off (slower)") (\(checkKeys.count * 3) shapes bitwise equal to the"
+                        + " record kernel; \(timedLaunches)-launch chain at \(timedKeys) keys: record \(record / 1000) us,"
+                        + " ahead \(ahead / 1000) us)"
+                }
+            } catch {
+                note = "off (error: \(error))"
+            }
+        } else if scheduledOffered {
+            note = "off (a cut of the record source did not match once)"
+        }
+        FileHandle.standardError.write(Data("DF2 sdpa16 load-ahead: \(note)\n".utf8))
+    }
+
+    static let checkKeys = Array(16 ... 49) + [560, 661, 1000]
+    static let timedKeys = 1000
+    static let timedLaunches = 128
+
+    /// The best of four timings per kernel in the order record, ahead, ahead, record (twice), in
+    /// nanoseconds, of `timedLaunches` launches where each launch's output is the next one's queries.
+    /// Each chain's graph is built before its clock starts.
+    private static func chainTimes() -> (record: UInt64, ahead: UInt64) {
+        let keys = MLXArray.ones([1, 8, timedKeys, 128], dtype: .float32) * 0.01
+        let values = MLXArray.ones([1, 8, timedKeys, 128], dtype: .float32) * 0.5
+        let start = MLXArray.ones([1, 32, 16, 128], dtype: .float32)
+        eval(keys, values, start)
+        var best: [UInt64] = [.max, .max]
+        for scheduled in [false, true, true, false, false, true, true, false] {
+            var x = start
+            for _ in 0 ..< timedLaunches {
+                x = run(x, keys, values, scale: defaultScale, columns: columns, cacheQueries: cachedQueries,
+                    queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads,
+                    scheduled: scheduled)
+            }
+            Stream.gpu.synchronize()
+            let begin = DispatchTime.now().uptimeNanoseconds
+            eval(x)
+            let index = scheduled ? 1 : 0
+            best[index] = min(best[index], DispatchTime.now().uptimeNanoseconds - begin)
+        }
+        return (best[0], best[1])
+    }
+
+    private static func scheduledMismatch() -> String? {
+        let capacity = 1024
+        func values(_ count: Int, _ seed: Double) -> [Float] {
+            (0 ..< count).map { i -> Float in
+                let t = Double(i)
+                return Float(Foundation.sin(t * 0.7548776 + seed) * (1 + 0.5 * Foundation.cos(t * 0.0137 + seed)) * 2)
+            }
+        }
+        var k = values(8 * capacity * 128, 0.3)
+        var v = values(8 * capacity * 128, 1.1)
+        k[5 * 128 + 3] = -0.0
+        k[(2 * capacity + 17) * 128 + 2] = 1e30
+        v[7 * 128 + 9] = -0.0
+        v[(capacity + 40) * 128 + 1] = .infinity
+        v[(3 * capacity + 1) * 128 + 4] = -Float.leastNormalMagnitude / 8
+        let q = MLXArray(values(32 * 16 * 128, 2.7), [1, 32, 16, 128])
+        let kAll = MLXArray(k, [1, 8, capacity, 128])
+        let vAll = MLXArray(v, [1, 8, capacity, 128])
+        let scale = Float(1.0 / Double(128).squareRoot())
+        for n in checkKeys {
+            for start in [-1, 0, 7] {
+                let rows = max(start, 0) ..< max(start, 0) + n
+                let keys = start < 0 ? contiguous(kAll[0..., 0..., rows, 0...]) : kAll[0..., 0..., rows, 0...]
+                let vals = start < 0 ? contiguous(vAll[0..., 0..., rows, 0...]) : vAll[0..., 0..., rows, 0...]
+                func out(_ scheduled: Bool) -> MLXArray {
+                    contiguous(run(q, keys, vals, scale: scale, columns: columns, cacheQueries: cachedQueries,
+                        queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads,
+                        scheduled: scheduled)).view(dtype: .uint32)
+                }
+                let differing = (out(false) .!= out(true)).asType(.int32).sum().item(Int32.self)
+                if differing != 0 { return "\(differing) words differ at \(n) keys, slice start \(start)" }
+            }
+        }
+        return nil
     }
 }
