@@ -202,16 +202,53 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 }
 
 public struct CBv2RecurrentLayerState {
-    public let conv: MLXArray?
-    public let ssm: MLXArray?
+    private let storedConv: MLXArray?
+    private let storedSSM: MLXArray?
+    private let deferred: CBv2DeferredRecurrentLayerState?
+    public var conv: MLXArray? { deferred.map { $0.built.conv } ?? storedConv }
+    public var ssm: MLXArray? { deferred.map { $0.built.ssm } ?? storedSSM }
     /// Set only for a known row-contiguous producer (or its outer-row slice).
     /// Unknown views default to false. This metadata never evaluates or copies.
     public let ssmIsRowContiguous: Bool
+    /// A model-defined description of a state that is not built yet. A forward
+    /// that recognizes it can compute the state inside its own kernel and never
+    /// read `conv` or `ssm`; the first read of either builds it, once.
+    public var pendingCommit: AnyObject? { deferred?.commit }
 
     public init(conv: MLXArray?, ssm: MLXArray?, ssmIsRowContiguous: Bool = false) {
-        self.conv = conv
-        self.ssm = ssm
+        self.storedConv = conv
+        self.storedSSM = ssm
+        self.deferred = nil
         self.ssmIsRowContiguous = ssmIsRowContiguous && ssm != nil
+    }
+
+    /// A state `build` makes on the first read of `conv` or `ssm`. `build` must
+    /// return a row-contiguous `ssm` whose bits do not depend on when it runs.
+    public init(pendingCommit: AnyObject, build: @escaping () -> (conv: MLXArray, ssm: MLXArray)) {
+        self.storedConv = nil
+        self.storedSSM = nil
+        self.deferred = CBv2DeferredRecurrentLayerState(commit: pendingCommit, build: build)
+        self.ssmIsRowContiguous = true
+    }
+}
+
+/// The state behind a pending commit, built on first read. Engine thread only.
+final class CBv2DeferredRecurrentLayerState {
+    let commit: AnyObject
+    private var build: (() -> (conv: MLXArray, ssm: MLXArray))?
+    private var state: (conv: MLXArray, ssm: MLXArray)?
+
+    init(commit: AnyObject, build: @escaping () -> (conv: MLXArray, ssm: MLXArray)) {
+        self.commit = commit
+        self.build = build
+    }
+
+    var built: (conv: MLXArray, ssm: MLXArray) {
+        if let state { return state }
+        let made = build!()
+        state = made
+        build = nil
+        return made
     }
 }
 

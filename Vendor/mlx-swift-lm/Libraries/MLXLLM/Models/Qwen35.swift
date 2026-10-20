@@ -2081,6 +2081,76 @@ enum Qwen35RegisterGatedSIMD {
     }
 }
 
+/// One GDN layer's strict-prefix commit that has not run: replaying rows `path[skip...]` of a
+/// 16-row verify's delta tape on `base` gives the committed state. The next verify runs those rows
+/// in its own kernel (`Qwen35FusedGDNVerify.applyCommitting`); any other reader builds the state
+/// with the record replay kernels (`state()`).
+final class Qwen35PendingCommit {
+    /// fp32 [1, Hv, 128, 128], row-contiguous. With `skip` 0 it is the state before row 0 (the
+    /// verify's input state, or the committed state a `.beforeScan` verify stored); with `skip` 1
+    /// it is the state after row 0, which an `.afterRowZero` verify stored.
+    let base: MLXArray
+    let skip: Int
+    let k: MLXArray
+    let delta: MLXArray
+    let convInput: MLXArray
+    /// The committed verify rows, anchor first (`0 ..< m` for a chain prefix).
+    let path: [Int32]
+    /// int32 [20]: the number of rows to replay, those rows (16 slots), and the three `convInput`
+    /// rows that hold the committed conv state.
+    let descriptor: MLXArray
+
+    init(base: MLXArray, skip: Int, k: MLXArray, delta: MLXArray, convInput: MLXArray, path: [Int32]) {
+        self.base = base
+        self.skip = skip
+        self.k = k
+        self.delta = delta
+        self.convInput = convInput
+        self.path = path
+        let rows = Array(path.dropFirst(skip))
+        let key = [Int32(rows.count)] + rows + Array(repeating: 0, count: 16 - rows.count)
+            + Self.convRows(path)
+        if let last = Self.lastDescriptor, last.key == key {
+            descriptor = last.array
+        } else {
+            descriptor = MLXArray(key)
+            Self.lastDescriptor = (key, descriptor)
+        }
+    }
+
+    /// Every layer of a round commits the same path; they share one descriptor array.
+    nonisolated(unsafe) private static var lastDescriptor: (key: [Int32], array: MLXArray)?
+
+    /// The `convInput` rows of the conv state after `path`: the record replay's `TAIL_ROW`.
+    static func convRows(_ path: [Int32]) -> [Int32] {
+        let m = path.count
+        return (0 ..< 3).map { r in m + r < 3 ? Int32(m + r) : 3 + path[m + r - 3] }
+    }
+
+    /// `(conv, ssm)` after `path`, the bits of `Qwen35GatedDeltaNet.replayedPrefixState`'s delta
+    /// replay. With `skip` 1 the replay starts at row 1 on the stored state after row 0, and the
+    /// conv rows are copied as raw bits, as the replay's own tail copy does.
+    func state() -> (conv: MLXArray, ssm: MLXArray) {
+        let m = path.count
+        if skip == 0 {
+            guard let replay = Qwen35DeltaReplay.run(
+                committedRows: m, k: k, delta: delta, state: base, convInput: convInput,
+                treeRows: CBv2BranchVerify.isBranch(path) ? MLXArray(path) : nil,
+                stateIsRowContiguous: true)
+            else { preconditionFailure("Qwen35 pending commit: delta replay unavailable") }
+            return (replay.1, replay.0)
+        }
+        let conv = convInput.view(dtype: .uint32).take(MLXArray(Self.convRows(path)), axis: 1)
+            .view(dtype: .float32)
+        guard m > 1 else { return (conv, base) }
+        guard let replay = Qwen35DeltaReplay.run(
+            committedRows: m - 1, k: k, delta: delta, state: base, convInput: convInput,
+            treeRows: MLXArray(Array(path.dropFirst())), stateIsRowContiguous: true)
+        else { preconditionFailure("Qwen35 pending commit: delta replay unavailable") }
+        return (conv, replay.0)
+    }
+}
+
 /// Verify-width GDN middle in one kernel: `Qwen35FusedConvSilu`,
 /// `Qwen35FusedQKNorm`, the contiguous copy of the value slice and
 /// `Qwen35RegisterGatedSIMD`. Each threadgroup of the recurrence (one value
@@ -2713,13 +2783,27 @@ enum Qwen35FusedGDNVerify {
     }()
 
     private static func treeVariant(tuned: Bool, delta: Bool) -> MLXFast.MLXFastKernel? {
+        guard let (text, route) = treeVariantText(tuned: tuned, delta: delta, snapshot: snapshotOffered)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : ""),
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
+            outputNames: delta
+                ? ["conv_in", "k_out", "y", "state_out", "conv_tail", "delta_out"]
+                : ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }
+
+    private static func treeVariantText(tuned: Bool, delta: Bool, snapshot snapshotWanted: Bool)
+        -> (text: String, route: String)?
+    {
         let record: String
         if tuned {
             guard let text = tunedSource else { return nil }
             record = text
         } else { record = source }
         let plainFast = fastTreeOffered ? fastTreeSource(record) : nil
-        let snapshot = snapshotOffered ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
+        let snapshot = snapshotWanted ? plainFast.flatMap(Qwen35FusedGDNVerify.snapshotTreeSource) : nil
         guard var text = snapshot ?? plainFast ?? treeSource(record) else { return nil }
         if tuned && plainFast != nil {
             // The descriptor covers 288 words; SG16 has 512 threads rather than 256.
@@ -2739,18 +2823,233 @@ enum Qwen35FusedGDNVerify {
             text = captured
         }
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
-        return MLXFast.metalKernel(
-            name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : ""),
-            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
-            outputNames: delta
-                ? ["conv_in", "k_out", "y", "state_out", "conv_tail", "delta_out"]
-                : ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
-            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+        return (text, route)
     }
 
     private static let deltaTreeKernel = treeVariant(tuned: false, delta: true)
     private static let tunedTreeKernel = treeVariant(tuned: true, delta: false)
     private static let tunedDeltaTreeKernel = treeVariant(tuned: true, delta: true)
+
+    /// Where a committing verify stores the state its successor starts from.
+    /// `.afterRowZero`: the state after row 0. Every path starts at row 0, so the next
+    /// commit replays one row fewer, and the tree restarts reload it (row 0 pinned as the
+    /// snapshot); a branchy tree stores nothing else, since only a chain can accept all 16
+    /// rows. `.beforeScan` (`DARKBLOOM_BONSAI_FUSED_COMMIT_TREE_SNAPSHOT=1`): the replayed
+    /// state, before row 0; the tree keeps the record snapshot and final store.
+    enum CommitForm { case afterRowZero, beforeScan }
+
+    /// `DARKBLOOM_BONSAI_FUSED_COMMIT=0` keeps the separate delta replay.
+    static let commitOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FUSED_COMMIT"] != "0"
+    static let commitForm: CommitForm =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_FUSED_COMMIT_TREE_SNAPSHOT"] == "1"
+        ? .beforeScan : .afterRowZero
+    /// Written once by `prepare`; read-only afterwards.
+    nonisolated(unsafe) private(set) static var commitPassed = false
+
+    /// The SG16 delta verify (`tree`: the fast tree for `.afterRowZero`, the snapshot tree for
+    /// `.beforeScan`) with a commit prologue: the window's conv rows come from the previous
+    /// window's `conv_in` (`p_desc` rows 17 ... 19), and before row 0 each thread replays
+    /// `p_desc[0]` rows of the previous delta tape on its 32 state registers with the record
+    /// replay's per-element ops, `s *= g` then `s = fma(k, d, s)`. The tape loads issue first;
+    /// the key rows go through threadgroup memory 8 rows (4 KiB) at a time.
+    static func committingSource(_ record: String, tree: Bool, form: CommitForm) -> String? {
+        var s = record
+        func swap(_ from: String, _ to: String, count: Int = 1) -> Bool {
+            guard s.components(separatedBy: from).count == count + 1 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let prologue = """
+            {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const uint fc_n = uint(p_desc[0]);
+            threadgroup float4 fc_k[8 * 32];
+            float fc_g[16];
+            float fc_d0[16];
+            float fc_d1[16];
+            #pragma clang loop unroll(full)
+            for (uint fc_t = 0; fc_t < 16u; ++fc_t) {
+              if (fc_t < fc_n) {
+                const uint fc_at = (uint(p_desc[1u + fc_t]) * uint(Hv) + hv_idx) * uint(Dv + 1);
+                fc_g[fc_t] = p_delta[fc_at + uint(Dv)];
+                fc_d0[fc_t] = p_delta[fc_at + dvbase];
+                fc_d1[fc_t] = p_delta[fc_at + dvbase + 1u];
+              }
+            }
+            float4 fc_kr[2];
+            #pragma clang loop unroll(full)
+            for (uint fc_c = 0; fc_c < 2u; ++fc_c) {
+              const uint fc_t = fc_c * 8u + (tid >> 5);
+              fc_kr[fc_c] = tid < 256u && fc_t < fc_n
+                  ? ((const device float4*)(p_k + uint(p_desc[1u + fc_t]) * uint(Hk * Dk) + hk_idx * uint(Dk)))[tid & 31u]
+                  : float4(0.0f);
+            }
+            const uint fc_kc = dk0 / 4u;
+            #pragma clang loop unroll(full)
+            for (uint fc_c = 0; fc_c < 2u; ++fc_c) {
+              if (fc_c * 8u < fc_n) {
+                if (fc_c > 0u) { threadgroup_barrier(mem_flags::mem_threadgroup); }
+                if (tid < 256u) { fc_k[tid] = fc_kr[fc_c]; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                #pragma clang loop unroll(full)
+                for (uint fc_u = 0; fc_u < 8u; ++fc_u) {
+                  const uint fc_t = fc_c * 8u + fc_u;
+                  if (fc_t < fc_n) {
+                    const float fc_gt = fc_g[fc_t];
+                    #pragma clang loop unroll(full)
+                    for (int d = 0; d < DVPL; ++d) {
+                      const float fc_dd = d == 0 ? fc_d0[fc_t] : fc_d1[fc_t];
+                      #pragma clang loop unroll(full)
+                      for (int j = 0; j < R / 4; ++j) {
+                        const float4 fc_kv = fc_k[fc_u * 32u + fc_kc + uint(j)];
+                        state[d][4 * j] *= fc_gt; state[d][4 * j + 1] *= fc_gt;
+                        state[d][4 * j + 2] *= fc_gt; state[d][4 * j + 3] *= fc_gt;
+                        state[d][4 * j] = fma(fc_kv.x, fc_dd, state[d][4 * j]);
+                        state[d][4 * j + 1] = fma(fc_kv.y, fc_dd, state[d][4 * j + 1]);
+                        state[d][4 * j + 2] = fma(fc_kv.z, fc_dd, state[d][4 * j + 2]);
+                        state[d][4 * j + 3] = fma(fc_kv.w, fc_dd, state[d][4 * j + 3]);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            }
+
+            """
+        let store = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              device float4* fc_out4 = (device float4*)(state_z + (n * Dv + dvbase + d) * Dk + dk0);
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                fc_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+              }
+            }
+
+            """
+        let finalStore = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+              }
+            }
+            """
+        let scan = "// Qwen35RegisterGatedSIMD with q/k/v read from threadgroup memory."
+        var ok = swap("conv_state[t * C + c]", "conv_state[uint(p_desc[17u + t]) * C + c]", count: 2)
+            && swap("conv_state[r * C + c]", "conv_state[uint(p_desc[17u + r]) * C + c]")
+            && swap(scan, prologue + (form == .beforeScan ? store : "") + scan)
+        if form == .afterRowZero {
+            ok = ok && swap("q_ += Dk;", "if (t == 0) {\n" + store + "}\nq_ += Dk;")
+        }
+        if tree && form == .afterRowZero {
+            ok = ok
+                && swap(
+                    "const device float4* s_re4 = (const device float4*)(state_in + ",
+                    "const device float4* s_re4 = (const device float4*)(state_z + ")
+                && swap(
+                    "for (int sp_i = 0; sp_i < sp_d; ++sp_i) {",
+                    "for (int sp_i = 1; sp_i < sp_d; ++sp_i) {")
+                && s.hasSuffix(finalStore) && s.components(separatedBy: finalStore).count == 2
+            if ok {
+                s = String(s.dropLast(finalStore.count)) + """
+                    bool fc_chain = true;
+                    for (int fc_t = 1; fc_t < int(T); ++fc_t) { fc_chain = fc_chain && tb_desc[fc_t] == fc_t - 1; }
+                    if (fc_chain) {
+
+                    """ + finalStore + "\n}"
+            }
+        }
+        if tree && form == .beforeScan {
+            ok = ok && swap(
+                "const device float* sn_src = sn_use ? (const device float*)state_out : state_in;",
+                "const device float* sn_src = sn_use ? (const device float*)state_out : (const device float*)state_z;")
+        }
+        return ok ? s : nil
+    }
+
+    private static func committingKernel(tree: Bool) -> MLXFast.MLXFastKernel? {
+        let form = commitForm
+        let record: String?
+        if tree {
+            let variant = treeVariantText(tuned: true, delta: true, snapshot: form == .beforeScan)
+            record = variant?.route == (form == .beforeScan ? "snapshot" : "fast") ? variant?.text : nil
+        } else {
+            record = tunedSource.flatMap(capturingDelta)
+        }
+        guard let record, let text = committingSource(record, tree: tree, form: form) else { return nil }
+        let name = (tree ? (form == .beforeScan ? "qwen35_gdn_verify_tree_snapshot" : "qwen35_gdn_verify_tree_fast")
+            : "qwen35_gdn_verify_fused") + "_sg16_delta_commit_" + (form == .beforeScan ? "c" : "z")
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"]
+                + (tree ? ["tree"] : []) + ["p_k", "p_delta", "p_desc"],
+            outputNames: ["conv_in", "k_out", "y", "state_out", "conv_tail", "delta_out", "state_z"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }
+
+    private static let commitChainKernel = committingKernel(tree: false)
+    private static let commitTreeKernel = committingKernel(tree: true)
+
+    /// `apply` (or `applyTree`) for a 16-row window whose input state is `commit`: the kernel
+    /// replays the commit's rows before row 0, so the state is never built. Returns the verify
+    /// outputs and `stored`, the state the next commit starts from (see `CommitForm`); nil when
+    /// the committing path does not apply.
+    static func applyCommitting(
+        _ commit: Qwen35PendingCommit, qkv: MLXArray, convWeight: MLXArray, a: MLXArray,
+        b: MLXArray, aLog: MLXArray, dtBias: MLXArray, tree: MLXArray?, keyHeads: Int,
+        valueHeads: Int
+    ) -> (result: VerifyResult, stored: MLXArray)? {
+        guard commitPassed else { return nil }
+        return committing(commit, qkv: qkv, convWeight: convWeight, a: a, b: b, aLog: aLog,
+            dtBias: dtBias, tree: tree, keyHeads: keyHeads, valueHeads: valueHeads)
+    }
+
+    private static func committing(
+        _ commit: Qwen35PendingCommit, qkv: MLXArray, convWeight: MLXArray, a: MLXArray,
+        b: MLXArray, aLog: MLXArray, dtBias: MLXArray, tree: MLXArray?, keyHeads: Int,
+        valueHeads: Int
+    ) -> (result: VerifyResult, stored: MLXArray)? {
+        guard keyHeads == 16, valueHeads == 32,
+            let kernel = tree == nil ? commitChainKernel : commitTreeKernel,
+            qkv.ndim == 3, convWeight.ndim == 3, a.ndim == 3, b.ndim == 3,
+            qkv.dtype == .float32, convWeight.dtype == .float32, a.dtype == .float32,
+            b.dtype == .float32, aLog.dtype == .float32, dtBias.dtype == .float32,
+            commit.base.dtype == .float32, commit.k.dtype == .float32,
+            commit.delta.dtype == .float32, commit.convInput.dtype == .float32,
+            tree.map({ $0.dtype == .int32 && $0.size >= 288 }) ?? true,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let C = 2 * keyHeads * 128 + valueHeads * 128
+        guard qkv.shape3 == (1, 16, C), convWeight.shape3 == (C, 4, 1),
+            a.shape3 == (1, 16, valueHeads), b.shape3 == (1, 16, valueHeads),
+            commit.base.shape == [1, valueHeads, 128, 128],
+            commit.k.shape == [1, 16, keyHeads, 128], commit.delta.shape == [1, 16, valueHeads, 129],
+            commit.convInput.shape == [1, 19, C]
+        else { return nil }
+        var inputs = [commit.convInput, qkv, convWeight, a, b, aLog, dtBias, commit.base]
+        if let tree { inputs.append(tree) }
+        inputs += [commit.k, commit.delta, commit.descriptor]
+        let stateShape = [1, valueHeads, 128, 128]
+        let o = kernel(
+            inputs,
+            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+                ("CONV_DIM", C), ("MAX_T", maximumRows),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (512, 1, valueHeads), threadGroup: (512, 1, 1),
+            outputShapes: [[1, 19, C], [1, 16, keyHeads, 128], [1, 16, valueHeads, 128], stateShape,
+                [1, 3, C], [1, 16, valueHeads, 129], stateShape],
+            outputDTypes: Array(repeating: .float32, count: 7))
+        guard o.count == 7 else { return nil }
+        return ((o[0], o[1], o[1], o[1], o[2], o[3], o[4], o[5]), o[6])
+    }
 
     /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
     static func applyTree(
@@ -2882,6 +3181,159 @@ enum Qwen35FusedGDNVerify {
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
             + " unroll=\(Qwen35DeltaReplay.unrolledPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
+        let commit: String
+        if !commitOffered {
+            commit = "off (DARKBLOOM_BONSAI_FUSED_COMMIT=0)"
+        } else if !(tunePassed && deltaPassed) {
+            commit = "off (the SG16 delta verify is off)"
+        } else {
+            let verdict: (Bool, String)
+            do {
+                verdict = try withError { checkCommitting() }
+            } catch {
+                verdict = (false, "check error: \(error)")
+            }
+            commitPassed = verdict.0
+            commit = (verdict.0 ? "on (" : "off (") + verdict.1 + ")"
+        }
+        let form = commitForm == .afterRowZero ? "after row 0" : "before the scan, tree snapshot kept"
+        FileHandle.standardError.write(Data("qwen35 fused commit: \(commit), store \(form)\n".utf8))
+    }
+
+    /// The committing kernels against the record path, bit for bit: the delta replay of the
+    /// commit's path, then the record SG16 delta verify on the replayed state and conv tail.
+    /// Window A runs the record verify (chain, two branchy trees, a chain-shaped tree) and the
+    /// committing kernel with no prologue rows. Each path of A (chain prefixes 1 ... 15, every
+    /// tree path) then commits from both bases a production commit can have: A's input state
+    /// (skip 0) and the state window A's committing kernel stored. Window B runs on that
+    /// commit, over the four shapes in turn. Every verify output must match (the final state
+    /// where it is kept, so a full acceptance commits the record state), so must the stored
+    /// state and the lazy build (`Qwen35PendingCommit.state()`); finite, NaN/Inf/signed-zero
+    /// state and NaN/Inf/signed-zero qkv. Two broken commits per shape must differ.
+    private static func checkCommitting() -> (Bool, String) {
+        guard commitChainKernel != nil, commitTreeKernel != nil else {
+            return (false, "a kernel source anchor did not match")
+        }
+        let shapes: [(MLXArray, [[Int]])?] = [nil,
+            probeTree([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14]),
+            probeTree([-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            probeTree(Array(-1 ..< 15))]
+        let chainShaped = [true, false, false, true]
+        let weight = probeRows([8192, 4, 1], seed: 0.03, scale: 0.1)
+        let aLog = probeRows([32], seed: 0.06, scale: 2)
+        let bias = probeRows([32], seed: 0.07, scale: 3)
+        func equal(_ x: [MLXArray], _ y: [MLXArray]) -> MLXArray {
+            var all = MLXArray(true)
+            for (l, r) in zip(x, y) {
+                guard l.shape == r.shape else { return MLXArray(false) }
+                all = logicalAnd(all, (l.view(dtype: .uint32) .== r.view(dtype: .uint32)).all())
+            }
+            return all
+        }
+        func outputs(_ r: VerifyResult, final: Bool) -> [MLXArray] {
+            [r.0, r.3, r.4, r.6] + (r.7.map { [$0] } ?? []) + (final ? [r.5] : [])
+        }
+        var cases = 0
+        var controls = 0
+        for kind in 0 ..< 3 {
+            let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
+            let state = kind == 1 ? probeWords([1, 32, 128, 128])
+                : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)
+            let windows = [0.02, 0.12].map { (seed: Float) in
+                (qkv: kind == 2 ? probeWords([1, 16, 8192])
+                    : probeRows([1, 16, 8192], seed: seed, scale: 0.5),
+                 a: probeRows([1, 16, 32], seed: seed + 0.02, scale: 30),
+                 b: probeRows([1, 16, 32], seed: seed + 0.03, scale: 8))
+            }
+            func record(_ w: Int, _ conv: MLXArray, _ s: MLXArray, _ shape: Int) -> VerifyResult? {
+                let x = windows[w]
+                if let tree = shapes[shape]?.0 {
+                    return applyTree(convState: conv, qkv: x.qkv, convWeight: weight, a: x.a, b: x.b,
+                        aLog: aLog, dtBias: bias, state: s, tree: tree, keyHeads: 16, valueHeads: 32)
+                }
+                return apply(convState: conv, qkv: x.qkv, convWeight: weight, a: x.a, b: x.b,
+                    aLog: aLog, dtBias: bias, state: s, keyHeads: 16, valueHeads: 32)
+            }
+            func fused(_ w: Int, _ commit: Qwen35PendingCommit, _ shape: Int)
+                -> (result: VerifyResult, stored: MLXArray)?
+            {
+                let x = windows[w]
+                return committing(commit, qkv: x.qkv, convWeight: weight, a: x.a, b: x.b, aLog: aLog,
+                    dtBias: bias, tree: shapes[shape]?.0, keyHeads: 16, valueHeads: 32)
+            }
+            // The state a committing verify stores, given the state it scanned from.
+            func stored(_ r: VerifyResult, from s: MLXArray) -> MLXArray? {
+                guard commitForm == .afterRowZero else { return s }
+                guard let tape = r.7 else { return nil }
+                return Qwen35DeltaReplay.run(committedRows: 1, k: r.3, delta: tape, state: s,
+                    convInput: r.0, stateIsRowContiguous: true)?.0
+            }
+            for a in shapes.indices {
+                guard let recA = record(0, convState, state, a), let tapeA = recA.7,
+                    let storedA = stored(recA, from: state)
+                else { return (false, "record verify unavailable") }
+                let padded = concatenated([convState, MLXArray.zeros([1, 16, 8192])], axis: 1)
+                let empty = Qwen35PendingCommit(base: state, skip: 0, k: recA.3, delta: tapeA,
+                    convInput: padded, path: [])
+                guard let fusA = fused(0, empty, a) else { return (false, "committing verify unavailable") }
+                let finalA = chainShaped[a] || commitForm == .beforeScan
+                guard logicalAnd(equal(outputs(fusA.result, final: finalA), outputs(recA, final: finalA)),
+                    equal([fusA.stored], [storedA])).item(Bool.self)
+                else { return (false, "an empty-prologue case differed") }
+                cases += 1
+                let bases = [(state, 0), (fusA.stored, commitForm == .afterRowZero ? 1 : 0)]
+                let paths = shapes[a].map { $0.1.filter { $0.count < 16 } }
+                    ?? (1 ... 15).map { Array(0 ..< $0) }
+                for (p, path) in paths.enumerated() {
+                    let rows = path.map { Int32($0) }
+                    guard let replay = Qwen35DeltaReplay.run(committedRows: rows.count, k: recA.3,
+                        delta: tapeA, state: state, convInput: recA.0,
+                        treeRows: CBv2BranchVerify.isBranch(rows) ? MLXArray(rows) : nil,
+                        stateIsRowContiguous: true)
+                    else { return (false, "record replay unavailable") }
+                    let b = (a + p) % shapes.count
+                    let finalB = chainShaped[b] || commitForm == .beforeScan
+                    guard let recB = record(1, replay.1, replay.0, b),
+                        let storedB = stored(recB, from: replay.0)
+                    else { return (false, "record verify unavailable") }
+                    var ok = MLXArray(true)
+                    for (base, skip) in bases {
+                        let commit = Qwen35PendingCommit(base: base, skip: skip, k: recA.3, delta: tapeA,
+                            convInput: recA.0, path: rows)
+                        guard let fusB = fused(1, commit, b) else {
+                            return (false, "committing verify unavailable")
+                        }
+                        let built = commit.state()
+                        ok = logicalAnd(ok, logicalAnd(
+                            equal(outputs(fusB.result, final: finalB), outputs(recB, final: finalB)),
+                            equal([fusB.stored, built.conv, built.ssm], [storedB, replay.1, replay.0])))
+                        cases += 1
+                    }
+                    guard ok.item(Bool.self) else {
+                        return (false, "a case differed (shape \(a), path \(path), into shape \(b))")
+                    }
+                    guard kind == 0, p == paths.count / 2, rows.count > 1 else { continue }
+                    // Controls: one committed row short, and the input state read as if it
+                    // already held row 0. Each must change the verify output.
+                    let broken = [
+                        Qwen35PendingCommit(base: state, skip: 0, k: recA.3, delta: tapeA,
+                            convInput: recA.0, path: Array(rows.dropLast())),
+                        Qwen35PendingCommit(base: state, skip: 1, k: recA.3, delta: tapeA,
+                            convInput: recA.0, path: rows),
+                    ]
+                    for commit in broken {
+                        guard let fusB = fused(1, commit, b) else {
+                            return (false, "committing verify unavailable")
+                        }
+                        guard !equal([fusB.result.4], [recB.4]).item(Bool.self) else {
+                            return (false, "a broken commit matched the record (the check is blind)")
+                        }
+                        controls += 1
+                    }
+                }
+            }
+        }
+        return (true, "\(cases) cases bit-identical, \(controls) broken commits caught")
     }
 
     private static func probeRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
@@ -4221,23 +4673,42 @@ final class Qwen35GatedDeltaNet: Module {
             projectedZ = projected.z
         }
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        let tree = S == 16 && B == 1 ? CBv2BranchVerify.tree : nil
+        let fusedEligible = !exactTargetVerify && conv1d.bias == nil && convKernelSize == 4
+            && headKDim == 128 && headVDim == 128
+        // The previous verify's strict-prefix commit, run in this verify's own kernel; its
+        // state is then never built.
+        let committing = fusedEligible && B == 1
+            ? (recurrentState[0].inputState(modelLayerIndex: modelLayerIndex)?.pendingCommit
+                as? Qwen35PendingCommit).flatMap {
+                    Qwen35FusedGDNVerify.applyCommitting(
+                        $0, qkv: qkv, convWeight: conv1d.weight, a: a, b: b, aLog: aLog,
+                        dtBias: dtBias, tree: tree, keyHeads: numKHeads, valueHeads: numVHeads)
+                }
+            : nil
+
+        // The input states, read only off the committing path (nil exactly when it runs).
+        var convState: MLXArray?
+        var ssmState: MLXArray?
+        if committing == nil {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for evaluation in recurrentState {
+                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         // Conv over the whole window in one call (same as processChunk); the
         // per-position conv tail is a free slice of the padded input: after
@@ -4246,10 +4717,11 @@ final class Qwen35GatedDeltaNet: Module {
         let nKeep = convKernelSize - 1
         // Verify windows of 3 ... 8 rows: conv, SiLU, q/k norm and the scan
         // in one kernel (`Qwen35FusedGDNVerify`), the same bits.
-        let tree = S == 16 && B == 1 ? CBv2BranchVerify.tree : nil
-        let fusedMiddle = exactTargetVerify || conv1d.bias != nil || convKernelSize != 4
-            || headKDim != 128 || headVDim != 128
-            ? nil : (tree.map {
+        let fusedMiddle: Qwen35FusedGDNVerify.VerifyResult?
+        if let committing {
+            fusedMiddle = committing.result
+        } else if fusedEligible, let convState, let ssmState {
+            fusedMiddle = tree.map {
                 Qwen35FusedGDNVerify.applyTree(
                     convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                     aLog: aLog, dtBias: dtBias, state: ssmState, tree: $0,
@@ -4257,12 +4729,15 @@ final class Qwen35GatedDeltaNet: Module {
             } ?? Qwen35FusedGDNVerify.apply(
                 convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState,
-                keyHeads: numKHeads, valueHeads: numVHeads))
+                keyHeads: numKHeads, valueHeads: numVHeads)
+        } else {
+            fusedMiddle = nil
+        }
         precondition(tree == nil || fusedMiddle != nil, "Qwen35 tree verify: fused GDN tree kernel unavailable")
         let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
             || convKernelSize != 4
-            ? nil : Qwen35FusedConvSilu.apply(state: convState, qkv: qkv, weight: conv1d.weight)
-        let convInput = fusedMiddle?.0 ?? fusedConv?.0 ?? concatenated([convState, qkv], axis: 1)
+            ? nil : Qwen35FusedConvSilu.apply(state: convState!, qkv: qkv, weight: conv1d.weight)
+        let convInput = fusedMiddle?.0 ?? fusedConv?.0 ?? concatenated([convState!, qkv], axis: 1)
         let convOut: MLXArray
         if let fusedMiddle {
             convOut = fusedMiddle.1
@@ -4336,7 +4811,7 @@ final class Qwen35GatedDeltaNet: Module {
                         v: v[rowRange],
                         a: a[rowRange],
                         b: b[rowRange],
-                        ssmPre: ssmState[rowRange],
+                        ssmPre: ssmState.map { $0[rowRange] },
                         mask: nil,
                         rowCount: S,
                         convStateRows: nKeep,
@@ -4344,7 +4819,9 @@ final class Qwen35GatedDeltaNet: Module {
                     convOutBacking = convOut[rowRange]
                 }
                 var roots: [MLXArray]
-                if let delta = tape.delta, tape.ssmPreIsRowContiguous {
+                if let committing, let delta = tape.delta {
+                    roots = [tape.convInput, tape.k, delta, committing.stored]
+                } else if let delta = tape.delta, tape.ssmPreIsRowContiguous {
                     roots = [tape.convInput, tape.k, delta]
                 } else {
                     roots = [
@@ -4352,8 +4829,8 @@ final class Qwen35GatedDeltaNet: Module {
                     ]
                     if let delta = tape.delta { roots.append(delta) }
                 }
-                let inputSSM =
-                    evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
+                let inputSSM = committing != nil
+                    ? nil : evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
                 if B > 1 || inputSSM == nil {
                     if let ssmPre = tape.ssmPre { roots.append(ssmPre) }
                 }
@@ -4381,6 +4858,26 @@ final class Qwen35GatedDeltaNet: Module {
                 let materializedBytes = checkedByteCount(roots + [finalSSM])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
                 let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                // A strict-prefix commit of this window stays pending for the next verify to
+                // run in its kernel: from the state the committing kernel stored, else from
+                // this window's row-contiguous input state.
+                let commitBase: (state: MLXArray, skip: Int)?
+                if !Qwen35FusedGDNVerify.commitPassed || B != 1 || S != 16 || numKHeads != 16
+                    || numVHeads != 32 || tape.delta == nil
+                {
+                    commitBase = nil
+                } else if let committing {
+                    commitBase = (
+                        committing.stored,
+                        Qwen35FusedGDNVerify.commitForm == .afterRowZero ? 1 : 0)
+                } else if tape.ssmPreIsRowContiguous, let ssmPre = tape.ssmPre {
+                    commitBase = (ssmPre, 0)
+                } else {
+                    commitBase = nil
+                }
+                precondition(
+                    committing == nil || commitBase != nil,
+                    "Qwen35 fused commit: a committing verify left no commit base")
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -4404,8 +4901,20 @@ final class Qwen35GatedDeltaNet: Module {
                                 ssmIsRowContiguous: finalSSMIsRowContiguous)
                         },
                         replay: { [unowned self] keepPositions in
-                            self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                            guard let commitBase, let delta = tape.delta else {
+                                return self.replayedPrefixState(
+                                    tape: tape, committedRows: keepPositions)
+                            }
+                            let path: [Int32]
+                            if let rows = CBv2BranchVerify.committedRows, rows.count == keepPositions {
+                                path = rows
+                            } else {
+                                path = Array(0 ..< Int32(keepPositions))
+                            }
+                            let commit = Qwen35PendingCommit(
+                                base: commitBase.state, skip: commitBase.skip, k: tape.k,
+                                delta: delta, convInput: tape.convInput, path: path)
+                            return CBv2RecurrentLayerState(pendingCommit: commit) { commit.state() }
                         })
                 } catch {
                     preconditionFailure(
