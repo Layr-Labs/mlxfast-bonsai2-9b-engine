@@ -1323,21 +1323,21 @@ enum CBv2VerifyVectorAttention {
 
         if L > 8 && classesPerGroup == 2 {
             let inputs = [queries, keys, values, params]
-            let states = pairedPartial(
+            let states = CBv2VerifyAttentionPartial.noted(pairedPartial(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-                outputDTypes: [.float32, .float32, .float32])
+                outputDTypes: [.float32, .float32, .float32]))
             return combine(
                 states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
-        let parts = partial(
+        let parts = CBv2VerifyAttentionPartial.noted(partial(
             [queries, keys, values, params],
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-            outputDTypes: [.float32, .float32, .float32])
+            outputDTypes: [.float32, .float32, .float32]))
         return combine(
             parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
@@ -1365,22 +1365,22 @@ enum CBv2VerifyVectorAttention {
         let inputs = [queries, keys, values, params, tree]
         if L > 8 && classesPerGroup == 2 {
             guard let pairedTree else { return nil }
-            let states = pairedTree(
+            let states = CBv2VerifyAttentionPartial.noted(pairedTree(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-                outputDTypes: [.float32, .float32, .float32])
+                outputDTypes: [.float32, .float32, .float32]))
             return combine(
                 states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
         }
         guard let partialTree else { return nil }
-        let parts = partialTree(
+        let parts = CBv2VerifyAttentionPartial.noted(partialTree(
             inputs,
             template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
             outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
-            outputDTypes: [.float32, .float32, .float32])
+            outputDTypes: [.float32, .float32, .float32]))
         return combine(
             parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
@@ -1398,6 +1398,32 @@ extension MLXArray {
     public var hasNonNegativeUnitInnerStride4: Bool {
         guard let s = mlx_array_strides(ctx) else { return false }
         return s[3] == 1 && s[0] >= 0 && s[1] >= 0 && s[2] >= 0
+    }
+}
+
+/// The partial-state launch of the verify attention (`CBv2VerifyVectorAttention`),
+/// handed to a caller that orders a launch after it: a launch made to depend on
+/// the partial states runs beside the partial kernel instead of behind the
+/// combine. Graph build only; nothing is held outside `capturing`.
+public enum CBv2VerifyAttentionPartial {
+    nonisolated(unsafe) private static var active = false
+    nonisolated(unsafe) private static var captured: MLXArray?
+
+    /// `body()` and the partial states its verify attention launched, if any.
+    public static func capturing<T>(_ body: () -> T) -> (T, MLXArray?) {
+        active = true
+        captured = nil
+        defer {
+            active = false
+            captured = nil
+        }
+        let result = body()
+        return (result, captured)
+    }
+
+    static func noted(_ states: [MLXArray]) -> [MLXArray] {
+        if active { captured = states[0] }
+        return states
     }
 }
 

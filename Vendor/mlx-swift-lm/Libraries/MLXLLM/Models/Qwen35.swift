@@ -4719,13 +4719,25 @@ final class Qwen35Attention: Module {
         let queryRows = narrowsToLastQuery ? 1 : L
         let projectionLayers = narrowsToLastQuery ? [kProj, vProj] : [qProj, kProj, vProj]
 
-        let shared = promptProjections ?? (!exactTargetVerify
-            ? boundary.flatMap {
-                HadamardQuantizedLinear.boundaryProjections($0, projectionLayers)
-            } ?? (L >= 128
-                ? HadamardQuantizedLinear.sharedPromptProjections(x, projectionLayers)
-                : HadamardQuantizedLinear.sharedShortProjections(x, projectionLayers))
-            : nil)
+        // The gate halves of the query projection leave its launch and run
+        // beside the attention (`VerifySplitGate`); nil keeps the record launch.
+        var gateSplit: (query: MLXArray, key: MLXArray, value: MLXArray, gate: (MLXArray) -> MLXArray?)? = nil
+        if !exactTargetVerify, !narrowsToLastQuery, promptProjections == nil, B == 1, let boundary {
+            gateSplit = HadamardQuantizedLinear.boundarySplitQueryGate(
+                boundary, query: qProj, key: kProj, value: vProj)
+        }
+        let shared: [MLXArray]?
+        if let gateSplit {
+            shared = [gateSplit.query, gateSplit.key, gateSplit.value]
+        } else {
+            shared = promptProjections ?? (!exactTargetVerify
+                ? boundary.flatMap {
+                    HadamardQuantizedLinear.boundaryProjections($0, projectionLayers)
+                } ?? (L >= 128
+                    ? HadamardQuantizedLinear.sharedPromptProjections(x, projectionLayers)
+                    : HadamardQuantizedLinear.sharedShortProjections(x, projectionLayers))
+                : nil)
+        }
         let qProjOutput: MLXArray
         if narrowsToLastQuery {
             qProjOutput = promptProjections?[0] ?? (qProj as! HadamardQuantizedLinear).callPromptLastRow(x)!
@@ -4792,24 +4804,35 @@ final class Qwen35Attention: Module {
         }
 
         let attended: MLXArray
+        var gateProjection = qProjOutput
         if narrowsToLastQuery {
             attended = (cache as! any CBv2LastQueryPrefillLayerCache).updateAndAttendLastQuery(
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        } else if let gateSplit, let boundary {
+            let partial: MLXArray?
+            (attended, partial) = CBv2VerifyAttentionPartial.capturing {
+                cache.updateAndAttend(queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+            }
+            gateProjection = gateSplit.gate(partial ?? attended)
+                ?? HadamardQuantizedLinear.boundaryProjections(boundary, [qProj])?[0] ?? qProj(x)
         } else {
             attended = cache.updateAndAttend(
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
         }
         if !narrowsToLastQuery, !exactTargetVerify, B == 1, let packed = oProj as? HadamardQuantizedLinear,
-            let gated = packed.callAfterAttentionGate(attended, queryProjection: qProjOutput)
+            let gated = packed.callAfterAttentionGate(attended, queryProjection: gateProjection)
         {
             return gated
         }
         if !narrowsToLastQuery, !exactTargetVerify, B == 1, L >= 64, let packed = oProj as? HadamardQuantizedLinear,
-            let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: qProjOutput)
+            let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: gateProjection)
         {
             return gated
         }
-        let gate = qSplitParts()[1].reshaped(B, queryRows, -1)
+        let gate = (gateSplit == nil
+            ? qSplitParts()[1]
+            : gateProjection.reshaped(B, queryRows, attentionHeads, -1).split(parts: 2, axis: -1)[1]
+        ).reshaped(B, queryRows, -1)
         let output = attended
             .transposed(0, 2, 1, 3)
             .reshaped(B, queryRows, -1)

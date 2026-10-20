@@ -7206,6 +7206,256 @@ enum VerifySplitZ {
     }
 }
 
+/// The attention output gate out of the q/k/v verify launch. The query
+/// projection interleaves each 512-wide head as [query 256 | gate 256]; the
+/// gate feeds only the attention-gate rotation after the attention, but in
+/// the record it shares the launch the q/k RoPE waits on. Split, the q/k/v
+/// launch runs the query halves only, and the gate halves run in a second
+/// launch ordered after the attention's partial kernel, with no barrier
+/// between them. Both launches run the record kernels with only the column
+/// tile map changed, and write into a full-width `[rows, 8192]` buffer whose
+/// other halves stay unwritten and unread. The split serves only after
+/// `check` found every read half equal, bit for bit, to the record route's
+/// on synthetic operands at every verify row count, both offset forms and
+/// both weight layouts; otherwise the record launch stays.
+/// `DARKBLOOM_BONSAI_VERIFY_GATE_SPLIT=0` keeps the record launch.
+enum VerifySplitGate {
+    static let offered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_GATE_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    nonisolated(unsafe) private static var failed = false
+
+    /// Resolved once, at the first packed module's init, after
+    /// `VerifyInt8Matmul.route` and before any timed work.
+    static let ready: Bool = {
+        let (passed, note) = check()
+        FileHandle.standardError.write(Data("int8 verify attention gate split: \(note)\n".utf8))
+        return passed
+    }()
+
+    private static func check() -> (Bool, String) {
+        guard offered else { return (false, "off (DARKBLOOM_BONSAI_VERIFY_GATE_SPLIT=0)") }
+        guard VerifyInt8Matmul.route != .off else { return (false, "off (int8 verify off)") }
+        let k = 4096, kg = k / 128
+        let widths = [1024, 64, 64]
+        let total = widths.reduce(0, +)
+        let maxRows = VerifyInt8Matmul.tileRows
+        func pattern(_ count: Int, _ mul: Int, _ add: Int, _ mod: Int, _ center: Int, _ scale: Float) -> [Float] {
+            var values: [Float] = []
+            values.reserveCapacity(count)
+            for i in 0 ..< count {
+                let v: Int = (i * mul + add) % mod - center
+                values.append(Float(v) / scale)
+            }
+            return values
+        }
+        let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
+            let centered: Int = (i * 37 + 11) % 255 - 127
+            return Int8(truncatingIfNeeded: centered)
+        }
+        let codes = MLXArray(codeValues, [maxRows, k])
+        let words: [UInt32] = (0 ..< total * k / 16).map { (i: Int) -> UInt32 in
+            let value: UInt64 = UInt64(i + 1) &* 2_654_435_761
+            return UInt32(truncatingIfNeeded: value)
+        }
+        let weight = MLXArray(words, [total, k / 16])
+        let scaleValues: [Float16] = (0 ..< kg * total).map { (i: Int) -> Float16 in
+            let value: Float = Float(1 + i % 13) / 1024
+            return Float16(value)
+        }
+        let scalesT = MLXArray(scaleValues, [kg, total])
+        let biasValues: [Float16] = (0 ..< kg * total).map { (i: Int) -> Float16 in
+            let value: Float = -Float(i % 7) / 512
+            return Float16(value)
+        }
+        let biasesT = MLXArray(biasValues, [kg, total])
+        let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+        let ascale = MLXArray(pattern(maxRows * kg, 1, 11, 11, -1, 256))
+        let rsb = MLXArray(pattern(maxRows * kg, 1, 0, 17, 8, 64))
+        let ranges = [0 ..< widths[0], widths[0] ..< widths[0] + widths[1], widths[0] + widths[1] ..< total]
+        let packed: [MLXArray]? = VerifyInt8Matmul.streamReady
+            ? ranges.map { VerifyInt8Matmul.streamPack(weight[$0], k: k, columns: 16) } : nil
+        if let packed { eval(packed) }
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        func half(_ a: MLXArray, _ index: Int, rows: Int) -> MLXArray {
+            a.reshaped([rows, widths[0] / 512, 2, 256])[0..., 0..., index, 0...]
+        }
+        var matched = true
+        var cases = 0
+        failed = false
+        withErrorHandler({ _ in VerifySplitGate.failed = true }) {
+            for m in VerifyInt8Matmul.rowRange.reversed() where matched {
+                for negative in [false, true] where matched {
+                    let offsets = negative ? negatedT : biasesT
+                    let layers = ranges.map {
+                        (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0], negative: negative)
+                    }
+                    for streamed in packed == nil ? [nil] : [nil, packed] where matched {
+                        let activation = PromptInt8Activation(codes: codes, ascale: ascale, rsb: rsb, rows: m, k: k)
+                        guard let reference = VerifyInt8Matmul.matmul(
+                                activation, layers: layers, streamedWeights: streamed),
+                            let lead = VerifyInt8Matmul.gateSplitLead(
+                                activation, layers: layers, streamedWeights: streamed),
+                            let gate = VerifyInt8Matmul.gateSplitGate(
+                                VerifySplitZ.ordered(activation, after: lead[0]), layers: layers,
+                                streamedWeights: streamed)
+                        else { matched = false; break }
+                        let checks = [
+                            MLX.all(u(half(lead[0], 0, rows: m)) .== u(half(reference[0], 0, rows: m))),
+                            MLX.all(u(half(gate, 1, rows: m)) .== u(half(reference[0], 1, rows: m))),
+                            MLX.all(u(lead[1]) .== u(reference[1])),
+                            MLX.all(u(lead[2]) .== u(reference[2])),
+                        ]
+                        eval(checks)
+                        matched = !failed && reference.count == 3 && lead.count == 3
+                            && checks.allSatisfy { $0.item(Bool.self) }
+                        cases += 1
+                    }
+                }
+            }
+        }
+        if failed { matched = false }
+        failed = false
+        let rows = VerifyInt8Matmul.rowRange
+        return matched
+            ? (true, "on (\(VerifyInt8Matmul.route), rows \(rows.lowerBound)...\(rows.upperBound), \(cases) cases bit-identical)")
+            : (false, "off (a case differed or failed to compile)")
+    }
+}
+
+extension VerifyInt8Matmul {
+    /// Layer 0's 32-column tiles in the split: threadgroup `t` of a half
+    /// takes tile `(t / 8) * 16 + t % 8`, plus 8 for the gate half, so the
+    /// query (gate) half of each 512-wide head lands where the record writes
+    /// it. Nil when an anchor is missing.
+    static func gateSplitSource(_ source: String, gate: Bool) -> String? {
+        let anchor = "int N = ksz[2];\n"
+        guard source.components(separatedBy: anchor).count == 2 else { return nil }
+        let remap = gate
+            ? "bx = (bx >> 3) * 16 + (bx & 7) + 8;\n"
+            : "if (bx < N / 64) { bx = (bx >> 3) * 16 + (bx & 7); } else { bx += N / 64; }\n"
+        return source.replacingOccurrences(of: anchor, with: anchor + remap)
+    }
+
+    static func gateSplitPlainSource() -> String? {
+        let anchor = "const int n0 = int(threadgroup_position_in_grid.x) * 32;"
+        guard plainSource.components(separatedBy: anchor).count == 2 else { return nil }
+        return plainSource.replacingOccurrences(
+            of: anchor,
+            with: "const int n0 = ((int(threadgroup_position_in_grid.x) >> 3) * 16 + (int(threadgroup_position_in_grid.x) & 7) + 8 * HALF) * 32;")
+    }
+
+    /// `[lead canonical, lead streamed, gate canonical, gate streamed]`.
+    private static let gateSplitKernels: [MLXFast.MLXFastKernel?] = [(false, false), (false, true), (true, false), (true, true)]
+        .map { gate, streamed in
+            let layers = gate ? 1 : 3
+            let record = streamed ? streamedFormsSource(layers: layers) : naxFormsSource(layers: layers)
+            return gateSplitSource(record, gate: gate).map { source in
+                MLXFast.metalKernel(
+                    name: "bonsai_q8_verify_\(streamed ? "streamed_col" : "matmul_nax_forms")\(layers)_\(gate ? "gate" : "query")_half",
+                    inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
+                        + (0 ..< layers).map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+                    outputNames: (0 ..< layers).map { "out\($0)" },
+                    source: source, header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+            }
+        }
+
+    private static let gateSplitPlainKernel: MLXFast.MLXFastKernel? = gateSplitPlainSource().map {
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_matmul_plain_half",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"], source: $0, ensureRowContiguous: true)
+    }
+
+    /// The record's three-layer launch takes the compile-time forms here.
+    private static func gateSplitTakesForms(
+        k: Int, layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)]
+    ) -> Bool {
+        naxFast && naxShared && hasMatchedForm(k: k, layers: 1)
+            && usesForms(k: k, layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) })
+    }
+
+    /// Layer 0 of the split on the plain route: one half of each head.
+    private static func gateSplitPlain(
+        _ activation: PromptInt8Activation,
+        layer: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool), gate: Bool
+    ) -> MLXArray? {
+        guard let kernel = gateSplitPlainKernel else { return nil }
+        let m = activation.rows, k = activation.k, n = layer.weight.dim(0)
+        return kernel(
+            [activation.codes, layer.weight, layer.scalesT, layer.biasesT, activation.ascale, activation.rsb,
+             HostConstants.int32([Int32(k), Int32(m), Int32(n)])],
+            template: [("ROWS", m), ("NEG", layer.negative && negativeForms ? 1 : 0), ("HALF", gate ? 1 : 0)],
+            grid: (n / 64 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// The first launch of the split: `[query halves, k, v]` as the record's
+    /// q/k/v launch computes them, layer 0 `[rows, N0]` with only the query
+    /// half of each 512-wide head written. Nil where the split does not apply.
+    static func gateSplitLead(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        streamedWeights: [MLXArray]?
+    ) -> [MLXArray]? {
+        guard route != .off, rowRange.contains(activation.rows), layers.count == 3,
+            layers[0].weight.dim(0) % 512 == 0
+        else { return nil }
+        let m = activation.rows, k = activation.k
+        guard route == .nax else {
+            guard let query = gateSplitPlain(activation, layer: layers[0], gate: false),
+                let key = matmul(
+                    activation, weight: layers[1].weight, scalesT: layers[1].scalesT,
+                    biasesT: layers[1].biasesT, negative: layers[1].negative),
+                let value = matmul(
+                    activation, weight: layers[2].weight, scalesT: layers[2].scalesT,
+                    biasesT: layers[2].biasesT, negative: layers[2].negative)
+            else { return nil }
+            return [query, key, value]
+        }
+        guard gateSplitTakesForms(k: k, layers: layers),
+            let kernel = gateSplitKernels[streamedWeights == nil ? 0 : 1]
+        else { return nil }
+        let ns = layers.map { $0.weight.dim(0) }
+        let ws = streamedWeights ?? layers.map(\.weight)
+        let inputs: [MLXArray] = [activation.codes] + ws + layers.map(\.scalesT) + layers.map(\.biasesT)
+            + [activation.ascale, activation.rsb, HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })]
+        let negative = negativeForms && layers.allSatisfy(\.negative)
+        return kernel(
+            inputs, template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)],
+            grid: ((ns[0] / 2 + ns[1] + ns[2]) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { [m, $0] }, outputDTypes: [.float32, .float32, .float32])
+    }
+
+    /// The second launch of the split: layer 0 `[rows, N0]` with only the
+    /// gate half of each 512-wide head written, in the offset form the
+    /// record's q/k/v launch gives it.
+    static func gateSplitGate(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        streamedWeights: [MLXArray]?
+    ) -> MLXArray? {
+        guard route != .off, rowRange.contains(activation.rows), layers.count == 3,
+            layers[0].weight.dim(0) % 512 == 0
+        else { return nil }
+        guard route == .nax else { return gateSplitPlain(activation, layer: layers[0], gate: true) }
+        let m = activation.rows, k = activation.k, n = layers[0].weight.dim(0)
+        guard gateSplitTakesForms(k: k, layers: layers),
+            let kernel = gateSplitKernels[streamedWeights == nil ? 2 : 3]
+        else { return nil }
+        let negative = negativeForms && layers.allSatisfy(\.negative)
+        return kernel(
+            [activation.codes, streamedWeights?[0] ?? layers[0].weight, layers[0].scalesT, layers[0].biasesT,
+             activation.ascale, activation.rsb, HostConstants.int32([Int32(k), Int32(m), Int32(n)])],
+            template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)],
+            grid: (n / 64 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+}
+
 /// Group-major copies of a packed module's F16 scales and offsets for
 /// `PromptInt8Matmul`, made on first use. A plain class, so nothing enters the
 /// module parameter tree.
@@ -7323,6 +7573,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             _ = PromptInt8Matmul.route
             _ = VerifyInt8Matmul.route
             _ = VerifySplitZ.ready
+            _ = VerifySplitGate.ready
             if weight.dim(0) % 32 == 0, VerifyInt8Matmul.formsK.contains(transform.width) {
                 if let copied = promptConstants.streamWeight(weight, k: transform.width, columns: 16),
                     VerifyInt8Matmul.checkRealStreams, let biases
@@ -7705,6 +7956,41 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     layer: (operands.1.weight, operands.1.scalesT, operands.1.biasesT),
                     negative: shared ? pair : operands.1.negative, streamedWeight: streamed?[1]
                 )?.reshaped(shape + [second.weight.dim(0)])
+            })
+    }
+
+    /// The query/key/value projections of the boundary route in two launches
+    /// (`VerifySplitGate`): `query` holds the query half of each 512-wide
+    /// head of the query projection, `key` and `value` are the record's, and
+    /// `gate(dependency)` is the launch of the gate halves ordered after
+    /// `dependency` without reading it. Each half the attention reads is the
+    /// record route's, bit for bit; the other halves are unwritten. Nil when
+    /// the split did not qualify at load or the shapes do not take it; the
+    /// caller then runs the record route.
+    public static func boundarySplitQueryGate(
+        _ boundary: VerifyBoundary, query: Linear, key: Linear, value: Linear
+    ) -> (query: MLXArray, key: MLXArray, value: MLXArray, gate: (MLXArray) -> MLXArray?)? {
+        let packed = [query, key, value].compactMap { $0 as? HadamardQuantizedLinear }
+        guard VerifySplitGate.ready, packed.count == 3,
+            packed.allSatisfy({
+                $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil && $0.bias == nil
+                    && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
+                    && $0.transform.isIdentical(to: boundary.transform)
+            })
+        else { return nil }
+        let layers = packed.map(\.verifyOperands)
+        let streamed = Self.streamedWeights(packed)
+        let activation = boundary.activation
+        guard let lead = VerifyInt8Matmul.gateSplitLead(activation, layers: layers, streamedWeights: streamed)
+        else { return nil }
+        let shape = Array(boundary.normalized.shape.dropLast())
+        let outputs = zip(packed, lead).map { layer, output in output.reshaped(shape + [layer.weight.dim(0)]) }
+        return (
+            outputs[0], outputs[1], outputs[2],
+            { dependency in
+                VerifyInt8Matmul.gateSplitGate(
+                    VerifySplitZ.ordered(activation, after: dependency), layers: layers, streamedWeights: streamed
+                )?.reshaped(shape + [packed[0].weight.dim(0)])
             })
     }
 
