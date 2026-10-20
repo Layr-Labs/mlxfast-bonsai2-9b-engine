@@ -1855,14 +1855,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 h = step.h
                 normed = step.nextNormed
                 normedCodes = step.nextCodes
-                if let normed {
-                    if isLast {
-                        asyncEval(normed)
+                // Launch the first layer promptly, then hand off pairs and the tail.
+                if index == 0 || (index + 1) % 2 == 0 || isLast {
+                    if let normed {
+                        if isLast {
+                            asyncEval(normed)
+                        } else {
+                            asyncEval(h, normed)
+                        }
                     } else {
-                        asyncEval(h, normed)
+                        asyncEval(h)
                     }
-                } else {
-                    asyncEval(h)
                 }
             }
             if var finalNormed = normed {
