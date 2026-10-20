@@ -4946,6 +4946,281 @@ extension PromptInt8Matmul {
     }
 }
 
+/// The MLP gate/up pair with SwiGLU formed in the matmul's epilogue. In the
+/// record the pair's launch stores `gate` and `up` (2 x 24 MiB per layer at
+/// 512 rows) and the next quantizing rotation reads both and forms
+/// `((g * sigmoid(g)) * u) * sign` per element. Here the threadgroup of the
+/// register-weight forms pairs its simdgroups: the gate simdgroup and the up
+/// simdgroup run the record's 32 x 32 x 128 operation chain on the same rows
+/// and columns (same operand build, same epilogue, so each `g` and `u` is the
+/// record's bits), the up simdgroup parks its 32 values per lane in
+/// threadgroup memory, and the gate simdgroup stores the product with the
+/// quantizer's own statements. The rotation then reads the product with its
+/// plain read (`product * sign`), the same bits as the SwiGLU read. The pair
+/// serves only after `checkSwiGLU` found the quantized codes and constants
+/// equal, bit for bit, to the record chain's; otherwise the record launch
+/// stays. `DARKBLOOM_BONSAI_PREFILL_SWIGLU=0` keeps the record chain.
+extension PromptInt8Matmul {
+    static let swigluOffered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_SWIGLU"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var swigluCanonicalReady = false
+    nonisolated(unsafe) private static var swigluStreamedReady = false
+    nonisolated(unsafe) private static var swigluCheckFailed = false
+
+    /// `operandBody` (a register-weight body) for one sibling pair in one
+    /// launch. Simdgroup role 0 takes layer 0 and role 1 layer 1 on the same
+    /// 32 columns; `cols128` threadgroups (four simdgroups) hold two such
+    /// column halves, the 64-column form's (two simdgroups) one. Nil when the
+    /// body no longer carries the fragments this edits.
+    private static func swigluSource(cols128: Bool, operandBody: String) -> String? {
+        let roleOf = cols128 ? "(simdgroup_index_in_threadgroup >> 1)" : "simdgroup_index_in_threadgroup"
+        let halfOf = cols128 ? "(simdgroup_index_in_threadgroup & 1u)" : "0u"
+        let store = "#pragma clang loop unroll(full)\nfor (int i = 0; i < 32; i += 4) {\n  const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);\n  const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);\n  *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = v;\n}"
+        let epilogue = """
+            if (swiglu_role == 1u) {
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < 32; i++) { swiglu_stash[(swiglu_half * 32u + uint(i)) * 32u + lane] = acc[i]; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (swiglu_role == 0u) {
+              #pragma clang fp reassociate(off)
+              #pragma clang fp contract(off)
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < 32; i += 4) {
+                const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+                const float4 g = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+                const uint sb = (swiglu_half * 32u + uint(i)) * 32u + lane;
+                const float4 u = float4(swiglu_stash[sb], swiglu_stash[sb + 32u], swiglu_stash[sb + 64u], swiglu_stash[sb + 96u]);
+                const float4 e = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+                const float4 sigmoid_g = select(1.0f - e, e, g < 0.0f);
+                *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = (g * sigmoid_g) * u;
+              }
+            }
+            """
+        guard operandBody.components(separatedBy: store).count == 2,
+            operandBody.components(separatedBy: "const int Kg = K / 128;").count == 2,
+            operandBody.components(separatedBy: "const int ns = bx * 64 + 32 * int(sg);").count == 2
+        else { return nil }
+        var body = operandBody
+            .replacingOccurrences(of: store, with: epilogue)
+            .replacingOccurrences(
+                of: "const int Kg = K / 128;",
+                with: "const uint swiglu_role = \(roleOf);\nconst uint swiglu_half = \(halfOf);\n"
+                    + "if (swiglu_role == 1u) { w = w1; scalesT = s1; biasesT = b1; }\nconst int Kg = K / 128;")
+            .replacingOccurrences(
+                of: "const int ns = bx * 64 + 32 * int(sg);",
+                with: cols128 ? "const int ns = bx * 64 + 32 * int(sg & 1);" : "const int ns = bx * 32;")
+        if cols128 {
+            body = "using elem_index = metal::conditional_t<INDEX32, uint, size_t>;\n"
+                + body.replacingOccurrences(of: "(size_t)", with: "(elem_index)")
+                    .replacingOccurrences(of: "const size_t ", with: "const elem_index ")
+        }
+        return naxSgSource(layers: 1, body: "threadgroup float swiglu_stash[2 * 32 * 32];\n" + body)
+    }
+
+    /// Index `(cols128 ? 2 : 0) + (streamed ? 1 : 0)`.
+    private static let swigluKernels: [MLXFast.MLXFastKernel?] = [
+        (false, false), (false, true), (true, false), (true, true),
+    ].map { cols128, streamed in
+        guard let source = swigluSource(
+            cols128: cols128, operandBody: streamed ? (streamedRegBody ?? "") : naxRegBody)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_swiglu_\(cols128 ? "cols128" : "reg")_\(streamed ? "c16" : "canonical")",
+            inputNames: ["xq", "w0", "w1", "s0", "s1", "b0", "b1", "ascale", "rsb", "ksz"],
+            outputNames: ["out0"], source: source, header: naxHeader, ensureRowContiguous: true)
+    }
+
+    private static func runSwiGLU(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
+        m: Int, k: Int, negative: Bool, form: SgForm, streamed: Bool
+    ) -> MLXArray? {
+        let cols128: Bool
+        switch form {
+        case .register: cols128 = false
+        case .registerCols128: cols128 = true
+        case .staged: return nil
+        }
+        guard layers.count == 2, let kernel = swigluKernels[(cols128 ? 2 : 0) + (streamed ? 1 : 0)] else { return nil }
+        let limit = Int(Int32.max)
+        let n = layers[0].weight.dim(0)
+        guard layers[1].weight.dim(0) == n, n > 0, n % 64 == 0, n <= limit / (k / 16), m <= limit / n,
+            m > 0, m % 32 == 0, k >= 128, k % 128 == 0
+        else { return nil }
+        let (l0, l1) = (layers[0], layers[1])
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n), Int32(n)])
+        let index32 = m % 64 == 0 && m <= limit / k
+        let template: [(String, any KernelTemplateArg)] = cols128
+            ? [("NEG", negative ? 1 : 0), ("INDEX32", index32), ("MFIRST", traversalMFirst)]
+            : [("NEG", negative ? 1 : 0), ("MFIRST", traversalMFirst)]
+        let threads = cols128 ? 128 : 64
+        let columns = cols128 ? 64 : 32
+        return kernel(
+            [codes, l0.weight, l1.weight, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims],
+            template: template, grid: (n / columns * threads, m / 32, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// `silu(gate) * up` of a sibling pair, in the kernel form and word
+    /// layout the pair's own `matmul(_:layers:)` launch takes. Nil when that
+    /// launch is not a register-weight form, the pair did not qualify, or the
+    /// shapes differ; the caller then runs the record pair.
+    static func matmulSwiGLU(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        streamedWeights: [MLXArray]?, qualifying: Bool = false
+    ) -> MLXArray? {
+        guard swigluOffered || qualifying, route == .nax, naxSg, naxSgShared, layers.count == 2 else { return nil }
+        let negative = negativeForms && layers.allSatisfy { $0.negative }
+        let copies: [MLXArray]
+        if let streamedWeights, streamedWeights.count == 2,
+            streamPromptReady, activation.rows >= 64, activation.rows % 64 == 0,
+            activation.k >= 128, activation.k % 128 == 0,
+            layers.allSatisfy({ $0.weight.dim(0) > 0 && $0.weight.dim(0) % 64 == 0 })
+        {
+            copies = streamedWeights
+        } else {
+            copies = layers.compactMap { promptStream($0.weight, m: activation.rows, k: activation.k) }
+        }
+        if copies.count == 2 {
+            guard swigluStreamedReady || qualifying else { return nil }
+            return runSwiGLU(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                layers: layers.enumerated().map { i, entry in (copies[i], entry.scalesT, entry.biasesT) },
+                m: activation.rows, k: activation.k, negative: negative, form: streamedForm, streamed: true)
+        }
+        guard swigluCanonicalReady || qualifying else { return nil }
+        return runSwiGLU(
+            codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+            layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
+            m: activation.rows, k: activation.k, negative: negative, form: sgForm, streamed: false)
+    }
+
+    /// The pair's end-to-end chain against the record's, on fixed synthetic
+    /// operands: the int8 codes and the group constants the down projection's
+    /// rotation forms from `matmulSwiGLU`'s product (plain read) against the
+    /// ones it forms from the record pair's `gate` and `up` (SwiGLU read), bit
+    /// for bit, at 512, 192 and 128 rows, K 4096, N 4096 and, at 512 rows, the
+    /// tower's 12288, for the offset forms the pair can take. Returns the
+    /// number of cases, nil when one differed or failed to compile.
+    static func checkSwiGLU(streamed: Bool) -> Int? {
+        guard route == .nax, naxSg, naxSgShared, sgForm != .staged, !streamed || (streamPromptReady && streamedForm != .staged)
+        else { return nil }
+        let k = 4096, kg = k / 128, maxRows = 512
+        let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
+            let centered: Int = (i * 37 + 11) % 255 - 127
+            return Int8(truncatingIfNeeded: centered)
+        }
+        let codes = MLXArray(codeValues, [maxRows, k])
+        let ascaleValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 11 + 1) / 256 }
+        let rsbValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }
+        let ascale = MLXArray(ascaleValues), rsb = MLXArray(rsbValues)
+        func operands(_ n: Int) -> [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negatedT: MLXArray)] {
+            (0 ..< 2).map { layer in
+                let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+                    let value: UInt64 = UInt64(i + 1 + 7919 * layer) &* 2_654_435_761
+                    return UInt32(truncatingIfNeeded: value)
+                }
+                let scaleValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = Float(1 + (i + layer) % 13) / 4096
+                    return Float16(value)
+                }
+                let biasValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = -Float((i + 3 * layer) % 7) / 2048
+                    return Float16(value)
+                }
+                let scalesT = MLXArray(scaleValues, [kg, n])
+                let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                return (MLXArray(words, [n, k / 16]), scalesT, MLXArray(biasValues, [kg, n]), negatedT)
+            }
+        }
+        let noted = streamPromptNoted
+        defer { streamPromptNoted = noted }
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        var matched = true
+        var cases = 0
+        swigluCheckFailed = false
+        withErrorHandler({ _ in PromptInt8Matmul.swigluCheckFailed = true }) {
+            for (n, rowList) in [(4096, [512, 192, 128]), (12288, [512])] where matched {
+                let pair = operands(n)
+                let copies: [MLXArray]? = streamed ? pair.map { VerifyInt8Matmul.streamPack($0.weight, k: k, columns: 16) } : nil
+                if let copies { eval(copies) }
+                let signs: [Float] = (0 ..< n).map { (i: Int) -> Float in (i &* 40503 >> 3) & 1 == 0 ? 1 : -1 }
+                guard let transform = try? SignedBlockHadamard(blockSize: 4096, signs: signs) else { matched = false; break }
+                for m in rowList where matched {
+                    let activation = PromptInt8Activation(
+                        codes: codes[0 ..< m], ascale: ascale[0 ..< m * kg], rsb: rsb[0 ..< m * kg], rows: m, k: k)
+                    for negative in [false, true] where matched {
+                        let layers = pair.map { operand in
+                            (weight: operand.weight, scalesT: operand.scalesT,
+                             biasesT: negative ? operand.negatedT : operand.biasesT, negative: negative)
+                        }
+                        guard let reference = matmul(activation, layers: layers, streamedWeights: copies), reference.count == 2,
+                            let product = matmulSwiGLU(
+                                activation, layers: layers, streamedWeights: copies, qualifying: true),
+                            let record = transform.quantizedForPrompt(reference[0], up: reference[1]),
+                            let fused = transform.quantizedForPrompt(product)
+                        else { matched = false; break }
+                        let checks = [
+                            MLX.all(record.codes .== fused.codes), MLX.all(u(record.ascale) .== u(fused.ascale)),
+                            MLX.all(u(record.rsb) .== u(fused.rsb)),
+                        ]
+                        eval(checks)
+                        matched = !swigluCheckFailed && checks.allSatisfy { $0.item(Bool.self) }
+                        cases += 1
+                    }
+                }
+            }
+        }
+        matched = matched && !swigluCheckFailed
+        swigluCheckFailed = false
+        return matched ? cases : nil
+    }
+
+    nonisolated(unsafe) private static var swigluPrepared = false
+
+    /// Called at load after `prepareStreaming`, so both word layouts and the
+    /// final traversal order are known; on a device without the tensor route
+    /// the record pair stays and nothing compiles.
+    static func prepareSwiGLU() {
+        guard !swigluPrepared else { return }
+        swigluPrepared = true
+        guard route == .nax else {
+            FileHandle.standardError.write(Data("int8 prompt SwiGLU pair epilogue: off (the tensor route is not in use)\n".utf8))
+            return
+        }
+        qualifySwiGLU(streamed: false)
+        if streamPromptReady { qualifySwiGLU(streamed: true) }
+    }
+
+    /// Resolved once per word layout, at load, before any timed work.
+    private static func qualifySwiGLU(streamed: Bool) {
+        let note: String
+        let passed: Bool
+        if !swigluOffered {
+            (passed, note) = (false, "off (DARKBLOOM_BONSAI_PREFILL_SWIGLU=0)")
+        } else if let cases = checkSwiGLU(streamed: streamed) {
+            (passed, note) = (true, "on (\(streamed ? sgFormName(streamedForm) : sgFormName(sgForm)), rows 512/192/128, \(cases) cases: quantized codes and constants bit-identical)")
+        } else {
+            (passed, note) = (false, "off (not a register-weight launch, or a case differed or failed to compile; record pair kept)")
+        }
+        if streamed { swigluStreamedReady = passed } else { swigluCanonicalReady = passed }
+        FileHandle.standardError.write(Data("int8 prompt SwiGLU pair epilogue, \(streamed ? "streamed words" : "canonical words"): \(note)\n".utf8))
+    }
+
+    private static func sgFormName(_ form: SgForm) -> String {
+        switch form {
+        case .staged: return "staged"
+        case .register: return "register"
+        case .registerCols128: return "register cols128"
+        }
+    }
+}
+
 /// The prompt GDN z projection out of the qkv launch. In the record the
 /// prompt qkv and z run as one launch (one per layer on the plain route)
 /// before the convolution, the b/a GEMM and the fresh8 scan, though z feeds
@@ -7799,6 +8074,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// request scratch is changed, and no request work is moved into begin.
     public static func prepareSharedVerifyWeights() {
         PromptInt8Matmul.prepareStreaming()
+        PromptInt8Matmul.prepareSwiGLU()
     }
 
     public let transform: SignedBlockHadamard
@@ -7920,6 +8196,23 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return promptLastRow(activation)
     }
 
+    /// Whether `callAfterPromptProduct` takes a `[rows, width]` product here: the
+    /// guards of `promptInt8Forward` for the plain (no `up`) read.
+    func acceptsPromptProduct(rows: Int, width: Int) -> Bool {
+        gdnLayout == nil && readsFloat16ConstantsInPlace && transform.blockSize == 4096
+            && transform.width == width && width % 512 == 0 && weight.dim(0) % 64 == 0
+            && PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
+            && rows * width <= Int(Int32.max) && StreamOrDevice.default == StreamOrDevice.gpu
+    }
+
+    /// The prompt-width output from `silu(gate) * up` already formed (by
+    /// `PromptInt8Matmul.matmulSwiGLU`): the rotation's plain read of the product
+    /// gives the codes `callAfterSwiGLU` forms from `gate` and `up`.
+    public func callAfterPromptProduct(_ product: MLXArray) -> MLXArray? {
+        guard gdnLayout == nil, let output = promptInt8Forward(product) else { return nil }
+        return bias.map { output + $0 } ?? output
+    }
+
     /// Form prompt SwiGLU values inside the existing quantizing transform.
     public func callAfterSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
         guard gdnLayout == nil,
@@ -7929,9 +8222,13 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     /// Share the residual, RMSNorm and rotation for an eligible projection group.
+    ///
+    /// With `swigluDown`, the MLP's down projection, a prompt-width gate/up pair that
+    /// `PromptInt8Matmul.matmulSwiGLU` serves returns one projection, `silu(gate) * up`,
+    /// for `callAfterPromptProduct`; otherwise the pair as before.
     public static func sharedResidualNormProjections(
         _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear]
+        projections: [Linear], swigluDown: HadamardQuantizedLinear? = nil
     ) -> (residual: MLXArray, projections: [MLXArray])? {
         guard x.ndim >= 2, x.dim(-1) == 4096 else { return nil }
         let rows = x.size / 4096
@@ -7949,6 +8246,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
         else { return nil }
+        if quantized, !verify, let swigluDown, packed.count == 2, packed.allSatisfy({ $0.bias == nil }),
+            swigluDown.acceptsPromptProduct(rows: rows, width: packed[0].weight.dim(0)),
+            let product = PromptInt8Matmul.matmulSwiGLU(
+                PromptInt8Activation(
+                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+                layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
+        {
+            return (activation.last!, [product.reshaped(Array(x.shape.dropLast()) + [packed[0].weight.dim(0)])])
+        }
         let promptOutputs = quantized && !verify
             ? PromptInt8Matmul.matmul(
                 PromptInt8Activation(
