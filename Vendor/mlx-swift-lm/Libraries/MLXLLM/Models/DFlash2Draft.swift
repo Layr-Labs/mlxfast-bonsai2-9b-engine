@@ -792,9 +792,14 @@ private final class DFlash2Attention: Module {
         }
 
         let output: MLXArray
+        let useTokenMajor = B == 1 && heads == 32 && L > 8 && DF2Fast.tokenMajorOProj
         if mask == nil,
-            let specialized = DraftSDPA.attention(queries, keys, values, scale: scale)
+            let specialized = DraftSDPA.attention(
+                queries, keys, values, scale: scale, tokenMajor: useTokenMajor)
         {
+            if useTokenMajor {
+                return DF2Fast.linear(specialized, oProj)
+            }
             output = specialized
         } else {
             output = MLXFast.scaledDotProductAttention(
@@ -804,7 +809,7 @@ private final class DFlash2Attention: Module {
         // [1, L, 4096] view is already row-contiguous: read it in place rather than
         // have the head-major quantizer's input check copy it. Same values, same
         // column order, same bits. The vector path (L <= 8) writes head-major.
-        if B == 1, heads == 32, L > 8, DF2Fast.tokenMajorOProj {
+        if useTokenMajor {
             return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
         }
         if B == 1, heads == 32, let y = DF2Fast.linearHeadMajor(output, oProj, L: L) {
@@ -948,6 +953,26 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         return c
     }
 
+    /// Set DARKBLOOM_BONSAI_SEED_NOZERO=0 to zero-fill new buffers again.
+    private static let skipZeroFill =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SEED_NOZERO"] != "0"
+
+    private static let uninitialized = MLXFast.metalKernel(
+        name: "df2_kv_uninitialized", inputNames: [String](), outputNames: ["out"],
+        source: "", ensureRowContiguous: false)
+
+    /// Every row a reader sees lies in `start ..< end + L`, and each such row is
+    /// written before the slice that exposes it is taken, so the fill is dead.
+    /// One output per launch: a sibling output's storage stays held until its
+    /// command buffer completes, which would stop the first slice update from
+    /// donating it and copy the whole buffer instead.
+    private static func allocate(_ shape: [Int], dtype: DType) -> MLXArray {
+        guard skipZeroFill else { return MLXArray.zeros(shape, dtype: dtype) }
+        return uninitialized(
+            [], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [shape], outputDTypes: [dtype])[0]
+    }
+
     private func ensureCapacity(
         extra: Int, B: Int, kvHeads: Int, kDim: Int, vDim: Int, kDType: DType, vDType: DType
     ) {
@@ -960,8 +985,8 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         let valid = end - start
         let needed = valid + extra
         let cap = ((needed + 512 + 255) / 256) * 256
-        let newK = MLXArray.zeros([B, kvHeads, cap, kDim], dtype: kDType)
-        let newV = MLXArray.zeros([B, kvHeads, cap, vDim], dtype: vDType)
+        let newK = Self.allocate([B, kvHeads, cap, kDim], dtype: kDType)
+        let newV = Self.allocate([B, kvHeads, cap, vDim], dtype: vDType)
         if let currentKeys = kBuf, let currentValues = vBuf, valid > 0 {
             newK[.ellipsis, ..<valid, 0...] =
                 currentKeys[.ellipsis, start ..< end, 0...].asType(kDType)
@@ -7218,7 +7243,7 @@ private enum DraftSDPA {
     static let limitedThreads = ProcessInfo.processInfo.environment["DF2_SDPA16_LIMIT"] != "0"
 
     static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
-                          scale: Float) -> MLXArray? {
+                          scale: Float, tokenMajor: Bool = false) -> MLXArray? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
             q.ndim == 4, k.ndim == 4, v.ndim == 4,
             q.shape4 == (1, 32, 16, 128)
@@ -7230,7 +7255,8 @@ private enum DraftSDPA {
             v.hasNonNegativeUnitInnerStride4
         else { return nil }
         return run(q, k, v, scale: scale, columns: columns, cacheQueries: cachedQueries,
-                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads)
+                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads,
+                   tokenMajor: tokenMajor)
     }
 
     static let header = """
@@ -7420,7 +7446,7 @@ private enum DraftSDPA {
     static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
                     columns: Int = 128, cacheQueries: Bool = false,
                     queryRows: Int = 16, headsPerGroup: Int = 1,
-                    limitThreads: Bool = false) -> MLXArray {
+                    limitThreads: Bool = false, tokenMajor: Bool = false) -> MLXArray {
         let kernel: MLXFast.MLXFastKernel
         switch (limitThreads, headsPerGroup) {
         case (false, 1): kernel = plain1
@@ -7431,11 +7457,12 @@ private enum DraftSDPA {
         case (true, _): kernel = limited4
         }
         let scaleArray = scale.bitPattern == defaultScale.bitPattern ? defaultScaleArray : MLXArray(scale)
-        return kernel([q, k, v, scaleArray],
+        let out = kernel([q, k, v, scaleArray],
                template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
-               outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+               outputShapes: [tokenMajor ? [1, 16, 4096] : [1, 16, 32, 128]], outputDTypes: [.float32])[0]
+        return tokenMajor ? out : out.transposed(0, 2, 1, 3)
     }
 }
 

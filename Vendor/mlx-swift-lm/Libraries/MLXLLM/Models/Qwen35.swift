@@ -2396,17 +2396,57 @@ enum Qwen35FusedGDNVerify {
             """
         // The window copy is read only through its three boundary rows, which `conv_tail`
         // and the replay already take from the inputs.
-        let qkConvStore = "          conv_in[t * C + c] = xin[t];\n"
-        let vConvStore = "      conv_in[t * C + c] = xv;\n"
+        let qkConvBlock = """
+                if (owns_qk) {
+                  #pragma clang loop unroll(full)
+                  for (uint t = 0; t < 3u + uint(MAX_T); ++t) {
+                    if (t < 3u + T) {
+                      conv_in[t * C + c] = xin[t];
+                      // The retained tail, detached: the bits of `x + 0` (-0 -> +0).
+                      if (t >= T) {
+                        const uint xb = as_type<uint>(xin[t]);
+                        conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+                      }
+                    }
+                  }
+                }
+            """
+        let vConvBlock = """
+                for (uint t = tid / uint(DVPT); t < 3u + T; t += 256u / uint(DVPT)) {
+                  const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];
+                  conv_in[t * C + c] = xv;
+                  if (t >= T) {
+                    const uint xb = as_type<uint>(xv);
+                    conv_tail[(t - T) * C + c] = as_type<float>(xb == 0x80000000u ? 0u : xb);
+                  }
+                }
+            """
+        let vConvBlockTuned = vConvBlock.replacingOccurrences(
+            of: "uint t = tid / uint(DVPT);", with: "uint t = vtid / uint(DVPT);")
+        let finalStateBlock = """
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < DVPL; ++d) {
+              device float4* s_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+              #pragma clang loop unroll(full)
+              for (int j = 0; j < R / 4; ++j) {
+                s_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+              }
+            }
+            """
+        let vBlockCount = s.components(separatedBy: vConvBlock).count - 1
+            + s.components(separatedBy: vConvBlockTuned).count - 1
         guard s.components(separatedBy: from).count == 2,
             s.components(separatedBy: vStore).count == 2,
             s.components(separatedBy: qkStore).count == 2,
-            !dead || (s.components(separatedBy: qkConvStore).count == 2
-                && s.components(separatedBy: vConvStore).count == 2)
+            !dead || (s.components(separatedBy: qkConvBlock).count == 2
+                && vBlockCount == 1
+                && s.components(separatedBy: finalStateBlock).count == 2)
         else { return nil }
         let kept = dead
-            ? s.replacingOccurrences(of: qkConvStore, with: "")
-                .replacingOccurrences(of: vConvStore, with: "")
+            ? s.replacingOccurrences(of: qkConvBlock, with: "")
+                .replacingOccurrences(of: vConvBlock, with: "")
+                .replacingOccurrences(of: vConvBlockTuned, with: "")
+                .replacingOccurrences(of: finalStateBlock, with: "")
             : s
         return kept.replacingOccurrences(of: vStore, with: "")
             .replacingOccurrences(of: qkStore, with: kOnlyStore)
@@ -2426,7 +2466,7 @@ enum Qwen35FusedGDNVerify {
         return MLXFast.metalKernel(
             name: "qwen35_gdn_verify_fused_delta_nocv",
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-            outputNames: ["k_out", "y", "state_out", "conv_tail", "delta_out"],
+            outputNames: ["k_out", "y", "delta_out"],
             source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
 
@@ -2454,7 +2494,7 @@ enum Qwen35FusedGDNVerify {
         return MLXFast.metalKernel(
             name: "qwen35_gdn_verify_fused_sg16_delta_nocv",
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
-            outputNames: ["k_out", "y", "state_out", "conv_tail", "delta_out"],
+            outputNames: ["k_out", "y", "delta_out"],
             source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
 
@@ -2777,7 +2817,7 @@ enum Qwen35FusedGDNVerify {
                 + (dead ? "_nocv" : ""),
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
             outputNames: dead
-                ? ["k_out", "y", "state_out", "conv_tail", "delta_out"]
+                ? (snapshot != nil ? ["k_out", "y", "state_out", "delta_out"] : ["k_out", "y", "delta_out"])
                 : delta
                 ? ["conv_in", "k_out", "y", "state_out", "conv_tail", "delta_out"]
                 : ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
@@ -2825,8 +2865,11 @@ enum Qwen35FusedGDNVerify {
         guard let selected = deadKernel ?? selected else { return nil }
         let qShape = [1, S, keyHeads, 128]
         let vShape = [1, S, valueHeads, 128]
+        let usesSnapshotScratch = fastTreeOffered && snapshotOffered
         let shapes = deadKernel != nil
-            ? [qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C], [1, S, valueHeads, 129]]
+            ? (usesSnapshotScratch
+                ? [qShape, vShape, [1, valueHeads, 128, 128], [1, S, valueHeads, 129]]
+                : [qShape, vShape, [1, S, valueHeads, 129]])
             : captureDelta
             ? [[1, S + 3, C], qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C], [1, S, valueHeads, 129]]
             : [[1, S + 3, C], vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C]]
@@ -2839,11 +2882,11 @@ enum Qwen35FusedGDNVerify {
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads), threadGroup: (tuned ? 512 : 256, 1, 1),
             outputShapes: shapes,
-            outputDTypes: deadKernel != nil ? Array(repeating: .float32, count: 5)
-                : captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+            outputDTypes: Array(repeating: .float32, count: shapes.count))
         if deadKernel != nil {
             // `qkv` stands for the window rows of the conv input; the three rows before them are `convState`.
-            return (qkv, o[0], o[0], o[0], o[1], o[2], o[3], o[4])
+            // Full acceptance replays from `delta_out` via `Qwen35DeltaReplay`.
+            return (qkv, o[0], o[0], o[0], o[1], state, convState, o[usesSnapshotScratch ? 3 : 2])
         }
         if captureDelta {
             return (o[0], o[1], o[1], o[1], o[2], o[3], o[4], o[5])
@@ -2895,7 +2938,7 @@ enum Qwen35FusedGDNVerify {
         let convShape = [1, S + 3, C]
         let tailShape = [1, 3, C]
         let shapes = deadKernel != nil
-            ? [qShape, vShape, [1, valueHeads, 128, 128], tailShape, [1, S, valueHeads, 129]]
+            ? [qShape, vShape, [1, S, valueHeads, 129]]
             : captureDelta
             ? [convShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape, [1, S, valueHeads, 129]]
             : [convShape, vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape]
@@ -2909,10 +2952,9 @@ enum Qwen35FusedGDNVerify {
             grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads),
             threadGroup: (tuned ? 512 : 256, 1, 1),
             outputShapes: shapes,
-            outputDTypes: deadKernel != nil ? Array(repeating: .float32, count: 5)
-                : captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+            outputDTypes: Array(repeating: .float32, count: shapes.count))
         if deadKernel != nil {
-            return (qkv, outputs[0], outputs[0], outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+            return (qkv, outputs[0], outputs[0], outputs[0], outputs[1], state, convState, outputs[2])
         }
         if captureDelta {
             return (outputs[0], outputs[1], outputs[1], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5])
@@ -3087,14 +3129,15 @@ enum Qwen35FusedGDNVerify {
             }
             for tuned in [false, true] where deadOK {
                 // The dead-output kernels hand back the window rows and leave the three boundary
-                // rows to `convState`; everything else is the record's bits.
+                // rows to `convState` and full acceptance to `Qwen35DeltaReplay`; everything else
+                // is the record's bits.
                 guard let dead = probeForward(inputs, tuned: tuned, delta: true, tree: tree, dead: true),
                     let deadTape = dead.7, let capturedTape = plainCapture.7
                 else { deadOK = false; break }
                 let probeWindow = negativeControl ? dead.0 + 1 : dead.0
                 let probeState = negativeControl ? convState + 1 : convState
-                deadOK = sameBits([probeWindow, dead.3, dead.4, dead.5, dead.6, deadTape],
-                    [qkv, record.3, record.4, record.5, record.6, capturedTape]) && deadOK
+                deadOK = sameBits([probeWindow, dead.3, dead.4, deadTape],
+                    [qkv, record.3, record.4, capturedTape]) && deadOK
                 deadOK = sameBits([record.0], [concatenated([convState, qkv], axis: 1)]) && deadOK
                 let paths = descriptor.map { $0.1 }
                     ?? (1...16).map { (steps: Int) -> [Int] in Array(0..<steps) }
@@ -4026,7 +4069,8 @@ final class Qwen35GatedDeltaNet: Module {
         tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> Bool {
         guard committedRows > 0,
-              committedRows < tape.rowCount,
+              committedRows <= tape.rowCount,
+              committedRows < tape.rowCount || tape.convState != nil,
               tape.convStateRows == convKernelSize - 1
         else { return false }
 
@@ -4557,6 +4601,7 @@ final class Qwen35GatedDeltaNet: Module {
                 let materializedBytes = checkedByteCount(roots + [finalSSM])
                 let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
                 let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                let fullAcceptanceRoots = splitConvWindow ? strictReplayRoots : [tape.convInput]
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -4569,8 +4614,12 @@ final class Qwen35GatedDeltaNet: Module {
                         strictReplayRetainedByteCount: strictReplayRetainedBytes,
                         strictReplayRetainedRoots: strictReplayRoots,
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
-                        fullAcceptanceRetainedRoots: [tape.convInput],
-                        fullAcceptance: {
+                        fullAcceptanceRetainedRoots: fullAcceptanceRoots,
+                        fullAcceptance: { [unowned self] in
+                            if splitConvWindow {
+                                return self.replayedPrefixState(
+                                    tape: tape, committedRows: S)
+                            }
                             // The fused kernel wrote these bits to their own
                             // buffer; otherwise add zero to detach the tail.
                             let detachedConv = fusedTail ?? finalConv + MLXArray.zeros(
@@ -5861,6 +5910,7 @@ enum Qwen35Layer0FP32 {
         verifyPassed = verify.passed
         FileHandle.standardError.write(Data(
             "qwen35 layer0 fp32: prompt \(prompt.note) (rows 512), verify \(verify.note) (rows 2-16)\n".utf8))
+        Qwen35VerifyStartFusion.prepare(model)
     }
 
     private static func verdict(_ body: () -> Bool) -> (passed: Bool, note: String) {
@@ -5965,6 +6015,122 @@ enum Qwen35Layer0FP32 {
             for (o, n) in zip(old1.projections, fused1.projections) { eqs.append(bitsEqual(o, n)) }
         }
         return MLX.all(MLX.stacked(eqs)).item(Bool.self)
+    }
+}
+
+enum Qwen35VerifyStartFusion {
+    static let offered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VSTART_FUSE"] != "0"
+    static let negativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VSTART_FUSE_NEGCTL"] == "1"
+    nonisolated(unsafe) static var verified = false
+
+    static let source: String = {
+        let record = SignedBlockHadamard.fused4096Source(residualNorm: false)
+        let head = record.components(separatedBy: "if (sizeof(T) == 4) {")
+        precondition(head.count == 2)
+        let branches = head[1].components(separatedBy: "} else {")
+        precondition(branches.count == 2)
+        let read = "float val = float(x[in_offset + r]);"
+        let store = "y[batch_idx + idx] = T(val);"
+        let buffer = "threadgroup float buf[256 * 17];"
+        let offset = "const uint in_offset = batch_idx + uint(base0);"
+        let fused = head[0] + "{" + branches.dropFirst().joined(separator: "} else {")
+        precondition([read, store, buffer, offset].allSatisfy { fused.components(separatedBy: $0).count == 2 })
+        let dequant = "const uint8_t d = (uint(wb[r >> 2]) >> (2 * (r & 3))) & 0x03; const T q = scale * d + bias; float val = float(q);"
+        return fused
+            .replacingOccurrences(of: offset, with: "")
+            .replacingOccurrences(of: buffer, with: """
+                const int64_t raw = int64_t(ids[block_idx]); const int64_t tok = raw < 0 ? raw + int64_t(w_shape[0]) : raw;
+                const device uint8_t* wb = (const device uint8_t*)(w + tok * 256) + (int(i) << 2);
+                const T scale = scales[tok * 32 + (i >> 3)];
+                const T bias = biases[tok * 32 + (i >> 3)];
+                \(buffer)
+                """)
+            .replacingOccurrences(of: read, with: dequant)
+            .replacingOccurrences(of: store, with: negativeControl ? "y[batch_idx + idx] = val;" : "y[batch_idx + idx] = float(T(val));")
+    }()
+
+    static let kernel = MLXFast.metalKernel(
+        name: negativeControl ? "qwen35_verify_start_embed_negctl" : "qwen35_verify_start_embed",
+        inputNames: ["ids", "w", "scales", "biases", "signs"], outputNames: ["y"],
+        source: source, header: SignedBlockHadamard.fused4096Header)
+
+    static func packed(_ model: Qwen35TextModelInner) -> HadamardQuantizedEmbedding? {
+        guard let e = model.embedTokens as? HadamardQuantizedEmbedding, e.bits == 2, e.groupSize == 128,
+            e.transform.blockSize == 4096, e.transform.width == 4096, e.weight.dtype == .uint32,
+            e.weight.ndim == 2, e.weight.dim(1) == 256, e.scales.dtype == .float16, e.scales.dim(1) == 32,
+            let biases = e.biases, biases.dtype == .float16, biases.shape == e.scales.shape,
+            StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        return e
+    }
+
+    static func rows(_ e: HadamardQuantizedEmbedding, _ ids: MLXArray) -> MLXArray {
+        kernel(
+            [ids, e.weight, e.scales, e.biases!, e.transform.signs],
+            template: [("T", DType.float16), ("BLOCKS_PER_ROW", 1), ("INVERSE", true)],
+            grid: (256, ids.size, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[ids.size, 4096]], outputDTypes: [.float32])[0]
+    }
+
+    static func embed(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
+        guard verified, inputs.ndim == 2, inputs.dim(0) == 1, (2 ... 16).contains(inputs.dim(1)),
+            inputs.dtype == .int32, let e = packed(model)
+        else { return nil }
+        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
+    }
+
+    static func prepare(_ model: Qwen35TextModelInner) {
+        let note: String
+        if !offered {
+            note = "off"
+        } else if !Qwen35Layer0FP32.verifyPassed {
+            note = "off (layer0 fp32 verify off)"
+        } else if let e = packed(model) {
+            do {
+                let (bad, cases) = try withError { check(e) }
+                verified = bad == 0
+                note = verified
+                    ? "on (\(cases) cases bitwise equal: rows 2-16 chain and tree, negative ids, all \(e.weight.dim(0)) ids)"
+                    : "off (mismatch: \(bad) of \(cases) cases differ, record chain kept)"
+            } catch {
+                note = "off (error, record chain kept: \(error))"
+            }
+        } else {
+            note = "off (embedding not 2-bit g128 WHT-4096 F16)"
+        }
+        FileHandle.standardError.write(Data("qwen35 verify start fusion: \(note)\n".utf8))
+    }
+
+    private static func check(_ e: HadamardQuantizedEmbedding) -> (Int, Int) {
+        let vocabulary = e.weight.dim(0)
+        var batches: [[Int32]] = []
+        for count in 2 ... 16 {
+            let chain = (0 ..< count).map { Int32((11 + $0 &* 7919 &+ count &* 104_729) % vocabulary) }
+            var tree = chain
+            for j in 1 ..< count { tree[j] = chain[(j - 1) / 2] }
+            tree[count - 1] = Int32(vocabulary - 1)
+            tree[0] = 0
+            batches += [chain, tree]
+        }
+        batches.append([-1, Int32(-vocabulary), -2, -7919])
+        var start = 0
+        while start < vocabulary {
+            let n = min(2048, vocabulary - start)
+            batches.append((start ..< start + n).map { Int32($0) })
+            start += n
+        }
+        var bad = 0
+        for ids in batches {
+            let shaped = MLXArray(ids).reshaped([1, ids.count])
+            let record = e(shaped).asType(.float32)
+            let fused = rows(e, shaped.reshaped([-1])).reshaped(record.shape)
+            let same = MLX.all(
+                contiguous(record).view(dtype: .uint32) .== contiguous(fused).view(dtype: .uint32))
+            if !same.item(Bool.self) { bad += 1 }
+        }
+        return (bad, batches.count)
     }
 }
 
@@ -6161,7 +6327,10 @@ public class Qwen35TextModelInner: Module {
         let shapeCall = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
-        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        var hiddenStates = inputEmbeddings
+            ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
+                && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
+            ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
         let tapLayerIds = dFlash2Tap.layerIds

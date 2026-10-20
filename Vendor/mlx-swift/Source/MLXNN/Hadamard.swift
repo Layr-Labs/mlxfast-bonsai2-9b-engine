@@ -93,7 +93,7 @@ public enum HostConstants {
 public struct SignedBlockHadamard {
     public let blockSize: Int
     public let width: Int
-    private let signs: MLXArray
+    public let signs: MLXArray
     private let signValues: [Float]
 
     public init(blockSize: Int, signs: [Float]) throws {
@@ -139,7 +139,7 @@ public struct SignedBlockHadamard {
             const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
             """
 
-    private static func fused4096Source(residualNorm: Bool) -> String {
+    public static func fused4096Source(residualNorm: Bool) -> String {
         let prefix = residualNorm ? residualNormSource : ""
         let valueRead = residualNorm ? """
             const float4 raw = in4[v] + *((const device float4*)(residual + in_offset) + v);
@@ -227,7 +227,7 @@ public struct SignedBlockHadamard {
             """
     }
 
-    private static let fused4096Header = """
+    public static let fused4096Header = """
             using namespace metal;
             METAL_FUNC void hadamard_radix16(thread float* x) {
               #pragma clang loop unroll(full)
