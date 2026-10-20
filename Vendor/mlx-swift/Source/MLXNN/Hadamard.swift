@@ -3717,7 +3717,7 @@ enum PromptInt8Matmul {
         using elem_index = metal::conditional_t<INDEX32, uint, size_t>;
         const int Kg = K / 128;
         const int n0 = bx * 64;
-        const int m0 = int(threadgroup_position_in_grid.y) * 64;
+        const int m0 = ty * 64;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
         const uint tid = thread_position_in_threadgroup.x;
@@ -3808,7 +3808,14 @@ enum PromptInt8Matmul {
     static func naxSgSource(layers: Int, body: String = naxSgBody) -> String {
         var pick = """
             const int K = ksz[0]; const int M = ksz[1];
-            int bx = int(threadgroup_position_in_grid.x);
+            int tx = int(threadgroup_position_in_grid.x);
+            int ty = int(threadgroup_position_in_grid.y);
+            if (MFIRST) {
+              const uint lin = threadgroup_position_in_grid.y * threadgroups_per_grid.x + threadgroup_position_in_grid.x;
+              tx = int(lin / threadgroups_per_grid.y);
+              ty = int(lin % threadgroups_per_grid.y);
+            }
+            int bx = tx;
             const device uint32_t* w = w0;
             const device half* scalesT = s0;
             const device half* biasesT = b0;
@@ -3850,7 +3857,7 @@ enum PromptInt8Matmul {
         const int Kg = K / 128;
         const uint lane = thread_index_in_simdgroup;
         const uint sg = simdgroup_index_in_threadgroup;
-        const int ms = int(threadgroup_position_in_grid.y) * 32;
+        const int ms = ty * 32;
         const int ns = bx * 64 + 32 * int(sg);
         const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
         const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
@@ -3980,8 +3987,8 @@ enum PromptInt8Matmul {
             + operandBody.replacingOccurrences(of: "(size_t)", with: "(elem_index)")
                 .replacingOccurrences(of: "const size_t ", with: "const elem_index ")
         return swapped(naxSgSource(layers: layers, body: body), [
-            (of: "int bx = int(threadgroup_position_in_grid.x);",
-             with: "int bx = 2 * int(threadgroup_position_in_grid.x) + int(simdgroup_index_in_threadgroup >> 1);"),
+            (of: "int bx = tx;",
+             with: "int bx = 2 * tx + int(simdgroup_index_in_threadgroup >> 1);"),
             (of: "const int Kg = K / 128;", with: "if (bx >= N / 64) { return; }\nconst int Kg = K / 128;"),
             (of: "const int ns = bx * 64 + 32 * int(sg);", with: "const int ns = bx * 64 + 32 * int(sg & 1);"),
         ])
@@ -4242,6 +4249,15 @@ enum PromptInt8Matmul {
             FileHandle.standardError.write(Data("prompt C16 register qualification: \(qualified.same ? "passed" : "FAILED; canonical buffers kept") \(sgForm)\n".utf8))
         }
         streamPromptReady = allMatched
+        if allMatched, traversalMFirst {
+            for rows in [registerCheckRows, 192] where traversalMFirst {
+                let (same, text) = matchesStaged(streamedForm, streamed: true, rows: rows, traversal: true)
+                if !same {
+                    traversalMFirst = false
+                    FileHandle.standardError.write(Data("int8 prompt M-first traversal: off for the streamed form (\(text))\n".utf8))
+                }
+            }
+        }
         FileHandle.standardError.write(Data("prompt C16 selected form: \(streamedForm); canonical form: \(sgForm)\n".utf8))
         // A failed prefill qualification keeps the canonical layout on both
         // paths, rather than enabling copies with an unqualified consumer.
@@ -4278,13 +4294,20 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var naxSgShared = false
     nonisolated(unsafe) private static var sgForm = SgForm.staged
 
+    /// Launch order of `runSg`'s threadgroups: M-first (consecutive threadgroups
+    /// take the same weight columns on successive 32 or 64 row tiles, so the
+    /// packed weights stream through the caches once) instead of N-first. The
+    /// tile each threadgroup computes is unchanged; only which threadgroup
+    /// position computes it. Set by `checkTraversal` and `prepareStreaming`.
+    nonisolated(unsafe) private static var traversalMFirst = false
+
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
     /// one activation, in `form`; every N a multiple of 64, `m` of 64. Every
     /// form has the same outputs.
     private static func runSg(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, form: SgForm, streamed: Bool = false
+        m: Int, k: Int, negative: Bool, form: SgForm, streamed: Bool = false, mFirst: Bool? = nil
     ) -> [MLXArray] {
         let limit = Int(Int32.max)
         let dims: MLXArray
@@ -4345,10 +4368,11 @@ enum PromptInt8Matmul {
         }
         let index32 = m > 0 && m % 64 == 0 && k >= 128 && k % 128 == 0
             && m <= limit / k && allNValid
+        let mFirstOrder = mFirst ?? traversalMFirst
         let template: [(String, any KernelTemplateArg)] =
             (form == .staged || form == .registerCols128)
-            ? [("NEG", negative ? 1 : 0), ("INDEX32", index32)]
-            : [("NEG", negative ? 1 : 0)]
+            ? [("NEG", negative ? 1 : 0), ("INDEX32", index32), ("MFIRST", mFirstOrder)]
+            : [("NEG", negative ? 1 : 0), ("MFIRST", mFirstOrder)]
         let launch = streamed ? form.streamedLaunch : form.launch
         let kernels = launch.kernels
         return kernels[layers.count - 1](
@@ -4403,8 +4427,10 @@ enum PromptInt8Matmul {
     /// `NEG = 1`; every output bit compared. A compile or run error counts as
     /// a mismatch. Returns whether every bit matched, and the detail for the
     /// stderr line.
-    private static func matchesStaged(_ form: SgForm, streamed: Bool = false) -> (same: Bool, detail: String) {
-        let m = registerCheckRows
+    private static func matchesStaged(
+        _ form: SgForm, streamed: Bool = false, rows: Int = registerCheckRows, traversal: Bool = false
+    ) -> (same: Bool, detail: String) {
+        let m = rows
         var same = true
         var compared = 0
         registerFailed = false
@@ -4440,14 +4466,16 @@ enum PromptInt8Matmul {
                     if streamed { eval(copies) }
                     let packed: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)] = streamed
                         ? layers.enumerated().map { i, layer in (copies[i], layer.scalesT, layer.biasesT) } : layers
-                    func outputs(_ which: SgForm) -> [MLXArray] {
-                        let useCopies = streamed && which == form
+                    func outputs(_ which: SgForm, candidate: Bool) -> [MLXArray] {
+                        let useCopies = streamed && candidate
                         return runSg(
                             codes: codes, ascale: ascale, rsb: rsb, layers: useCopies ? packed : layers,
-                            m: m, k: k, negative: negative, form: which, streamed: useCopies
+                            m: m, k: k, negative: negative, form: which, streamed: useCopies,
+                            mFirst: traversal && candidate
                         ).map { $0.view(dtype: .uint32) }
                     }
-                    let checks = zip(outputs(.staged), outputs(form)).map { MLX.all($0 .== $1) }
+                    let checks = zip(outputs(.staged, candidate: false), outputs(form, candidate: true))
+                        .map { MLX.all($0 .== $1) }
                     eval(checks)
                     same = !registerFailed && checks.allSatisfy { $0.item(Bool.self) }
                     compared += m * shape.ns.reduce(0, +)
@@ -4492,6 +4520,24 @@ enum PromptInt8Matmul {
         let (same, detail) = matchesStaged(.registerCols128)
         if same { sgForm = .registerCols128 }
         return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
+    }
+
+    /// M-first launch order against the record's N-first order, bit for bit, on
+    /// every `registerCheckShapes` call at the 512-row prompt and at 192 rows (a
+    /// tile count that is no power of two), in the form the prompt route runs.
+    /// `DARKBLOOM_BONSAI_PREFILL_TRAVERSAL=0` keeps the record order.
+    private static func checkTraversal() -> String {
+        traversalMFirst = false
+        if switchedOff("DARKBLOOM_BONSAI_PREFILL_TRAVERSAL") { return "off (DARKBLOOM_BONSAI_PREFILL_TRAVERSAL=0)" }
+        guard naxSg else { return "off (the per-simdgroup kernel is not in use)" }
+        var detail = ""
+        for rows in [registerCheckRows, 192] {
+            let (same, text) = matchesStaged(sgForm, rows: rows, traversal: true)
+            guard same else { return "off (\(text); record order kept)" }
+            detail += (detail.isEmpty ? "" : "; ") + text
+        }
+        traversalMFirst = true
+        return "on (\(detail))"
     }
 
     /// MLX's own NAX rule (device.cpp `is_nax_available`): GPU generation 17
@@ -4641,6 +4687,8 @@ enum PromptInt8Matmul {
                 "int8 prompt register-weight kernel: \(checkRegister())\n".data(using: .utf8)!)
             FileHandle.standardError.write(
                 "int8 prompt register-weight 128-column kernel: \(checkRegisterCols128())\n".data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "int8 prompt M-first traversal: \(checkTraversal())\n".data(using: .utf8)!)
         }
         return chosen
     }()
