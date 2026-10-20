@@ -93,7 +93,7 @@ public enum HostConstants {
 public struct SignedBlockHadamard {
     public let blockSize: Int
     public let width: Int
-    private let signs: MLXArray
+    public let signs: MLXArray
     private let signValues: [Float]
 
     public init(blockSize: Int, signs: [Float]) throws {
@@ -139,7 +139,7 @@ public struct SignedBlockHadamard {
             const float norm_inv = metal::precise::rsqrt(norm_total / 4096.0f + epsilon[0]);
             """
 
-    private static func fused4096Source(residualNorm: Bool) -> String {
+    public static func fused4096Source(residualNorm: Bool) -> String {
         let prefix = residualNorm ? residualNormSource : ""
         let valueRead = residualNorm ? """
             const float4 raw = in4[v] + *((const device float4*)(residual + in_offset) + v);
@@ -227,7 +227,7 @@ public struct SignedBlockHadamard {
             """
     }
 
-    private static let fused4096Header = """
+    public static let fused4096Header = """
             using namespace metal;
             METAL_FUNC void hadamard_radix16(thread float* x) {
               #pragma clang loop unroll(full)
@@ -1343,6 +1343,67 @@ enum WideRowSource {
     }
 }
 // WIDEROW-GEN END
+// WIDEROW-LEAN BEGIN
+enum WideRowLean {
+    static func source(_ record: String, threads: Int, form f: WideRowSource.Form, negative: Bool = false) -> String? {
+        let e = 4096 / threads
+        guard e == 4 || e == 8 else { return nil }
+        let b = e == 4 ? 2 : 3, shift = e == 4 ? 7 : 11, step = e == 4 ? 2 : 4
+        let size = 4096 + ((4095 >> shift) << step) + 4
+        var s = record
+        func swap(_ old: String, _ new: String) -> Bool {
+            guard let r = s.range(of: old), s.range(of: old, range: r.upperBound ..< s.endIndex) == nil else { return false }
+            s.replaceSubrange(r, with: new)
+            return true
+        }
+        func pad(_ idx: String) -> String { "(\(idx)) + (((\(idx)) >> \(shift)u) << \(step)u)" }
+        func stage(_ m: Int) -> String {
+            "#pragma clang loop unroll(full)\nfor (uint r = 0; r < \(e)u; r++) {\n  const float o = simd_shuffle_xor(x_reg[r], ushort(\(m)));\n  x_reg[r] = (i & \(m)u) ? (o - x_reg[r]) : (x_reg[r] + o);\n}\n"
+        }
+        func store(_ at: String, _ scale: String = "") -> String {
+            (0 ..< e / 4).map { w in
+                "*((threadgroup float4*)(buf + \(pad("\(at) + \(4 * w)u")))) = float4(x_reg[\(4 * w)], x_reg[\(4 * w + 1)], x_reg[\(4 * w + 2)], x_reg[\(4 * w + 3)])\(scale);\n"
+            }.joined()
+        }
+        func load(_ at: String, _ into: String) -> String {
+            (0 ..< e / 4).map { w in
+                "{\nconst float4 t = *((threadgroup float4*)(buf + \(pad("\(at) + \(4 * w)u"))));\n\(into)[\(4 * w)] = t.x; \(into)[\(4 * w + 1)] = t.y; \(into)[\(4 * w + 2)] = t.z; \(into)[\(4 * w + 3)] = t.w;\n}\n"
+            }.joined()
+        }
+        let start = "widerow_radix\(e)(x_reg);\n#pragma clang loop unroll(full)\nfor (uint r = 0; r < \(e)u; r++) {\n  buf[(base0 + r) + ((base0 + r) >> \(b)u)] = x_reg[r];\n}\n"
+        let end = "threadgroup_barrier(mem_flags::mem_threadgroup);\n\nfloat v[\(e)];\n"
+        guard let a = s.range(of: start), s.range(of: start, range: a.upperBound ..< s.endIndex) == nil,
+            let z = s.range(of: end, range: a.upperBound ..< s.endIndex),
+            s.range(of: end, range: z.upperBound ..< s.endIndex) == nil,
+            s[a.upperBound ..< z.lowerBound].utf8.reduce(UInt64(0xcbf2_9ce4_8422_2325), { ($0 ^ UInt64($1)) &* 0x100_0000_01b3 })
+                == (e == 4 ? 0x7ba6_13bb_738b_304b : 0xc896_ead6_e628_1ebf)
+        else { return nil }
+        let second = e == 4
+            ? "const uint t0 = ((i >> 5u) << 2u) | ((i & 31u) << 7u);\n" + load("t0", "x_reg")
+                + [1, 2, 4, 8, 16].map(stage).joined() + store("t0", " * 0.015625f")
+            : "const uint t0 = (i >> 1u) | ((i & 1u) << 11u);\n#pragma clang loop unroll(full)\nfor (uint r = 0; r < 8u; r++) {\n  x_reg[r] = buf[\(pad("t0 + (r << 8u)"))];\n}\nwiderow_radix8(x_reg);\n"
+                + stage(1) + "#pragma clang loop unroll(full)\nfor (uint r = 0; r < 8u; r++) {\n  buf[\(pad("t0 + (r << 8u)"))] = x_reg[r] * 0.015625f;\n}\n"
+        s.replaceSubrange(a.lowerBound ..< z.upperBound, with: "widerow_radix\(e)(x_reg);\n"
+            + (negative ? [2, 1, 4, 8, 16] : [1, 2, 4, 8, 16]).map(stage).joined() + store("base0")
+            + "threadgroup_barrier(mem_flags::mem_threadgroup);\n{\n" + second + "}\n" + end)
+        guard swap("threadgroup float buf[4096 + \(4096 / e)];",
+                "threadgroup float4 buf_v[\(size / 4)];\nthreadgroup float* buf = (threadgroup float*)buf_v;"),
+            swap("\n  v[r] = buf[(base0 + r) + ((base0 + r) >> \(b)u)];", ""),
+            swap("float v[\(e)];\nfloat amax = 0.0f;\n", "float v[\(e)];\nfloat amax = 0.0f;\n" + load("base0", "v")),
+            swap("const size_t qidx = size_t(row) * size_t(kg) + size_t(g);", "const uint qidx = row * kg + g;")
+        else { return nil }
+        if f.gatedNorm && e == 4 {
+            guard swap("threadgroup float head_part[32 * 32];", "float head_acc = 0.0f;"),
+                swap("    head_part[(base0 >> 2) + uint(w)] = acc;", "    head_acc = acc;"),
+                swap("}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nfloat head_inv_value", "}\nfloat head_inv_value"),
+                swap("simd_sum(head_part[(head_base + k) * 32u + norm_lane])", "simd_sum(head_acc)"),
+                swap("  const uint head_base = simdgroup_index_in_threadgroup * 1u;\n", "")
+            else { return nil }
+        }
+        return s
+    }
+}
+// WIDEROW-LEAN END
 
 extension SignedBlockHadamard {
     /// The verify-width per-row forms: those whose rows carry an RMS
@@ -1489,23 +1550,39 @@ extension SignedBlockHadamard {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
+    static let wideRowLean: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
+    static let wideRowLeanThreads: [WideRowKind: Int] = [
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
+    ]
 
-    private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false)
+    private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
         -> [WideRowKind: MLXFast.MLXFastKernel]
     {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
         for kind in WideRowKind.allCases
         where wideRowKindEnabled(kind) && wideRowLaneCandidates(kind).contains(threads) {
             if headError2 && kind != .plainRot && kind != .residualNormRot { continue }
+            if lean && wideRowLeanThreads[kind] != threads { continue }
             var form = kind.form
             form.hoist = hoist
             form.headError2 = headError2
             let hoisted = hoist && (form.residualNorm || form.normOnly || form.gatedNorm)
+            var source = WideRowSource.source(threads: threads, form: form)
+            if lean {
+                guard let text = WideRowLean.source(source, threads: threads, form: form, negative: wideRowLeanNegative)
+                else { continue }
+                source = text
+            }
             kernels[kind] = MLXFast.metalKernel(
-                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")",
+                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
                 outputNames: wideRowOutputNames(kind) + (headError2 ? ["qerror2"] : []),
-                source: WideRowSource.source(threads: threads, form: form),
+                source: source,
                 header: WideRowSource.header(threads: threads) + (headError2 ? ExactVerifyHead.l2Header : ""), ensureRowContiguous: true)
         }
         return kernels
@@ -1518,6 +1595,10 @@ extension SignedBlockHadamard {
     private static let wideRowHeadKernels: [Int: [WideRowKind: MLXFast.MLXFastKernel]] = [
         512: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 512, headError2: true),
         1024: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 1024, headError2: true),
+    ]
+    private static let wideRowLeanKernels: [Int: [WideRowKind: MLXFast.MLXFastKernel]] = [
+        512: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 512, lean: true),
+        1024: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 1024, lean: true),
     ]
 
     /// The lane count each form serves (absent: the record kernel).
@@ -1564,6 +1645,19 @@ extension SignedBlockHadamard {
                     "hadamard wide rows: \(kind.rawValue) w\(threads) load check \(note == "passed" ? note : note + ", " + next) (rows 3, 11, 16)\n".utf8))
                 if wideRowVerdict[kind] != nil { break }
             }
+            if wideRowLean, let threads = wideRowVerdict[kind], let lean = wideRowLeanKernels[threads]?[kind] {
+                var note = "off (mismatch, record kernel kept)"
+                do {
+                    if try withError({ wideRowCheck(kind, threads: threads, lean: lean) }) {
+                        wideRowResolvedKernels[kind.index] = lean
+                        note = "on"
+                    }
+                } catch {
+                    note = "off (error: \(error), record kernel kept)"
+                }
+                FileHandle.standardError.write(Data(
+                    "hadamard wide rows lean: \(kind.rawValue) w\(threads) \(note) (rows 1-\(VerifyInt8Matmul.tileRows) bitwise)\n".utf8))
+            }
         }
         wideRowReady = true
     }
@@ -1586,9 +1680,9 @@ extension SignedBlockHadamard {
     /// real shapes (the SwiGLU input 12288 wide, the attention output in its
     /// `[1, 16, rows, 256]` head-major layout beside the `[rows, 8192]`
     /// query projection).
-    private static func wideRowCheck(_ kind: WideRowKind, threads: Int) -> Bool {
+    private static func wideRowCheck(_ kind: WideRowKind, threads: Int, lean: MLXFast.MLXFastKernel? = nil) -> Bool {
         var same: [MLXArray] = []
-        for rows in [3, 11, 16] {
+        for rows in lean == nil ? [3, 11, 16] : Array(1 ... VerifyInt8Matmul.tileRows) {
             let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
             let scale = MLXArray((0 ..< rows).map { Float($0 == 0 ? 0 : ($0 == 1 ? 30 : 1)) })
                 .reshaped([rows, 1])
@@ -1615,9 +1709,9 @@ extension SignedBlockHadamard {
                 inputs = [attention, gate, signs]
             }
             let record = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: 0)
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: lean == nil ? 0 : threads)
             let wide = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads)
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads, kernel: lean)
             same.append(MLX.all(record[0] .== wide[0]))
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
@@ -1631,7 +1725,7 @@ extension SignedBlockHadamard {
     /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
     private static func wideRowDispatch(
         _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
-        sideShape: [Int]? = nil, lanes: Int, headError2: Bool = false
+        sideShape: [Int]? = nil, lanes: Int, headError2: Bool = false, kernel: MLXFast.MLXFastKernel? = nil
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
@@ -1642,7 +1736,7 @@ extension SignedBlockHadamard {
         let resolvedKernel: MLXFast.MLXFastKernel? = wideRowReady
             ? (headError2 ? wideRowResolvedHeadKernels[kind.index] : wideRowResolvedKernels[kind.index])
             : (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind]
-        if lanes > 0, let kernel = resolvedKernel {
+        if lanes > 0, let kernel = kernel ?? resolvedKernel {
             return kernel(
                 inputs + [HostConstants.int32([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
