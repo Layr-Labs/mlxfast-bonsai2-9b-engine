@@ -1635,8 +1635,10 @@ extension SignedBlockHadamard {
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
-            + Array(
-                repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
+        let sideOutputCount = kind.sideOutputCount
+        if sideOutputCount > 0 {
+            shapes += Array(repeating: sideShape ?? inputs[0].shape, count: sideOutputCount)
+        }
         if headError2 { shapes.append([rows * 32 * blocks]) }
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         let resolvedKernel: MLXFast.MLXFastKernel? = wideRowReady
