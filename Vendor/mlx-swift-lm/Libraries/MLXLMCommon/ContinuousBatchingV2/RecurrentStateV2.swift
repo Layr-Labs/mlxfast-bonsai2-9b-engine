@@ -324,18 +324,20 @@ public final class CBv2RecurrentRequestState {
     }
 
     /// Confirmed per-layer state. A verify-window commit records the
-    /// selection as `deferredCommitted` and builds its (lazy) arrays on first
-    /// read, normally the next `bind()`. The MTP engine finalizes a round,
-    /// submits the next round's draft chain and only then binds the target
-    /// for verification, so the host builds the strict-prefix replay graph
-    /// after the GPU already has the drafts instead of before. The arrays,
-    /// and the work they describe, are the same either way.
+    /// selection as `deferredCommitted`, which builds each layer's (lazy)
+    /// arrays on that layer's first read: normally its own layer in the next
+    /// target forward, or an earlier layer that builds the replay beside its
+    /// own launches. The MTP engine finalizes a round, submits the next
+    /// round's draft chain and only then binds the target for verification,
+    /// so the host builds the strict-prefix replay graph after the GPU
+    /// already has the drafts instead of before. The arrays, and the work
+    /// they describe, are the same either way.
     private var committedStorage: [Int: CBv2RecurrentLayerState] = [:]
-    private var deferredCommitted: (() -> [Int: CBv2RecurrentLayerState])?
+    private var deferredCommitted: CBv2DeferredCommit?
     private var committed: [Int: CBv2RecurrentLayerState] {
         get {
-            if let make = deferredCommitted {
-                committedStorage = make()
+            if let deferred = deferredCommitted {
+                committedStorage = deferred.all()
                 deferredCommitted = nil
             }
             return committedStorage
@@ -450,9 +452,10 @@ public final class CBv2RecurrentRequestState {
                 "bind over an unresolved compact prefix replay window")
         }
         bindingOpen = true
-        let input = last?.layers ?? committed
+        let deferred = last == nil ? deferredCommitted : nil
+        let input = last?.layers ?? (deferred == nil ? committed : [:])
         let evaluation = CBv2RecurrentStateEvaluation(
-            owner: self, generation: nextGeneration, input: input,
+            owner: self, generation: nextGeneration, input: input, deferred: deferred,
             requiredLayers: Set(spec.modelLayerIndices))
         nextGeneration &+= 1
         return evaluation
@@ -538,19 +541,21 @@ public final class CBv2RecurrentRequestState {
             let fullAcceptance = keep == positions
             committed = [:]
             if fullAcceptance {
-                deferredCommitted = {
-                    replay.mapValues { stage in stage.fullAcceptance?() ?? stage.finalState }
-                }
+                deferredCommitted = CBv2DeferredCommit(replay.mapValues { stage in
+                    { stage.fullAcceptance?() ?? stage.finalState }
+                })
             } else {
                 // A draft tree commit replays its accepted path: the rows are read now, the
                 // lazy replay may run after the round.
                 let treePath = CBv2BranchVerify.committedRows
-                deferredCommitted = {
-                    let outer = CBv2BranchVerify.committedRows
-                    CBv2BranchVerify.committedRows = treePath
-                    defer { CBv2BranchVerify.committedRows = outer }
-                    return replay.mapValues { $0.replay(keep) }
-                }
+                deferredCommitted = CBv2DeferredCommit(replay.mapValues { stage in
+                    {
+                        let outer = CBv2BranchVerify.committedRows
+                        CBv2BranchVerify.committedRows = treePath
+                        defer { CBv2BranchVerify.committedRows = outer }
+                        return stage.replay(keep)
+                    }
+                })
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []
@@ -619,6 +624,30 @@ public final class CBv2RecurrentRequestState {
     }
 }
 
+/// A verify commit's per-layer committed states. A layer's state is built on
+/// its first read and kept, so every reader gets the same arrays.
+final class CBv2DeferredCommit {
+    private var builders: [Int: () -> CBv2RecurrentLayerState]
+    private var built: [Int: CBv2RecurrentLayerState] = [:]
+
+    init(_ builders: [Int: () -> CBv2RecurrentLayerState]) {
+        self.builders = builders
+    }
+
+    func layer(_ index: Int) -> CBv2RecurrentLayerState? {
+        if let state = built[index] { return state }
+        guard let build = builders.removeValue(forKey: index) else { return nil }
+        let state = build()
+        built[index] = state
+        return state
+    }
+
+    func all() -> [Int: CBv2RecurrentLayerState] {
+        for index in builders.keys.sorted() { _ = layer(index) }
+        return built
+    }
+}
+
 /// A single forward's recurrent transaction. The model reads its row-local
 /// input and stages one output for every declared recurrent layer. The engine
 /// then calls `evaluate()` before submitting the arrays to MLX and later
@@ -627,6 +656,7 @@ public final class CBv2RecurrentStateEvaluation {
     private unowned let owner: CBv2RecurrentRequestState
     private let generation: UInt64
     private let input: [Int: CBv2RecurrentLayerState]
+    private let deferred: CBv2DeferredCommit?
     private let requiredLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
     private var stagedCapturedPositions: Int?
@@ -643,11 +673,13 @@ public final class CBv2RecurrentStateEvaluation {
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
-        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>
+        input: [Int: CBv2RecurrentLayerState], deferred: CBv2DeferredCommit?,
+        requiredLayers: Set<Int>
     ) {
         self.owner = owner
         self.generation = generation
         self.input = input
+        self.deferred = deferred
         self.requiredLayers = requiredLayers
     }
 
@@ -656,7 +688,7 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     public func inputState(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
-        input[modelLayerIndex]
+        deferred?.layer(modelLayerIndex) ?? input[modelLayerIndex]
     }
 
     public func stage(

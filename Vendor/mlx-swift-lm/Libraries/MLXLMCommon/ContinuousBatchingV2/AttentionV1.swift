@@ -1409,6 +1409,13 @@ public enum CBv2VerifyAttentionPartial {
     nonisolated(unsafe) private static var active = false
     nonisolated(unsafe) private static var captured: MLXArray?
 
+    /// Set by the model around one attention layer's verify build and taken
+    /// by its partial launch: called with the partial states, it builds
+    /// launches ordered after them. The combine waits for their outputs
+    /// through `depends`, so they are encoded in the partial kernel's barrier
+    /// epoch. An empty result leaves the combine's inputs unchanged.
+    nonisolated(unsafe) public static var beside: ((MLXArray) -> [MLXArray])?
+
     /// `body()` and the partial states its verify attention launched, if any.
     public static func capturing<T>(_ body: () -> T) -> (T, MLXArray?) {
         active = true
@@ -1423,7 +1430,11 @@ public enum CBv2VerifyAttentionPartial {
 
     static func noted(_ states: [MLXArray]) -> [MLXArray] {
         if active { captured = states[0] }
-        return states
+        guard let build = beside else { return states }
+        beside = nil
+        let launches = build(states[0])
+        guard !launches.isEmpty else { return states }
+        return [depends(input: states[0], dependencies: launches)] + states.dropFirst()
     }
 }
 
@@ -1434,13 +1445,17 @@ public enum CBv2BranchVerify {
     nonisolated(unsafe) public static var tree: MLXArray?
     nonisolated(unsafe) public private(set) static var committedRowsIsBranch = false
     nonisolated(unsafe) public private(set) static var committedRowsArray: MLXArray?
+    /// The last branch path and its array: a path set again (once per replayed layer)
+    /// reuses the array instead of allocating one more.
+    nonisolated(unsafe) private static var lastBranch: (rows: [Int32], array: MLXArray)?
     /// The accepted path's verify rows (anchor first) while a tree round commits; nil or the
     /// prefix 0 ..< n keeps the record replay.
     nonisolated(unsafe) public static var committedRows: [Int32]? {
         didSet {
             if let rows = committedRows, isBranch(rows) {
                 committedRowsIsBranch = true
-                committedRowsArray = MLXArray(rows)
+                if lastBranch?.rows != rows { lastBranch = (rows, MLXArray(rows)) }
+                committedRowsArray = lastBranch?.array
             } else {
                 committedRowsIsBranch = false
                 committedRowsArray = nil

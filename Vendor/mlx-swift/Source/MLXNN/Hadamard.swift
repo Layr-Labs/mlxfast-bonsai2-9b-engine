@@ -4227,6 +4227,7 @@ enum PromptInt8Matmul {
         // paths, rather than enabling copies with an unqualified consumer.
         if !allMatched { VerifyInt8Matmul.streamReady = false }
         FileHandle.standardError.write(Data("prompt streamed loadcheck: \(streamPromptReady ? "passed" : "FAILED")\n".utf8))
+        if streamPromptReady { PromptSplitZ.qualifyStreamed() }
     }
 
     enum SgForm {
@@ -4734,6 +4735,187 @@ enum PromptInt8Matmul {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
         }
         return outputs.count == layers.count ? outputs : nil
+    }
+}
+
+extension PromptInt8Matmul {
+    /// `matmul(_:layers:)` of a pair in two launches, each in the kernel
+    /// form, word layout and offset form the pair's own launch takes, one
+    /// layer each: `first` now, and `second(activation)`. Nil when the pair
+    /// would not run, or would read streamed words `streamedQualified` does
+    /// not admit. The per-layer fallback runs only while no streamed words
+    /// serve, since its one-layer calls may find registered copies.
+    static func splitPair(
+        _ activation: PromptInt8Activation,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
+        streamedWeights: [MLXArray]?, streamedQualified: Bool
+    ) -> (first: MLXArray, second: (PromptInt8Activation) -> MLXArray?)? {
+        guard route != .off, layers.count == 2 else { return nil }
+        let negative = negativeForms && layers.allSatisfy { $0.negative }
+        if naxSgShared {
+            let copies: [MLXArray]
+            if let streamedWeights, streamedWeights.count == 2,
+                streamPromptReady, activation.rows >= 64, activation.rows % 64 == 0,
+                activation.k >= 128, activation.k % 128 == 0,
+                layers.allSatisfy({ $0.weight.dim(0) > 0 && $0.weight.dim(0) % 64 == 0 })
+            {
+                copies = streamedWeights
+            } else {
+                copies = layers.compactMap { promptStream($0.weight, m: activation.rows, k: activation.k) }
+            }
+            if copies.count == 2 {
+                guard streamedQualified else { return nil }
+                func launch(_ a: PromptInt8Activation, _ index: Int) -> MLXArray {
+                    let layer = layers[index]
+                    let output = runSg(codes: a.codes, ascale: a.ascale, rsb: a.rsb,
+                        layers: [(copies[index], layer.scalesT, layer.biasesT)], m: a.rows, k: a.k,
+                        negative: negative, form: streamedForm, streamed: true)
+                    return streamOutputs(output) {
+                        runSg(codes: a.codes, ascale: a.ascale, rsb: a.rsb,
+                            layers: [(layer.weight, layer.scalesT, layer.biasesT)], m: a.rows, k: a.k,
+                            negative: negative, form: sgForm)
+                    }[0]
+                }
+                return (launch(activation, 0), { launch($0, 1) })
+            }
+        }
+        if route == .nax, naxSg, naxSgShared {
+            func launch(_ a: PromptInt8Activation, _ index: Int) -> MLXArray {
+                let layer = layers[index]
+                return runSg(codes: a.codes, ascale: a.ascale, rsb: a.rsb,
+                    layers: [(layer.weight, layer.scalesT, layer.biasesT)], m: a.rows, k: a.k,
+                    negative: negative, form: sgForm)[0]
+            }
+            return (launch(activation, 0), { launch($0, 1) })
+        }
+        guard !streamPromptReady else { return nil }
+        let (lead, late) = (layers[0], layers[1])
+        guard let first = matmul(
+            activation, weight: lead.weight, scalesT: lead.scalesT, biasesT: lead.biasesT, negative: lead.negative)
+        else { return nil }
+        return (first, {
+            matmul($0, weight: late.weight, scalesT: late.scalesT, biasesT: late.biasesT, negative: late.negative)
+        })
+    }
+
+    nonisolated(unsafe) private static var splitCheckFailed = false
+
+    /// `splitPair`, its second launch ordered after its first, against
+    /// `matmul(_:layers:)` on fixed synthetic operands: every output bit at
+    /// 512, 192 and 128 rows, for each pair of offset forms, on the
+    /// canonical words or, with `streamed`, on their streamed copies. A
+    /// compile or run error counts as a mismatch. Returns the number of
+    /// cases, nil when one differed.
+    static func checkSplitPair(streamed: Bool) -> Int? {
+        let k = 4096, kg = k / 128, maxRows = 512
+        let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
+            let centered: Int = (i * 37 + 11) % 255 - 127
+            return Int8(truncatingIfNeeded: centered)
+        }
+        let codes = MLXArray(codeValues, [maxRows, k])
+        let ascaleValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 11 + 1) / 256 }
+        let rsbValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }
+        let ascale = MLXArray(ascaleValues), rsb = MLXArray(rsbValues)
+        let operands: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negatedT: MLXArray)] =
+            [256, 128].enumerated().map { layer, n in
+                let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+                    let value: UInt64 = UInt64(i + 1 + 7919 * layer) &* 2_654_435_761
+                    return UInt32(truncatingIfNeeded: value)
+                }
+                let scaleValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = Float(1 + (i + layer) % 13) / 1024
+                    return Float16(value)
+                }
+                let biasValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = -Float((i + 3 * layer) % 7) / 512
+                    return Float16(value)
+                }
+                let scalesT = MLXArray(scaleValues, [kg, n])
+                let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                return (MLXArray(words, [n, k / 16]), scalesT, MLXArray(biasValues, [kg, n]), negatedT)
+            }
+        let copies: [MLXArray]? = streamed
+            ? operands.map { VerifyInt8Matmul.streamPack($0.weight, k: k, columns: 16) } : nil
+        if let copies { eval(copies) }
+        let noted = streamPromptNoted
+        defer { streamPromptNoted = noted }
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        var matched = true
+        var cases = 0
+        splitCheckFailed = false
+        withErrorHandler({ _ in PromptInt8Matmul.splitCheckFailed = true }) {
+            for m in [512, 192, 128] where matched {
+                let activation = PromptInt8Activation(
+                    codes: codes[0 ..< m], ascale: ascale[0 ..< m * kg], rsb: rsb[0 ..< m * kg], rows: m, k: k)
+                for negatives in [(false, false), (true, true), (true, false), (false, true)] where matched {
+                    let layers = zip(operands, [negatives.0, negatives.1]).map { operand, negative in
+                        (weight: operand.weight, scalesT: operand.scalesT,
+                         biasesT: negative ? operand.negatedT : operand.biasesT, negative: negative)
+                    }
+                    guard let reference = matmul(activation, layers: layers, streamedWeights: copies),
+                        let split = splitPair(
+                            activation, layers: layers, streamedWeights: copies, streamedQualified: true),
+                        let second = split.second(VerifySplitZ.ordered(activation, after: split.first)),
+                        reference.count == 2
+                    else { matched = false; break }
+                    let checks = zip([split.first, second], reference).map { MLX.all(u($0) .== u($1)) }
+                    eval(checks)
+                    matched = !splitCheckFailed && checks.allSatisfy { $0.item(Bool.self) }
+                    cases += 1
+                }
+            }
+        }
+        matched = matched && !splitCheckFailed
+        splitCheckFailed = false
+        return matched ? cases : nil
+    }
+}
+
+/// The prompt GDN z projection out of the qkv launch. In the record the
+/// prompt qkv and z run as one launch (one per layer on the plain route)
+/// before the convolution, the b/a GEMM and the fresh8 scan, though z feeds
+/// only the gated norm after the scan. Split, z runs in its own launch
+/// whose codes are ordered after the scan output, with no barrier between
+/// them, so z's weight stream overlaps the latency-bound scan. The split
+/// serves only after `PromptInt8Matmul.checkSplitPair` found every output
+/// equal, bit for bit, to the record route's; otherwise the record launch
+/// stays. `DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0` keeps the record launch.
+enum PromptSplitZ {
+    static let offered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_Z_SPLIT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// The split qualified on the canonical words. Resolved once, at the
+    /// first packed module's init, after `PromptInt8Matmul.route` and
+    /// before any timed work.
+    static let ready: Bool = {
+        let passed: Bool
+        let note: String
+        if !offered {
+            (passed, note) = (false, "off (DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0)")
+        } else if PromptInt8Matmul.route == .off {
+            (passed, note) = (false, "off (int8 prompt off)")
+        } else if let cases = PromptInt8Matmul.checkSplitPair(streamed: false) {
+            (passed, note) = (true, "on (\(PromptInt8Matmul.route), rows 512/192/128, \(cases) cases bit-identical)")
+        } else {
+            (passed, note) = (false, "off (a case differed or failed to compile)")
+        }
+        FileHandle.standardError.write(Data("int8 prompt z split: \(note)\n".utf8))
+        return passed
+    }()
+
+    /// The split qualified on the streamed words too. Set once, at load,
+    /// by `PromptInt8Matmul.prepareStreaming` after those words qualify.
+    nonisolated(unsafe) private(set) static var streamedReady = false
+
+    static func qualifyStreamed() {
+        guard ready else { return }
+        let cases = PromptInt8Matmul.checkSplitPair(streamed: true)
+        streamedReady = cases != nil
+        let note = cases.map { "on (\($0) cases bit-identical)" } ?? "off (a case differed or failed to compile)"
+        FileHandle.standardError.write(Data("int8 prompt z split, streamed words: \(note)\n".utf8))
     }
 }
 
@@ -7609,6 +7791,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     if !matched { VerifyInt8Matmul.streamReady = false }
                 }
             }
+            _ = PromptSplitZ.ready
         }
     }
 
@@ -7731,8 +7914,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// and, with `normalized`, the normalized rows as well.
     public static func sharedResidualNormPromptProjections(
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false
-    ) -> (residual: MLXArray, normalized: MLXArray?, projections: [MLXArray])? {
+        projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false, deferLast: Bool = false
+    ) -> (residual: MLXArray, normalized: MLXArray?, projections: [MLXArray], deferred: ((MLXArray) -> MLXArray?)?)? {
         guard x.ndim >= 2, x.dtype == .float32, x.dim(-1) == 4096,
             PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
             PromptInt8Matmul.route != .off
@@ -7751,6 +7934,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let activation = PromptInt8Activation(
             codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
         let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
+        if deferLast, !firstProjectionLastRow,
+            let split = splitPromptPair(activation, full, shape: Array(x.shape.dropLast()))
+        {
+            return (codes[3], normalized ? codes[4] : nil, [split.lead], split.deferred)
+        }
         guard let outputs = PromptInt8Matmul.matmul(
             activation, layers: full.map(\.verifyOperands), streamedWeights: Self.streamedWeights(full))
         else { return nil }
@@ -7759,7 +7947,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return layer.bias.map { output + $0 } ?? output
         }
         if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
-        return (codes[3], normalized ? codes[4] : nil, projected)
+        return (codes[3], normalized ? codes[4] : nil, projected, nil)
     }
 
     /// `sharedPromptProjections(rmsNorm(x, weight), projections)` with the
@@ -7768,8 +7956,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// layer input). Nil when the norm, the shapes, the packing or the route
     /// do not qualify; the caller then normalizes and projects separately.
     public static func sharedNormPromptProjections(
-        _ x: MLXArray, weight: MLXArray, eps: Float, projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false
-    ) -> (normalized: MLXArray?, projections: [MLXArray])? {
+        _ x: MLXArray, weight: MLXArray, eps: Float, projections: [Linear], normalized: Bool, firstProjectionLastRow: Bool = false,
+        deferLast: Bool = false
+    ) -> (normalized: MLXArray?, projections: [MLXArray], deferred: ((MLXArray) -> MLXArray?)?)? {
         guard x.ndim >= 2, x.dtype == .float32, x.dim(-1) == 4096,
             PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
             PromptInt8Matmul.route != .off
@@ -7787,6 +7976,11 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         let activation = PromptInt8Activation(
             codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
         let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
+        if deferLast, !firstProjectionLastRow,
+            let split = splitPromptPair(activation, full, shape: Array(x.shape.dropLast()))
+        {
+            return (normalized ? codes[3] : nil, [split.lead], split.deferred)
+        }
         guard let outputs = PromptInt8Matmul.matmul(
             activation, layers: full.map(\.verifyOperands), streamedWeights: Self.streamedWeights(full))
         else { return nil }
@@ -7795,7 +7989,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             return layer.bias.map { output + $0 } ?? output
         }
         if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
-        return (normalized ? codes[3] : nil, projected)
+        return (normalized ? codes[3] : nil, projected, nil)
     }
 
     /// Reuse prompt codes within this forward when all input transforms match.
@@ -8083,6 +8277,29 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     private var streamedVerifyWeight: MLXArray? {
         let columns = VerifyInt8Matmul.streamColumns(k: transform.width, n: weight.dim(0))
         return promptConstants.streamWeight(weight, k: transform.width, columns: columns)
+    }
+
+    /// A prompt projection pair over one activation in two launches
+    /// (`PromptSplitZ`): `lead` now, and `deferred(dependency)`, the second
+    /// launch ordered after `dependency` without reading it. Each output is
+    /// the record route's, bit for bit. Nil when the split did not qualify at
+    /// load or the pair's launch does not take it; the caller then runs the
+    /// record route.
+    private static func splitPromptPair(
+        _ activation: PromptInt8Activation, _ pair: [HadamardQuantizedLinear], shape: [Int]
+    ) -> (lead: MLXArray, deferred: (MLXArray) -> MLXArray?)? {
+        guard PromptSplitZ.ready, pair.count == 2,
+            let split = PromptInt8Matmul.splitPair(
+                activation, layers: pair.map(\.verifyOperands), streamedWeights: Self.streamedWeights(pair),
+                streamedQualified: PromptSplitZ.streamedReady)
+        else { return nil }
+        func shaped(_ layer: HadamardQuantizedLinear, _ output: MLXArray) -> MLXArray {
+            let output = output.reshaped(shape + [layer.weight.dim(0)])
+            return layer.bias.map { output + $0 } ?? output
+        }
+        return (shaped(pair[0], split.first), { dependency in
+            split.second(VerifySplitZ.ordered(activation, after: dependency)).map { shaped(pair[1], $0) }
+        })
     }
 
     private static func streamedWeights(_ layers: [HadamardQuantizedLinear]) -> [MLXArray]? {

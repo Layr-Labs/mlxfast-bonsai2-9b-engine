@@ -3085,7 +3085,151 @@ private enum Qwen35DeltaReplay {
             grid: (1024, 1, state.dim(1)), threadGroup: (128, 1, 1),
             outputShapes: [state.shape, [1, 3, convInput.dim(2)]],
             outputDTypes: [.float32, .float32])
+        guard result.count == 2 else { return nil }
         return (result[0], result[1])
+    }
+}
+
+/// Moves the accepted-prefix replays (`Qwen35DeltaReplay`) of the GDN layers
+/// right after a verify attention layer into that layer's attention window.
+/// The replay's `delta` input is made to follow the attention partial states
+/// and the combine is made to wait for the replay's outputs, both through MLX
+/// `depends`, so the replay is encoded in the partial kernel's barrier epoch
+/// instead of the epoch before its own layer's qkv launch. Same kernel, same
+/// inputs, same bits. `DARKBLOOM_BONSAI_VERIFY_REPLAY_MOVE=0` keeps each
+/// replay beside its own layer.
+enum Qwen35VerifyReplayMove {
+    static let offered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_REPLAY_MOVE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// GDN layers after each attention layer whose replays move into its window.
+    static let perWindow = 2
+
+    /// Resolved once, at the first text model init, before any timed work.
+    static let ready: Bool = {
+        var (passed, note) = (false, "off (error)")
+        do {
+            (passed, note) = try withError { check() }
+        } catch {
+            note = "off (error: \(error))"
+        }
+        FileHandle.standardError.write(Data("qwen35 verify replay move: \(note)\n".utf8))
+        return passed
+    }()
+
+    nonisolated(unsafe) private static var after: MLXArray?
+    nonisolated(unsafe) private static var moved = false
+
+    /// `Qwen35DeltaReplay.run`; while a moved replay builds, its `delta` is
+    /// ordered after the attention window's partial states.
+    static func run(
+        q: MLXArray, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
+        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false
+    ) -> (MLXArray, MLXArray)? {
+        guard let after else {
+            return Qwen35DeltaReplay.run(
+                q: q, k: k, delta: delta, state: state, convInput: convInput,
+                treeRows: treeRows, stateIsRowContiguous: stateIsRowContiguous)
+        }
+        // `depends` takes the stream of its input's primitive. The captured delta is already
+        // evaluated (no primitive), so `stopGradient` (a buffer alias) puts the node on this
+        // forward's stream; on MLX's global default stream it would split the encoder.
+        guard let replay = Qwen35DeltaReplay.run(
+            q: q, k: k, delta: depends(input: stopGradient(delta), dependencies: [after]),
+            state: state, convInput: convInput, treeRows: treeRows,
+            stateIsRowContiguous: stateIsRowContiguous)
+        else { return nil }
+        moved = true
+        return replay
+    }
+
+    /// For the attention layer at `index`: builds, beside its verify partial
+    /// kernel, the replays of the next `perWindow` GDN layers. Nil when no
+    /// layer can move.
+    static func window(
+        after index: Int, layerCount: Int, isLinear: (Int) -> Bool,
+        evaluation: CBv2RecurrentStateEvaluation
+    ) -> ((MLXArray) -> [MLXArray])? {
+        guard ready else { return nil }
+        let moving = (index + 1 ... index + perWindow).filter { $0 < layerCount && isLinear($0) }
+        guard !moving.isEmpty else { return nil }
+        return { partial in
+            moving.flatMap { layer in
+                ordered(after: partial) { evaluation.inputState(modelLayerIndex: layer) }
+            }
+        }
+    }
+
+    /// The outputs of the delta replay `read` builds, ordered after `partial`;
+    /// empty when it builds none (already built, or another replay path, which
+    /// keeps its record placement).
+    private static func ordered(
+        after partial: MLXArray, _ read: () -> CBv2RecurrentLayerState?
+    ) -> [MLXArray] {
+        after = partial
+        moved = false
+        let state = read()
+        let built = moved
+        after = nil
+        moved = false
+        guard built, let state else { return [] }
+        return [state.ssm, state.conv].compactMap { $0 }
+    }
+
+    /// The ordered replay (`ordered` over `run`, as a moved layer builds it)
+    /// against the record replay on a synthetic 16-row tape at the pack's GDN
+    /// geometry: every chain prefix 1 ... 15 and six tree paths, each with both
+    /// state flags, compared bit for bit.
+    private static func check() -> (Bool, String) {
+        guard offered else { return (false, "off (DARKBLOOM_BONSAI_VERIFY_REPLAY_MOVE=0)") }
+        let rows = 16, hk = 16, hv = 32, d = 128, convDim = 2 * hk * d + hv * d
+        func pattern(_ shape: [Int], seed: Float, scale: Float, offset: Float = 0) -> MLXArray {
+            let i = MLXArray(0 ..< shape.reduce(1, *)).asType(.float32)
+            return (MLX.sin(i * (0.7548776 + seed)) * scale + offset).reshaped(shape)
+        }
+        let q = pattern([1, rows, hk, d], seed: 0.01, scale: 0.5)
+        let k = pattern([1, rows, hk, d], seed: 0.02, scale: 0.1)
+        let delta = concatenated([
+            pattern([1, rows, hv, d], seed: 0.03, scale: 0.2),
+            pattern([1, rows, hv, 1], seed: 0.04, scale: 0.1, offset: 0.9),
+        ], axis: -1)
+        let state = pattern([1, hv, d, d], seed: 0.05, scale: 0.5)
+        let convInput = pattern([1, 3 + rows, convDim], seed: 0.06, scale: 0.5)
+        eval(q, k, delta, state, convInput)
+        let chains: [[Int32]?] = (1 ... rows - 1).map { _ in nil }
+        let trees: [[Int32]?] = [[0, 2], [0, 1, 3], [0, 2, 5, 9], [0, 3, 6], [0, 4, 8, 12, 15],
+            Array(0 ..< 15)]
+        var cases = 0
+        for (index, path) in (chains + trees).enumerated() {
+            let count = path?.count ?? index + 1
+            let caseQ = path == nil ? q[0..., 0 ..< count, 0...] : q
+            let treeRows = path.map { MLXArray($0) }
+            for contiguous in [true, false] {
+                guard let record = Qwen35DeltaReplay.run(
+                    q: caseQ, k: k, delta: delta, state: state, convInput: convInput,
+                    treeRows: treeRows, stateIsRowContiguous: contiguous)
+                else { return (false, "off (the record replay refused a case)") }
+                // An unevaluated stand-in for the partial states, as in a verify build.
+                let partial = MLX.cos(pattern([256], seed: 0.07 + Float(cases) / 64, scale: 1))
+                let replay = ordered(after: partial) {
+                    run(q: caseQ, k: k, delta: delta, state: state, convInput: convInput,
+                        treeRows: treeRows, stateIsRowContiguous: contiguous)
+                        .map { CBv2RecurrentLayerState(conv: $0.1, ssm: $0.0, ssmIsRowContiguous: true) }
+                }
+                guard replay.count == 2 else { return (false, "off (the ordered replay was not built)") }
+                for (lhs, rhs) in zip([record.0, record.1], replay) {
+                    guard lhs.shape == rhs.shape, lhs.dtype == rhs.dtype,
+                        MLX.all(lhs.view(dtype: .uint32) .== rhs.view(dtype: .uint32)).item(Bool.self)
+                    else { return (false, "off (a case differed)") }
+                }
+                cases += 1
+            }
+        }
+        return (true, "on (\(perWindow) per attention window, chain rows 1...\(rows - 1) and "
+            + "\(trees.count) tree paths, \(cases) cases bit-identical)")
     }
 }
 
@@ -3382,14 +3526,8 @@ final class Qwen35GatedDeltaNet: Module {
                 : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjQKV, inProjZ]))
             let qkv = shared?[0] ?? inProjQKV(inputs)
             let z = (shared?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
-            if let promptGates {
-                return (qkv, z, promptGates[0..., 0..., 0 ..< numVHeads],
-                    promptGates[0..., 0..., numVHeads...])
-            }
-            if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
-                return (qkv, z, ba.0, ba.1)
-            }
-            return (qkv, z, inProjB(inputs), inProjA(inputs))
+            let ba = projectBA(inputs, promptGates: promptGates)
+            return (qkv, z, ba.b, ba.a)
         }
         let outFused = fusedInProj(inputs)
         let qkvDim = keyDim * 2 + valueDim
@@ -3403,6 +3541,16 @@ final class Qwen35GatedDeltaNet: Module {
             outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
             outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
         )
+    }
+
+    /// b and a beside the unfused input projections: the halves of the
+    /// prompt gate GEMM when it ran, else the dense or the packed projections.
+    private func projectBA(_ inputs: MLXArray, promptGates: MLXArray?) -> (b: MLXArray, a: MLXArray) {
+        if let promptGates {
+            return (promptGates[0..., 0..., 0 ..< numVHeads], promptGates[0..., 0..., numVHeads...])
+        }
+        if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) { return ba }
+        return (inProjB(inputs), inProjA(inputs))
     }
 
     /// `projectInputs` on the verify boundary with z out of the qkv launch
@@ -3747,7 +3895,7 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog.dtype == .float32, dtBias.dtype == .float32, let ssmPre = tape.ssmPre
             else { preconditionFailure("Qwen35 tree commit: path replay unavailable") }
             if let delta = tape.delta,
-                let replay = Qwen35DeltaReplay.run(q: tape.q, k: tape.k, delta: delta,
+                let replay = Qwen35VerifyReplayMove.run(q: tape.q, k: tape.k, delta: delta,
                     state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
                     convInput: tape.convInput, treeRows: pathArray,
                     stateIsRowContiguous: tape.ssmPreIsRowContiguous)
@@ -3774,7 +3922,7 @@ final class Qwen35GatedDeltaNet: Module {
                 [tape.q.dim(0), numVHeads, headVDim, headKDim], dtype: .float32)
             let floatState = initial.dtype == .float32 ? initial : initial.asType(.float32)
             if let delta = tape.delta,
-                let replay = Qwen35DeltaReplay.run(
+                let replay = Qwen35VerifyReplayMove.run(
                     q: tape.q[0..., rows, 0...], k: tape.k, delta: delta,
                     state: floatState, convInput: tape.convInput,
                     stateIsRowContiguous: tape.ssmPreIsRowContiguous)
@@ -3933,7 +4081,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        promptProjections: [MLXArray]? = nil
+        promptProjections: [MLXArray]? = nil,
+        promptZ: ((MLXArray) -> MLXArray?)? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -3960,8 +4109,17 @@ final class Qwen35GatedDeltaNet: Module {
         let promptGates = canUsePromptMiddle(inputs, ssmState: ssmState)
             ? promptGateWeights.prepared(b: inProjB.weight, a: inProjA.weight).map { matmul(inputs, $0.T) }
             : nil
-        let (qkv, z, b, a) = projectInputs(
-            inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
+        // With `promptZ`, `promptProjections` holds qkv only and z is made
+        // after the recurrence, so its launch runs beside it (`PromptSplitZ`).
+        let qkv: MLXArray, projectedZ: MLXArray?, b: MLXArray, a: MLXArray
+        if promptZ != nil, !prepareFusedInputProjection(), let lead = promptProjections?.first {
+            let ba = projectBA(inputs, promptGates: promptGates)
+            (qkv, projectedZ, b, a) = (lead, nil, ba.b, ba.a)
+        } else {
+            let projected = projectInputs(
+                inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
+            (qkv, projectedZ, b, a) = (projected.qkv, projected.z, projected.b, projected.a)
+        }
         let middle = promptMiddle(
             inputs, qkv: qkv, a: a, b: b, convState: convState, ssmState: ssmState,
             freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil,
@@ -3995,6 +4153,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
+        let z = projectedZ ?? (promptZ.flatMap { $0(out) } ?? inProjZ(inputs))
+            .reshaped(B, S, numVHeads, headVDim)
         if out.ndim == 4, out.dim(-1) == 128, S >= 64,
             let packed = outProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterGatedNormPrompt(
@@ -5179,7 +5339,7 @@ final class Qwen35DecoderLayer: Module {
             } else if x.ndim == 3, x.dim(1) >= 128, let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
                     x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             {
                 // Prompt width: the input RMSNorm formed in the quantizing
@@ -5187,7 +5347,8 @@ final class Qwen35DecoderLayer: Module {
                 // `inputLayerNorm(x)` and its shared prompt codes).
                 r = linear.cbv2Forward(
                     normalized, modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState, promptProjections: prompt.projections)
+                    recurrentState: recurrentState, promptProjections: prompt.projections,
+                    promptZ: prompt.deferred)
             } else {
                 r = linearAttn!.cbv2Forward(
                     inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
@@ -5366,12 +5527,13 @@ extension Qwen35DecoderLayer {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
                     x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             else { return nil }
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
-                recurrentState: recurrentState, promptProjections: prompt.projections)
+                recurrentState: recurrentState, promptProjections: prompt.projections,
+                promptZ: prompt.deferred)
         } else {
             guard let attention = selfAttn, let attentionCache,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
@@ -5406,13 +5568,14 @@ extension Qwen35DecoderLayer {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
                     x, delta: delta, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             else { return nil }
             inputResidual = prompt.residual
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
-                recurrentState: recurrentState, promptProjections: prompt.projections)
+                recurrentState: recurrentState, promptProjections: prompt.projections,
+                promptZ: prompt.deferred)
         } else {
             guard let attention = selfAttn, let attentionCache else { return nil }
             let lastQueryOnly = lastPositionOnly && attention.canUseLastQueryPrefill(
@@ -5644,6 +5807,7 @@ public class Qwen35TextModelInner: Module {
             Qwen35A3BConstructionContext.targetVerifyArithmetic == .exactM1
 
         super.init()
+        if !exactTargetVerify { _ = Qwen35VerifyReplayMove.ready }
     }
 
     /// Returns the pre-norm hidden state from the final layer.
@@ -5814,6 +5978,14 @@ public class Qwen35TextModelInner: Module {
         }
         var pendingDelta: MLXArray? = nil
         for (modelLayerIndex, layer) in layers.enumerated() {
+            // The next GDN layers' accepted-prefix replays run beside this
+            // attention layer's partial kernel (`Qwen35VerifyReplayMove`).
+            if fuseVerifyBoundaries, !layer.isLinear, recurrentState.count == 1 {
+                CBv2VerifyAttentionPartial.beside = Qwen35VerifyReplayMove.window(
+                    after: modelLayerIndex, layerCount: layers.count,
+                    isLinear: { layers[$0].isLinear }, evaluation: recurrentState[0])
+            }
+            defer { CBv2VerifyAttentionPartial.beside = nil }
             let attentionCache: (any CBv2AttendingLayerCache)?
             if layer.isLinear {
                 attentionCache = nil
