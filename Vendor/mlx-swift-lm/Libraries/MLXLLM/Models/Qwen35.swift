@@ -2354,7 +2354,12 @@ enum Qwen35FusedGDNVerify {
         guard change("// all 256 threads run in parallel (tid 0..127 -> Q, tid 128..255 -> K).\n  {",
             "// The first 256 threads form Q/K; the remaining threads form V.\n  if (tid < 256u) {") else { return nil }
         guard change("constexpr int DVPT = DVPS * 8;", "constexpr int DVPT = DVPS * 16;") else { return nil }
-        guard change("256u / uint(DVPT)", "512u / uint(DVPT)", count: 2) else { return nil }
+        guard change(
+            "  // Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.\n  {\n    const uint col = tid % uint(DVPT);",
+            "  // Eight simdgroups share Q/K for 64 value channels, without increasing per-thread state.\n  if (tid >= 256u) {\n    const uint vtid = tid - 256u;\n    const uint col = vtid % uint(DVPT);"
+        ) else { return nil }
+        guard change("uint t = tid / uint(DVPT);", "uint t = vtid / uint(DVPT);") else { return nil }
+        guard change("uint p = tid / uint(DVPT);", "uint p = vtid / uint(DVPT);") else { return nil }
         guard change("job += 8u", "job += 16u") else { return nil }
         guard let beginRange = s.range(of: "// The scan state loads first, so they overlap the conv and norm below.")
         else { return nil }
@@ -4770,7 +4775,7 @@ final class Qwen35Attention: Module {
                 let fused = Qwen35VerifyQKNormRoPE.applyTree(
                     queryProjection: qProjOutput, keyProjection: kProjection,
                     queryWeight: qNorm.weight, keyWeight: kNorm.weight,
-                    queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
+                    queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets,
                     queryHeads: attentionHeads, keyHeads: kvHeads,
                     ropeDims: plainRope.dims, ropeBase: plainRope.base, tree: tree)
             else { preconditionFailure("Qwen35 tree verify: tree q/k RoPE unavailable") }
@@ -4779,7 +4784,7 @@ final class Qwen35Attention: Module {
             let fused = Qwen35VerifyQKNormRoPE.apply(
                 queryProjection: qProjOutput, keyProjection: kProjection,
                 queryWeight: qNorm.weight, keyWeight: kNorm.weight,
-                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets + 0,
+                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets,
                 queryHeads: attentionHeads, keyHeads: kvHeads,
                 ropeDims: plainRope.dims, ropeBase: plainRope.base, lastQueryOnly: narrowsToLastQuery)
         {
@@ -4797,7 +4802,7 @@ final class Qwen35Attention: Module {
                 (queries, keys) = mrope.apply(
                     queries: queries, keys: keys, positionIds: positionIds)
             } else {
-                let offsets = cache.positionOffsets + 0
+                let offsets = cache.positionOffsets
                 queries = rope(queries, offset: narrowsToLastQuery ? offsets + Int32(L - 1) : offsets)
                 keys = rope(keys, offset: offsets)
             }
