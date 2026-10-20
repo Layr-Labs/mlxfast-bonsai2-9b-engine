@@ -344,14 +344,14 @@ extension DFlash2Target {
 }
 
 /// Model-derived draft-head read budgets, independent of prompts or reference outputs.
-/// A request may grow from one eighth to half to full vocabulary as trusted anchors
+/// A request may grow from one sixteenth to one eighth to half to full vocabulary as trusted anchors
 /// leave its current prefix. An explicit DF2_VOCAB override supplies one tier;
 /// zero or an unsupported size keeps the full head.
 enum DF2Vocab {
     static let overrideRows = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "")
 
     static func widths(vocabularySize: Int, topK: Int) -> [Int] {
-        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 8, vocabularySize / 2]
+        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 16, vocabularySize / 8, vocabularySize / 2]
         // The fast selector scans eight blocks of 256 threads. Keep all blocks
         // populated, in addition to satisfying the configured candidate count.
         let minimumRows = Swift.max(topK, 8 * 256)
@@ -390,8 +390,8 @@ public final class DFlash2DraftHeadSlot {
             screenedRows.removeAll()
         }
         if checkedRows.contains(rows) { return prefixes[rows] }
-        // At most two policy tiers; retain failures so requests do not repeat checks.
-        guard checkedRows.count < 2 else { return nil }
+        // At most three policy tiers; retain failures so requests do not repeat checks.
+        guard checkedRows.count < 3 else { return nil }
         checkedRows.insert(rows)
         guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
             rows > 0, rows < full.weight.dim(0)
