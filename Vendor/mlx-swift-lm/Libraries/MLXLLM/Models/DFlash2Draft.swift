@@ -343,14 +343,22 @@ extension DFlash2Target {
     ) -> (ids: MLXArray, values: MLXArray)? { nil }
 }
 
-/// The drafter's vocabulary: the first `DF2Vocab.rows` token ids. Ids 0 ..< 96k
-/// are the tokenizer's Latin, code and byte-level merges (rounded to 98304 = 96 * 1024);
-/// the rows above 96k are the CJK and other scripts block. A draft never
-/// reaches the output unverified: the target's full head checks every drafted
-/// token, so a narrower draft vocabulary changes only which tokens are proposed.
-/// `DF2_VOCAB=0` restores the full head.
+/// Model-derived draft-head read budgets, independent of prompts or reference outputs.
+/// A request may grow from quarter to half to full vocabulary as trusted anchors
+/// leave its current prefix. An explicit DF2_VOCAB override supplies one tier;
+/// zero or an unsupported size keeps the full head.
 enum DF2Vocab {
-    static let rows: Int = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "") ?? 98304
+    static let overrideRows = Int(ProcessInfo.processInfo.environment["DF2_VOCAB"] ?? "")
+
+    static func widths(vocabularySize: Int, topK: Int) -> [Int] {
+        let requested = overrideRows.map { [$0] } ?? [vocabularySize / 4, vocabularySize / 2]
+        // The fast selector scans eight blocks of 256 threads. Keep all blocks
+        // populated, in addition to satisfying the configured candidate count.
+        let minimumRows = Swift.max(topK, 8 * 256)
+        return Array(Set(requested.map { ($0 / 64) * 64 }.filter {
+            $0 >= minimumRows && $0 < vocabularySize
+        })).sorted()
+    }
 }
 
 /// The target head's prefix rows as one module, kept OFF the module tree (see
@@ -358,10 +366,10 @@ enum DF2Vocab {
 /// head's arrays: views of the same buffers, no copy. Built once per head
 /// instance, at bind (load time), and kept only after a bitwise self-check.
 public final class DFlash2DraftHeadSlot {
-    private var source: ObjectIdentifier?
-    private var rows = 0
-    private var prefix: HadamardQuantizedLinear?
-    private var screened = false
+    private weak var source: HadamardQuantizedLinear?
+    private var checkedRows: Set<Int> = []
+    private var prefixes: [Int: HadamardQuantizedLinear] = [:]
+    private var screenedRows: Set<Int> = []
 
     public init() {}
 
@@ -370,16 +378,21 @@ public final class DFlash2DraftHeadSlot {
     public func shortlist(
         _ hidden: MLXArray, of full: HadamardQuantizedLinear, rows: Int
     ) -> (ids: MLXArray, values: MLXArray)? {
-        guard let prefix = head(of: full, rows: rows), screened else { return nil }
+        guard let prefix = head(of: full, rows: rows), screenedRows.contains(rows) else { return nil }
         return prefix.draftScreen(hidden, shortlist: DF2Fast.shortlist)
     }
 
     public func head(of full: HadamardQuantizedLinear, rows: Int) -> HadamardQuantizedLinear? {
-        if source == ObjectIdentifier(full), self.rows == rows { return prefix }
-        source = ObjectIdentifier(full)
-        self.rows = rows
-        prefix = nil
-        screened = false
+        if source !== full {
+            source = full
+            checkedRows.removeAll()
+            prefixes.removeAll()
+            screenedRows.removeAll()
+        }
+        if checkedRows.contains(rows) { return prefixes[rows] }
+        // At most two policy tiers; retain failures so requests do not repeat checks.
+        guard checkedRows.count < 2 else { return nil }
+        checkedRows.insert(rows)
         guard full.bias == nil, let biases = full.biases, rows % 64 == 0,
             rows > 0, rows < full.weight.dim(0)
         else {
@@ -400,15 +413,15 @@ public final class DFlash2DraftHeadSlot {
             return nil
         }
         Self.report(rows, "on (bitwise equal to the full head's first \(rows) columns, 15 rows, FP32 and BF16)")
-        if DF2Fast.screenAllowed, rows == 98304 {
+        if DF2Fast.screenAllowed, rows >= 8 * 256 {
             let failure: String? = candidate.qualifyDraftScreen(shortlist: DF2Fast.shortlist)
-            screened = failure == nil
+            if failure == nil { screenedRows.insert(rows) }
             let state: String = failure.map { "off (\($0))" }
                 ?? "on (bit-identical to its reference; rescore bit-identical to the head)"
             Self.report(rows, "K 2048 screen \(state)")
         }
-        prefix = candidate
-        return prefix
+        prefixes[rows] = candidate
+        return candidate
     }
 
     /// The prefix head against the full head's first `rows` output columns on a
@@ -1581,8 +1594,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         self.target = target
         // Build the prefix head (and run its bitwise self-check) at load, on
         // both drafter paths, so no proposal pays for it.
-        let rows = DF2Vocab.rows
-        if rows >= config.dflash.selectorTopK && rows < config.vocabularySize {
+        for rows in DF2Vocab.widths(
+            vocabularySize: config.vocabularySize, topK: config.dflash.selectorTopK)
+        {
             let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
             eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
         }
@@ -1601,11 +1615,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// width. The proposals run on a throwaway cache and are discarded; nothing
     /// here reaches a request's state.
     private func prepareFirstRound(_ target: any DFlash2Target) throws {
+        let draftRows = DF2Vocab.widths(
+            vocabularySize: config.vocabularySize, topK: config.dflash.selectorTopK).first
         let cache = try makeCache()
         DF2Fast.w4Recording = !DF2Fast.w4TilesOn
         for rows in [32, 16] {
             let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
-            eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize))
+            eval(try propose(anchor: [0], targetHidden: context, cache: cache, blockSize: config.dflash.blockSize, draftRows: draftRows))
         }
         if DF2Fast.w4Recording {
             DF2Fast.w4Recording = false
@@ -1615,7 +1631,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 let warm = try makeCache()
                 for rows in [32, 16] {
                     let context = MLXArray.zeros([1, rows, config.targetHiddenSize], dtype: dtype)
-                    eval(try propose(anchor: [0], targetHidden: context, cache: warm, blockSize: config.dflash.blockSize))
+                    eval(try propose(anchor: [0], targetHidden: context, cache: warm, blockSize: config.dflash.blockSize, draftRows: draftRows))
                 }
             }
         }
@@ -1984,9 +2000,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
     }
 
-    func logits(_ hidden: MLXArray) throws -> MLXArray {
+    func logits(_ hidden: MLXArray, draftRows: Int? = nil) throws -> MLXArray {
         guard let target else { throw DFlash2Error.notBound }
-        let rows = DF2Vocab.rows
+        let rows = draftRows ?? config.vocabularySize
         var logits =
             rows >= config.dflash.selectorTopK && rows < config.vocabularySize
             ? target.draftLogitsForDFlash2Hidden(hidden, rows: rows)
@@ -2002,19 +2018,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     /// The fast selectors' 128 (id, value) pairs per position: the target's
     /// screened prefix head when it qualified and this block takes it (15
-    /// positions, the 98,304-row prefix, no logit transform), else the top-k
+    /// positions, a qualified model-derived prefix, no logit transform), else the top-k
     /// of the full draft logits.
-    private func draftTop(_ hidden: MLXArray, blockSize: Int) throws -> [MLXArray] {
+    private func draftTop(_ hidden: MLXArray, blockSize: Int, draftRows: Int?) throws -> [MLXArray] {
         guard let target else { throw DFlash2Error.notBound }
-        let rows: Int = DF2Vocab.rows
+        let rows = draftRows ?? config.vocabularySize
         let softcap: Float = config.dflash.finalLogitSoftcapping ?? 0
-        if DF2Fast.screenAllowed, blockSize == 16, rows == 98304, rows < config.vocabularySize,
+        if DF2Fast.screenAllowed, blockSize == 16, rows >= 8 * 256, rows < config.vocabularySize,
             rows >= config.dflash.selectorTopK, config.dflash.outputMultiplier == 1, softcap <= 0,
             let screened = target.draftShortlistForDFlash2Hidden(hidden, rows: rows)
         {
             return [screened.ids, screened.values]
         }
-        return DF2Fast.top(try logits(hidden))
+        return DF2Fast.top(try logits(hidden, draftRows: draftRows))
     }
 
     // MARK: Context projection ahead of acceptance
@@ -2146,11 +2162,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray,
         cache: [KVCache],
         blockSize: Int,
-        projection: DFlash2ContextProjection? = nil
+        projection: DFlash2ContextProjection? = nil,
+        draftRows: Int? = nil
     ) throws -> MLXArray {
         try proposeWithHidden(
             anchor: anchor, targetHidden: targetHidden, cache: cache, blockSize: blockSize,
-            projection: projection
+            projection: projection, draftRows: draftRows
         ).tokens
     }
 
@@ -2160,7 +2177,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         targetHidden: MLXArray,
         cache: [KVCache],
         blockSize: Int,
-        projection: DFlash2ContextProjection?
+        projection: DFlash2ContextProjection?,
+        draftRows: Int? = nil
     ) throws -> (tokens: MLXArray, hidden: MLXArray, codes: DF2Fast.W4Codes?) {
         guard blockSize >= 2 else { throw DFlash2Error.invalidBlockSize(blockSize) }
         let masks = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
@@ -2179,7 +2197,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     DF2Fast.w4LinearsFromCodes(
                         $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
                 }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
-            let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize)
+            let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize, draftRows: draftRows)
             if DF2Fast.treeOn, blockSize == 16 {
                 let (tokens, desc) = DF2Fast.selectTree(
                     top: top, projected: projected,
@@ -2198,7 +2216,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         let tokens = candidateSelector.selectGreedy(
             hidden: hidden,
-            logits: try logits(hidden),
+            logits: try logits(hidden, draftRows: draftRows),
             anchor: MLXArray(anchor.map { Int32($0) }))
         return (tokens, hidden, finalCodes)
     }
