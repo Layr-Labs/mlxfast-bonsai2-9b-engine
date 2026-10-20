@@ -4268,7 +4268,8 @@ final class Qwen35GatedDeltaNet: Module {
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
         promptProjections: [MLXArray]? = nil,
-        promptZ: ((MLXArray) -> MLXArray?)? = nil
+        promptZ: ((MLXArray) -> MLXArray?)? = nil,
+        fold: PromptResidualFold? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -4344,7 +4345,7 @@ final class Qwen35GatedDeltaNet: Module {
         if out.ndim == 4, out.dim(-1) == 128, S >= 64,
             let packed = outProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterGatedNormPrompt(
-                out, gate: z, normWeight: norm.weight, eps: norm.eps)
+                out, gate: z, normWeight: norm.weight, eps: norm.eps, fold: fold)
         {
             return gated
         }
@@ -5080,7 +5081,8 @@ final class Qwen35Attention: Module {
         positionIds: MLXArray? = nil,
         exactTargetVerify: Bool = false,
         boundary: HadamardQuantizedLinear.VerifyBoundary? = nil,
-        promptProjections: [MLXArray]? = nil, lastQueryOnly: Bool = false
+        promptProjections: [MLXArray]? = nil, lastQueryOnly: Bool = false,
+        fold: PromptResidualFold? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -5200,7 +5202,7 @@ final class Qwen35Attention: Module {
             return gated
         }
         if !narrowsToLastQuery, !exactTargetVerify, B == 1, L >= 64, let packed = oProj as? HadamardQuantizedLinear,
-            let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: gateProjection)
+            let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: gateProjection, fold: fold)
         {
             return gated
         }
@@ -5435,9 +5437,9 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen3NextMLP {
-    func qwen35ProjectedGateUp(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    func qwen35ProjectedGateUp(_ gate: MLXArray, _ up: MLXArray, fold: PromptResidualFold? = nil) -> MLXArray {
         if let down = downProj as? HadamardQuantizedLinear,
-            let output = down.callAfterSwiGLU(gate: gate, up: up)
+            let output = down.callAfterSwiGLU(gate: gate, up: up, fold: fold)
         {
             return output
         }
@@ -5729,10 +5731,12 @@ extension Qwen35DecoderLayer {
         modelLayerIndex: Int,
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        positionIds: MLXArray?
-    ) -> (residual: MLXArray, delta: MLXArray)? {
+        positionIds: MLXArray?,
+        foldDown: Bool = false
+    ) -> (residual: MLXArray, delta: MLXArray?)? {
         guard let dense = mlp as? Qwen3NextMLP, x.ndim == 3, x.dim(1) >= 128 else { return nil }
         let r: MLXArray
+        let outFold = PromptResidualFold(x)
         if isLinear {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
@@ -5743,7 +5747,7 @@ extension Qwen35DecoderLayer {
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
                 recurrentState: recurrentState, promptProjections: prompt.projections,
-                promptZ: prompt.deferred)
+                promptZ: prompt.deferred, fold: outFold)
         } else {
             guard let attention = selfAttn, let attentionCache,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
@@ -5752,13 +5756,15 @@ extension Qwen35DecoderLayer {
             else { return nil }
             r = attention.cbv2Forward(
                 x, cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: false, promptProjections: prompt.projections)
+                exactTargetVerify: false, promptProjections: prompt.projections, fold: outFold)
         }
         guard let post = HadamardQuantizedLinear.sharedResidualNormProjections(
-            x, residual: r, weight: postAttentionLayerNorm.weight,
+            outFold.folded ? r : x, residual: outFold.folded ? nil : r, weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         else { return nil }
-        return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+        let downFold = foldDown ? PromptResidualFold(post.residual) : nil
+        let down = dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1], fold: downFold)
+        return downFold?.folded == true ? (down, nil) : (post.residual, down)
     }
 
     /// Prompt-width layer whose input arrives as `(x, delta)` unadded, fusing
@@ -5769,11 +5775,13 @@ extension Qwen35DecoderLayer {
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?,
-        lastPositionOnly: Bool = false
-    ) -> (inputResidual: MLXArray, residual: MLXArray, delta: MLXArray)? {
+        lastPositionOnly: Bool = false,
+        foldDown: Bool = false
+    ) -> (inputResidual: MLXArray, residual: MLXArray, delta: MLXArray?)? {
         guard let dense = mlp as? Qwen3NextMLP, x.ndim == 3, x.dim(1) >= 128 else { return nil }
         let inputResidual: MLXArray
         let r: MLXArray
+        var outFold: PromptResidualFold? = nil
         if isLinear {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
@@ -5782,10 +5790,11 @@ extension Qwen35DecoderLayer {
                 let normalized = prompt.normalized
             else { return nil }
             inputResidual = prompt.residual
+            outFold = lastPositionOnly ? nil : PromptResidualFold(inputResidual)
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
                 recurrentState: recurrentState, promptProjections: prompt.projections,
-                promptZ: prompt.deferred)
+                promptZ: prompt.deferred, fold: outFold)
         } else {
             guard let attention = selfAttn, let attentionCache else { return nil }
             let lastQueryOnly = lastPositionOnly && attention.canUseLastQueryPrefill(
@@ -5796,23 +5805,26 @@ extension Qwen35DecoderLayer {
                     firstProjectionLastRow: lastQueryOnly)
             else { return nil }
             inputResidual = prompt.residual
+            outFold = lastPositionOnly ? nil : PromptResidualFold(inputResidual)
             r = attention.cbv2Forward(
                 inputResidual, cache: attentionCache, positionIds: positionIds,
-                exactTargetVerify: false, promptProjections: prompt.projections, lastQueryOnly: lastQueryOnly)
+                exactTargetVerify: false, promptProjections: prompt.projections, lastQueryOnly: lastQueryOnly,
+                fold: outFold)
         }
+        let folded = outFold?.folded == true
         let xPost = lastPositionOnly && inputResidual.dim(1) > 1
             ? inputResidual[0..., (inputResidual.dim(1) - 1)..., 0...] : inputResidual
         let rPost = lastPositionOnly && r.dim(1) > 1
             ? r[0..., (r.dim(1) - 1)..., 0...] : r
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
-            xPost, residual: rPost, weight: postAttentionLayerNorm.weight,
+            folded ? rPost : xPost, residual: folded ? nil : rPost, weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         {
-            return (
-                inputResidual, post.residual,
-                dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+            let downFold = foldDown ? PromptResidualFold(post.residual) : nil
+            let down = dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1], fold: downFold)
+            return downFold?.folded == true ? (inputResidual, down, nil) : (inputResidual, post.residual, down)
         }
-        let h = xPost + rPost
+        let h = folded ? rPost : xPost + rPost
         return (inputResidual, h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
     }
 }
@@ -6220,14 +6232,18 @@ public class Qwen35TextModelInner: Module {
                 let fused = layer.cbv2ForwardPromptFused(
                     hiddenStates, delta: delta, modelLayerIndex: modelLayerIndex,
                     attentionCache: attentionCache, recurrentState: recurrentState,
-                    positionIds: positionIds, lastPositionOnly: layerLastOnly)
+                    positionIds: positionIds, lastPositionOnly: layerLastOnly,
+                    foldDown: modelLayerIndex + 2 < layers.count)
             {
                 if let tapLayerIds, let prevSlot = tapLayerIds.firstIndex(of: modelLayerIndex - 1) {
                     tapped[prevSlot] = fused.inputResidual
                 }
                 (hiddenStates, pendingDelta) = (fused.residual, fused.delta)
                 if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
-                    asyncEval(hiddenStates, fused.delta)
+                    if let delta = fused.delta { asyncEval(hiddenStates, delta) } else { asyncEval(hiddenStates) }
+                }
+                if fused.delta == nil, let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+                    tapped[slot] = hiddenStates
                 }
                 continue
             }
@@ -6254,11 +6270,14 @@ public class Qwen35TextModelInner: Module {
                 let split = layer.cbv2ForwardPromptSplitOutput(
                     hiddenStates, modelLayerIndex: modelLayerIndex,
                     attentionCache: attentionCache, recurrentState: recurrentState,
-                    positionIds: positionIds)
+                    positionIds: positionIds, foldDown: modelLayerIndex + 2 < layers.count)
             {
                 (hiddenStates, pendingDelta) = (split.residual, split.delta)
                 if Self.submitsVerify(after: modelLayerIndex, of: layers.count) {
-                    asyncEval(hiddenStates, split.delta)
+                    if let delta = split.delta { asyncEval(hiddenStates, delta) } else { asyncEval(hiddenStates) }
+                }
+                if split.delta == nil, let tapLayerIds, let slot = tapLayerIds.firstIndex(of: modelLayerIndex) {
+                    tapped[slot] = hiddenStates
                 }
                 continue
             }

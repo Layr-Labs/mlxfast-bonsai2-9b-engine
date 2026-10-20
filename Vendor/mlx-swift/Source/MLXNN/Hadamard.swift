@@ -4185,6 +4185,7 @@ enum PromptInt8Matmul {
     static func prepareStreaming() {
         guard !streamPromptPrepared else { return }
         streamPromptPrepared = true
+        defer { prepareFold() }
         guard streamPromptAllowed, VerifyInt8Matmul.streamReady, route == .nax, naxSg else { return }
         guard streamedRegBody != nil, streamedSgBody != nil else {
             VerifyInt8Matmul.streamReady = false
@@ -4804,6 +4805,245 @@ enum PromptInt8Matmul {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
         }
         return outputs.count == layers.count ? outputs : nil
+    }
+}
+
+/// A prompt projection output with its residual stream added in the matmul's
+/// epilogue. In the record the out and down launches store `d` and the next
+/// quantizing kernel reads `x` and `d`, forms `x + d`, stores it as the new
+/// residual and quantizes the normalized sum. Here the register-weight forms
+/// read `x` beside the store and write `v + x` (`v` is the record's `d`, the
+/// same operand build and epilogue; the add is the quantizer's own fp32 add,
+/// taken under `fp contract(off)` and `reassociate(off)`), and the next kernel
+/// is the norm-only form that reads the stored sum. A fold serves only after
+/// `checkFold` found the fused output equal, bit for bit, to the record
+/// launch's output plus the residual; otherwise the record launches stay.
+/// `DARKBLOOM_BONSAI_PREFILL_RESFOLD=0` keeps them.
+public final class PromptResidualFold {
+    public let residual: MLXArray
+    /// Set by the projection when its output already is `residual + projection`.
+    public internal(set) var folded = false
+    public init(_ residual: MLXArray) { self.residual = residual }
+}
+
+extension PromptInt8Matmul {
+    static let foldOffered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_RESFOLD"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var foldCanonicalReady = false
+    nonisolated(unsafe) private static var foldStreamedReady = false
+    nonisolated(unsafe) private static var foldCheckFailed = false
+
+    /// `operandBody` (a register-weight body) with its store replaced by the
+    /// residual-adding store. Nil when the body no longer carries the store.
+    private static func foldSource(cols128: Bool, operandBody: String) -> String? {
+        let store = "#pragma clang loop unroll(full)\nfor (int i = 0; i < 32; i += 4) {\n  const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);\n  const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);\n  *(device float4*)(out + (size_t)mm * N + nb + 16 * ((i >> 3) & 1)) = v;\n}"
+        let epilogue = """
+            {
+              #pragma clang fp reassociate(off)
+              #pragma clang fp contract(off)
+              #pragma clang loop unroll(full)
+              for (int i = 0; i < 32; i += 4) {
+                const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+                const float4 v = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+                const size_t at = (size_t)mm * N + nb + 16 * ((i >> 3) & 1);
+                *(device float4*)(out + at) = v + *(const device float4*)(residual + at);
+              }
+            }
+            """
+        guard operandBody.components(separatedBy: store).count == 2 else { return nil }
+        let body = operandBody.replacingOccurrences(of: store, with: epilogue)
+        return cols128 ? naxRegCols128Source(layers: 1, operandBody: body) : naxSgSource(layers: 1, body: body)
+    }
+
+    /// Index `(cols128 ? 2 : 0) + (streamed ? 1 : 0)`.
+    private static let foldKernels: [MLXFast.MLXFastKernel?] = [
+        (false, false), (false, true), (true, false), (true, true),
+    ].map { cols128, streamed in
+        guard let source = foldSource(
+            cols128: cols128, operandBody: streamed ? (streamedRegBody ?? "") : naxRegBody)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_prompt_resfold_\(cols128 ? "cols128" : "reg")_\(streamed ? "c16" : "canonical")",
+            inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz", "residual"],
+            outputNames: ["out0"], source: source, header: naxHeader, ensureRowContiguous: true)
+    }
+
+    private static func runFold(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layer: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray), residual: MLXArray,
+        m: Int, k: Int, negative: Bool, form: SgForm, streamed: Bool
+    ) -> MLXArray? {
+        let cols128: Bool
+        switch form {
+        case .register: cols128 = false
+        case .registerCols128: cols128 = true
+        case .staged: return nil
+        }
+        guard let kernel = foldKernels[(cols128 ? 2 : 0) + (streamed ? 1 : 0)] else { return nil }
+        let limit = Int(Int32.max)
+        let n = layer.weight.dim(0)
+        guard n > 0, n % 64 == 0, n <= limit / (k / 16), m <= limit / n, m > 0, m % 32 == 0,
+            k >= 128, k % 128 == 0, residual.dtype == .float32, residual.size == m * n
+        else { return nil }
+        let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
+        let index32 = m % 64 == 0 && m <= limit / k
+        let template: [(String, any KernelTemplateArg)] = cols128
+            ? [("NEG", negative ? 1 : 0), ("INDEX32", index32), ("MFIRST", traversalMFirst)]
+            : [("NEG", negative ? 1 : 0), ("MFIRST", traversalMFirst)]
+        let threads = cols128 ? 128 : 64
+        let columns = cols128 ? 128 : 64
+        return kernel(
+            [codes, layer.weight, layer.scalesT, layer.biasesT, ascale, rsb, dims, residual.reshaped([m, n])],
+            template: template, grid: ((n + columns - 1) / columns * threads, m / 32, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [.float32])[0]
+    }
+
+    /// `residual + matmul(activation, ...)` for one projection, in the kernel
+    /// form and word layout `matmul` takes. Nil when that launch is not a
+    /// register-weight form, the fold did not qualify, or the shapes differ;
+    /// the caller then runs `matmul` and adds the residual itself.
+    static func matmulFold(
+        _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
+        negative: Bool, streamedWeight: MLXArray? = nil, residual: MLXArray, qualifying: Bool = false
+    ) -> MLXArray? {
+        guard foldOffered || qualifying, route == .nax, naxSg else { return nil }
+        let copied: MLXArray?
+        if let streamedWeight, streamPromptReady,
+            activation.rows >= 64, activation.rows % 64 == 0,
+            activation.k >= 128, activation.k % 128 == 0,
+            weight.dim(0) > 0, weight.dim(0) % 64 == 0
+        {
+            copied = streamedWeight
+        } else {
+            copied = promptStream(weight, m: activation.rows, k: activation.k)
+        }
+        if let copied {
+            guard foldStreamedReady || qualifying else { return nil }
+            return runFold(
+                codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                layer: (copied, scalesT, biasesT), residual: residual,
+                m: activation.rows, k: activation.k, negative: negative && negativeForms,
+                form: streamedForm, streamed: true)
+        }
+        guard foldCanonicalReady || qualifying else { return nil }
+        return runFold(
+            codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+            layer: (weight, scalesT, biasesT), residual: residual,
+            m: activation.rows, k: activation.k, negative: negative && negativeForms,
+            form: sgForm, streamed: false)
+    }
+
+    /// The fold's output against `matmul`'s plus the residual (MLX add), on
+    /// fixed synthetic operands, every bit, at 512, 192 and 128 rows for the
+    /// tower's out and down shapes (K 4096 and K 12288, N 4096), the offset
+    /// forms the projections can take, residuals of mixed sign and magnitude.
+    /// Returns the number of cases, nil when one differed or failed to compile.
+    static func checkFold(streamed: Bool) -> Int? {
+        guard route == .nax, naxSg, sgForm != .staged, !streamed || (streamPromptReady && streamedForm != .staged)
+        else { return nil }
+        let maxRows = 512
+        func u(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint32) }
+        let n = 4096
+        var matched = true
+        var cases = 0
+        foldCheckFailed = false
+        let noted = streamPromptNoted
+        defer { streamPromptNoted = noted }
+        withErrorHandler({ _ in PromptInt8Matmul.foldCheckFailed = true }) {
+            for (k, rowList) in [(4096, [512, 192, 128]), (12288, [512, 128])] where matched {
+                let kg = k / 128
+                let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
+                    let centered: Int = (i * 37 + 11) % 255 - 127
+                    return Int8(truncatingIfNeeded: centered)
+                }
+                let codes = MLXArray(codeValues, [maxRows, k])
+                let ascaleValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 11 + 1) / 256 }
+                let rsbValues: [Float] = (0 ..< maxRows * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }
+                let ascale = MLXArray(ascaleValues), rsb = MLXArray(rsbValues)
+                let words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+                    let value: UInt64 = UInt64(i + 1 + 104_729 * k) &* 2_654_435_761
+                    return UInt32(truncatingIfNeeded: value)
+                }
+                let scaleValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = Float(1 + i % 13) / 4096
+                    return Float16(value)
+                }
+                let biasValues: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                    let value: Float = -Float(i % 7) / 2048
+                    return Float16(value)
+                }
+                let weight = MLXArray(words, [n, k / 16])
+                let scalesT = MLXArray(scaleValues, [kg, n])
+                let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                let biasesT = MLXArray(biasValues, [kg, n])
+                let copy: MLXArray? = streamed ? VerifyInt8Matmul.streamPack(weight, k: k, columns: 16) : nil
+                if let copy { eval(copy) }
+                for m in rowList where matched {
+                    let activation = PromptInt8Activation(
+                        codes: codes[0 ..< m], ascale: ascale[0 ..< m * kg], rsb: rsb[0 ..< m * kg], rows: m, k: k)
+                    let residualValues: [Float] = (0 ..< m * n).map { (i: Int) -> Float in
+                        let h: UInt64 = UInt64(i + 17) &* 2_654_435_761
+                        let bucket: Int = Int((h >> 7) & 0x7ff_ffff) % 200_003
+                        let base: Float = Float(bucket) / 1009.0 - 99.0
+                        if i % 5 == 0 { return base * 512.0 }
+                        if i % 7 == 0 { return base / 4096.0 }
+                        return base
+                    }
+                    let residual = MLXArray(residualValues, [m, n])
+                    for negative in [false, true] where matched {
+                        let biasUsed = negative ? negatedT : biasesT
+                        guard let record = matmul(
+                                activation, weight: weight, scalesT: scalesT, biasesT: biasUsed,
+                                negative: negative, streamedWeight: copy),
+                            let fused = matmulFold(
+                                activation, weight: weight, scalesT: scalesT, biasesT: biasUsed,
+                                negative: negative, streamedWeight: copy, residual: residual, qualifying: true)
+                        else { matched = false; break }
+                        let reference = record + residual
+                        let check = MLX.all(u(reference) .== u(fused))
+                        eval(check)
+                        matched = !foldCheckFailed && check.item(Bool.self)
+                        cases += 1
+                    }
+                }
+            }
+        }
+        matched = matched && !foldCheckFailed
+        foldCheckFailed = false
+        return matched ? cases : nil
+    }
+
+    nonisolated(unsafe) private static var foldPrepared = false
+
+    /// Called at load once the word layouts and the traversal order are
+    /// known (the end of `prepareStreaming`); on a device without the tensor
+    /// route the record launches stay and nothing compiles.
+    static func prepareFold() {
+        guard !foldPrepared else { return }
+        foldPrepared = true
+        guard route == .nax else {
+            FileHandle.standardError.write(Data("int8 prompt residual epilogue: off (the tensor route is not in use)\n".utf8))
+            return
+        }
+        qualifyFold(streamed: false)
+        if streamPromptReady { qualifyFold(streamed: true) }
+    }
+
+    private static func qualifyFold(streamed: Bool) {
+        let note: String
+        let passed: Bool
+        if !foldOffered {
+            (passed, note) = (false, "off (DARKBLOOM_BONSAI_PREFILL_RESFOLD=0)")
+        } else if let cases = checkFold(streamed: streamed) {
+            (passed, note) = (true, "on (\(streamed ? "\(streamedForm)" : "\(sgForm)"), rows 512/192/128, K 4096 and 12288, \(cases) cases: outputs bit-identical to the record launch plus the residual)")
+        } else {
+            (passed, note) = (false, "off (not a register-weight launch, or a case differed or failed to compile; record launches kept)")
+        }
+        if streamed { foldStreamedReady = passed } else { foldCanonicalReady = passed }
+        FileHandle.standardError.write(Data("int8 prompt residual epilogue, \(streamed ? "streamed words" : "canonical words"): \(note)\n".utf8))
     }
 }
 
@@ -8011,19 +8251,35 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// The prompt-width integer route (`PromptInt8Matmul`); nil when the
     /// input, the packing or the device does not take it.
-    private func promptInt8Forward(_ x: MLXArray, up: MLXArray? = nil) -> MLXArray? {
+    private func promptInt8Forward(
+        _ x: MLXArray, up: MLXArray? = nil, fold: PromptResidualFold? = nil
+    ) -> MLXArray? {
         guard readsFloat16ConstantsInPlace, transform.blockSize == 4096, x.dtype == .float32,
             x.ndim >= 2, PromptInt8Matmul.applies(rows: x.size / x.dim(-1)),
             weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
-            let activation = transform.quantizedForPrompt(gdnLayout.map { $0(x) } ?? x, up: up)
-        else { return nil }
-        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-        let streamed = promptConstants.streamWeight(weight, k: transform.width, columns: 16)
-        guard let output = PromptInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamed)
+            let activation = transform.quantizedForPrompt(gdnLayout.map { $0(x) } ?? x, up: up),
+            let output = promptMatmul(activation, fold: fold)
         else { return nil }
         return output.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+    }
+
+    /// `PromptInt8Matmul.matmul` of this module's weight; with `fold`, the
+    /// epilogue-added `fold.residual + projection` when the fold serves (and
+    /// `fold.folded` set), else the plain projection.
+    private func promptMatmul(_ activation: PromptInt8Activation, fold: PromptResidualFold?) -> MLXArray? {
+        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
+        let streamed = promptConstants.streamWeight(weight, k: transform.width, columns: 16)
+        if let fold, bias == nil,
+            let output = PromptInt8Matmul.matmulFold(
+                activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+                negative: promptConstants.negative, streamedWeight: streamed, residual: fold.residual)
+        {
+            fold.folded = true
+            return output
+        }
+        return PromptInt8Matmul.matmul(
+            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+            negative: promptConstants.negative, streamedWeight: streamed)
     }
 
     public func canCallPromptLastRow(_ x: MLXArray) -> Bool {
@@ -8052,16 +8308,20 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     /// Form prompt SwiGLU values inside the existing quantizing transform.
-    public func callAfterSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray? {
+    public func callAfterSwiGLU(gate: MLXArray, up: MLXArray, fold: PromptResidualFold? = nil) -> MLXArray? {
         guard gdnLayout == nil,
-            let output = promptInt8Forward(gate, up: up) ?? verifyInt8Forward(gate, up: up)
+            let output = promptInt8Forward(gate, up: up, fold: fold) ?? verifyInt8Forward(gate, up: up)
         else { return nil }
         return bias.map { output + $0 } ?? output
     }
 
     /// Share the residual, RMSNorm and rotation for an eligible projection group.
+    ///
+    /// A nil `residual` means `x` already is the residual stream (a projection's
+    /// epilogue added it, `PromptResidualFold`): the prompt width forms the norm
+    /// and the codes from `x` alone and returns `x` as the residual.
     public static func sharedResidualNormProjections(
-        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float,
+        _ x: MLXArray, residual: MLXArray?, weight: MLXArray, eps: Float,
         projections: [Linear]
     ) -> (residual: MLXArray, projections: [MLXArray])? {
         guard x.ndim >= 2, x.dim(-1) == 4096 else { return nil }
@@ -8075,11 +8335,21 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             packed.allSatisfy({
                 $0.readsFloat16ConstantsInPlace && $0.gdnLayout == nil
                     && $0.weight.dim(0) % 64 == 0 && $0.transform.isIdentical(to: first.transform)
-            }),
-            let activation = first.transform.residualNorm(
+            })
+        else { return nil }
+        let activation: [MLXArray]
+        if let residual {
+            guard let formed = first.transform.residualNorm(
                 x, residual: residual, weight: weight, eps: eps, quantized: quantized,
                 verifyRows: verify ? rows : 0)
-        else { return nil }
+            else { return nil }
+            activation = formed
+        } else {
+            guard quantized, !verify,
+                let formed = first.transform.normPrompt(x, weight: weight, eps: eps, normalized: false)
+            else { return nil }
+            activation = formed + [x]
+        }
         let promptOutputs = quantized && !verify
             ? PromptInt8Matmul.matmul(
                 PromptInt8Activation(
@@ -8634,19 +8904,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// prompt integer matmul, as `self(norm(x, gate))` computes it. Nil when
     /// the route, the packing or the shapes do not qualify.
     public func callAfterGatedNormPrompt(
-        _ x: MLXArray, gate: MLXArray, normWeight: MLXArray, eps: Float
+        _ x: MLXArray, gate: MLXArray, normWeight: MLXArray, eps: Float, fold: PromptResidualFold? = nil
     ) -> MLXArray? {
         guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
             x.ndim >= 3, PromptInt8Matmul.applies(rows: x.size / 4096),
             weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
             let activation = transform.quantizedForPromptGatedNorm(
-                x, gate: gate, weight: normWeight, eps: eps)
-        else { return nil }
-        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-        let streamed = promptConstants.streamWeight(weight, k: transform.width, columns: 16)
-        guard let output = PromptInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamed)
+                x, gate: gate, weight: normWeight, eps: eps),
+            let output = promptMatmul(activation, fold: fold)
         else { return nil }
         let shaped = output.reshaped(Array(x.shape.dropLast(2)) + [weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
@@ -8677,19 +8942,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     /// quantizing rotation, as `[1, rows, N]`. Nil when the route, the
     /// packing or the shapes do not qualify.
     public func callAfterAttentionGatePrompt(
-        _ attention: MLXArray, queryProjection: MLXArray
+        _ attention: MLXArray, queryProjection: MLXArray, fold: PromptResidualFold? = nil
     ) -> MLXArray? {
         guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
             attention.ndim == 4, PromptInt8Matmul.applies(rows: attention.dim(2)),
             weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
             let activation = transform.quantizedForPromptAttentionGate(
-                attention, queryProjection: queryProjection)
-        else { return nil }
-        let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-        let streamed = promptConstants.streamWeight(weight, k: transform.width, columns: 16)
-        guard let output = PromptInt8Matmul.matmul(
-            activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-            negative: promptConstants.negative, streamedWeight: streamed)
+                attention, queryProjection: queryProjection),
+            let output = promptMatmul(activation, fold: fold)
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
