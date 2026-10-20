@@ -948,6 +948,26 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         return c
     }
 
+    /// Set DARKBLOOM_BONSAI_SEED_NOZERO=0 to zero-fill new buffers again.
+    private static let skipZeroFill =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SEED_NOZERO"] != "0"
+
+    private static let uninitialized = MLXFast.metalKernel(
+        name: "df2_kv_uninitialized", inputNames: [String](), outputNames: ["out"],
+        source: "", ensureRowContiguous: false)
+
+    /// Every row a reader sees lies in `start ..< end + L`, and each such row is
+    /// written before the slice that exposes it is taken, so the fill is dead.
+    /// One output per launch: a sibling output's storage stays held until its
+    /// command buffer completes, which would stop the first slice update from
+    /// donating it and copy the whole buffer instead.
+    private static func allocate(_ shape: [Int], dtype: DType) -> MLXArray {
+        guard skipZeroFill else { return MLXArray.zeros(shape, dtype: dtype) }
+        return uninitialized(
+            [], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [shape], outputDTypes: [dtype])[0]
+    }
+
     private func ensureCapacity(
         extra: Int, B: Int, kvHeads: Int, kDim: Int, vDim: Int, kDType: DType, vDType: DType
     ) {
@@ -960,8 +980,8 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
         let valid = end - start
         let needed = valid + extra
         let cap = ((needed + 512 + 255) / 256) * 256
-        let newK = MLXArray.zeros([B, kvHeads, cap, kDim], dtype: kDType)
-        let newV = MLXArray.zeros([B, kvHeads, cap, vDim], dtype: vDType)
+        let newK = Self.allocate([B, kvHeads, cap, kDim], dtype: kDType)
+        let newV = Self.allocate([B, kvHeads, cap, vDim], dtype: vDType)
         if let currentKeys = kBuf, let currentValues = vBuf, valid > 0 {
             newK[.ellipsis, ..<valid, 0...] =
                 currentKeys[.ellipsis, start ..< end, 0...].asType(kDType)
