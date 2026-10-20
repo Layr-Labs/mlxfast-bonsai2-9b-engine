@@ -8017,8 +8017,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let outputs = PromptInt8Matmul.matmul(
             activation, layers: full.map(\.verifyOperands), streamedWeights: Self.streamedWeights(full))
         else { return nil }
+        let outputShapePrefix = Array(x.shape.dropLast())
         var projected = zip(full, outputs).map { layer, output in
-            let output = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+            let output = output.reshaped(outputShapePrefix + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
         if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
@@ -8059,8 +8060,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let outputs = PromptInt8Matmul.matmul(
             activation, layers: full.map(\.verifyOperands), streamedWeights: Self.streamedWeights(full))
         else { return nil }
+        let outputShapePrefix = Array(x.shape.dropLast())
         var projected = zip(full, outputs).map { layer, output in
-            let output = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+            let output = output.reshaped(outputShapePrefix + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
         if firstProjectionLastRow { projected.insert(first.promptLastRow(activation), at: 0) }
@@ -8086,8 +8088,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let outputs = PromptInt8Matmul.matmul(
                 activation, layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
         else { return nil }
+        let outputShapePrefix = Array(x.shape.dropLast())
         return zip(packed, outputs).map { layer, output in
-            let output = output.reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
+            let output = output.reshaped(outputShapePrefix + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
     }
@@ -8173,8 +8176,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard let outputs = VerifyInt8Matmul.matmul(
             boundary.activation, layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
         else { return nil }
+        let outputShapePrefix = Array(boundary.normalized.shape.dropLast())
         return zip(packed, outputs).map { layer, output in
-            output.reshaped(Array(boundary.normalized.shape.dropLast()) + [layer.weight.dim(0)])
+            output.reshaped(outputShapePrefix + [layer.weight.dim(0)])
         }
     }
 
