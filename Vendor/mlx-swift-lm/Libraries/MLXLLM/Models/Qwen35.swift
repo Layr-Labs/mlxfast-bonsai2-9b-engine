@@ -2870,7 +2870,7 @@ enum Qwen35FusedGDNVerify {
         prepared = true
         guard tuneOffered || deltaOffered else { return }
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
-        var verdict = (false, false)
+        var verdict = (false, false, false)
         do {
             verdict = try withError { checkPreparedKernels() }
         } catch {
@@ -2878,7 +2878,9 @@ enum Qwen35FusedGDNVerify {
         }
         tunePassed = tuneOffered && verdict.0
         deltaPassed = deltaOffered && verdict.1
-        let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)\n"
+        Qwen35DeltaReplay.unrolledPassed = deltaPassed && Qwen35DeltaReplay.unrolledOffered && verdict.2
+        let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
+            + " unroll=\(Qwen35DeltaReplay.unrolledPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
     }
 
@@ -2951,13 +2953,14 @@ enum Qwen35FusedGDNVerify {
         return (MLXArray(descriptor), paths)
     }
 
-    private static func checkPreparedKernels() -> (Bool, Bool) {
+    private static func checkPreparedKernels() -> (Bool, Bool, Bool) {
         defer { tunePassed = false; deltaPassed = false }
         guard tunedKernel != nil, tunedDeltaKernel != nil, deltaKernel != nil,
             deltaTreeKernel != nil, tunedTreeKernel != nil, tunedDeltaTreeKernel != nil
-        else { return (false, false) }
+        else { return (false, false, false) }
         var tuneOK = true
         var deltaOK = true
+        var unrollOK = true
         for kind in 0..<3 {
             let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
             let qkv = kind == 2 ? probeWords([1, 16, 8192])
@@ -2972,7 +2975,8 @@ enum Qwen35FusedGDNVerify {
             let inputs = [convState, qkv, weight, a, b, aLog, bias, state]
             let parents: [[Int]?] = [nil,
                 [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
-                [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+                [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                Array(-1..<15)]
             for parent in parents {
             let descriptor = parent.map { probeTree($0) }
             let tree = descriptor.map { $0.0 }
@@ -2980,14 +2984,14 @@ enum Qwen35FusedGDNVerify {
                 let tuned = probeForward(inputs, tuned: true, delta: false, tree: tree),
                 let plainCapture = probeForward(inputs, tuned: false, delta: true, tree: tree),
                 let tunedCapture = probeForward(inputs, tuned: true, delta: true, tree: tree)
-            else { return (false, false) }
+            else { return (false, false, false) }
             tuneOK = sameBits(seven(record), seven(tuned)) && tuneOK
             deltaOK = sameBits(five(record), five(plainCapture)) && deltaOK
             deltaOK = sameBits(five(record), five(tunedCapture)) && deltaOK
             for capture in [plainCapture, tunedCapture] {
-                guard let tape = capture.7 else { return (false, false) }
+                guard let tape = capture.7 else { return (false, false, false) }
                 let paths = descriptor.map { $0.1 }
-                    ?? [1, 2, 4, 8, 15, 16].map { Array(0..<$0) }
+                    ?? (1...16).map { (steps: Int) -> [Int] in Array(0..<steps) }
                 for path in paths {
                     let q = record.2[0..., 0..<path.count, 0...]
                     let treeRows = tree == nil ? nil : MLXArray(path)
@@ -2996,21 +3000,31 @@ enum Qwen35FusedGDNVerify {
                         guard let replay = Qwen35RegisterGatedSIMD.runTreeReplay(q: record.2,
                             k: record.3, v: record.1, a: a, b: b, aLog: aLog, dtBias: bias,
                             state: state, convInput: record.0, rows: treeRows)
-                        else { return (false, false) }
+                        else { return (false, false, false) }
                         old = replay
                     } else {
                         old = Qwen35RegisterGatedSIMD.runReplay(q: q, k: record.3, v: record.1,
                             a: a, b: b, aLog: aLog, dtBias: bias, state: state, convInput: record.0)
                     }
                     guard let new = Qwen35DeltaReplay.run(committedRows: path.count, k: capture.3, delta: tape,
-                        state: state, convInput: capture.0, treeRows: treeRows, stateIsRowContiguous: true)
-                    else { return (false, false) }
+                        state: state, convInput: capture.0, treeRows: treeRows, stateIsRowContiguous: true,
+                        unrolled: false)
+                    else { return (false, false, false) }
                     deltaOK = sameBits([old.0, old.1], [new.0, new.1]) && deltaOK
+                    // A failure of the unrolled variant only keeps the record replay kernels.
+                    let unrolledSame = (try? withError { () -> Bool in
+                        guard let unrolled = Qwen35DeltaReplay.run(committedRows: path.count, k: capture.3,
+                            delta: tape, state: state, convInput: capture.0, treeRows: treeRows,
+                            stateIsRowContiguous: true, unrolled: true)
+                        else { return false }
+                        return sameBits([new.0, new.1], [unrolled.0, unrolled.1])
+                    }) ?? false
+                    unrollOK = unrolledSame && unrollOK
                 }
             }
         }
         }
-        return (tuneOK, deltaOK)
+        return (tuneOK, deltaOK, unrollOK)
     }
 
 }
@@ -3087,9 +3101,113 @@ private enum Qwen35DeltaReplay {
             .replacingOccurrences(of: "(T + r) * cdim", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * cdim"),
         ensureRowContiguous: true)
 
+    /// The same recurrence with the step count as a template constant: the loop unrolls, the
+    /// gate and delta loads of every step issue before the scan, and the key rows of the
+    /// window reach threadgroup memory in one cooperative load. Each state element sees the
+    /// same multiply and FMA in the same order as `source`.
+    private static let unrolledBody = """
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(off)
+        constexpr uint NT = uint(NSTEP);
+        const uint tid = thread_position_in_grid.x;
+        const uint tl = tid & 127u;
+        const uint hv = threadgroup_position_in_grid.z;
+        const uint dv = tid / 8u;
+        const uint dk = (tid % 8u) * 16u;
+        const uint kh = hv / (Hv / Hk);
+        threadgroup float4 ks[NT * 32u];
+        float s[16];
+        const uint so = (hv * uint(Dv) + dv) * uint(Dk) + dk;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+          const float4 sv = ((const device float4*)(state_in + so))[j];
+          s[j * 4] = sv.x; s[j * 4 + 1] = sv.y;
+          s[j * 4 + 2] = sv.z; s[j * 4 + 3] = sv.w;
+        }
+        float gs[NT];
+        float ds[NT];
+        #pragma clang loop unroll(full)
+        for (uint t = 0; t < NT; ++t) {
+          const uint row = STEP_ROW(t);
+          const uint d_base = (row * uint(Hv) + hv) * uint(Dv + 1);
+          gs[t] = delta[d_base + uint(Dv)];
+          ds[t] = delta[d_base + dv];
+        }
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < (NT + 3u) / 4u; ++u) {
+          const uint i = u * 128u + tl;
+          if (i < NT * 32u) {
+            const uint row = STEP_ROW(i >> 5);
+            ks[i] = ((const device float4*)(k + row * uint(Hk * Dk) + kh * uint(Dk)))[i & 31u];
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint kc = (tid % 8u) * 4u;
+        #pragma clang loop unroll(full)
+        for (uint t = 0; t < NT; ++t) {
+          const float g = gs[t];
+          const float d = ds[t];
+          #pragma clang loop unroll(full)
+          for (int j = 0; j < 4; ++j) {
+            const float4 kv = ks[t * 32u + kc + uint(j)];
+            s[j * 4] *= g; s[j * 4 + 1] *= g;
+            s[j * 4 + 2] *= g; s[j * 4 + 3] *= g;
+            s[j * 4] = fma(kv.x, d, s[j * 4]);
+            s[j * 4 + 1] = fma(kv.y, d, s[j * 4 + 1]);
+            s[j * 4 + 2] = fma(kv.z, d, s[j * 4 + 2]);
+            s[j * 4 + 3] = fma(kv.w, d, s[j * 4 + 3]);
+          }
+        }
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+          ((device float4*)(state_out + so))[j] =
+              float4(s[j * 4], s[j * 4 + 1], s[j * 4 + 2], s[j * 4 + 3]);
+        }
+        // Match the old replay's raw-bit conv tail, including signed zero.
+        const uint cdim = uint(conv_in_shape[2]);
+        const uint gid = hv * threads_per_grid.x + tid;
+        const uint nthreads = uint(Hv) * threads_per_grid.x;
+        const device uint* src = (const device uint*)conv_in;
+        device uint* dst = (device uint*)conv_tail;
+        for (uint i = gid; i < 3u * cdim; i += nthreads) {
+          const uint r = i / cdim;
+          const uint c = i - r * cdim;
+          dst[i] = src[TAIL_ROW(r) * cdim + c];
+        }
+        """
+
+    private static let unrolledChainSource = """
+        #define STEP_ROW(t) (t)
+        #define TAIL_ROW(r) (NT + (r))
+
+        """ + unrolledBody
+
+    private static let unrolledTreeSource = """
+        #define STEP_ROW(t) uint(tree_rows[t])
+        #define TAIL_ROW(r) ((NT + (r)) < 3u ? (NT + (r)) : 3u + uint(tree_rows[NT + (r) - 3u]))
+
+        """ + unrolledBody
+
+    private static let unrolledKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_replay_unrolled",
+        inputNames: ["k", "delta", "state_in", "conv_in"],
+        outputNames: ["state_out", "conv_tail"], source: unrolledChainSource,
+        ensureRowContiguous: true)
+
+    private static let unrolledTreeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_tree_replay_unrolled",
+        inputNames: ["k", "delta", "state_in", "conv_in", "tree_rows"],
+        outputNames: ["state_out", "conv_tail"], source: unrolledTreeSource,
+        ensureRowContiguous: true)
+
+    /// `GDN_REPLAY_UNROLL=0` keeps the record replay kernels.
+    static let unrolledOffered = ProcessInfo.processInfo.environment["GDN_REPLAY_UNROLL"] != "0"
+    /// Written once by `Qwen35FusedGDNVerify.prepare`; read-only afterwards.
+    nonisolated(unsafe) static var unrolledPassed = false
+
     static func run(
         committedRows: Int, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
-        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false
+        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false, unrolled: Bool? = nil
     ) -> (MLXArray, MLXArray)? {
         guard (1...16).contains(committedRows),
             k.ndim == 4, k.dim(0) == 1, (1...16).contains(k.dim(1)), k.dim(3) == 128,
@@ -3106,18 +3224,22 @@ private enum Qwen35DeltaReplay {
         }
         let inputs: [MLXArray]
         let selected: MLXFast.MLXFastKernel
+        let unroll = unrolled ?? unrolledPassed
         if let treeRows {
             guard treeRows.dtype == .int32, treeRows.ndim == 1,
                 treeRows.size == committedRows else { return nil }
             inputs = [k, delta, state, convInput, treeRows]
-            selected = treeKernel
+            selected = unroll ? unrolledTreeKernel : treeKernel
         } else {
-            inputs = [HostConstants.int32([Int32(committedRows)]), k, delta, state, convInput]
-            selected = kernel
+            inputs = unroll ? [k, delta, state, convInput]
+                : [HostConstants.int32([Int32(committedRows)]), k, delta, state, convInput]
+            selected = unroll ? unrolledKernel : kernel
         }
+        var template: [(String, Int)] = [("Dk", 128), ("Dv", 128), ("Hk", k.dim(2)), ("Hv", state.dim(1))]
+        if unroll { template.append(("NSTEP", committedRows)) }
         let result = selected(
             inputs,
-            template: [("Dk", 128), ("Dv", 128), ("Hk", k.dim(2)), ("Hv", state.dim(1))],
+            template: template,
             grid: (1024, 1, state.dim(1)), threadGroup: (128, 1, 1),
             outputShapes: [state.shape, [1, 3, convInput.dim(2)]],
             outputDTypes: [.float32, .float32])
