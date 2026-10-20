@@ -1200,6 +1200,10 @@ open class ArraysCache: BaseKVCache {
         public let rowCount: Int
         public let convStateRows: Int
         public let delta: MLXArray?
+        /// The pre-window conv rows, set only when `convInput` holds the window rows alone
+        /// (`rowCount` rows): logical row `L` of the conv window is `convState[L]` below
+        /// `convStateRows` and `convInput[L - convStateRows]` from there on.
+        public let convState: MLXArray?
 
         public init(
             convInput: MLXArray,
@@ -1213,9 +1217,11 @@ open class ArraysCache: BaseKVCache {
             rowCount: Int,
             convStateRows: Int,
             delta: MLXArray? = nil,
-            ssmPreIsRowContiguous: Bool = false
+            ssmPreIsRowContiguous: Bool = false,
+            convState: MLXArray? = nil
         ) {
             self.convInput = convInput
+            self.convState = convState
             self.q = q
             self.k = k
             self.v = v

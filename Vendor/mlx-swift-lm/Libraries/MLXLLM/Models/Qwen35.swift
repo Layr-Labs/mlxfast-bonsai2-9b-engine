@@ -2379,7 +2379,7 @@ enum Qwen35FusedGDNVerify {
 
     private static let tunedSource = tunedSourceFor(source)
 
-    private static func capturingDelta(_ s: String) -> String? {
+    private static func capturingDelta(_ s: String, dead: Bool = false) -> String? {
         let from = "const float delta = (vt[d] - kv[d]) * bt;"
         let vStore = "      v_out[(p * uint(Hv) + hv_idx) * uint(Dv) + dvblock * uint(DVPT) + col] = out;\n"
         let qkStore = """
@@ -2394,11 +2394,21 @@ enum Qwen35FusedGDNVerify {
                   ((device float4*)dst)[0] = normed;
                 }
             """
+        // The window copy is read only through its three boundary rows, which `conv_tail`
+        // and the replay already take from the inputs.
+        let qkConvStore = "          conv_in[t * C + c] = xin[t];\n"
+        let vConvStore = "      conv_in[t * C + c] = xv;\n"
         guard s.components(separatedBy: from).count == 2,
             s.components(separatedBy: vStore).count == 2,
-            s.components(separatedBy: qkStore).count == 2
+            s.components(separatedBy: qkStore).count == 2,
+            !dead || (s.components(separatedBy: qkConvStore).count == 2
+                && s.components(separatedBy: vConvStore).count == 2)
         else { return nil }
-        return s.replacingOccurrences(of: vStore, with: "")
+        let kept = dead
+            ? s.replacingOccurrences(of: qkConvStore, with: "")
+                .replacingOccurrences(of: vConvStore, with: "")
+            : s
+        return kept.replacingOccurrences(of: vStore, with: "")
             .replacingOccurrences(of: qkStore, with: kOnlyStore)
             .replacingOccurrences(of: from, with: """
             const float delta = (vt[d] - kv[d]) * bt;
@@ -2410,6 +2420,15 @@ enum Qwen35FusedGDNVerify {
             }
             """)
     }
+
+    private static let deltaKernelDead: MLXFast.MLXFastKernel? = {
+        guard deadOutputsOffered, let text = capturingDelta(source, dead: true) else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_fused_delta_nocv",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["k_out", "y", "state_out", "conv_tail", "delta_out"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
 
     private static let tunedKernel: MLXFast.MLXFastKernel? = {
         guard let text = tunedSource else { return nil }
@@ -2429,10 +2448,23 @@ enum Qwen35FusedGDNVerify {
             source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
 
+    private static let tunedDeltaKernelDead: MLXFast.MLXFastKernel? = {
+        guard deadOutputsOffered, let record = tunedSource,
+            let text = capturingDelta(record, dead: true) else { return nil }
+        return MLXFast.metalKernel(
+            name: "qwen35_gdn_verify_fused_sg16_delta_nocv",
+            inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in"],
+            outputNames: ["k_out", "y", "state_out", "conv_tail", "delta_out"],
+            source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
+    }()
+
+    static let deadOutputsOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS"] != "0"
     private static let tuneOffered = ProcessInfo.processInfo.environment["GDN_VERIFY_TUNE"] != "0"
     private static let deltaOffered = ProcessInfo.processInfo.environment["GDN_DELTA_REPLAY"] != "0"
     nonisolated(unsafe) private static var tunePassed = false
     nonisolated(unsafe) private static var deltaPassed = false
+    nonisolated(unsafe) private static var deadPassed = false
     nonisolated(unsafe) private static var prepared = false
 
     typealias VerifyResult = (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray?)
@@ -2712,7 +2744,8 @@ enum Qwen35FusedGDNVerify {
             header: Qwen35RegisterGatedSIMD.gateHeader)
     }()
 
-    private static func treeVariant(tuned: Bool, delta: Bool) -> MLXFast.MLXFastKernel? {
+    private static func treeVariant(tuned: Bool, delta: Bool, dead: Bool = false) -> MLXFast.MLXFastKernel? {
+        guard !dead || (delta && deadOutputsOffered) else { return nil }
         let record: String
         if tuned {
             guard let text = tunedSource else { return nil }
@@ -2735,14 +2768,17 @@ enum Qwen35FusedGDNVerify {
                 with: "if (tid < 256u) {\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;")
         }
         if delta {
-            guard let captured = capturingDelta(text) else { return nil }
+            guard let captured = capturingDelta(text, dead: dead) else { return nil }
             text = captured
         }
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
         return MLXFast.metalKernel(
-            name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : ""),
+            name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : "")
+                + (dead ? "_nocv" : ""),
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
-            outputNames: delta
+            outputNames: dead
+                ? ["k_out", "y", "state_out", "conv_tail", "delta_out"]
+                : delta
                 ? ["conv_in", "k_out", "y", "state_out", "conv_tail", "delta_out"]
                 : ["conv_in", "v_out", "q_out", "k_out", "y", "state_out", "conv_tail"],
             source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
@@ -2751,6 +2787,8 @@ enum Qwen35FusedGDNVerify {
     private static let deltaTreeKernel = treeVariant(tuned: false, delta: true)
     private static let tunedTreeKernel = treeVariant(tuned: true, delta: false)
     private static let tunedDeltaTreeKernel = treeVariant(tuned: true, delta: true)
+    private static let deltaTreeKernelDead = treeVariant(tuned: false, delta: true, dead: true)
+    private static let tunedDeltaTreeKernelDead = treeVariant(tuned: true, delta: true, dead: true)
 
     /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
     static func applyTree(
@@ -2783,10 +2821,13 @@ enum Qwen35FusedGDNVerify {
         let selected: MLXFast.MLXFastKernel?
         if tuned { selected = captureDelta ? tunedDeltaTreeKernel : tunedTreeKernel }
         else { selected = captureDelta ? deltaTreeKernel : treeKernel }
-        guard let selected else { return nil }
+        let deadKernel = captureDelta && deadPassed ? (tuned ? tunedDeltaTreeKernelDead : deltaTreeKernelDead) : nil
+        guard let selected = deadKernel ?? selected else { return nil }
         let qShape = [1, S, keyHeads, 128]
         let vShape = [1, S, valueHeads, 128]
-        let shapes = captureDelta
+        let shapes = deadKernel != nil
+            ? [qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C], [1, S, valueHeads, 129]]
+            : captureDelta
             ? [[1, S + 3, C], qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C], [1, S, valueHeads, 129]]
             : [[1, S + 3, C], vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C]]
         let o = selected(
@@ -2798,7 +2839,12 @@ enum Qwen35FusedGDNVerify {
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
             grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads), threadGroup: (tuned ? 512 : 256, 1, 1),
             outputShapes: shapes,
-            outputDTypes: captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+            outputDTypes: deadKernel != nil ? Array(repeating: .float32, count: 5)
+                : captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        if deadKernel != nil {
+            // `qkv` stands for the window rows of the conv input; the three rows before them are `convState`.
+            return (qkv, o[0], o[0], o[0], o[1], o[2], o[3], o[4])
+        }
         if captureDelta {
             return (o[0], o[1], o[1], o[1], o[2], o[3], o[4], o[5])
         }
@@ -2834,8 +2880,11 @@ enum Qwen35FusedGDNVerify {
         let wantsTuned = eligible && S == 16 && tunePassed
         let tuned = wantsTuned && (wantsDelta ? tunedDeltaKernel : tunedKernel) != nil
         let captureDelta = wantsDelta && (tuned ? tunedDeltaKernel : deltaKernel) != nil
+        let deadKernel = captureDelta && deadPassed ? (tuned ? tunedDeltaKernelDead : deltaKernelDead) : nil
         let selectedKernel: MLXFast.MLXFastKernel
-        if tuned {
+        if let deadKernel {
+            selectedKernel = deadKernel
+        } else if tuned {
             let selected = captureDelta ? tunedDeltaKernel : tunedKernel
             selectedKernel = selected ?? kernel
         } else {
@@ -2845,7 +2894,9 @@ enum Qwen35FusedGDNVerify {
         let vShape = [1, S, valueHeads, 128]
         let convShape = [1, S + 3, C]
         let tailShape = [1, 3, C]
-        let shapes = captureDelta
+        let shapes = deadKernel != nil
+            ? [qShape, vShape, [1, valueHeads, 128, 128], tailShape, [1, S, valueHeads, 129]]
+            : captureDelta
             ? [convShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape, [1, S, valueHeads, 129]]
             : [convShape, vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape]
         let outputs = selectedKernel(
@@ -2858,7 +2909,11 @@ enum Qwen35FusedGDNVerify {
             grid: (tuned ? 512 : 256, tuned ? 1 : 2, valueHeads),
             threadGroup: (tuned ? 512 : 256, 1, 1),
             outputShapes: shapes,
-            outputDTypes: captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+            outputDTypes: deadKernel != nil ? Array(repeating: .float32, count: 5)
+                : captureDelta ? [.float32, .float32, .float32, .float32, .float32, .float32] : [.float32, .float32, .float32, .float32, .float32, .float32, .float32])
+        if deadKernel != nil {
+            return (qkv, outputs[0], outputs[0], outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+        }
         if captureDelta {
             return (outputs[0], outputs[1], outputs[1], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5])
         }
@@ -2870,7 +2925,7 @@ enum Qwen35FusedGDNVerify {
         prepared = true
         guard tuneOffered || deltaOffered else { return }
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
-        var verdict = (false, false, false)
+        var verdict = (false, false, false, false)
         do {
             verdict = try withError { checkPreparedKernels() }
         } catch {
@@ -2879,8 +2934,9 @@ enum Qwen35FusedGDNVerify {
         tunePassed = tuneOffered && verdict.0
         deltaPassed = deltaOffered && verdict.1
         Qwen35DeltaReplay.unrolledPassed = deltaPassed && Qwen35DeltaReplay.unrolledOffered && verdict.2
+        deadPassed = deltaPassed && deadOutputsOffered && verdict.3
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
-            + " unroll=\(Qwen35DeltaReplay.unrolledPassed)\n"
+            + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
     }
 
@@ -2924,9 +2980,12 @@ enum Qwen35FusedGDNVerify {
         [a.0, a.3, a.4, a.5, a.6]
     }
 
-    private static func probeForward(_ inputs: [MLXArray], tuned: Bool, delta: Bool, tree: MLXArray? = nil) -> VerifyResult? {
+    private static func probeForward(
+        _ inputs: [MLXArray], tuned: Bool, delta: Bool, tree: MLXArray? = nil, dead: Bool = false
+    ) -> VerifyResult? {
         tunePassed = tuned
         deltaPassed = delta
+        deadPassed = dead
         if let tree {
             return applyTree(convState: inputs[0], qkv: inputs[1], convWeight: inputs[2],
                 a: inputs[3], b: inputs[4], aLog: inputs[5], dtBias: inputs[6],
@@ -2953,14 +3012,18 @@ enum Qwen35FusedGDNVerify {
         return (MLXArray(descriptor), paths)
     }
 
-    private static func checkPreparedKernels() -> (Bool, Bool, Bool) {
-        defer { tunePassed = false; deltaPassed = false }
+    private static func checkPreparedKernels() -> (Bool, Bool, Bool, Bool) {
+        defer { tunePassed = false; deltaPassed = false; deadPassed = false }
         guard tunedKernel != nil, tunedDeltaKernel != nil, deltaKernel != nil,
             deltaTreeKernel != nil, tunedTreeKernel != nil, tunedDeltaTreeKernel != nil
-        else { return (false, false, false) }
+        else { return (false, false, false, false) }
         var tuneOK = true
         var deltaOK = true
         var unrollOK = true
+        var deadOK = deadOutputsOffered && deltaKernelDead != nil && tunedDeltaKernelDead != nil
+            && deltaTreeKernelDead != nil && tunedDeltaTreeKernelDead != nil
+        let negativeControl = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS_NEGCTL"] == "1"
+        var splitUnrollOK = true
         for kind in 0..<3 {
             let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
             let qkv = kind == 2 ? probeWords([1, 16, 8192])
@@ -2984,12 +3047,12 @@ enum Qwen35FusedGDNVerify {
                 let tuned = probeForward(inputs, tuned: true, delta: false, tree: tree),
                 let plainCapture = probeForward(inputs, tuned: false, delta: true, tree: tree),
                 let tunedCapture = probeForward(inputs, tuned: true, delta: true, tree: tree)
-            else { return (false, false, false) }
+            else { return (false, false, false, false) }
             tuneOK = sameBits(seven(record), seven(tuned)) && tuneOK
             deltaOK = sameBits(five(record), five(plainCapture)) && deltaOK
             deltaOK = sameBits(five(record), five(tunedCapture)) && deltaOK
             for capture in [plainCapture, tunedCapture] {
-                guard let tape = capture.7 else { return (false, false, false) }
+                guard let tape = capture.7 else { return (false, false, false, false) }
                 let paths = descriptor.map { $0.1 }
                     ?? (1...16).map { (steps: Int) -> [Int] in Array(0..<steps) }
                 for path in paths {
@@ -3000,7 +3063,7 @@ enum Qwen35FusedGDNVerify {
                         guard let replay = Qwen35RegisterGatedSIMD.runTreeReplay(q: record.2,
                             k: record.3, v: record.1, a: a, b: b, aLog: aLog, dtBias: bias,
                             state: state, convInput: record.0, rows: treeRows)
-                        else { return (false, false, false) }
+                        else { return (false, false, false, false) }
                         old = replay
                     } else {
                         old = Qwen35RegisterGatedSIMD.runReplay(q: q, k: record.3, v: record.1,
@@ -3009,7 +3072,7 @@ enum Qwen35FusedGDNVerify {
                     guard let new = Qwen35DeltaReplay.run(committedRows: path.count, k: capture.3, delta: tape,
                         state: state, convInput: capture.0, treeRows: treeRows, stateIsRowContiguous: true,
                         unrolled: false)
-                    else { return (false, false, false) }
+                    else { return (false, false, false, false) }
                     deltaOK = sameBits([old.0, old.1], [new.0, new.1]) && deltaOK
                     // A failure of the unrolled variant only keeps the record replay kernels.
                     let unrolledSame = (try? withError { () -> Bool in
@@ -3022,9 +3085,52 @@ enum Qwen35FusedGDNVerify {
                     unrollOK = unrolledSame && unrollOK
                 }
             }
+            for tuned in [false, true] where deadOK {
+                // The dead-output kernels hand back the window rows and leave the three boundary
+                // rows to `convState`; everything else is the record's bits.
+                guard let dead = probeForward(inputs, tuned: tuned, delta: true, tree: tree, dead: true),
+                    let deadTape = dead.7, let capturedTape = plainCapture.7
+                else { deadOK = false; break }
+                let probeWindow = negativeControl ? dead.0 + 1 : dead.0
+                let probeState = negativeControl ? convState + 1 : convState
+                deadOK = sameBits([probeWindow, dead.3, dead.4, dead.5, dead.6, deadTape],
+                    [qkv, record.3, record.4, record.5, record.6, capturedTape]) && deadOK
+                deadOK = sameBits([record.0], [concatenated([convState, qkv], axis: 1)]) && deadOK
+                let paths = descriptor.map { $0.1 }
+                    ?? (1...16).map { (steps: Int) -> [Int] in Array(0..<steps) }
+                for path in paths {
+                    let treeRows = tree == nil ? nil : MLXArray(path)
+                    let old: (MLXArray, MLXArray)
+                    if let treeRows {
+                        guard let replay = Qwen35RegisterGatedSIMD.runTreeReplay(q: record.2,
+                            k: record.3, v: record.1, a: a, b: b, aLog: aLog, dtBias: bias,
+                            state: state, convInput: record.0, rows: treeRows)
+                        else { deadOK = false; break }
+                        old = replay
+                    } else {
+                        old = Qwen35RegisterGatedSIMD.runReplay(
+                            q: record.2[0..., 0..<path.count, 0...], k: record.3, v: record.1,
+                            a: a, b: b, aLog: aLog, dtBias: bias, state: state, convInput: record.0)
+                    }
+                    guard let new = Qwen35DeltaReplay.run(committedRows: path.count, k: dead.3, delta: deadTape,
+                        state: state, convInput: dead.0, treeRows: treeRows, stateIsRowContiguous: true,
+                        unrolled: false, convState: probeState)
+                    else { deadOK = false; break }
+                    deadOK = sameBits([old.0, old.1], [new.0, new.1]) && deadOK
+                    // A failure of the unrolled split variant only keeps the record kernels.
+                    let splitUnrolledSame = (try? withError { () -> Bool in
+                        guard let unrolled = Qwen35DeltaReplay.run(committedRows: path.count, k: dead.3,
+                            delta: deadTape, state: state, convInput: dead.0, treeRows: treeRows,
+                            stateIsRowContiguous: true, unrolled: true, convState: probeState)
+                        else { return false }
+                        return sameBits([new.0, new.1], [unrolled.0, unrolled.1])
+                    }) ?? false
+                    splitUnrollOK = splitUnrolledSame && splitUnrollOK
+                }
+            }
         }
         }
-        return (tuneOK, deltaOK, unrollOK)
+        return (tuneOK, deltaOK, unrollOK, deadOK && (splitUnrollOK || !unrollOK))
     }
 
 }
@@ -3205,9 +3311,60 @@ private enum Qwen35DeltaReplay {
     /// Written once by `Qwen35FusedGDNVerify.prepare`; read-only afterwards.
     nonisolated(unsafe) static var unrolledPassed = false
 
+    /// The same kernels with the conv window split in two inputs: `conv_state` holds logical
+    /// rows 0 ..< 3 and `conv_in` the window rows after them. The tail copy takes the same bits.
+    private static let splitSource = source
+        .replacingOccurrences(
+            of: "const device uint* src = (const device uint*)conv_in;",
+            with: "const device uint* src = (const device uint*)conv_in;\n        const device uint* sst = (const device uint*)conv_state;")
+        .replacingOccurrences(
+            of: "dst[i] = src[(T + r) * cdim + c];",
+            with: "const uint row = T + r;\n          dst[i] = row < 3u ? sst[row * cdim + c] : src[(row - 3u) * cdim + c];")
+
+    private static let splitKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_replay_split",
+        inputNames: ["t_in", "k", "delta", "state_in", "conv_state", "conv_in"],
+        outputNames: ["state_out", "conv_tail"], source: splitSource, ensureRowContiguous: true)
+
+    private static let splitTreeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_tree_replay_split",
+        inputNames: ["k", "delta", "state_in", "conv_state", "conv_in", "tree_rows"],
+        outputNames: ["state_out", "conv_tail"],
+        source: splitSource
+            .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
+            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+            .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
+            .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
+            .replacingOccurrences(of: "const uint row = T + r;", with: "const uint row = (T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u]);"),
+        ensureRowContiguous: true)
+
+    private static func splitUnrolled(_ text: String) -> String {
+        text.replacingOccurrences(
+                of: "const device uint* src = (const device uint*)conv_in;",
+                with: "const device uint* src = (const device uint*)conv_in;\n        const device uint* sst = (const device uint*)conv_state;")
+            .replacingOccurrences(
+                of: "dst[i] = src[TAIL_ROW(r) * cdim + c];",
+                with: "const uint row = TAIL_ROW(r);\n          dst[i] = row < 3u ? sst[row * cdim + c] : src[(row - 3u) * cdim + c];")
+    }
+
+    private static let unrolledSplitKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_replay_unrolled_split",
+        inputNames: ["k", "delta", "state_in", "conv_state", "conv_in"],
+        outputNames: ["state_out", "conv_tail"], source: splitUnrolled(unrolledChainSource),
+        ensureRowContiguous: true)
+
+    private static let unrolledSplitTreeKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_delta_tree_replay_unrolled_split",
+        inputNames: ["k", "delta", "state_in", "conv_state", "conv_in", "tree_rows"],
+        outputNames: ["state_out", "conv_tail"], source: splitUnrolled(unrolledTreeSource),
+        ensureRowContiguous: true)
+
+    /// `convState` set: `convInput` is the verify window alone (`Qwen35FusedGDNVerify` without
+    /// its conv copy) and `convState` the three rows before it.
     static func run(
         committedRows: Int, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
-        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false, unrolled: Bool? = nil
+        treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false, unrolled: Bool? = nil,
+        convState: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard (1...16).contains(committedRows),
             k.ndim == 4, k.dim(0) == 1, (1...16).contains(k.dim(1)), k.dim(3) == 128,
@@ -3225,15 +3382,25 @@ private enum Qwen35DeltaReplay {
         let inputs: [MLXArray]
         let selected: MLXFast.MLXFastKernel
         let unroll = unrolled ?? unrolledPassed
+        if let convState {
+            guard convState.shape == [1, 3, convInput.dim(2)], convState.dtype == .float32,
+                convInput.dim(1) == k.dim(1), convInput.dtype == .float32 else { return nil }
+        }
         if let treeRows {
             guard treeRows.dtype == .int32, treeRows.ndim == 1,
                 treeRows.size == committedRows else { return nil }
-            inputs = [k, delta, state, convInput, treeRows]
-            selected = unroll ? unrolledTreeKernel : treeKernel
+            inputs = convState.map { [k, delta, state, $0, convInput, treeRows] }
+                ?? [k, delta, state, convInput, treeRows]
+            selected = convState == nil
+                ? (unroll ? unrolledTreeKernel : treeKernel)
+                : (unroll ? unrolledSplitTreeKernel : splitTreeKernel)
         } else {
-            inputs = unroll ? [k, delta, state, convInput]
-                : [HostConstants.int32([Int32(committedRows)]), k, delta, state, convInput]
-            selected = unroll ? unrolledKernel : kernel
+            let rows = HostConstants.int32([Int32(committedRows)])
+            let lead = unroll ? [k, delta, state] : [rows, k, delta, state]
+            inputs = lead + (convState.map { [$0, convInput] } ?? [convInput])
+            selected = convState == nil
+                ? (unroll ? unrolledKernel : kernel)
+                : (unroll ? unrolledSplitKernel : splitKernel)
         }
         var template: [(String, Int)] = [("Dk", 128), ("Dv", 128), ("Hk", k.dim(2)), ("Hv", state.dim(1))]
         if unroll { template.append(("NSTEP", committedRows)) }
@@ -3864,7 +4031,9 @@ final class Qwen35GatedDeltaNet: Module {
         else { return false }
 
         let batch = tape.k.dim(0)
-        guard tape.convInput.shape3 == (batch, tape.convStateRows + tape.rowCount, convDim),
+        let windowRows = tape.convState == nil ? tape.convStateRows + tape.rowCount : tape.rowCount
+        guard tape.convInput.shape3 == (batch, windowRows, convDim),
+              tape.convState.map({ $0.shape3 == (batch, tape.convStateRows, convDim) }) ?? true,
               tape.k.shape4 == (batch, tape.rowCount, numKHeads, headKDim),
               tape.a.shape3 == (batch, tape.rowCount, numVHeads),
               tape.b.shape3 == (batch, tape.rowCount, numVHeads),
@@ -3913,9 +4082,10 @@ final class Qwen35GatedDeltaNet: Module {
                 let replay = Qwen35DeltaReplay.run(committedRows: committedRows, k: tape.k, delta: delta,
                     state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
                     convInput: tape.convInput, treeRows: pathArray,
-                    stateIsRowContiguous: tape.ssmPreIsRowContiguous)
+                    stateIsRowContiguous: tape.ssmPreIsRowContiguous, convState: tape.convState)
             { return CBv2RecurrentLayerState(
                 conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true) }
+            precondition(tape.convState == nil, "Qwen35 tree commit: split conv window needs the delta replay")
             guard let replayed = Qwen35RegisterGatedSIMD.runTreeReplay(
                     q: tape.q, k: tape.k, v: tape.v, a: tape.a, b: tape.b, aLog: aLog, dtBias: dtBias,
                     state: ssmPre.dtype == .float32 ? ssmPre : ssmPre.asType(.float32),
@@ -3940,9 +4110,10 @@ final class Qwen35GatedDeltaNet: Module {
                 let replay = Qwen35DeltaReplay.run(
                     committedRows: committedRows, k: tape.k, delta: delta,
                     state: floatState, convInput: tape.convInput,
-                    stateIsRowContiguous: tape.ssmPreIsRowContiguous)
+                    stateIsRowContiguous: tape.ssmPreIsRowContiguous, convState: tape.convState)
             { return CBv2RecurrentLayerState(
                 conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true) }
+            precondition(tape.convState == nil, "Qwen35 commit: split conv window needs the delta replay")
             let (boundarySsm, boundaryConv) = Qwen35RegisterGatedSIMD.runReplay(
                 q: tape.q[0..., rows, 0...],
                 k: tape.k,
@@ -4302,6 +4473,9 @@ final class Qwen35GatedDeltaNet: Module {
             let fusedTail = fusedMiddle?.6
             let finalSSMIsRowContiguous = fusedMiddle != nil
             let capturedDelta = fusedMiddle.flatMap { $0.7 }
+            // The dead-output verify kernel hands back the window rows alone, not a copy with
+            // the three conv state rows in front.
+            let splitConvWindow = capturedDelta != nil && convInput.dim(1) == S
             for (row, evaluation) in recurrentState.enumerated() {
                 let finalConv: MLXArray
                 let finalSSM: MLXArray
@@ -4323,7 +4497,8 @@ final class Qwen35GatedDeltaNet: Module {
                         convStateRows: nKeep,
                         delta: capturedDelta,
                         ssmPreIsRowContiguous: evaluation.inputState(
-                            modelLayerIndex: modelLayerIndex)?.ssmIsRowContiguous == true)
+                            modelLayerIndex: modelLayerIndex)?.ssmIsRowContiguous == true,
+                        convState: splitConvWindow ? convState : nil)
                     convOutBacking = convOut
                 } else {
                     let rowRange = row ..< (row + 1)
@@ -4346,6 +4521,7 @@ final class Qwen35GatedDeltaNet: Module {
                 var roots: [MLXArray]
                 if let delta = tape.delta, tape.ssmPreIsRowContiguous {
                     roots = [tape.convInput, tape.k, delta]
+                    if let convState = tape.convState { roots.append(convState) }
                 } else {
                     roots = [
                         tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
