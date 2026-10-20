@@ -5949,14 +5949,15 @@ enum DF2Fast {
         return (outs[0].reshaped([1, P]), outs[1])
     }
 
-    /// `treeSelector`'s outputs `[tokens [P], desc [333]]` (or `kernel`'s, a 512-thread twin), unchecked.
+    /// `treeSelector`'s outputs `[tokens [P], desc [333]]` (or `kernel`'s, a 256-thread twin), unchecked.
     static func recordTreeOutputs(
         top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray?, succLookup: MLXArray?, kernel: MLXFast.MLXFastKernel? = nil
     ) -> [MLXArray] {
         let P = top[0].dim(0)
         precondition(P == 15, "DF2 tree: block of \(P) positions")
-        let threads = 512
+        // Keep the reference at 512; qualify and run the lean twin with eight SIMD groups.
+        let threads = kernel == nil ? 512 : 256
         return (kernel ?? treeSelector!)(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
@@ -7447,7 +7448,7 @@ private enum DraftSDPA {
 ///
 /// - Each lane's edge loop runs a constant 4 steps (`r = lane + 64 i`, and lane < 32 makes
 ///   `r >> 6 == i`), so the loads of its codebook words issue together.
-/// - Up to 256 of the 512 threads build the tokens and the descriptor instead of thread 0 alone. A
+/// - Up to 256 threads build the tokens and the descriptor instead of thread 0 alone. A
 ///   node's row is 1 + its preorder rank, and preorder is the order of the nodes' root paths read
 ///   as 60-bit keys of 4-bit expansion indices, root first: a child is expanded after its parent,
 ///   and the record's walk visits siblings in expansion order.
@@ -7526,7 +7527,7 @@ private enum DF2LeanIndex {
         return ok ? s : nil
     }
 
-    /// Launched only by `recordTreeOutputs`, with 512 threads (the tail needs 256).
+    /// Launched only by `recordTreeOutputs`, with 256 threads (the tail needs all 256).
     static let tree: MLXFast.MLXFastKernel? = {
         guard enabled, let source = DF2Fast.treeSource.flatMap(treeSource) else { return nil }
         return MLXFast.metalKernel(
