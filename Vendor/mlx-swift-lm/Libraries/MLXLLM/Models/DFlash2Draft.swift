@@ -1858,11 +1858,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 // Launch the first layer promptly, then hand off pairs and the tail.
                 if index == 0 || (index + 1) % 2 == 0 || isLast {
                     if let normed {
-                        if isLast {
-                            asyncEval(normed)
-                        } else {
-                            asyncEval(h, normed)
-                        }
+                        // Both outputs share the fused primitive; evaluating normed schedules h too.
+                        asyncEval(normed)
                     } else {
                         asyncEval(h)
                     }
@@ -5473,8 +5470,8 @@ enum DF2Fast {
             }
             """
 
-    /// Off by default (the record top-k runs); `DARKBLOOM_BONSAI_DF2_TOPK_FAST=1` turns the fast top-k on.
-    static let topkFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOPK_FAST"] == "1"
+    /// `DARKBLOOM_BONSAI_DF2_TOPK_FAST=0` keeps the record top-k.
+    static let topkFastAllowed = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DF2_TOPK_FAST"] != "0"
     /// Written once by `prepareTopkFast` at bind, before any proposal; read-only afterwards.
     nonisolated(unsafe) static var topkFastPassed = false
     nonisolated(unsafe) private static var topkFastPrepared = false
@@ -5534,7 +5531,7 @@ enum DF2Fast {
     static func prepareTopkFast() {
         guard !topkFastPrepared else { return }
         topkFastPrepared = true
-        var note = "off (DARKBLOOM_BONSAI_DF2_TOPK_FAST is not 1)"
+        var note = "off (DARKBLOOM_BONSAI_DF2_TOPK_FAST=0)"
         if topkFastAllowed, let fast = topkFast {
             do {
                 let detail: String? = try withError { try topkFastMismatch(fast) }
@@ -5985,10 +5982,9 @@ extension DF2Fast {
     /// rows, and an expanded out-of-range id is out of bounds there too. S' runs the 15 expansions on
     /// one simdgroup, reading the expanded node's edge row by its slot, never by token. The merge, edge, softmax and descriptor
     /// text is cut from `treeSource` and `selectorEdgeText`; `prepare` qualifies the three kernels
-    /// against the record kernel once, at bind. Off by default (the record kernel runs);
-    /// `DARKBLOOM_BONSAI_TREE_WIDE=1` turns the three kernels on.
+    /// against the record kernel once, at bind. `DARKBLOOM_BONSAI_TREE_WIDE=0` keeps the record kernel.
     enum TreeWide {
-        static let enabled: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_WIDE"] == "1"
+        static let enabled: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_WIDE"] != "0"
         /// Written once by `prepare` at bind, before any proposal; read-only afterwards.
         nonisolated(unsafe) static var passed = false
         nonisolated(unsafe) static var prepared = false
@@ -6478,7 +6474,7 @@ extension DF2Fast {
         static func prepare(selector: DFlash2CandidateSelector, vocabulary: Int) {
             guard !prepared else { return }
             prepared = true
-            var note: String = "off (DARKBLOOM_BONSAI_TREE_WIDE is not 1)"
+            var note: String = "off (DARKBLOOM_BONSAI_TREE_WIDE=0)"
             if enabled && !treeOn {
                 note = "off (tree selector off)"
             } else if enabled, let kernels {

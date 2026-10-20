@@ -6836,10 +6836,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
     /// that row count run here, at load, instead of inside the first round.
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
-        if rows == 16 {
-            Qwen35FusedGDNVerify.prepare()
-            CBv2VerifyAttentionPartial.prepareLean()
-        }
+        if rows == 16 { Qwen35FusedGDNVerify.prepare() }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }

@@ -1300,201 +1300,6 @@ enum CBv2VerifyVectorAttention {
             }
             """
 
-    /// `DARKBLOOM_BONSAI_VATTN_LEAN=0` keeps the record partial kernels.
-    private static let leanSwitch: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VATTN_LEAN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    /// Lean twin of a record partial source (same keys in the same order, same floating-point
-    /// operations on the same values). The key and value rows come from running pointers stepped
-    /// by 32 rows, in 32-bit row strides, where the record multiplies the row by the 64-bit
-    /// stride at every key. The tree twin runs the chain keys (rows before the window) in that
-    /// loop and peels the window key: with a depth below 32 a class has at most one, it is the
-    /// class's last key, and it sits at `tree_d` rows into the window, so the per-key window test
-    /// and row select go away. nil when an anchor is missing.
-    static func leanSource(_ record: String, tree: Bool) -> String? {
-        let header = "for (int i = c; i <= limit; i += 32) {"
-        let footer = "\n}\n#pragma clang loop unroll(full)\nfor (int h = 0; h < G; h++) {\n  const uint slot"
-        let limitLine = "const int limit = N - int(L) + int(t);"
-        func once(_ text: String, _ piece: String) -> Range<String.Index>? {
-            guard text.components(separatedBy: piece).count == 2 else { return nil }
-            return text.range(of: piece)
-        }
-        guard let head = once(record, header), let foot = once(record, footer),
-            head.upperBound <= foot.lowerBound
-        else { return nil }
-        var prefix = String(record[..<head.lowerBound])
-        let suffix = String(record[foot.lowerBound...])
-        var body = String(record[head.upperBound ..< foot.lowerBound])
-        func swap(_ text: inout String, _ from: String, _ to: String, count: Int = 1) -> Bool {
-            guard text.components(separatedBy: from).count == count + 1 else { return false }
-            text = text.replacingOccurrences(of: from, with: to)
-            return true
-        }
-        var ok = swap(&prefix, "const int64_t ks = keys_strides[2];",
-                "const int ks = int(keys_strides[2]);\nconst int kstep = 32 * ks;")
-            && swap(&prefix, "const int64_t vs = values_strides[2];",
-                "const int vs = int(values_strides[2]);\nconst int vstep = 32 * vs;")
-            && swap(&body, "(kp + i * ks + ", "(kr + ", count: 2)
-            && swap(&body, "(vp + i * vs + ", "(vr + ", count: 2)
-        guard ok else { return nil }
-        if !tree {
-            return prefix
-                + "const device float* kr = kp + c * ks;\nconst device float* vr = vp + c * vs;\n"
-                + "for (int i = c; i <= limit; i += 32, kr += kstep, vr += vstep) {"
-                + body + suffix
-        }
-        ok = swap(&prefix, limitLine, """
-            const int tv_base = N - int(L);
-            const int tree_depth = tree[16 + t];
-            const int tree_d = (c - tv_base) & 31;
-            const int tree_pi = tv_base + (tree_d <= tree_depth ? tree[32 + 16 * t + tree_d] : 0);
-            """)
-        guard ok else { return nil }
-        return prefix
-            + "const device float* kr = kp + c * ks;\nconst device float* vr = vp + c * vs;\n"
-            + "for (int i = c; i < tv_base; i += 32, kr += kstep, vr += vstep) {"
-            + body
-            + "\n}\nif (tree_d <= tree_depth) {\n"
-            + "const device float* kr = kp + tree_pi * ks;\nconst device float* vr = vp + tree_pi * vs;"
-            + body + suffix
-    }
-
-    private static func leanKernel(_ name: String, _ source: String?, tree: Bool)
-        -> MLXFast.MLXFastKernel?
-    {
-        guard leanSwitch, let source else { return nil }
-        return MLXFast.metalKernel(
-            name: name,
-            inputNames: tree ? ["queries", "keys", "values", "n_keys", "tree"]
-                : ["queries", "keys", "values", "n_keys"],
-            outputNames: ["part_o", "part_m", "part_s"],
-            source: source,
-            ensureRowContiguous: false)
-    }
-
-    private static let partialLean = leanKernel(
-        "cbv2_verify_sdpa_partial_lean", leanSource(partialSource, tree: false), tree: false)
-    private static let partialTreeLean = leanKernel(
-        "cbv2_verify_sdpa_partial_tree_lean", leanSource(partialSource, tree: true), tree: true)
-    private static let pairedLean = leanKernel(
-        "cbv2_verify_sdpa_paired_lean", leanSource(pairedSource, tree: false), tree: false)
-    private static let pairedTreeLean = leanKernel(
-        "cbv2_verify_sdpa_paired_tree_lean", leanSource(pairedSource, tree: true), tree: true)
-
-    /// The partial states `[part_o, part_m, part_s]` of the record kernel this device dispatches,
-    /// or of its lean twin when `lean` and the twin exists. `tree` is nil for a chain verify.
-    private static func launchStates(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, params: MLXArray,
-        tree: MLXArray?, L: Int, lean: Bool
-    ) -> [MLXArray]? {
-        let inputs = tree.map { [queries, keys, values, params, $0] } ?? [queries, keys, values, params]
-        let outputShapes = [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]]
-        let outputDTypes: [DType] = [.float32, .float32, .float32]
-        let isTree = tree != nil
-        if L > 8 && classesPerGroup == 2 {
-            let twin = lean ? (isTree ? pairedTreeLean : pairedLean) : nil
-            guard let kernel = twin ?? (isTree ? pairedTree : pairedPartial) else { return nil }
-            return kernel(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
-                outputShapes: outputShapes, outputDTypes: outputDTypes)
-        }
-        let twin = lean ? (isTree ? partialTreeLean : partialLean) : nil
-        guard let kernel = twin ?? (isTree ? partialTree : partial) else { return nil }
-        return kernel(
-            inputs, template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
-            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
-            outputShapes: outputShapes, outputDTypes: outputDTypes)
-    }
-
-    /// True when the 32-bit row offsets of the lean twins cannot overflow for `array`.
-    private static func leanStrideFits(_ array: MLXArray, keys nKeys: Int) -> Bool {
-        guard let s = mlx_array_strides(array.ctx) else { return false }
-        let rowStride = Int(s[2])
-        return rowStride >= 0 && (nKeys + 64) * rowStride < Int(Int32.max)
-    }
-
-    private static func leanApplies(keys: MLXArray, values: MLXArray, nKeys: Int) -> Bool {
-        leanVerdict && leanStrideFits(keys, keys: nKeys) && leanStrideFits(values, keys: nKeys)
-    }
-
-    /// Whether this device's lean twins gave the record kernels' bits on fixed probes (chain and
-    /// tree, the two row counts the engine verifies, window-edge key counts), checked once. A GPU
-    /// with one class per group keeps the record kernels, since the check's
-    /// largest launch does not exist there.
-    private static let leanVerdict: Bool = {
-        guard leanSwitch else { return false }
-        var passed = false
-        do {
-            passed = try withError { checkLean() }
-        } catch {
-            FileHandle.standardError.write(Data("vattn lean check error: \(error)\n".utf8))
-        }
-        FileHandle.standardError.write(Data("vattn lean checked: \(passed)\n".utf8))
-        return passed
-    }()
-
-    static func prepareLean() { _ = leanVerdict }
-
-    private static func probe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
-        let n = shape.reduce(1, *)
-        let i = MLXArray(0 ..< n).asType(.float32)
-        let amplitude = 1 + 0.5 * MLX.cos(i * 0.0137 + seed)
-        return (MLX.sin(i * (0.7548776 + seed)) * amplitude * scale).reshaped(shape)
-    }
-
-    private static func probeTree(_ parents: [Int]) -> MLXArray {
-        var paths = [[Int]]()
-        for row in parents.indices {
-            var path = parents[row] < 0 ? [] : paths[parents[row]]
-            path.append(row)
-            paths.append(path)
-        }
-        var descriptor = parents.map { Int32($0) }
-        descriptor += paths.map { Int32($0.count - 1) }
-        for path in paths {
-            descriptor += path.map { Int32($0) }
-            descriptor += Array(repeating: Int32(0), count: 16 - path.count)
-        }
-        return MLXArray(descriptor)
-    }
-
-    private static func checkLean() -> Bool {
-        guard classesPerGroup == 2 else { return false }
-        let trees: [[Int]] = [
-            Array(-1 ..< 15),
-            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
-        ]
-        let treeChoices: [MLXArray?] = [nil] + trees.map { probeTree($0) }
-        for L in [16, 7] {
-            let queries = probe([1, 16, L, 256], seed: 0.01, scale: 1.5)
-            for nKeys in [L, L + 1, L + 31, L + 33, 512, 640] {
-                let keys = probe([1, 4, nKeys, 256], seed: 0.02, scale: 1.5)
-                let values = probe([1, 4, nKeys, 256], seed: 0.03, scale: 1.0)
-                let params = MLXArray([Int32(nKeys), Int32(bitPattern: Float(0.0625).bitPattern)])
-                for tree in treeChoices {
-                    guard
-                        let record = launchStates(
-                            queries: queries, keys: keys, values: values, params: params,
-                            tree: tree, L: L, lean: false),
-                        let lean = launchStates(
-                            queries: queries, keys: keys, values: values, params: params,
-                            tree: tree, L: L, lean: true)
-                    else { return false }
-                    for (a, b) in zip(record, lean) {
-                        let same = (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all().item(Bool.self)
-                        if !same { return false }
-                    }
-                }
-            }
-        }
-        return true
-    }
-
     /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
@@ -1514,12 +1319,26 @@ enum CBv2VerifyVectorAttention {
         let L = qShape.2
         let nKeys = kShape.2
         let params = HostConstants.recentInt32([Int32(nKeys), Int32(bitPattern: scale.bitPattern)])
-        guard let states = launchStates(
-            queries: queries, keys: keys, values: values, params: params, tree: nil, L: L,
-            lean: leanApplies(keys: keys, values: values, nKeys: nKeys))
-        else { return nil }
+
+        if L > 8 && classesPerGroup == 2 {
+            let inputs = [queries, keys, values, params]
+            let states = CBv2VerifyAttentionPartial.noted(pairedPartial(
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
+                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+                outputDTypes: [.float32, .float32, .float32]))
+            return combine(
+                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+        }
+        let parts = CBv2VerifyAttentionPartial.noted(partial(
+            [queries, keys, values, params],
+            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
+            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+            outputDTypes: [.float32, .float32, .float32]))
         return combine(
-            CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
 
@@ -1542,12 +1361,27 @@ enum CBv2VerifyVectorAttention {
         else { return nil }
         let L = qShape.2
         let params = HostConstants.recentInt32([Int32(kShape.2), Int32(bitPattern: scale.bitPattern)])
-        guard let states = launchStates(
-            queries: queries, keys: keys, values: values, params: params, tree: tree, L: L,
-            lean: leanApplies(keys: keys, values: values, nKeys: kShape.2))
-        else { return nil }
+        let inputs = [queries, keys, values, params, tree]
+        if L > 8 && classesPerGroup == 2 {
+            guard let pairedTree else { return nil }
+            let states = CBv2VerifyAttentionPartial.noted(pairedTree(
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
+                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+                outputDTypes: [.float32, .float32, .float32]))
+            return combine(
+                states, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+        }
+        guard let partialTree else { return nil }
+        let parts = CBv2VerifyAttentionPartial.noted(partialTree(
+            inputs,
+            template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
+            grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
+            outputShapes: [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]],
+            outputDTypes: [.float32, .float32, .float32]))
         return combine(
-            CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+            parts, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
 }
@@ -1590,9 +1424,6 @@ public enum CBv2VerifyAttentionPartial {
         if active { captured = states[0] }
         return states
     }
-
-    /// Runs the lean twins' one-time bit check at load.
-    public static func prepareLean() { CBv2VerifyVectorAttention.prepareLean() }
 }
 
 /// Draft tree verify: the round's tree descriptor (int32 [333], `DF2Fast.treeSource`) for
