@@ -9146,8 +9146,8 @@ extension HadamardQuantizedLinear {
     /// Resolves the fast head gather once (drafter bind, before any request) and logs its state.
     public static func prepareDraftGather() { VerifyInt8Matmul.prepareGatherFast() }
 
-    /// The leading 128-groups (K 2048 of 4096) the screen scores every row on.
-    public static let draftScreenGroups = 16
+    /// The leading twelve 128-feature groups (1536 of 4096) used to screen every row.
+    public static let draftScreenGroups = 12
 
     private var draftScreenPacking: Bool {
         readsFloat16ConstantsInPlace && bits == 2 && groupSize == 128 && weight.dtype == .uint32
