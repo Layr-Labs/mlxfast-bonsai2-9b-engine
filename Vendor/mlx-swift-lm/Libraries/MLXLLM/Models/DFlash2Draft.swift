@@ -5945,7 +5945,7 @@ enum DF2Fast {
         let outs = recordTreeOutputs(
             top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
             predLookup: predLookup, succLookup: succLookup,
-            kernel: DF2LeanIndex.treePassed ? DF2LeanIndex.tree : nil)
+            kernel: DF2LeanIndex.tailPassed ? DF2LeanIndex.tail : (DF2LeanIndex.treePassed ? DF2LeanIndex.tree : nil))
         return (outs[0].reshaped([1, P]), outs[1])
     }
 
@@ -7459,6 +7459,14 @@ private enum DF2LeanIndex {
     /// Written once by `prepare` at drafter bind, before any proposal; read-only afterwards.
     nonisolated(unsafe) static var treePassed = false
     nonisolated(unsafe) private static var prepared = false
+    /// `DARKBLOOM_BONSAI_SERIAL_TAIL=0` keeps the lean twin's expansion loop (`tail` is never built).
+    static let tailEnabled = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SERIAL_TAIL"] != "0"
+    /// `DARKBLOOM_BONSAI_SERIAL_TAIL_NEGCTL=1` builds `tail` without its consumed-slot mask, so an
+    /// expanded slot can be picked again and the check must fail. Validation only.
+    static let tailNegativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SERIAL_TAIL_NEGCTL"] == "1"
+    /// Written once by `prepare` at drafter bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var tailPassed = false
 
     private static func swap(_ text: inout String, _ from: String, _ to: String) -> Bool {
         guard text.components(separatedBy: from).count == 2 else { return false }
@@ -7536,6 +7544,134 @@ private enum DF2LeanIndex {
             source: DF2Fast.treeConfigured(source))
     }()
 
+    private static let expansionSoftmax = """
+            if (tid < 16u) {
+              float mx = tev[0];
+              for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
+              if (TREE_SPLIT && e == 0) {
+                float z1 = 0.0f;
+                for (int c = 0; c < 16; c++) { z1 += metal::precise::exp(tev[c] - mx); }
+                if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }
+              }
+              float z = 0.0f, mine = 0.0f;
+              for (int c = 0; c < 16; c++) {
+                const float x = metal::precise::exp((tev[c] - mx) * tsc);
+                z += x;
+                if (c == int(tid)) { mine = x; }
+              }
+              fprob[16 * e + int(tid)] = pp * (mine / z);
+            }
+
+        """
+
+    private static let tailSoftmax = """
+            if (tid < 32u) {
+              float mx = tev[0];
+              for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
+              const int st_c = int(tid & 15u);
+              if (TREE_SPLIT && e == 0) {
+                const float x1 = metal::precise::exp(tev[st_c] - mx);
+                float z1 = 0.0f;
+                for (ushort c = 0; c < 16; c++) { z1 += simd_shuffle(x1, c); }
+                if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }
+              }
+              const float mine = metal::precise::exp((tev[st_c] - mx) * tsc);
+              float z = 0.0f;
+              for (ushort c = 0; c < 16; c++) { z += simd_shuffle(mine, c); }
+              if (tid < 16u) { fprob[16 * e + int(tid)] = pp * (mine / z); }
+            }
+
+        """
+
+    private static let expansionPick = """
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float bv = NEG;
+          int bs = 0x7fffffff;
+          for (uint s = tid; s < uint(16 * (e + 1)); s += NT) {
+            const float v = fprob[s];
+            if (v > bv) { bv = v; bs = int(s); }
+          }
+          const float m = simd_max(bv);
+          const int ms = simd_min(bv == m ? bs : 0x7fffffff);
+          if (lane == 0) { rv[sg] = m; ri[sg] = ms; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float wv = rv[0];
+          int ws = ri[0];
+          for (uint g = 1; g < NSG; g++) {
+            if (rv[g] > wv || (rv[g] == wv && ri[g] < ws)) { wv = rv[g]; ws = ri[g]; }
+          }
+          const int pe = ws / 16 - 1;
+          pj = ws % 16;
+          pd = pe < 0 ? 0 : nd[pe] + 1;
+          pr = tc[pd][pj];
+          pp = wv;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (tid == 0) { nd[e] = pd; nj[e] = pj; npar[e] = pe; fprob[ws] = NEG; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        """
+
+    private static func tailPick(mask: Bool) -> String {
+        """
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          float wv = NEG;
+          int ws = 0x7fffffff;
+          #pragma clang loop unroll(full)
+          for (int k = 0; k < 8; k++) {
+            const int s = int(lane) + 32 * k;
+            if (s < 16 * (e + 1)) {
+              const float v = ((st_used >> uint(k)) & 1u) != 0u ? NEG : fprob[s];
+              if (v > wv) { wv = v; ws = s; }
+            }
+          }
+          const float m = simd_max(wv);
+          ws = simd_min(wv == m ? ws : 0x7fffffff);
+          wv = m;
+          const int pe = ws / 16 - 1;
+          pj = ws % 16;
+          pd = pe < 0 ? 0 : nd[pe] + 1;
+          pr = tc[pd][pj];
+          pp = wv;
+          if (\(mask ? "ws < 256" : "false") && (ws & 31) == int(lane)) { st_used |= 1u << uint(ws >> 5); }
+          if (tid == 0) { nd[e] = pd; nj[e] = pj; npar[e] = pe; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        """
+    }
+
+    /// The lean twin with a shorter serial chain per expansion, cut by exact-once edits; every
+    /// floating-point operation and its order are the record's, or nil when a cut misses.
+    ///
+    /// - The 16-way softmax: lane c of simdgroup 0 takes the exp of score c, and every lane adds
+    ///   the 16 terms read back by `simd_shuffle` in the record's order c = 0...15.
+    /// - The pick: every simdgroup scans all open slots itself (8 per lane, ascending, strict `>`),
+    ///   then `simd_max` and the lowest slot holding it, which is the record's winner, with no
+    ///   per-simdgroup winners and no serial combine over them.
+    /// - Expanded slots live in a per-lane 8-bit mask instead of a thread-0 write of `-inf` into
+    ///   `fprob`, so `fprob` is written once and the two barriers around that write go. Thread 0's
+    ///   node writes (`nd[e]`, read only after a later barrier) stay; one barrier after the loop
+    ///   fences them for the descriptor.
+    static func tailSource(_ lean: String) -> String? {
+        var s = lean
+        let ok = swap(&s, "float tsc = TREE_SCALE;\n", "float tsc = TREE_SCALE;\nuint st_used = 0u;\n")
+            && swap(&s, expansionSoftmax, tailSoftmax)
+            && swap(&s, expansionPick, tailPick(mask: !tailNegativeControl))
+        return ok ? s : nil
+    }
+
+    /// Launched only by `recordTreeOutputs`, with 512 threads, like `tree`.
+    static let tail: MLXFast.MLXFastKernel? = {
+        guard enabled, tailEnabled, let source = DF2Fast.treeSource.flatMap(treeSource).flatMap(tailSource)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "df2_tree_tail_" + (DF2Fast.treeSplit ? "split" : (DF2Fast.treeSharp ? "t08" : "t10")),
+            inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+            outputNames: ["tokens", "desc"],
+            source: DF2Fast.treeConfigured(source))
+    }()
+
     /// Every tree case of `DF2Fast.TreeWide` (all codebook sets, all kinds) at three edge gains:
     /// the twin's tokens and descriptor against the record kernel's.
     private static func treeCheck(
@@ -7605,5 +7741,23 @@ private enum DF2LeanIndex {
         }
         if negativeControl { note += "; negative control" }
         FileHandle.standardError.write(Data("DF2 lean index tree: \(note)\n".utf8))
+        var tailNote: String
+        if !tailEnabled {
+            tailNote = "off (DARKBLOOM_BONSAI_SERIAL_TAIL=0)"
+        } else if !enabled || !DF2Fast.treeOn {
+            tailNote = "off (lean twin or tree selector off)"
+        } else if let tail {
+            do {
+                let (ok, detail) = try withError { try treeCheck(tail, selector: selector, vocabulary: vocabulary) }
+                tailPassed = ok
+                tailNote = (ok ? "on (" : "off (") + detail + ")"
+            } catch {
+                tailNote = "off (error: \(error))"
+            }
+        } else {
+            tailNote = "off (a cut of the lean source did not match once)"
+        }
+        if tailNegativeControl { tailNote += "; negative control" }
+        FileHandle.standardError.write(Data("DF2 serial tail tree: \(tailNote)\n".utf8))
     }
 }
