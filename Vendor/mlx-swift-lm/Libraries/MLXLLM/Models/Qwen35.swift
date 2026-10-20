@@ -3418,14 +3418,8 @@ final class Qwen35GatedDeltaNet: Module {
                 : HadamardQuantizedLinear.sharedShortProjections(inputs, [inProjQKV, inProjZ]))
             let qkv = shared?[0] ?? inProjQKV(inputs)
             let z = (shared?[1] ?? inProjZ(inputs)).reshaped(B, S, numVHeads, headVDim)
-            if let promptGates {
-                return (qkv, z, promptGates[0..., 0..., 0 ..< numVHeads],
-                    promptGates[0..., 0..., numVHeads...])
-            }
-            if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) {
-                return (qkv, z, ba.0, ba.1)
-            }
-            return (qkv, z, inProjB(inputs), inProjA(inputs))
+            let ba = projectBA(inputs, promptGates: promptGates)
+            return (qkv, z, ba.b, ba.a)
         }
         let outFused = fusedInProj(inputs)
         let qkvDim = keyDim * 2 + valueDim
@@ -3439,6 +3433,16 @@ final class Qwen35GatedDeltaNet: Module {
             outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
             outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
         )
+    }
+
+    /// b and a beside the unfused input projections: the halves of the
+    /// prompt gate GEMM when it ran, else the dense or the packed projections.
+    private func projectBA(_ inputs: MLXArray, promptGates: MLXArray?) -> (b: MLXArray, a: MLXArray) {
+        if let promptGates {
+            return (promptGates[0..., 0..., 0 ..< numVHeads], promptGates[0..., 0..., numVHeads...])
+        }
+        if let ba = Qwen35DenseGateProjection.apply(inputs, b: inProjB, a: inProjA) { return ba }
+        return (inProjB(inputs), inProjA(inputs))
     }
 
     /// `projectInputs` on the verify boundary with z out of the qkv launch
@@ -3970,7 +3974,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        promptProjections: [MLXArray]? = nil
+        promptProjections: [MLXArray]? = nil,
+        promptZ: ((MLXArray) -> MLXArray?)? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -3997,8 +4002,17 @@ final class Qwen35GatedDeltaNet: Module {
         let promptGates = canUsePromptMiddle(inputs, ssmState: ssmState)
             ? promptGateWeights.prepared(b: inProjB.weight, a: inProjA.weight).map { matmul(inputs, $0.T) }
             : nil
-        let (qkv, z, b, a) = projectInputs(
-            inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
+        // With `promptZ`, `promptProjections` holds qkv only and z is made
+        // after the recurrence, so its launch runs beside it (`PromptSplitZ`).
+        let qkv: MLXArray, projectedZ: MLXArray?, b: MLXArray, a: MLXArray
+        if promptZ != nil, !prepareFusedInputProjection(), let lead = promptProjections?.first {
+            let ba = projectBA(inputs, promptGates: promptGates)
+            (qkv, projectedZ, b, a) = (lead, nil, ba.b, ba.a)
+        } else {
+            let projected = projectInputs(
+                inputs, B: B, S: S, prompt: promptProjections, promptGates: promptGates)
+            (qkv, projectedZ, b, a) = (projected.qkv, projected.z, projected.b, projected.a)
+        }
         let middle = promptMiddle(
             inputs, qkv: qkv, a: a, b: b, convState: convState, ssmState: ssmState,
             freshState: B == 1 && recurrentState[0].inputState(modelLayerIndex: modelLayerIndex) == nil,
@@ -4032,6 +4046,8 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
+        let z = projectedZ ?? (promptZ.flatMap { $0(out) } ?? inProjZ(inputs))
+            .reshaped(B, S, numVHeads, headVDim)
         if out.ndim == 4, out.dim(-1) == 128, S >= 64,
             let packed = outProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterGatedNormPrompt(
@@ -5235,7 +5251,7 @@ final class Qwen35DecoderLayer: Module {
             } else if x.ndim == 3, x.dim(1) >= 128, let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
                     x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             {
                 // Prompt width: the input RMSNorm formed in the quantizing
@@ -5243,7 +5259,8 @@ final class Qwen35DecoderLayer: Module {
                 // `inputLayerNorm(x)` and its shared prompt codes).
                 r = linear.cbv2Forward(
                     normalized, modelLayerIndex: modelLayerIndex,
-                    recurrentState: recurrentState, promptProjections: prompt.projections)
+                    recurrentState: recurrentState, promptProjections: prompt.projections,
+                    promptZ: prompt.deferred)
             } else {
                 r = linearAttn!.cbv2Forward(
                     inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
@@ -5422,12 +5439,13 @@ extension Qwen35DecoderLayer {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
                     x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             else { return nil }
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
-                recurrentState: recurrentState, promptProjections: prompt.projections)
+                recurrentState: recurrentState, promptProjections: prompt.projections,
+                promptZ: prompt.deferred)
         } else {
             guard let attention = selfAttn, let attentionCache,
                 let prompt = HadamardQuantizedLinear.sharedNormPromptProjections(
@@ -5462,13 +5480,14 @@ extension Qwen35DecoderLayer {
             guard let linear = linearAttn,
                 let prompt = HadamardQuantizedLinear.sharedResidualNormPromptProjections(
                     x, delta: delta, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true),
+                    projections: [linear.inProjQKV, linear.inProjZ], normalized: true, deferLast: true),
                 let normalized = prompt.normalized
             else { return nil }
             inputResidual = prompt.residual
             r = linear.cbv2Forward(
                 normalized, modelLayerIndex: modelLayerIndex,
-                recurrentState: recurrentState, promptProjections: prompt.projections)
+                recurrentState: recurrentState, promptProjections: prompt.projections,
+                promptZ: prompt.deferred)
         } else {
             guard let attention = selfAttn, let attentionCache else { return nil }
             let lastQueryOnly = lastPositionOnly && attention.canUseLastQueryPrefill(
