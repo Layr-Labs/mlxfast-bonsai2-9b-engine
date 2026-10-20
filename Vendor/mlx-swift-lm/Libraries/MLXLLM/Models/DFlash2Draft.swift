@@ -2661,20 +2661,22 @@ enum DF2Fast {
         /// `w`, `sT` and `bT` are then released.
         var tiles: MLXArray? = nil
         private let sizeLock = NSLock()
-        private var cachedSizes: (words: [Int32], array: MLXArray)?
+        private var cachedSizes: (K: Int, rows: Int, ns: [Int], array: MLXArray)?
         init(w: MLXArray, sT: MLXArray, bT: MLXArray, n: Int, k: Int) {
             self.w = w; self.sT = sT; self.bT = bT; self.n = n; self.k = k
         }
 
         func dispatchSizes(K: Int, rows: Int, ns: [Int]) -> MLXArray {
-            let words = [Int32(K), Int32(rows)] + ns.map { Int32($0) }
             sizeLock.lock()
             defer { sizeLock.unlock() }
-            if let cachedSizes, cachedSizes.words == words {
+            if let cachedSizes, cachedSizes.K == K, cachedSizes.rows == rows,
+                cachedSizes.ns == ns
+            {
                 return cachedSizes.array
             }
+            let words = [Int32(K), Int32(rows)] + ns.map { Int32($0) }
             let array = MLXArray(words)
-            cachedSizes = (words, array)
+            cachedSizes = (K, rows, ns, array)
             return array
         }
     }
