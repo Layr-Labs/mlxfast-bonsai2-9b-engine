@@ -160,6 +160,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         /// Lazy proposals retained until the engine's finalize fence.
         var roots: [MLXArray] = []
         var prestaged: (anchor: Int, depth: Int, tokens: MLXArray)?
+        /// Trusted host anchors only; a request can widen but never shrink its budget.
+        var largestDraftAnchor = -1
         /// The in-flight verify's context projection (`projectRoundContext`),
         /// and how many of its columns the round committed (0 until then).
         var projection: DFlash2ContextProjection?
@@ -238,6 +240,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
             prestaged = nil
+            largestDraftAnchor = -1
             pendingRows = 0
             isReleased = true
         }
@@ -305,6 +308,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) throws -> MLXArray {
         let state = self.state(requestState)
+        state.largestDraftAnchor = max(state.largestDraftAnchor, anchor)
         // Prestage restores this key until the engine consumes its proposal.
         state.preparedLookup = nil
         if let p = state.prestaged {
@@ -371,9 +375,13 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             }
             state.cacheSeeded = true
         }
+        let draftRows = DF2Vocab.widths(
+            vocabularySize: drafter.config.vocabularySize,
+            topK: drafter.config.dflash.selectorTopK
+        ).first { $0 > state.largestDraftAnchor }
         let tokens = try drafter.propose(
             anchor: [anchor], targetHidden: context, cache: state.caches,
-            blockSize: depth + 1, projection: projection)
+            blockSize: depth + 1, projection: projection, draftRows: draftRows)
         state.absorbPending()
         state.contextAbsorbed = false
         state.roots.append(tokens)
