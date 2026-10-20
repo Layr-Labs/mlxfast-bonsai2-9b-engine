@@ -496,6 +496,10 @@ extension EngineLoopV2 {
             prefillCarries: prefillCarries)
     }
 
+    /// `DARKBLOOM_BONSAI_DEAD_WORK2=0` keeps the block drafter's KV buffers in the round's fence.
+    static let mtpFenceSkipsSubmittedDrafterState =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_WORK2"] != "0"
+
     /// A drafter's first round needs only the prompt's newest sampled token
     /// and the target's hidden at the position before it — the pair the
     /// prompt forward already computed — so a prompt row can carry straight
@@ -663,6 +667,12 @@ extension EngineLoopV2 {
             // acceptance packet.
             asyncEval(assistantEvalTargets)
             mtp.recordEarlyDraftSubmission()
+            if Self.mtpFenceSkipsSubmittedDrafterState {
+                // The drafter's KV buffers were submitted just above. In the round's fence too, they
+                // stay shared until the verify's command buffer retires, so the next round's first
+                // in-place KV write (layer 0, or a lookup round's absorption) copies the whole buffer.
+                assistantEvalTargets = proposals
+            }
             if CBv2MTPBlockTokenRow.enabled, batched.ndim == 2, batched.dim(0) == batch,
                 batched.dim(1) == k
             {
