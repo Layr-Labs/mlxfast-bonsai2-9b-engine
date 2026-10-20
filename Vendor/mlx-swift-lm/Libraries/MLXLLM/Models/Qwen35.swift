@@ -5444,6 +5444,20 @@ extension Qwen3NextMLP {
         return downProj(silu(gate) * up)
     }
 
+    /// `qwen35ProjectedGateUp` over `sharedResidualNormProjections`' result: one
+    /// projection is the gate/up product the matmul formed, two are the pair.
+    func qwen35ProjectedGateUp(_ projections: [MLXArray]) -> MLXArray {
+        if projections.count == 1 {
+            if let down = downProj as? HadamardQuantizedLinear,
+                let output = down.callAfterPromptProduct(projections[0])
+            {
+                return output
+            }
+            return downProj(projections[0])
+        }
+        return qwen35ProjectedGateUp(projections[0], projections[1])
+    }
+
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
         if !exact, x.ndim >= 2, x.dim(-2) >= 128,
             let shared = HadamardQuantizedLinear.sharedPromptProjections(x, [gateProj, upProj])
@@ -5756,9 +5770,10 @@ extension Qwen35DecoderLayer {
         }
         guard let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             x, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
+            swigluDown: dense.downProj as? HadamardQuantizedLinear)
         else { return nil }
-        return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+        return (post.residual, dense.qwen35ProjectedGateUp(post.projections))
     }
 
     /// Prompt-width layer whose input arrives as `(x, delta)` unadded, fusing
@@ -5806,11 +5821,10 @@ extension Qwen35DecoderLayer {
             ? r[0..., (r.dim(1) - 1)..., 0...] : r
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             xPost, residual: rPost, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
+            swigluDown: dense.downProj as? HadamardQuantizedLinear)
         {
-            return (
-                inputResidual, post.residual,
-                dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+            return (inputResidual, post.residual, dense.qwen35ProjectedGateUp(post.projections))
         }
         let h = xPost + rPost
         return (inputResidual, h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
