@@ -1602,6 +1602,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
         if DF2Fast.on {
             DF2Fast.TreeWide.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
+            DF2LeanIndex.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
             try prepareFirstRound(target)
             checkLayerZeroFront()
         }
@@ -5943,19 +5944,20 @@ enum DF2Fast {
         let P = top[0].dim(0)
         let outs = recordTreeOutputs(
             top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
-            predLookup: predLookup, succLookup: succLookup)
+            predLookup: predLookup, succLookup: succLookup,
+            kernel: DF2LeanIndex.treePassed ? DF2LeanIndex.tree : nil)
         return (outs[0].reshaped([1, P]), outs[1])
     }
 
-    /// `treeSelector`'s outputs `[tokens [P], desc [333]]`, unchecked.
+    /// `treeSelector`'s outputs `[tokens [P], desc [333]]` (or `kernel`'s, a 512-thread twin), unchecked.
     static func recordTreeOutputs(
         top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
-        predLookup: MLXArray?, succLookup: MLXArray?
+        predLookup: MLXArray?, succLookup: MLXArray?, kernel: MLXFast.MLXFastKernel? = nil
     ) -> [MLXArray] {
         let P = top[0].dim(0)
         precondition(P == 15, "DF2 tree: block of \(P) positions")
         let threads = 512
-        return treeSelector!(
+        return (kernel ?? treeSelector!)(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
             template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil),
@@ -7434,5 +7436,174 @@ private enum DraftSDPA {
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
                outputShapes: [[1, 16, 32, 128]], outputDTypes: [.float32])[0].transposed(0, 2, 1, 3)
+    }
+}
+
+/// Lean-index twin of the tree selector (`DF2Fast.treeSelector`, the last drafter kernel of every
+/// round), cut from its text by exact-once edits to index math, trip counts and control flow only:
+/// every floating-point operation and its order are the record's. `prepare` compares the twin with
+/// the record kernel bit for bit once, at drafter bind, and any mismatch, error or missing cut keeps
+/// the record kernel. `DARKBLOOM_BONSAI_LEAN_IDX=0` keeps the record kernel.
+///
+/// - Each lane's edge loop runs a constant 4 steps (`r = lane + 64 i`, and lane < 32 makes
+///   `r >> 6 == i`), so the loads of its codebook words issue together.
+/// - Up to 256 of the 512 threads build the tokens and the descriptor instead of thread 0 alone. A
+///   node's row is 1 + its preorder rank, and preorder is the order of the nodes' root paths read
+///   as 60-bit keys of 4-bit expansion indices, root first: a child is expanded after its parent,
+///   and the record's walk visits siblings in expansion order.
+private enum DF2LeanIndex {
+    static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LEAN_IDX"] != "0"
+    /// `DARKBLOOM_BONSAI_LEAN_IDX_NEGCTL=1` builds the twin with three edge steps instead of four,
+    /// so the check must fail. Validation only.
+    static let negativeControl = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LEAN_IDX_NEGCTL"] == "1"
+    /// Written once by `prepare` at drafter bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var treePassed = false
+    nonisolated(unsafe) private static var prepared = false
+
+    private static func swap(_ text: inout String, _ from: String, _ to: String) -> Bool {
+        guard text.components(separatedBy: from).count == 2 else { return false }
+        text = text.replacingOccurrences(of: from, with: to)
+        return true
+    }
+
+    private static let treeTail = """
+        threadgroup ulong lx_key[16];
+        threadgroup int lx_anc[16][16];
+        threadgroup int lx_row[16];
+        threadgroup int lx_node[16];
+        if (tid < uint(TREE_NODES)) {
+          int x = int(tid);
+          ulong key = 0;
+          for (int k = nd[tid]; k >= 0; k--) {
+            key |= ulong(x + 1) << (4 * (14 - k));
+            lx_anc[tid][k] = x;
+            x = npar[x];
+          }
+          lx_key[tid] = key;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < uint(TREE_NODES)) {
+          const ulong key = lx_key[tid];
+          int r = 1;
+          for (int v = 0; v < TREE_NODES; v++) { r += lx_key[v] < key ? 1 : 0; }
+          lx_row[tid] = r;
+          lx_node[r] = int(tid);
+          tokens[r - 1] = tc[nd[tid]][nj[tid]];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 256u) {
+          const int t = int(tid >> 4), d = int(tid & 15u);
+          const bool node = t >= 1 && t <= TREE_NODES;
+          const int u = node ? lx_node[t] : 0;
+          const int dep = node ? nd[u] + 1 : 0;
+          int val = -1;
+          if (t <= TREE_NODES && d <= dep) { val = d == 0 ? 0 : lx_row[lx_anc[u][d - 1]]; }
+          desc[32 + 16 * t + d] = val;
+          if (d == 0) {
+            desc[t] = node ? (npar[u] < 0 ? 0 : lx_row[npar[u]]) : -1;
+            desc[16 + t] = dep;
+          }
+        }
+        if (tid < 15u) {
+          const int n = int(tid);
+          desc[288 + 3 * n] = n < TREE_NODES ? nd[n] : -1;
+          desc[289 + 3 * n] = n < TREE_NODES ? nj[n] : -1;
+          desc[290 + 3 * n] = n < TREE_NODES ? npar[n] : -1;
+        }
+
+        """
+
+    /// The lean twin of `DF2Fast.treeSource` (before `treeConfigured`), or nil when a cut misses.
+    static func treeSource(_ record: String) -> String? {
+        let tail = "if (tid == 0) {\n  int order[16];"
+        guard record.components(separatedBy: tail).count == 2, let cut = record.range(of: tail) else { return nil }
+        var s = String(record[..<cut.lowerBound]) + treeTail
+        let ok = swap(
+            &s, "for (int r = int(lane); r < 256; r += 64) {",
+            "#pragma clang loop unroll(full)\nfor (int lx_i = 0; lx_i < \(negativeControl ? 3 : 4); lx_i++) {\n"
+                + "const int r = int(lane) + 64 * lx_i;")
+            && swap(&s, "const uint pair = uint(r >> 6) * 32u + lane;", "const uint pair = uint(lx_i) * 32u + lane;")
+        return ok ? s : nil
+    }
+
+    /// Launched only by `recordTreeOutputs`, with 512 threads (the tail needs 256).
+    static let tree: MLXFast.MLXFastKernel? = {
+        guard enabled, let source = DF2Fast.treeSource.flatMap(treeSource) else { return nil }
+        return MLXFast.metalKernel(
+            name: "df2_tree_lean_" + (DF2Fast.treeSplit ? "split" : (DF2Fast.treeSharp ? "t08" : "t10")),
+            inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+            outputNames: ["tokens", "desc"],
+            source: DF2Fast.treeConfigured(source))
+    }()
+
+    /// Every tree case of `DF2Fast.TreeWide` (all codebook sets, all kinds) at three edge gains:
+    /// the twin's tokens and descriptor against the record kernel's.
+    private static func treeCheck(
+        _ kernel: MLXFast.MLXFastKernel, selector: DFlash2CandidateSelector, vocabulary: Int
+    ) throws -> (Bool, String) {
+        typealias W = DF2Fast.TreeWide
+        guard let sets = try W.codebookSets(selector, vocabulary: vocabulary) else {
+            return (false, "synthetic codebooks did not pack as intended")
+        }
+        var names: [String] = []
+        var equal: [MLXArray] = []
+        var branched: [MLXArray] = []
+        let chain = MLXArray(Int32(0) ..< Int32(15))
+        for (n, books) in sets.enumerated() {
+            for (m, kind) in W.Kind.allCases.enumerated() {
+                for gain: Float in [1, 0.05, 0.002] {
+                    for seed in kind == .random ? [0, 1, 2] : [0] {
+                        let c = W.makeCase(kind, rows: books.rows, seed: UInt64(1000 * n + 10 * m + seed), gain: gain)
+                        let top = [MLXArray(c.ids, [15, 128]), MLXArray(c.values, [15, 128])]
+                        let projected = MLXArray(c.proj, [15, 256])
+                        let anchor = MLXArray([c.anchor])
+                        let record = try DF2Fast.checkedOutputs(
+                            DF2Fast.recordTreeOutputs(
+                                top: top, projected: projected, anchor: anchor, pred: books.pred, succ: books.succ,
+                                predLookup: books.predLookup, succLookup: books.succLookup),
+                            2, "tree record")
+                        let lean = try DF2Fast.checkedOutputs(
+                            DF2Fast.recordTreeOutputs(
+                                top: top, projected: projected, anchor: anchor, pred: books.pred, succ: books.succ,
+                                predLookup: books.predLookup, succLookup: books.succLookup, kernel: kernel),
+                            2, "tree lean")
+                        names.append("\(books.name)/\(kind.rawValue)/\(gain)/\(seed)")
+                        equal.append(MLX.all(MLX.stacked([W.same(record[0], lean[0]), W.same(record[1], lean[1])])))
+                        branched.append(MLX.any(record[1][1 ..< 16] .!= chain))
+                    }
+                }
+            }
+        }
+        let oks = MLX.stacked(equal).asArray(Bool.self)
+        if let bad = oks.firstIndex(of: false) {
+            return (false, "mismatch at \(names[bad]) (\(oks.filter { !$0 }.count) of \(oks.count) cases)")
+        }
+        let trees = MLX.stacked(branched).asArray(Bool.self).filter { $0 }.count
+        return (true, "\(oks.count) cases over \(sets.count) codebook sets (\(trees) branched) bitwise equal")
+    }
+
+    /// Runs once at drafter bind, before any proposal or measured window. The twin is used only
+    /// after every case evaluated equal; a mismatch, an MLX error or a missing cut keeps the record.
+    static func prepare(selector: DFlash2CandidateSelector, vocabulary: Int) {
+        guard !prepared else { return }
+        prepared = true
+        var note: String
+        if !enabled {
+            note = "off (DARKBLOOM_BONSAI_LEAN_IDX=0)"
+        } else if !DF2Fast.treeOn {
+            note = "off (tree selector off)"
+        } else if let tree {
+            do {
+                let (ok, detail) = try withError { try treeCheck(tree, selector: selector, vocabulary: vocabulary) }
+                treePassed = ok
+                note = (ok ? "on (" : "off (") + detail + ")"
+            } catch {
+                note = "off (error: \(error))"
+            }
+        } else {
+            note = "off (a cut of the record source did not match once)"
+        }
+        if negativeControl { note += "; negative control" }
+        FileHandle.standardError.write(Data("DF2 lean index tree: \(note)\n".utf8))
     }
 }
