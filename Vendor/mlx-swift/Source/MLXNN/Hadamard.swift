@@ -3051,6 +3051,7 @@ enum ExactVerifyHead {
 /// The head's `Amax_g, Bmax_g` for `ExactVerifyHead`, made on first use.
 final class ExactVerifyHeadBounds {
     var compactVerified: Bool?
+    var streamHeadVerified: Bool?
     var compactParallelVerified: Bool?
     var residualL2Verified: Bool?
     var exactAnchorsVerified: Bool?
@@ -5816,15 +5817,17 @@ enum VerifyInt8Matmul {
         }
         """
 
+    private static let compactHeadStore = """
+        for (int e = int(tid); e < ROWS * 8; e += 128) {
+          float4 v = r0[e] + r1[e];
+          v = v + r2[e];
+          v = v + r3[e];
+          *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = good ? v : float4(as_type<float>(0x7fc00000u));
+        }
+        """
+
     private static let compactHeadKernel = {
-        let store = """
-            for (int e = int(tid); e < ROWS * 8; e += 128) {
-              float4 v = r0[e] + r1[e];
-              v = v + r2[e];
-              v = v + r3[e];
-              *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = good ? v : float4(as_type<float>(0x7fc00000u));
-            }
-            """
+        let store = compactHeadStore
         let original = naxFastSource(layers: 1)
         precondition(original.components(separatedBy: store).count == 2)
         let source = original.replacingOccurrences(of: store, with: compactHeadEpilogue)
@@ -5838,20 +5841,147 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }()
 
+    /// The compact head on the stream copy: the streamed one-layer body
+    /// (`streamedFormsSource(layers: 1)`, which `checkStreamed` matches
+    /// against the canonical form: 16-B word loads and, once the staging twin
+    /// passed, 32-B tile stores) with the compact head's epilogue in place of
+    /// the store, as `compactHeadKernel` does on the canonical body. Same
+    /// staged tile, tensor op, FP32 steps and selection: the same bits. Built
+    /// after `route` (so after `prepareWideStore`); nil if a cut misses.
+    private static let compactHeadStreamedKernel: MLXFast.MLXFastKernel? = {
+        guard let body = makeStreamedBody(naxFastBody, columns: 32),
+            body.components(separatedBy: compactHeadStore).count == 2 else { return nil }
+        let prefix = naxFastPick(layers: 1).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+        let source = prefix + body.replacingOccurrences(of: compactHeadStore, with: compactHeadEpilogue)
+            .replacingOccurrences(of: "(size_t)", with: "(uint)")
+        return MLXFast.metalKernel(
+            name: "bonsai_q8_verify_head_top4_streamed_v2",
+            inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"],
+            outputNames: ["out0", "part_ids", "omitted", "part_bad"], source: source,
+            header: PromptInt8Matmul.naxHeader + Float16ConstantQMV.topTwoHeader,
+            ensureRowContiguous: true)
+    }()
+
+    /// `DARKBLOOM_BONSAI_HEAD_STREAM=0` keeps the 16-row compact head on the
+    /// canonical words (the record path).
+    static let streamHeadAllowed: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_HEAD_STREAM"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+    nonisolated(unsafe) private static var streamHeadFailed = false
+
+    /// Decided once at load, after `route`: the streamed compact head
+    /// matched the canonical one bit for bit on all four outputs.
+    static let streamHeadReady: Bool = {
+        guard streamHeadAllowed else {
+            FileHandle.standardError.write(Data("int8 verify streamed head: off (DARKBLOOM_BONSAI_HEAD_STREAM=0)\n".utf8))
+            return false
+        }
+        let ready = route == .nax && streamReady && compactHeadStreamedKernel != nil && checkStreamedHead()
+        let stores = wideStore ? "32-B" : "16-B"
+        FileHandle.standardError.write(Data(
+            "int8 verify streamed head: \(ready ? "on (M16 compact top4, NEG 0/1 bit-identical, \(stores) tile stores)" : "off")\n".utf8))
+        return ready
+    }()
+
+    /// Input-independent: synthetic codes (rows of -128, 127 and both),
+    /// words (all-ones and zero columns) and constants at 16 rows (the only
+    /// row count this head takes), K 4096, N 512 (16 threadgroups), both
+    /// offset forms (NEG 0 and 1); any launch error fails it; canonical and
+    /// streamed compact heads compared on ids, values, omitted and flags.
+    private static func checkStreamedHead() -> Bool {
+        let k = 4096, n = 512, kg = k / 128, rows = tileRows
+        guard compactHeadAvailable(rows: rows, k: k, n: n) else { return false }
+        var matched = true
+        streamHeadFailed = false
+        withErrorHandler({ _ in VerifyInt8Matmul.streamHeadFailed = true }) {
+            let q: [Int8] = (0 ..< rows * k).map { (i: Int) -> Int8 in
+                let row: Int = i / k
+                if row == 12 { return -128 }
+                if row == 13 { return 127 }
+                if row == 14 { return i % 2 == 0 ? -128 : 127 }
+                let centered: Int = (i * 37 + 11) % 255 - 127
+                return Int8(truncatingIfNeeded: centered)
+            }
+            let w: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in
+                let column: Int = i / (k / 16)
+                if column == 0 { return 0xFFFF_FFFF }
+                if column == 1 { return 0 }
+                let value: UInt64 = UInt64(i + 1) &* 2_654_435_761
+                return UInt32(truncatingIfNeeded: value)
+            }
+            let sv: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                let value: Float = Float(1 + i % 13) / 1024
+                return Float16(value)
+            }
+            let bv: [Float16] = (0 ..< kg * n).map { (i: Int) -> Float16 in
+                let value: Float = -Float(i % 7) / 512
+                return Float16(value)
+            }
+            let av: [Float] = (0 ..< rows * kg).map { (i: Int) -> Float in
+                let value: Float = Float(1 + i % 11) / 256
+                return value
+            }
+            let rv: [Float] = (0 ..< rows * kg).map { (i: Int) -> Float in
+                let centered: Int = i % 17 - 8
+                return Float(centered) / 64
+            }
+            let activation = PromptInt8Activation(
+                codes: MLXArray(q, [rows, k]), ascale: MLXArray(av), rsb: MLXArray(rv), rows: rows, k: k)
+            let weight = MLXArray(w, [n, k / 16])
+            let scales = MLXArray(sv, [kg, n]), biases = MLXArray(bv, [kg, n])
+            let negativeBias = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let packed = streamPack(weight, k: k, columns: 16)
+            eval(packed)
+            for negative in [false, true] where matched {
+                let offsets = negative ? negativeBias : biases
+                guard
+                    let a = compactHead(activation, weight: weight, scalesT: scales, biasesT: offsets, negative: negative),
+                    let b = compactHead(
+                        activation, weight: weight, scalesT: scales, biasesT: offsets, negative: negative,
+                        streamedWeight: packed, checking: true)
+                else { matched = false; break }
+                matched = sameCompactBits(a, b)
+            }
+        }
+        return matched && !streamHeadFailed
+    }
+
+    static func sameCompactBits(
+        _ a: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray),
+        _ b: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)
+    ) -> Bool {
+        let pairs: [(MLXArray, MLXArray)] = [(a.ids, b.ids), (a.values, b.values), (a.omitted, b.omitted), (a.bad, b.bad)]
+        let checks: [MLXArray] = pairs.map { (pair: (MLXArray, MLXArray)) -> MLXArray in
+            MLX.all(pair.0.view(dtype: .uint32) .== pair.1.view(dtype: .uint32))
+        }
+        eval(checks)
+        return !streamHeadFailed && checks.allSatisfy { (check: MLXArray) -> Bool in check.item(Bool.self) }
+    }
+
     static func compactHeadAvailable(rows: Int, k: Int, n: Int) -> Bool {
         route == .nax && naxFast && rows == 16 && k == 4096 && n % 64 == 0
             && formsAllowed && hasMatchedForm(k: k, layers: 1) && formsFit(k: k, n: n)
     }
 
+    /// `streamedWeight` (the module's `streamPack` copy, 16 columns) is read
+    /// only once `streamHeadReady` holds, or by its own check (`checking`).
     static func compactHead(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
-        negative: Bool
+        negative: Bool, streamedWeight: MLXArray? = nil, checking: Bool = false
     ) -> (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)? {
         guard compactHeadAvailable(rows: activation.rows, k: activation.k, n: weight.dim(0))
         else { return nil }
         let tiles = weight.dim(0) / 32
-        let result = compactHeadKernel(
-            [activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb,
+        var kernel = compactHeadKernel
+        var words = weight
+        if let streamedWeight, checking || streamHeadReady, let streamed = compactHeadStreamedKernel {
+            kernel = streamed
+            words = streamedWeight
+        }
+        let result = kernel(
+            [activation.codes, words, scalesT, biasesT, activation.ascale, activation.rsb,
              HostConstants.int32([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
             template: [("ROWS", 16), ("NEG", negative && negativeForms ? 1 : 0), ("KC", activation.k)],
             grid: (tiles * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -7855,6 +7985,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             _ = VerifyInt8Matmul.route
             _ = VerifySplitZ.ready
             _ = VerifySplitGate.ready
+            _ = VerifyInt8Matmul.streamHeadReady
             if weight.dim(0) % 32 == 0, VerifyInt8Matmul.formsK.contains(transform.width) {
                 if let copied = promptConstants.streamWeight(weight, k: transform.width, columns: 16),
                     VerifyInt8Matmul.checkRealStreams, let biases
@@ -8678,10 +8809,28 @@ extension HadamardQuantizedLinear {
         func compact() -> (ids: MLXArray, values: MLXArray)? {
             guard rows == 16, !ExactVerifyHead.checkEveryCall else { return nil }
             let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
-            guard let summary = VerifyInt8Matmul.compactHead(
-                activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
-                negative: promptConstants.negative)
-            else { return nil }
+            let copied = VerifyInt8Matmul.streamHeadReady && exactHeadBounds.streamHeadVerified != false
+                ? streamedVerifyWeight : nil
+            let streamed = copied.flatMap { (words: MLXArray) in
+                VerifyInt8Matmul.compactHead(
+                    activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: promptConstants.negative, streamedWeight: words)
+            }
+            let summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)
+            if let streamed, exactHeadBounds.streamHeadVerified == true {
+                summary = streamed
+            } else {
+                guard let canonical = VerifyInt8Matmul.compactHead(
+                    activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
+                    negative: promptConstants.negative)
+                else { return nil }
+                if let streamed {
+                    let match = VerifyInt8Matmul.sameCompactBits(canonical, streamed)
+                    exactHeadBounds.streamHeadVerified = match
+                    ExactVerifyHead.log("XHEAD streamed compact rows \(rows): \(match ? "on" : "MISMATCH, canonical words kept")")
+                }
+                summary = canonical
+            }
             let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
             func parallel(tight: Bool = false, anchors: Bool = false, partitionL2: Bool = false) -> (ids: MLXArray, values: MLXArray) {
                 ExactVerifyHead.runCompactParallel(
