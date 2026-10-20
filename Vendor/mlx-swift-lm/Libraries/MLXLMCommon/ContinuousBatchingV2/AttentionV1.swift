@@ -355,20 +355,16 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(batch)
-        for (index, row) in rows.enumerated() {
-            let (cachedKeys, cachedValues) = row.update(
-                keys: keys[index ..< index + 1],
-                values: values[index ..< index + 1])
-            outputs.append(
-                attend(
-                    queries: queries[index ..< index + 1],
-                    keys: cachedKeys, values: cachedValues,
-                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
-                    sinks: effectiveSinks, softcap: softcap))
+        return packedPerRow(batch: batch) { index, slice in
+            let (cachedKeys, cachedValues) = rows[index].update(
+                keys: slice(keys),
+                values: slice(values))
+            return attend(
+                queries: slice(queries),
+                keys: cachedKeys, values: cachedValues,
+                scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
+                sinks: effectiveSinks, softcap: softcap)
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
 
     /// One row's update + attention — verbatim the single-request ([1, L])
@@ -1053,11 +1049,14 @@ enum CBv2VerifyVectorAttention {
             "const int limit = N - int(L) + int(t);",
             """
             const int tv_base = N - int(L);
-            const int limit = tv_base + tree[16 + t];
+            const int tree_depth = tree[16 + t];
+            const int limit = tv_base + tree_depth;
+            const int tree_d = (c - tv_base) & 31;
+            const int tree_pi = tv_base + (tree_d <= tree_depth ? tree[32 + 16 * t + tree_d] : 0);
             """)
             && swap(
                 "for (int i = c; i <= limit; i += 32) {",
-                "for (int i = c; i <= limit; i += 32) {\nconst int pi = i < tv_base ? i : tv_base + tree[32 + 16 * t + (i - tv_base)];")
+                "for (int i = c; i <= limit; i += 32) {\nconst int pi = i < tv_base ? i : tree_pi;")
             && swap("(kp + i * ks + ", "(kp + pi * ks + ", count: 2)
             && swap("(vp + i * vs + ", "(vp + pi * vs + ", count: 2)
         return ok ? s : nil

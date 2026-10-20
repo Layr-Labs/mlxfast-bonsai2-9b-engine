@@ -660,6 +660,26 @@ public struct SignedBlockHadamard {
             codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
     }
 
+    /// `quantizedForPromptAttentionGate` for a single last-query prefill row (`rows == 1`),
+    /// writing `ascale` and `rsb` in the 64-row tiled layout `PromptInt8Matmul.matmulLastRow` reads.
+    func quantizedForPromptLastRowAttentionGate(
+        _ attention: MLXArray, queryProjection: MLXArray
+    ) -> PromptInt8Activation? {
+        guard blockSize == 4096, width == 4096, attention.dtype == .float32,
+            queryProjection.dtype == .float32, attention.ndim == 4, attention.dim(0) == 1,
+            attention.dim(1) == 16, attention.dim(2) == 1, attention.dim(3) == 256,
+            queryProjection.size == 8192, StreamOrDevice.default == StreamOrDevice.gpu
+        else { return nil }
+        let outputs = Self.attentionGatePromptQuantized4096Kernel(
+            [attention, queryProjection.reshaped([1, 8192]), signs],
+            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0), ("ATTENTION_ROWS", 1)],
+            grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 4096], [64 * 32], [64 * 32]],
+            outputDTypes: [.int8, .float32, .float32])
+        return PromptInt8Activation(
+            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: 1, k: 4096)
+    }
+
     /// `forward(silu(gate) * rmsNorm(x, weight))` quantized for
     /// `VerifyInt8Matmul`, with the RMSNorm over 128-wide heads: the GDN
     /// output gate, its norm and the out-projection rotation in one kernel.
@@ -8270,6 +8290,20 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
         return bias.map { shaped + $0 } ?? shaped
+    }
+
+    /// `callAfterAttentionGatePrompt` for a single last-query prefill row (`rows == 1`),
+    /// fusing the head-major attention transpose, gate slice, stable sigmoid multiply,
+    /// signed Hadamard rotation, and int8 quantization before `PromptInt8Matmul.matmulLastRow`.
+    public func callAfterAttentionGateLastRow(
+        _ attention: MLXArray, queryProjection: MLXArray
+    ) -> MLXArray? {
+        guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
+            transform.width == 4096, weight.dim(0) % 32 == 0, PromptInt8Matmul.route != .off,
+            let activation = transform.quantizedForPromptLastRowAttentionGate(
+                attention, queryProjection: queryProjection)
+        else { return nil }
+        return promptLastRow(activation)
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
