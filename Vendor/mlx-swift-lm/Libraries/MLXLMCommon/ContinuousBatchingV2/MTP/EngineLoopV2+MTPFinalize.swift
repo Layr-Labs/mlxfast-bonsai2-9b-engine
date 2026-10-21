@@ -120,6 +120,14 @@ extension EngineLoopV2 {
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
                 round.finalizedSeedIDs.insert(id)
+                if round.greedySeedIDs.remove(id) != nil {
+                    sampler.mtpRoundDidCommit(requestIDs: [id])
+                }
+                if round.skippedNeuralDraftIDs.remove(id) != nil,
+                    let state = round.committedObservationRows.first(where: { $0.id == id })?.assistantState
+                {
+                    mtp.blockDrafter?.recordSkippedNeuralDraft(requestState: state)
+                }
             }
         }
 
