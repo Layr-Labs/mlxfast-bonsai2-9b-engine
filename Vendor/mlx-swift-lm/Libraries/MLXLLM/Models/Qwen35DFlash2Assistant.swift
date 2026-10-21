@@ -640,21 +640,31 @@ enum DFlash2PromptLookup {
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
 
+    /// Shortest matching suffix accepted as a lookup hit. `DARKBLOOM_DFLASH_PROMPT_LOOKUP_MIN`
+    /// lowers it (4 ... 64) to spend more rounds on lookup proposals, which skip the drafter's
+    /// weight read; the target still verifies every proposed token.
+    static let minNgram: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_DFLASH_PROMPT_LOOKUP_MIN"],
+            let value = Int(raw)
+        else { return 8 }
+        return min(64, max(4, value))
+    }()
+
     static func continuation(history: [Int], depth: Int) -> [Int32]? {
         let count = history.count
-        guard enabled, depth >= 1, count >= 16 + depth else { return nil }
+        guard enabled, depth >= 1, count >= minNgram + depth else { return nil }
         let longest = min(64, count - depth)
-        var best = 15
+        var best = minNgram - 1
         var chosenEnd: Int?
         var ambiguous = false
-        for end in 16 ... (count - depth) {
+        for end in minNgram ... (count - depth) {
             guard history[end - 1] == history[count - 1] else { continue }
             var length = 1
             let limit = min(longest, end)
             while length < limit && history[end - length - 1] == history[count - length - 1] {
                 length += 1
             }
-            guard length >= 16, length >= best else { continue }
+            guard length >= minNgram, length >= best else { continue }
             if length > best {
                 best = length
                 chosenEnd = end
