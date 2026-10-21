@@ -5,7 +5,6 @@ import MLX
 import os
 
 
-/// Invalid transform metadata or incompatible packed weights.
 public enum HadamardError: Error {
     case invalidBlockSize
     case invalidSigns
@@ -14,18 +13,13 @@ public enum HadamardError: Error {
     case missingSignWidth(Int)
 }
 
-/// Small kernel inputs (problem dimensions, epsilons, scales, per-round key counts and offsets), reused while a
-/// bounded value table (load-time constants) or a small recent-value list (per-round values) holds them, and made per
-/// call otherwise.
 public enum HostConstants {
     public static let enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_HOSTCUT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
     }()
-    /// Entries per table before new values fall back to per-call arrays.
     private static let capacity = 4096
-    /// Entries in the recent-value list (oldest replaced first).
     private static let recentCapacity = 8
     nonisolated(unsafe) private static var int32Arrays: [[Int32]: MLXArray] = [:]
     nonisolated(unsafe) private static var float32Arrays: [[UInt32]: MLXArray] = [:]
@@ -34,7 +28,6 @@ public enum HostConstants {
     nonisolated(unsafe) private static var recentNext = 0
     nonisolated(unsafe) private static var lock = os_unfair_lock()
 
-    /// `MLXArray(values)`, int32 `[values.count]`, for values fixed at load.
     public static func int32(_ values: [Int32]) -> MLXArray {
         guard enabled else { return MLXArray(values) }
         os_unfair_lock_lock(&lock)
@@ -1559,7 +1552,7 @@ extension SignedBlockHadamard {
     nonisolated(unsafe) private static var wideRowResolvedKernels: [MLXFast.MLXFastKernel?] = [MLXFast.MLXFastKernel?](repeating: nil, count: 9)
     nonisolated(unsafe) private static var wideRowResolvedHeadKernels: [MLXFast.MLXFastKernel?] = [MLXFast.MLXFastKernel?](repeating: nil, count: 9)
     nonisolated(unsafe) private static var wideRowChecked = false
-    nonisolated(unsafe) private static var wideRowReady = false
+    nonisolated(unsafe) fileprivate static var wideRowReady = false
     private static let wideRowLock = NSLock()
 
     /// Runs the load check once, from the first prompt-width call of at least 1024 rows: the resident's boot warm,
@@ -6658,7 +6651,7 @@ enum VerifyInt8Matmul {
         return nil
     }
     @inline(__always)
-    private static func hasNarrow(k: Int) -> Bool {
+    fileprivate static func hasNarrow(k: Int) -> Bool {
         narrowShift(k: k).map { (narrowMask & (1 << $0)) != 0 } ?? false
     }
     @inline(__always)
@@ -6674,7 +6667,7 @@ enum VerifyInt8Matmul {
     /// forms when they match theirs.
     nonisolated(unsafe) private static var naxVector = false
     nonisolated(unsafe) private static var negativeForms = false
-    nonisolated(unsafe) private static var naxFast = false
+    nonisolated(unsafe) fileprivate static var naxFast = false
     nonisolated(unsafe) private static var naxShared = false
 
     private static func run(
@@ -7109,6 +7102,9 @@ enum VerifyInt8Matmul {
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool, streamedWeight: MLXArray? = nil
     ) -> MLXArray? {
+        if activation.k == 12288, weight.shape == [4096, 768], activation.rows == 16,
+            route == .nax, naxFast, let serve = BonsaiVerifyInt4.serve,
+            let out = serve([activation.codes, weight, scalesT, biasesT, activation.ascale, activation.rsb], activation.rows, negative && negativeForms) { return out }
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, hasNarrow(k: activation.k) {
             return runNarrow(
@@ -9684,5 +9680,24 @@ extension HadamardQuantizedLinear {
         ]
         eval(checks.map { $0.1 })
         return checks.first { !$0.1.item(Bool.self) }?.0
+    }
+}
+
+public enum BonsaiVerifyInt4 {
+    public static func prepare() { SignedBlockHadamard.wideRowPrepareIfBoot(rows: 1024) }
+    public static var prepared: Bool { SignedBlockHadamard.wideRowReady }
+    nonisolated(unsafe) public static var serve: (([MLXArray], Int, Bool) -> MLXArray?)?
+    public static var eligible: Bool { VerifyInt8Matmul.route == .nax && VerifyInt8Matmul.naxFast }
+    public static var columns: Int { VerifyInt8Matmul.hasNarrow(k: 12288) ? 16 : 32 }
+    public static func body(columns: Int) -> String {
+        columns == 16 ? VerifyInt8Matmul.naxNarrow16Body : VerifyInt8Matmul.naxFastBody
+    }
+    public static var header: String { PromptInt8Matmul.naxHeader }
+    public static func record(_ x: [MLXArray], rows: Int, negative: Bool) -> MLXArray? {
+        let saved = serve
+        serve = nil
+        defer { serve = saved }
+        let a = PromptInt8Activation(codes: x[0], ascale: x[4], rsb: x[5], rows: rows, k: 12288)
+        return VerifyInt8Matmul.matmul(a, weight: x[1], scalesT: x[2], biasesT: x[3], negative: negative)
     }
 }

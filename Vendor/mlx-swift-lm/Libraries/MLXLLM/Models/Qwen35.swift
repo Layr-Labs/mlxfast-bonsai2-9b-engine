@@ -7110,6 +7110,9 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        let outerInt4 = Qwen35VerifyInt4.live
+        Qwen35VerifyInt4.live = Qwen35VerifyInt4.scope(self, tokens: tokens, caches: caches, positions: positionIds)
+        defer { Qwen35VerifyInt4.live = outerInt4 }
         let canDeferFinal = !model.exactTargetVerify && (lmHead is HadamardQuantizedLinear)
         let (hiddenRaw, pendingDelta) = model.cbv2ForwardSplitFinal(
             tokens, inputEmbeddings: nil, caches: attending,
@@ -7230,6 +7233,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
             eval(fused.ids, fused.values, fused.residual)
         }
         HadamardQuantizedLinear.prepareSharedVerifyWeights()
+        if rows == 16 { Qwen35VerifyInt4.run(self) }
     }
 }
 
@@ -7580,5 +7584,544 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+}
+
+enum Qwen35VerifyInt4 {
+    private struct Copy {
+        let site: Int
+        let weight: MLXArray
+        let packed: MLXArray
+    }
+    nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) static var enabled = false
+    nonisolated(unsafe) static var live = false
+    nonisolated(unsafe) private static var attempted = false
+    nonisolated(unsafe) private static var failed = false
+    nonisolated(unsafe) private static var observing = false
+    nonisolated(unsafe) private static var corrupt = false
+    nonisolated(unsafe) private static var corrupted = false
+    nonisolated(unsafe) private static var eligible: [Int: Int] = [:]
+    nonisolated(unsafe) private static var hits: [Int: Int] = [:]
+    nonisolated(unsafe) private static var falls: [String: Int] = [:]
+    nonisolated(unsafe) private static var tapIds: [Int]?
+    nonisolated(unsafe) private static var exact = false
+    private static func note(_ text: String) { FileHandle.standardError.write(Data("int8 verify int4 down: \(text)\n".utf8)) }
+
+    private static let pack = MLXFast.metalKernel(name: "bonsai_verify_int4_pack",
+        inputNames: ["w", "dims"], outputNames: ["packed"], source: """
+        const uint K = dims[0], N = dims[1];
+        const uint i = thread_position_in_grid.x;
+        if (i >= N * K / 2) return;
+        const uint n = i / (K / 2), k = 2 * (i % (K / 2));
+        const uint v = w[n * (K / 16) + k / 16];
+        const uint p = k % 16;
+        const uint a = (v >> (8 * (p % 4) + 2 * (p / 4))) & 3u;
+        const uint b = (v >> (8 * ((p + 1) % 4) + 2 * ((p + 1) / 4))) & 3u;
+        packed[i] = dims[2] ? uchar((a << 4) | b) : uchar(a | (b << 4));
+        """, ensureRowContiguous: true)
+
+    private static func packed(_ weight: MLXArray, order: Int) -> MLXArray {
+        let k = 12288, n = weight.dim(0), count = n * k / 2
+        return pack([weight, MLXArray([Int32(k), Int32(n), Int32(order)])],
+            grid: (count, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[n, k / 2]], outputDTypes: [.uint8])[0]
+    }
+
+    private static func body(_ width: Int) -> String? {
+        var source = BonsaiVerifyInt4.body(columns: width)
+        func swap(_ old: String, _ new: String) -> Bool {
+            guard source.components(separatedBy: old).count == 2 else { return false }
+            source = source.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        guard swap("tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, \(width)));",
+            "tensor<device int4b_format, dextents<int, 2>, tensor_inline> B(packed, dextents<int, 2>(K, N));\n        auto tB0 = B.template slice<128, \(width)>(0, n0);"),
+            swap("metal::remove_addrspace_t<decltype(B)>, int32_t>()", "metal::remove_addrspace_t<decltype(tB0)>, int32_t>()")
+        else { return nil }
+        let begin = "const int j = int(lane & 7u);"
+        let end = width == 16 ? "half4 sA, bA" : "half4 sA, sB, bA"
+        guard let a = source.range(of: begin), let b = source.range(of: end), a.upperBound < b.lowerBound,
+            source.components(separatedBy: begin).count == 2, source.components(separatedBy: end).count == 2
+        else { return nil }
+        source.removeSubrange(a.lowerBound ..< b.lowerBound)
+        let prefetch = "for (int t = 0; t < \(width / 4); t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
+        for prefix in ["  ", "    "] {
+            guard swap(prefix + "#pragma clang loop unroll(full)\n" + prefix + prefetch, "") else { return nil }
+        }
+        let unpack = """
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < \(width / 4); t++) {
+            const uint32_t v = wv[t];
+            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
+          }
+        """
+        guard swap(unpack, ""),
+            swap("op.run(tA, B, cT);", "auto tB = B.template slice<128, \(width)>(g * 128, n0);\n          op.run(tA, tB, cT);")
+        else { return nil }
+        guard source.components(separatedBy: "simdgroup_barrier(mem_flags::mem_threadgroup);").count == 3 else { return nil }
+        source = source.replacingOccurrences(of: "simdgroup_barrier(mem_flags::mem_threadgroup);", with: "")
+        // Capacity and both axes must agree before any assumed destination indexing.
+        guard swap("const bool good = simd_all(ok);", """
+        const bool good = simd_all(ok);
+        threadgroup uint goodGroups[4];
+        if (lane == 0) goodGroups[sg] = uint(good);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!(goodGroups[0] && goodGroups[1] && goodGroups[2] && goodGroups[3])) {
+          for (int e = int(tid); e < ROWS * \(width); e += 128)
+            out[(size_t)(e / \(width)) * N + n0 + e % \(width)] = as_type<float>(0x7fc00000u);
+          return;
+        }
+        """) else { return nil }
+        guard !source.contains("wv["), !source.contains("wcol"), !source.contains("dst[") else { return nil }
+        return """
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        const int K = 12288, N = dims[0];
+        const int bx = int(threadgroup_position_in_grid.x);
+        \(source)
+        """
+    }
+
+    private static func native(_ x: [MLXArray], packed: MLXArray, rows: Int, negative: Bool, width: Int) -> MLXArray? {
+        guard let kernel = kernels[width] else { return nil }
+        let n = x[1].dim(0)
+        return kernel([x[0], packed, x[2], x[3], x[4], x[5], MLXArray([Int32(n)])],
+            template: [("ROWS", rows), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
+            grid: (n / width * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[rows, n]], outputDTypes: [.float32])[0]
+    }
+
+    private static func serve(_ x: [MLXArray], _ rows: Int, _ negative: Bool) -> MLXArray? {
+        guard let copy = copies[ObjectIdentifier(x[1])], copy.weight === x[1] else {
+            if observing { falls["unowned-site", default: 0] += 1 }
+            return nil
+        }
+        if observing { eligible[copy.site, default: 0] += 1 }
+        guard live, !failed else {
+            if observing { falls[live ? "error" : "record", default: 0] += 1 }
+            return nil
+        }
+        let bad = corrupt && !corrupted
+        if bad { corrupted = true }
+        let operand = bad ? copy.packed ^ MLXArray(UInt8(0x11)) : copy.packed
+        guard let out = native(x, packed: operand, rows: rows, negative: negative, width: BonsaiVerifyInt4.columns) else {
+            if observing { falls["missing-kernel", default: 0] += 1 }
+            return nil
+        }
+        if observing { hits[copy.site, default: 0] += 1 }
+        return out
+    }
+
+    static func scope(_ model: Qwen35TextModel, tokens: MLXArray, caches: [KVCache], positions: MLXArray?) -> Bool {
+        (enabled || live) && !failed && tokens.shape == [1, 16] && positions == nil
+            && model.model.exactTargetVerify == exact && model.dFlash2TapLayerIds == tapIds
+            && !caches.isEmpty && caches.allSatisfy { cache in
+                guard let cache = cache as? CBv2LayerCache else { return false }
+                return cache.mtpSerializesRectangularAttention && !cache.mtpBatchesRectangularAttention
+                    && cache.rows.allSatisfy { $0 is CBv2FullSequenceKV }
+            }
+    }
+
+    static func run(_ model: Qwen35TextModel) {
+        guard !attempted else { return }
+        attempted = true
+        guard BonsaiVerifyInt4.eligible,
+            !["0", "off", "false", "no"].contains(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VINT4"]?.lowercased() ?? "")
+        else { note("off (record route or off switch)"); return }
+        failed = false
+        let savedTapIds = model.dFlash2TapLayerIds
+        let savedTap = model.model.dFlash2Tap.tappedHidden
+        let savedTop = model.verifyHeadTopTwo.value
+        // Binding precedes engine tap arming. Qualify this public model-layout scope at load.
+        tapIds = savedTapIds ?? [2, 6, 10, 14, 18, 22, 26, 30]
+        model.dFlash2TapLayerIds = tapIds
+        defer {
+            model.dFlash2TapLayerIds = savedTapIds
+            model.model.dFlash2Tap.tappedHidden = savedTap
+            model.verifyHeadTopTwo.value = savedTop
+        }
+        exact = model.model.exactTargetVerify
+        var accepted = false
+        withErrorHandler({ _ in Qwen35VerifyInt4.failed = true }) {
+            // This load hook precedes resident warm. Qualify the record producers first.
+            BonsaiVerifyInt4.prepare()
+            Qwen35Layer0FP32.prepareIfBoot(model.model, promptRows: 1024)
+            guard !failed, BonsaiVerifyInt4.prepared, Qwen35Layer0FP32.verifyPassed else {
+                note("off (cold record prerequisites)")
+                return
+            }
+            note("cold prerequisites ready: wide-row producers, layer0 FP32, verify-start checks complete")
+            for width in [16, 32] {
+                guard let source = body(width) else { note("off (source anchors)"); return }
+                kernels[width] = MLXFast.metalKernel(name: "bonsai_verify_int4_n\(width)",
+                    inputNames: ["xq", "packed", "scalesT", "biasesT", "ascale", "rsb", "dims"],
+                    outputNames: ["out"], source: source, header: BonsaiVerifyInt4.header, ensureRowContiguous: true)
+            }
+            guard let order = check() else { note("off (native probe error or mismatch)"); return }
+            let downs = model.model.layers.compactMap { ($0.mlp as? Qwen3NextMLP)?.downProj as? HadamardQuantizedLinear }
+            guard downs.count == 32, downs.allSatisfy({ $0.weight.shape == [4096, 768] && $0.bits == 2 && $0.groupSize == 128 })
+            else { note("off (32 down sites required)"); return }
+            for (site, down) in downs.enumerated() {
+                let id = ObjectIdentifier(down.weight)
+                guard copies[id] == nil else { note("off (duplicate site)"); return }
+                let copy = packed(down.weight, order: order)
+                eval(copy)
+                guard !failed, copy.nbytes == 25_165_824, copyMatches(down.weight, copy, order: order)
+                else { note("off (copy allocation or bytes)"); return }
+                copies[id] = Copy(site: site, weight: down.weight, packed: copy)
+            }
+            guard copies.count == 32 else { return }
+            BonsaiVerifyInt4.serve = serve
+            let verdict = trial(model)
+            accepted = verdict.on && !failed
+            note(accepted ? "on (\(verdict.report); sites=32 resident=805306368 nibble=\(order))" : "off (\(verdict.report))")
+        }
+        live = false
+        enabled = accepted && !failed
+        if !enabled {
+            BonsaiVerifyInt4.serve = nil
+            copies.removeAll()
+            kernels.removeAll()
+            note("record retained; copies released")
+        }
+    }
+
+    private static let copyCheck = MLXFast.metalKernel(name: "bonsai_verify_int4_copy_check",
+        inputNames: ["w", "packed", "dims"], outputNames: ["ok"], source: """
+        const uint i = thread_position_in_grid.x;
+        if (i >= dims[0] * dims[1] / 16) return;
+        const uint n = i / (dims[0] / 16), j = i % (dims[0] / 16);
+        uint recovered = 0;
+        bool valid = true;
+        for (uint p = 0; p < 16; ++p) {
+          const uint k = 16 * j + p;
+          const uchar byte = packed[n * (dims[0] / 2) + k / 2];
+          const uint shift = 4 * ((k & 1u) ^ dims[2]);
+          const uint code = (uint(byte) >> shift) & 15u;
+          valid = valid && code < 4;
+          recovered |= code << (8 * (p % 4) + 2 * (p / 4));
+        }
+        ok[i] = valid && recovered == w[i];
+        """, ensureRowContiguous: true)
+
+    private static func copyMatches(_ weight: MLXArray, _ copy: MLXArray, order: Int) -> Bool {
+        let count = weight.size
+        let checks = copyCheck([weight, copy, MLXArray([Int32(12288), Int32(weight.dim(0)), Int32(order)])],
+            grid: (count, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[count]], outputDTypes: [.uint8])[0]
+        let ok = MLX.all(checks)
+        eval(ok)
+        return !failed && ok.item(Bool.self)
+    }
+
+    private static func integerSlices(_ codes: MLXArray, _ copy: MLXArray,
+                                      q: [Int8], words: [UInt32], width: Int) -> Bool {
+        let kernel = MLXFast.metalKernel(name: "bonsai_verify_int4_integer_n\(width)",
+            inputNames: ["xq", "packed", "dims"], outputNames: ["values", "layout"], source: """
+            const int K = 12288, N = 96, g = dims[0], n0 = dims[1];
+            const uint lane = thread_index_in_simdgroup;
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, \(width), 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+            tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+            tensor<device int4b_format, dextents<int, 2>, tensor_inline> B(packed, dextents<int, 2>(K, N));
+            auto tA0 = A.template slice<128, 16>(0, 0);
+            auto tB0 = B.template slice<128, \(width)>(0, n0);
+            auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(tB0)>, int32_t>();
+            const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
+            const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
+            const int cap = int(cT.get_capacity());
+            bool ok = cap == \(width / 2);
+            for (int i = 0; i < \(width / 2); ++i) {
+              if (i < cap) {
+                auto ids = cT.get_multidimensional_index(i);
+                ok = ok && int(ids[1]) == mrow + 8 * ((i >> 2) & 1)
+                    && int(ids[0]) == nb + (i & 3) + 16 * (i >> 3);
+                layout[lane * 34 + 2 + 2 * i] = int(ids[0]);
+                layout[lane * 34 + 3 + 2 * i] = int(ids[1]);
+              }
+            }
+            const bool good = simd_all(ok);
+            layout[lane * 34] = cap;
+            layout[lane * 34 + 1] = int(good);
+            if (!good) return;
+            auto tA = A.template slice<128, 16>(g * 128, 0);
+            auto tB = B.template slice<128, \(width)>(g * 128, n0);
+            op.run(tA, tB, cT);
+            for (int i = 0; i < \(width / 2); ++i) values[lane * \(width / 2) + i] = cT[i];
+            """, header: BonsaiVerifyInt4.header, ensureRowContiguous: true)
+        for group in [0, 1, 48, 95] {
+            for origin in [0, (48 / width) * width, 96 - width] {
+                let outputs = kernel([codes, copy, MLXArray([Int32(group), Int32(origin)])],
+                    grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[32 * width / 2], [32 * 34]], outputDTypes: [.int32, .int32])
+                eval(outputs)
+                guard !failed else { return false }
+                let layout = outputs[1].asArray(Int32.self)
+                for lane in 0 ..< 32 {
+                    guard layout[lane * 34] == Int32(width / 2), layout[lane * 34 + 1] == 1 else { return false }
+                }
+                let values = outputs[0].asArray(Int32.self)
+                for lane in 0 ..< 32 {
+                    for i in 0 ..< width / 2 {
+                        let col = origin + Int(layout[lane * 34 + 2 + 2 * i])
+                        let row = Int(layout[lane * 34 + 3 + 2 * i])
+                        guard (0 ..< 16).contains(row), (origin ..< origin + width).contains(col) else { return false }
+                        var dot: Int32 = 0
+                        for p in 0 ..< 128 {
+                            let k = 128 * group + p, slot = k % 16
+                            let code = (words[col * 768 + k / 16] >> UInt32(8 * (slot % 4) + 2 * (slot / 4))) & 3
+                            dot += Int32(q[row * 12288 + k]) * Int32(code)
+                        }
+                        if dot != values[lane * width / 2 + i] { return false }
+                    }
+                }
+            }
+        }
+        return !failed
+    }
+
+    private static func check() -> Int? {
+        let k = 12288, n = 96, kg = k / 128
+        var qs = [Int8](repeating: 0, count: 16 * k)
+        for i in qs.indices { qs[i] = Int8(truncatingIfNeeded: (i * 37 + 11) % 255 - 127) }
+        for i in 0 ..< k { qs[i] = 127; qs[k + i] = -127; qs[2 * k + i] = 0; qs[3 * k + i] = i % 2 == 0 ? 127 : -127 }
+        let codes = MLXArray(qs, [16, k])
+        let words = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in UInt32(truncatingIfNeeded: UInt64(i + 1) &* 2_654_435_761) }
+        let weight = MLXArray(words, [n, k / 16])
+        let scales = MLXArray((0 ..< kg * n).map { (i: Int) -> Float16 in Float16(Float(1 + i % 13) / 1024) }, [kg, n])
+        let biases = MLXArray((0 ..< kg * n).map { (i: Int) -> Float16 in Float16(-Float(i % 7) / 512) }, [kg, n])
+        let a = MLXArray((0 ..< 16 * kg).map { (i: Int) -> Float in Float(1 + i % 11) / 256 }, [16 * kg])
+        let r = MLXArray((0 ..< 16 * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }, [16 * kg])
+        var matches: [Int] = []
+        for order in 0 ... 1 {
+            let copy = packed(weight, order: order)
+            var ok = copyMatches(weight, copy, order: order)
+            for width in [16, 32] {
+                if !integerSlices(codes, copy, q: qs, words: words, width: width) { ok = false }
+            }
+            for negative in [false, true] {
+                let b = negative ? (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16) : biases
+                let x = [codes, weight, scales, b, a, r]
+                for rows in 2 ... 16 {
+                    guard let record = BonsaiVerifyInt4.record(x, rows: rows, negative: negative) else { return nil }
+                    for width in [16, 32] {
+                        guard let mine = native(x, packed: copy, rows: rows, negative: negative, width: width) else { return nil }
+                        if !sameWords([record], [mine]) { ok = false }
+                    }
+                }
+            }
+            guard !failed else { return nil }
+            if ok {
+                let x = [codes, weight, scales, biases, a, r]
+                guard let record = BonsaiVerifyInt4.record(x, rows: 16, negative: false),
+                    let wrong = native(x, packed: copy ^ MLXArray(UInt8(0x11)), rows: 16, negative: false, width: 16),
+                    !sameWords([record], [wrong]), !failed else { return nil }
+                note("native probe passed rows=2...16 K=12288 N=96 widths=16,32 all groups and final columns nibble=\(order)")
+                matches.append(order)
+            }
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+    private struct Failure: Error {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
+    }
+
+    private struct Pass {
+        let ns: Double
+        let out: [MLXArray]
+        let eligible: [Int: Int]
+        let dispatched: [Int: Int]
+        let fallbacks: [String: Int]
+    }
+
+    private static func sameWords(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+        guard !a.isEmpty, a.count == b.count else { return false }
+        var checks: [MLXArray] = []
+        for i in a.indices {
+            guard a[i].shape == b[i].shape, a[i].dtype == b[i].dtype else { return false }
+            checks.append(MLX.all(contiguous(a[i]).view(dtype: .uint8) .== contiguous(b[i]).view(dtype: .uint8)))
+        }
+        let same = MLX.all(MLX.stacked(checks))
+        eval(same)
+        return !failed && same.item(Bool.self)
+    }
+
+    private static func branchDescriptor() -> MLXArray {
+        var desc = [Int32](repeating: -1, count: 336)
+        for row in 0 ..< 16 {
+            let parent = row == 0 ? -1 : (row - 1) / 2
+            desc[row] = Int32(parent)
+            let depth = row == 0 ? 0 : Int(desc[16 + parent]) + 1
+            desc[16 + row] = Int32(depth)
+            var node = row
+            for d in stride(from: depth, through: 0, by: -1) {
+                desc[32 + 16 * row + d] = Int32(node)
+                node = Int(desc[node])
+            }
+        }
+        return MLXArray(desc)
+    }
+
+    // Each leg owns all mutable state. Prefill and allocations finish before the verify clock.
+    private static func pass(_ model: Qwen35TextModel, tree: MLXArray?, native: Bool,
+                             observe: Bool = false, poison: Bool = false) throws -> Pass {
+        let restoreDescriptors = CBv2BranchVerify.preserveTrialState()
+        let savedTap = model.model.dFlash2Tap.tappedHidden
+        let savedTop = model.verifyHeadTopTwo.value
+        defer {
+            restoreDescriptors()
+            model.model.dFlash2Tap.tappedHidden = savedTap
+            model.verifyHeadTopTwo.value = savedTop
+        }
+        let backend = CBv2ContiguousKVBackend(config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
+        let kinds = model.cbv2LayerKinds
+        let layerCaches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
+        let bank = CBv2LayerCacheBank(caches: layerCaches)
+        let rows = try backend.makeSequenceState(layerKinds: kinds, promptLength: 512, maxLength: 528)
+        let state = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+        defer {
+            bank.releaseBoundRows()
+            backend.release(rows)
+            if !state.isReleased { try? state.release() }
+        }
+        let caches = bank.layerCaches(rowStates: [rows]).compactMap { $0 as? KVCache }
+        guard caches.count == kinds.count else { throw Failure("cache factory coverage") }
+        func ids(_ count: Int, _ salt: Int) -> MLXArray {
+            MLXArray((0 ..< count).map { (i: Int) -> Int32 in
+                let value: Int = (i * 7919 + salt) % model.vocabularySize
+                return Int32(value)
+            }, [1, count])
+        }
+        func kvWords() -> [MLXArray] {
+            rows.compactMap { $0 }.flatMap { row -> [MLXArray] in
+                let snap = row.snapshot()
+                return [snap.keys, snap.values, MLXArray(Int32(snap.offset))]
+            }
+        }
+        live = false
+        observing = false
+        CBv2BranchVerify.tree = nil
+        let seed = try state.bind()
+        let prefill = model.cbv2ForwardWithHiddenForPrefill(ids(512, 13), caches: caches,
+            recurrentState: [seed], positionIds: nil, requirement: .lastPositionLogits)
+        let seedRoots = try seed.evaluate()
+        eval([prefill.logits, prefill.lastHidden] + seedRoots + caches.flatMap { $0.innerState() })
+        try seed.commit()
+        guard !failed else { throw Failure("prefill error") }
+        for cache in layerCaches {
+            guard let cache = cache as? CBv2LayerCache else { throw Failure("cache policy coverage") }
+            cache.mtpSerializesRectangularAttention = true
+            cache.mtpBatchesRectangularAttention = false
+        }
+        model.model.dFlash2Tap.tappedHidden = nil
+        model.verifyHeadTopTwo.value = nil
+        let block = ids(16, 101)
+        let positions = CBv2PositionState.decodePositionIds(states: [nil], cacheOffsets: [512], length: 16)
+        eligible = [:]
+        hits = [:]
+        falls = [:]
+        corrupted = false
+        observing = observe
+        corrupt = poison
+        live = native
+        CBv2BranchVerify.tree = tree
+        defer {
+            observing = false
+            corrupt = false
+            live = false
+            CBv2BranchVerify.tree = nil
+        }
+        for row in rows.compactMap({ $0 }) { row.beginSpeculativeWrite() }
+        Stream.gpu.synchronize()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let evaluation = try state.bind()
+        var evaluated = false
+        defer { if evaluated { try? evaluation.rollback() } }
+        let forward = model.cbv2ForwardWithHiddenCaptured(block, caches: caches,
+            recurrentState: [evaluation], positionIds: positions)
+        let roots = try evaluation.evaluate()
+        evaluated = true
+        var out = [forward.logits, forward.lastHidden] + roots + kvWords()
+        if let taps = model.dFlash2TappedHidden { out.append(taps) }
+        if tapIds != nil && model.dFlash2TappedHidden == nil { throw Failure("tap capture incomplete") }
+        if let top = model.verifyHeadTopTwo.value { out += [top.ids, top.values] }
+        eval(out + caches.flatMap { $0.innerState() })
+        Stream.gpu.synchronize()
+        let captured = evaluation.isCaptured
+        try evaluation.rollback()
+        evaluated = false
+        Stream.gpu.synchronize()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+        guard !failed, roots.count >= 48, captured else { throw Failure("capture forward incomplete") }
+        if poison && !corrupted { throw Failure("negative control missed candidate") }
+        return Pass(ns: elapsed, out: out, eligible: eligible, dispatched: hits, fallbacks: falls)
+    }
+
+    private static func trial(_ model: Qwen35TextModel) -> (on: Bool, report: String) {
+        let restoreBranchState = CBv2BranchVerify.preserveTrialState()
+        let outerTap = model.model.dFlash2Tap.tappedHidden
+        let outerTop = model.verifyHeadTopTwo.value
+        let outerObserving = observing
+        defer {
+            restoreBranchState()
+            model.model.dFlash2Tap.tappedHidden = outerTap
+            model.verifyHeadTopTwo.value = outerTop
+            live = false
+            observing = outerObserving
+        }
+        var result: (on: Bool, report: String) = (false, "full-pass error")
+        failed = false
+        withErrorHandler({ _ in Qwen35VerifyInt4.failed = true }) {
+            do {
+                CBv2BranchVerify.committedRows = nil
+                let descriptors: [MLXArray?] = [nil, branchDescriptor()]
+                var reports: [String] = []
+                for (index, tree) in descriptors.enumerated() {
+                    let label = index == 0 ? "chain" : "branch"
+                    let record = try pass(model, tree: tree, native: false, observe: true)
+                    let mine = try pass(model, tree: tree, native: true, observe: true)
+                    note("observed \(label) recordSites=\(record.eligible.count) candidateSites=\(mine.dispatched.count) fallback=\(mine.fallbacks) recordFallback=\(record.fallbacks)")
+                    guard record.eligible.count == 32, record.eligible.values.allSatisfy({ $0 == 1 }), record.dispatched.isEmpty,
+                        record.eligible == mine.eligible, mine.dispatched == record.eligible, mine.fallbacks.isEmpty
+                    else { throw Failure("\(label) dispatch coverage incomplete") }
+                    guard sameWords(record.out, mine.out) else { throw Failure("\(label) full-pass word mismatch") }
+                    let wrong = try pass(model, tree: tree, native: true, observe: true, poison: true)
+                    guard wrong.dispatched == mine.dispatched, !sameWords(record.out, wrong.out), !failed
+                    else { throw Failure("\(label) negative control not detected") }
+                    note("coverage \(label) eligible=\(record.eligible.values.reduce(0, +)) candidate=\(mine.dispatched.values.reduce(0, +)) sites=\(mine.dispatched.count) K=12288 N=4096 rows=16 tile=\(BonsaiVerifyInt4.columns) fallback=\(mine.fallbacks) recordFallback=\(record.fallbacks) negative-control=caught")
+                    func timed() throws -> (ratio: Double, saving: Double) {
+                        var samples = [[Double]](repeating: [], count: 2)
+                        for pair in 0 ..< 5 {
+                            for offset in 0 ..< 2 {
+                                let leg = (pair + offset) % 2
+                                let value = try pass(model, tree: tree, native: leg == 1, observe: true)
+                                guard value.eligible == record.eligible, value.dispatched == (leg == 1 ? record.eligible : [:]),
+                                    (leg == 0 || value.fallbacks.isEmpty), sameWords(record.out, value.out) else { throw Failure("\(label) timed word mismatch") }
+                                samples[leg].append(value.ns)
+                            }
+                        }
+                        var worstRatio = 0.0, leastSaving = Double.infinity
+                        for pair in 0 ..< 5 {
+                            worstRatio = max(worstRatio, samples[1][pair] / samples[0][pair])
+                            leastSaving = min(leastSaving, (samples[0][pair] - samples[1][pair]) / 1_000_000)
+                        }
+                        note("timed \(label) pairs=5 sites=32 hitsPerCandidate=32 K=12288 N=4096 rows=16 tile=\(BonsaiVerifyInt4.columns) candidateFallback=0")
+                        return (worstRatio, leastSaving)
+                    }
+                    let first = try timed(), confirm = try timed()
+                    reports.append(String(format: "\(label) full 16-row worst pair %.3fx %.3fms saved, confirm %.3fx %.3fms saved", first.ratio, first.saving, confirm.ratio, confirm.saving))
+                    guard !failed, first.ratio <= 0.98, confirm.ratio <= 0.98, first.saving >= 0.1, confirm.saving >= 0.1 else {
+                        result.report = reports.joined(separator: "; ")
+                        return
+                    }
+                }
+                result = (true, reports.joined(separator: "; "))
+            } catch let error as Failure { result.report = error.reason }
+            catch { result.report = "full-pass lifecycle error" }
+        }
+        return failed ? (false, "full-pass error") : result
     }
 }
