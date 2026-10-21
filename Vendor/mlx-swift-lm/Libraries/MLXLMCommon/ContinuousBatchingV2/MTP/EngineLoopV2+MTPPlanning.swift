@@ -243,6 +243,13 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: 0, reason: "step_kv_headroom")
             }
         }
+        if canSpeculate, mtp.planDepth > 0, eligibleRows.count == 1,
+            let rec = eligibleRows.first, mtp.hasValidCarry(for: rec),
+            mtp.shouldSkipNeuralDraft(for: rec)
+        {
+            mtp.markNeuralSkip(rec.id)
+            mtp.clampPlanDepth(to: 0, reason: "neural_rejection_cooldown")
+        }
         if mtp.planDepth > 0,
             eligibleRows.contains(where: { !mtp.hasValidCarry(for: $0) })
         {
