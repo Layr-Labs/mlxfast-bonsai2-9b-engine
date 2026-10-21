@@ -6286,6 +6286,20 @@ enum Qwen35VerifyStartFusion {
         return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
     }
 
+    /// The same fused gather, dequantize, inverse-WHT and FP32 cast at prompt width.
+    /// The load check already compares this kernel against the embedding module on
+    /// 2048-row batches and every id, so prompt widths are covered by it.
+    static let promptOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSTART_FUSE"] != "0"
+
+    static func embedPrompt(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
+        guard promptOffered, verified, inputs.ndim == 2, inputs.dim(0) == 1,
+            (64 ... 2048).contains(inputs.dim(1)), inputs.dim(1) % 64 == 0,
+            inputs.dtype == .int32, let e = packed(model)
+        else { return nil }
+        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
+    }
+
     static func prepare(_ model: Qwen35TextModelInner) {
         let note: String
         if !offered {
@@ -6535,6 +6549,9 @@ public class Qwen35TextModelInner: Module {
         var hiddenStates = inputEmbeddings
             ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
                 && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
+            ?? (!captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
+                && Qwen35Layer0FP32.promptPassed
+                ? Qwen35VerifyStartFusion.embedPrompt(self, inputs) : nil)
             ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
