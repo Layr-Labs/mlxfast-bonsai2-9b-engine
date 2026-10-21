@@ -1225,53 +1225,31 @@ enum CBv2VerifyVectorAttention {
     static func prepareCombine() { _ = combineDirectVerdict }
 
     private static func checkCombineDirect() -> Bool {
-        var note = "record (no timing gain)"
-        for L in [16, 7] {
+        for L in [16, 7, 2] {
             let slots = 16 * L * 32
             let o = probe([slots, 256], seed: 0.11, scale: 1.0)
             let m = probe([slots], seed: 0.12, scale: 2.0)
             let s = probe([slots], seed: 0.13, scale: 3.0)
-            let record = combine(
-                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-            let direct = combineDirect(
-                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-            let same = (record.view(dtype: .uint32) .== direct.view(dtype: .uint32)).all()
-                .item(Bool.self)
-            guard same else {
-                FileHandle.standardError.write(
-                    Data("vattn combine direct: off (bits differ at L \(L))\n".utf8))
-                return false
-            }
-            if L == 16 {
-                note = timingNote(o: o, m: m, s: s)
+            for zeroSum in [false, true] {
+                let sum = zeroSum ? MLXArray.zeros(like: s) : s
+                let record = combine(
+                    [o, m, sum], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+                let direct = combineDirect(
+                    [o, m, sum], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+                let same = (record.view(dtype: .uint32) .== direct.view(dtype: .uint32)).all()
+                    .item(Bool.self)
+                guard same else {
+                    FileHandle.standardError.write(
+                        Data("vattn combine direct: off (bits differ at L \(L))\n".utf8))
+                    return false
+                }
             }
         }
-        FileHandle.standardError.write(Data("vattn combine direct: \(note)\n".utf8))
-        return note.hasPrefix("on")
-    }
-
-    private static func timingNote(o: MLXArray, m: MLXArray, s: MLXArray) -> String {
-        func chain(_ kernel: MLXFast.MLXFastKernel) -> Double {
-            var best = Double.infinity
-            for _ in 0 ..< 4 {
-                let start = DispatchTime.now().uptimeNanoseconds
-                let out = kernel(
-                    [o, m, s], grid: (32 * 256, 16, 1), threadGroup: (256, 1, 1),
-                    outputShapes: [[1, 16, 16, 256]], outputDTypes: [.float32])[0]
-                eval(out)
-                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
-                best = min(best, elapsed)
-            }
-            return best
-        }
-        let recordTime = chain(combine)
-        let directTime = chain(combineDirect)
-        let gain = recordTime > 0 ? 1 - directTime / recordTime : 0
-        return gain >= 0.02
-            ? "on (\(Int((gain * 100).rounded()))% faster than the record)"
-            : "record (\(Int((gain * 100).rounded()))% direct)"
+        FileHandle.standardError.write(
+            Data("vattn combine direct: on (bits equal at L 2, 7, 16, zero-sum included)\n".utf8))
+        return true
     }
 
     /// One threadgroup per (head, query, half of the output dims); the 32
