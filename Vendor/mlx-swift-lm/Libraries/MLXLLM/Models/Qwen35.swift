@@ -6188,6 +6188,20 @@ enum Qwen35VerifyStartFusion {
         return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
     }
 
+    /// `DARKBLOOM_BONSAI_PSTART_FUSE=0` keeps the record chain at prompt width.
+    static let promptOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSTART_FUSE"] != "0"
+
+    /// The same rows at the prompt widths whose F16 embedding the forward casts to FP32
+    /// (`fusePromptBoundaries` with `promptPassed`); the check covers every id.
+    static func promptEmbed(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
+        guard promptOffered, verified, Qwen35Layer0FP32.promptPassed, inputs.ndim == 2,
+            inputs.dim(0) == 1, inputs.dim(1) >= 128, inputs.dim(1) % 64 == 0,
+            inputs.dtype == .int32, let e = packed(model)
+        else { return nil }
+        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
+    }
+
     static func prepare(_ model: Qwen35TextModelInner) {
         let note: String
         if !offered {
@@ -6208,6 +6222,10 @@ enum Qwen35VerifyStartFusion {
             note = "off (embedding not 2-bit g128 WHT-4096 F16)"
         }
         FileHandle.standardError.write(Data("qwen35 verify start fusion: \(note)\n".utf8))
+        let promptNote = !promptOffered ? "off"
+            : !Qwen35Layer0FP32.promptPassed ? "off (layer0 fp32 prompt off)"
+            : verified ? "on (same kernel and check)" : "off (verify start fusion off)"
+        FileHandle.standardError.write(Data("qwen35 prompt start fusion: \(promptNote)\n".utf8))
     }
 
     private static func check(_ e: HadamardQuantizedEmbedding) -> (Int, Int) {
@@ -6437,6 +6455,8 @@ public class Qwen35TextModelInner: Module {
         var hiddenStates = inputEmbeddings
             ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
                 && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
+            ?? (!captureRecurrentWindow && !exactTargetVerify
+                ? Qwen35VerifyStartFusion.promptEmbed(self, inputs) : nil)
             ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.

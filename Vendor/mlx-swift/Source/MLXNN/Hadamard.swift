@@ -315,6 +315,22 @@ public struct SignedBlockHadamard {
             }
             """
 
+    /// The residual-norm reads of `quantized4096Source`, with and without the normalized output.
+    private static let residualNormedRead = """
+        const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
+        *((device float4*)(residual_out + in_offset) + w) = raw;
+        const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+        const float4 normed = weight * (raw * norm_inv);
+        *((device float4*)(normed_out + in_offset) + w) = normed;
+        float4 val = normed * s4[w];
+        """
+    private static let residualNormRead = """
+        const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
+        *((device float4*)(residual_out + in_offset) + w) = raw;
+        const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
+        float4 val = (weight * (raw * norm_inv)) * s4[w];
+        """
+
     private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
         attentionGate: Bool = false, normalizedOutput: Bool = false,
@@ -338,19 +354,8 @@ public struct SignedBlockHadamard {
               rot4[w] = float4(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
             }
             """ : ""
-        let inputRead = residualNorm && normalizedOutput ? """
-            const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
-            *((device float4*)(residual_out + in_offset) + w) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            const float4 normed = weight * (raw * norm_inv);
-            *((device float4*)(normed_out + in_offset) + w) = normed;
-            float4 val = normed * s4[w];
-            """ : residualNorm ? """
-            const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
-            *((device float4*)(residual_out + in_offset) + w) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            float4 val = (weight * (raw * norm_inv)) * s4[w];
-            """ : attentionGate ? """
+        let inputRead = residualNorm && normalizedOutput ? residualNormedRead : residualNorm ? residualNormRead
+            : attentionGate ? """
             const uint ag_e = uint(base0) + 4u * uint(w);
             const uint ag_row = block_idx;
             const float4 attn = *((const device float4*)(x
@@ -484,32 +489,10 @@ public struct SignedBlockHadamard {
         let prefix = residualNormSource.replacingOccurrences(
             of: "(x + at))\n      + *((const device float4*)(residual + at));", with: "(x + at));")
         precondition(prefix != residualNormSource, "norm-only prefix not formed")
-        let read = normalizedOutput ? """
-            const float4 raw = in4[w];
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            const float4 normed = weight * (raw * norm_inv);
-            *((device float4*)(normed_out + in_offset) + w) = normed;
-            float4 val = normed * s4[w];
-            """ : """
-            const float4 raw = in4[w];
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            float4 val = (weight * (raw * norm_inv)) * s4[w];
-            """
+        let residualRead = normalizedOutput ? residualNormedRead : residualNormRead
+        let read = residualRead.replacingOccurrences(of: " + *((const device float4*)(residual + in_offset) + w);\n*((device float4*)(residual_out + in_offset) + w) = raw;", with: ";")
         let residualSource = quantized4096Source(
             swiglu: false, residualNorm: true, normalizedOutput: normalizedOutput)
-        let residualRead = normalizedOutput ? """
-            const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
-            *((device float4*)(residual_out + in_offset) + w) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            const float4 normed = weight * (raw * norm_inv);
-            *((device float4*)(normed_out + in_offset) + w) = normed;
-            float4 val = normed * s4[w];
-            """ : """
-            const float4 raw = in4[w] + *((const device float4*)(residual + in_offset) + w);
-            *((device float4*)(residual_out + in_offset) + w) = raw;
-            const float4 weight = *((const device float4*)(norm_weight + s_offset) + w);
-            float4 val = (weight * (raw * norm_inv)) * s4[w];
-            """
         let source = residualSource
             .replacingOccurrences(of: residualNormSource, with: prefix)
             .replacingOccurrences(of: residualRead, with: read)
@@ -1394,7 +1377,7 @@ extension SignedBlockHadamard {
             return f
         }
 
-        /// The elementwise forms, switched by `MLXFAST_WIDE_ROWS_ELEMENTWISE`.
+        /// The elementwise forms (512 lanes only, `wideRowLaneCandidates`).
         var elementwise: Bool {
             switch self {
             case .plain, .plainRot, .swiglu, .attentionGate: return true
@@ -1429,25 +1412,6 @@ extension SignedBlockHadamard {
         }
     }
 
-    /// `MLXFAST_WIDE_ROWS=0` keeps every record kernel.
-    static let wideRowEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-    /// `MLXFAST_WIDE_ROWS_ELEMENTWISE=0` keeps the record kernel for the
-    /// elementwise forms only (`WideRowKind.elementwise`).
-    static let wideRowElementwiseEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["MLXFAST_WIDE_ROWS_ELEMENTWISE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !["0", "false", "no", "off"].contains(value ?? "")
-    }()
-
-    private static func wideRowKindEnabled(_ kind: WideRowKind) -> Bool {
-        wideRowEnabled && (!kind.elementwise || wideRowElementwiseEnabled)
-    }
-    static let wideRowThreadsSetting: String? = ProcessInfo.processInfo
-        .environment["MLXFAST_WIDE_ROWS_THREADS"]?.trimmingCharacters(in: .whitespacesAndNewlines)
     static let wideRow1024Enabled: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WIDE_ROWS_1024"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1456,9 +1420,7 @@ extension SignedBlockHadamard {
 
     /// Lane counts tried in order: 1024 then 512 for the norm forms, 512 for the elementwise ones.
     static func wideRowLaneCandidates(_ kind: WideRowKind) -> [Int] {
-        if wideRowThreadsSetting == "512" || !wideRow1024Enabled { return [512] }
-        if wideRowThreadsSetting == "1024" || !kind.elementwise { return [1024, 512] }
-        return [512]
+        !wideRow1024Enabled || kind.elementwise ? [512] : [1024, 512]
     }
 
     private static func wideRowRecordKernel(_ kind: WideRowKind, headError2: Bool = false) -> MLXFast.MLXFastKernel {
@@ -1517,7 +1479,7 @@ extension SignedBlockHadamard {
     {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
         for kind in WideRowKind.allCases
-        where wideRowKindEnabled(kind) && wideRowLaneCandidates(kind).contains(threads) {
+        where wideRowLaneCandidates(kind).contains(threads) {
             if headError2 && kind != .plainRot && kind != .residualNormRot { continue }
             if lean && wideRowLeanThreads[kind] != threads { continue }
             var form = kind.form
@@ -1565,12 +1527,12 @@ extension SignedBlockHadamard {
     /// Runs the load check once, from the first prompt-width call of at least 1024 rows: the resident's boot warm,
     /// which runs before the socket serves and which no timed phase reaches (the timed prompts are 512 tokens).
     static func wideRowPrepareIfBoot(rows: Int) {
-        guard rows >= 1024, wideRowEnabled, !wideRowReady else { return }
+        guard rows >= 1024, !wideRowReady else { return }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
         guard !wideRowChecked else { return }
         wideRowChecked = true
-        for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
+        for kind in WideRowKind.allCases {
             let candidates = wideRowLaneCandidates(kind)
             for threads in candidates {
                 // An MLX error in the check (a pipeline that cannot run this
@@ -1608,7 +1570,6 @@ extension SignedBlockHadamard {
     }
 
     private static func wideRowLanes(_ kind: WideRowKind) -> Int {
-        guard wideRowKindEnabled(kind) else { return 0 }
         if wideRowReady { return wideRowResolvedLanes[kind.index] }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
@@ -2960,14 +2921,12 @@ enum ExactVerifyHead {
     }
 
     /// `DARKBLOOM_BONSAI_XHEAD=0` keeps the record's head (float top-2 at 2-4
-    /// rows, int8 logits at 5-8); `=5` takes this path at 5-8 rows only.
+    /// rows, int8 logits at 5-8).
     static let rowRange: ClosedRange<Int>? = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_XHEAD"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if ["0", "false", "no", "off"].contains(value ?? "") { return nil }
-        let high = 16
-        if let value, let low = Int(value), (2 ... 8).contains(low) { return low ... high }
-        return 2 ... high
+        return 2 ... 16
     }()
 
     /// Row counts whose first call passed (true) or failed (false) the
@@ -3068,8 +3027,8 @@ private enum DraftScreenQMV {
     /// screened row, and that row's index.
     static let rescore = MLXFast.metalKernel(
         name: "hadamard_qmv_screen_rescore_f16_constants",
-        inputNames: ["x", "w", "scales", "biases", "pick"], outputNames: ["y", "row"],
-        source: """
+        inputNames: ["x", "w", "scales", "biases", "pick"], outputNames: ["y", "row"], source: rescoreSource)
+    static let rescoreSource = """
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
             const int K = x_shape[1];
@@ -3113,7 +3072,7 @@ private enum DraftScreenQMV {
               y[c] = total;
               row[c] = r;
             }
-            """)
+            """
 
     /// Fused `argMax(partial.reshaped([blocks, 32]), axis: -1)` + `rescore`
     /// when `CH == 32` and `biases == -scales`: each 32-lane simdgroup reduces
@@ -3122,58 +3081,11 @@ private enum DraftScreenQMV {
     static let rescoreFast32 = MLXFast.metalKernel(
         name: "hadamard_qmv_screen_rescore_fast32_f16",
         inputNames: ["x", "w", "scales", "partial"], outputNames: ["y", "row"],
-        source: """
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-            const int K = x_shape[1];
-            const int in_w = K / 4;
-            const int in_g = K / 128;
-            const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
-            float best_v = partial[c * 32 + int(simd_lid)];
-            int best_i = int(simd_lid);
-            for (ushort offset = 16; offset > 0; offset >>= 1) {
-              const float other_v = simd_shuffle_xor(best_v, offset);
-              const int other_i = simd_shuffle_xor(best_i, offset);
-              if (other_v > best_v || (other_v == best_v && other_i < best_i)) {
-                best_v = other_v;
-                best_i = other_i;
-              }
-            }
-            const int r = c * 32 + best_i;
-            const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
-            const device half* sc = scales + r * in_g + simd_lid / 8;
-            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
-            float result = 0;
-            for (int k = 0; k < K; k += 512) {
-              float sum = 0;
-              float x_thread[16];
-              for (int i = 0; i < 4; ++i) {
-                const float4 xv = xp4[i];
-                sum += xv.x + xv.y + xv.z + xv.w;
-                x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y * 0.25f;
-                x_thread[4 * i + 2] = xv.z * 0.0625f;
-                x_thread[4 * i + 3] = xv.w * 0.015625f;
-              }
-              const uint packed_w = *(const device uint*)ws;
-              float accum = 0;
-              for (int i = 0; i < 4; i++) {
-                const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
-                accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
-                    + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
-              }
-              const float s = float(*sc);
-              result += s * accum + sum * (-s);
-              ws += 128;
-              sc += 4;
-              xp4 += 128;
-            }
-            const float total = simd_sum(result);
-            if (simd_lid == 0) {
-              y[c] = total;
-              row[c] = r;
-            }
-            """)
+        source: rescoreSource
+            .replacingOccurrences(of: "const int r = c * CH + int(pick[c]);", with: "float best_v = partial[c * 32 + int(simd_lid)];\nint best_i = int(simd_lid);\nfor (ushort offset = 16; offset > 0; offset >>= 1) {\n  const float other_v = simd_shuffle_xor(best_v, offset);\n  const int other_i = simd_shuffle_xor(best_i, offset);\n  if (other_v > best_v || (other_v == best_v && other_i < best_i)) {\n    best_v = other_v;\n    best_i = other_i;\n  }\n}\nconst int r = c * 32 + best_i;")
+            .replacingOccurrences(of: "\nconst device half* bi = biases + r * in_g + simd_lid / 8;", with: "")
+            .replacingOccurrences(of: "const float b = NEG ? -s : float(*bi);\n  result += s * accum + sum * b;", with: "result += s * accum + sum * (-s);")
+            .replacingOccurrences(of: "\n  bi += 4;", with: ""))
 
     /// Single-threadgroup final argmax + gather: finds the winning block across
     /// `y[0 ..< BLOCKS]`, resolves `win_row = row[best_c]`, and writes either
@@ -3594,81 +3506,11 @@ enum PromptInt8Matmul {
     // whose FP16 offsets are bit for bit its negated scales, checked at
     // init) the offsets are `-s` instead of a second load, the same FP32
     // value. The epilogue's arithmetic and order are unchanged.
-    static let naxVectorSource = """
-        const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int n0 = int(threadgroup_position_in_grid.x) * 64;
-        const int m0 = int(threadgroup_position_in_grid.y) * 64;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = thread_position_in_threadgroup.x;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(64, 64, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
-        threadgroup uint32_t bs[2][64 * 128 / 4];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
-        auto tA0 = A.template slice<128, 64>(0, m0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B0)>, int32_t>();
-        constexpr int CAP = 32;
-        const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-        const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-        const int nb = n0 + 16 * int(sg & 1) + fn;
-        const int mb = m0 + 16 * int(sg >> 1) + fm;
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) { acc[i] = 0.0f; }
-        const device half4* sp0 = (const device half4*)(scalesT + nb);
-        const device half4* sp1 = (const device half4*)(scalesT + nb + 32);
-        const device half4* bp0 = (const device half4*)(biasesT + nb);
-        const device half4* bp1 = (const device half4*)(biasesT + nb + 32);
-        const int NQ = N / 4;
-        const size_t tbase = (size_t)(m0 / 64) * (size_t)Kg * 64 + (size_t)((8 * int(sg >> 1) + fm) * 4);
-        const int sc = int(tid >> 1); const int sh = int(tid & 1);
-        const device uint32_t* wrow = w + (size_t)(n0 + sc) * (K / 16) + sh * 4;
-        auto stage = [&](int g, int buf) {
-          const device uint4* src = (const device uint4*)(wrow + g * 8);
-          const uint4 v = *src;
-          threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
-          #pragma clang loop unroll(full)
-          for (int j = 0; j < 4; j++) {
-            const uint32_t wv = v[j];
-            *(threadgroup uint4*)(dst + 4 * j) = uint4(
-                wv & 0x03030303u, (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);
-          }
-        };
-        stage(0, 0);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int g = 0; g < Kg; g++) {
-          const int cur = g & 1;
-          if (g + 1 < Kg) { stage(g + 1, cur ^ 1); }
-          auto tA = A.template slice<128, 64>(g * 128, m0);
-          if (cur == 0) { op.run(tA, B0, cT); } else { op.run(tA, B1, cT); }
-          const float4 s0 = float4(sp0[g * NQ]), s1 = float4(sp1[g * NQ]);
-          const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);
-          const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);
-          const float4 as4 = *(const device float4*)(ascale + tbase + (size_t)g * 64);
-          const float4 rb4 = *(const device float4*)(rsb + tbase + (size_t)g * 64);
-          float as[4], rb[4];
-          as[0] = as4.x; as[1] = as4.y; as[2] = as4.z; as[3] = as4.w;
-          rb[0] = rb4.x; rb[1] = rb4.y; rb[2] = rb4.z; rb[3] = rb4.w;
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            const int c = i & 3; const int nh = (i >> 3) & 1; const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-            const float s = nh ? s1[c] : s0[c];
-            const float b = nh ? b1[c] : b0[c];
-            const float t = s * float(cT[i]);
-            acc[i] = fma(b, rb[mh], fma(as[mh], t, acc[i]));
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i += 4) {
-          const int nh = (i >> 3) & 1;
-          const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-          *(device float4*)(out + (size_t)mm * N + nb + 32 * nh) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
-        }
-        """
+    static let naxVectorSource = naxSource
+        .replacingOccurrences(of: "dst[4 * j + 0] = wv & 0x03030303u;\n    dst[4 * j + 1] = (wv >> 2) & 0x03030303u;\n    dst[4 * j + 2] = (wv >> 4) & 0x03030303u;\n    dst[4 * j + 3] = (wv >> 6) & 0x03030303u;", with: "*(threadgroup uint4*)(dst + 4 * j) = uint4(\n        wv & 0x03030303u, (wv >> 2) & 0x03030303u, (wv >> 4) & 0x03030303u, (wv >> 6) & 0x03030303u);")
+        .replacingOccurrences(of: "const float4 b0 = float4(bp0[g * NQ]), b1 = float4(bp1[g * NQ]);", with: "const float4 b0 = NEG ? -s0 : float4(bp0[g * NQ]);\n  const float4 b1 = NEG ? -s1 : float4(bp1[g * NQ]);")
+        .replacingOccurrences(of: "for (int i = 0; i < CAP; i++) {\n  const int c = i & 3; const int nh", with: "for (int i = 0; i < CAP; i += 4) {\n  const int nh")
+        .replacingOccurrences(of: "out[(size_t)mm * N + nb + c + 32 * nh] = acc[i];", with: "*(device float4*)(out + (size_t)mm * N + nb + 32 * nh) = float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);")
 
     private static let naxKernel = MLXFast.metalKernel(
         name: "bonsai_q8_prompt_matmul_nax",
@@ -4034,10 +3876,11 @@ enum PromptInt8Matmul {
     }
 
     // Only the word loads differ; the cooperative operand and all math stay native.
-    private static let streamedRegBody: String? = replacingStreamFragments(naxRegBody, [
+    private static let streamRegSwaps: [(of: String, with: String)] = [
         (of: "const size_t cs = (size_t)(K / 8);\nconst device uint4* wcol = (const device uint4*)(w + (size_t)(ns + nl) * (size_t)(K / 16));\nuint4 wv[8];", with: "const device uint4* wcol = (const device uint4*)(w + (size_t)(ns / 16) * Kg * 128 + (size_t)nl * 8);\nuint4 wv[8];"),
         (of: "  const device uint4* src = wcol + (size_t)g * 2;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * cs]; wv[2 * c + 1] = src[c * cs + 1]; }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }", with: "  const device uint4* src = wcol + (size_t)g * 32;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const size_t off = (size_t)(c >> 1) * Kg * 32 + (c & 1) * 16;\n    wv[2*c] = src[off]; wv[2*c+1] = src[off+1];\n  }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }"),
-    ])
+    ]
+    private static let streamedRegBody: String? = replacingStreamFragments(naxRegBody, streamRegSwaps)
 
     private static let streamedRegKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
@@ -4060,7 +3903,16 @@ enum PromptInt8Matmul {
     }
 
     // No tensor operation: compare the 32 packed operand words in each lane.
-    private static let registerOperandProofSource = "const uint lane = thread_index_in_simdgroup;\nconst uint3 pos = threadgroup_position_in_grid;\nconst int Kg = K / 128;\nconst int ns = int(pos.x) * 32;\nconst int g = int(pos.y);\nconst int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));\nconst uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));\nuint32_t reference[32], candidate[32];\n{\n  const device uint32_t* w = canonical;\n  thread uint32_t* bw = reference;\n  const size_t cs = (size_t)(K / 8);\n  const device uint4* wcol = (const device uint4*)(w + (size_t)(ns + nl) * (size_t)(K / 16));\n  uint4 wv[8];\n  const device uint4* src = wcol + (size_t)g * 2;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) { wv[2 * c] = src[c * cs]; wv[2 * c + 1] = src[c * cs + 1]; }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }\n}\n{\n  const device uint32_t* w = packed;\n  thread uint32_t* bw = candidate;\n  const device uint4* wcol = (const device uint4*)(w + (size_t)(ns / 16) * Kg * 128 + (size_t)nl * 8);\n  uint4 wv[8];\n  const device uint4* src = wcol + (size_t)g * 32;\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const size_t off = (size_t)(c >> 1) * Kg * 32 + (c & 1) * 16;\n    wv[2*c] = src[off]; wv[2*c+1] = src[off+1];\n  }\n  #pragma clang loop unroll(full)\n  for (int c = 0; c < 4; c++) {\n    const uint4 lo = wv[2 * c]; const uint4 hi = wv[2 * c + 1];\n    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;\n    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;\n    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;\n    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;\n  }\n}\nuint diff = 0;\nfor (int i = 0; i < 32; ++i) diff |= reference[i] ^ candidate[i];\nbad[(size_t(pos.x) * Kg + pos.y) * 32 + lane] = diff != 0 ? 1 : 0;\n"
+    private static let registerOperandProofSource: String = {
+        func block(_ w: String, _ bw: String, _ first: String, _ second: String) -> String {
+            "{\n  const device uint32_t* w = " + w + ";\n  thread uint32_t* bw = " + bw + ";\n  "
+                + first.replacingOccurrences(of: "\n", with: "\n  ") + "\n" + second + "\n}\n"
+        }
+        return "const uint lane = thread_index_in_simdgroup;\nconst uint3 pos = threadgroup_position_in_grid;\nconst int Kg = K / 128;\nconst int ns = int(pos.x) * 32;\nconst int g = int(pos.y);\nconst int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));\nconst uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));\nuint32_t reference[32], candidate[32];\n"
+            + block("canonical", "reference", streamRegSwaps[0].of, streamRegSwaps[1].of)
+            + block("packed", "candidate", streamRegSwaps[0].with, streamRegSwaps[1].with)
+            + "uint diff = 0;\nfor (int i = 0; i < 32; ++i) diff |= reference[i] ^ candidate[i];\nbad[(size_t(pos.x) * Kg + pos.y) * 32 + lane] = diff != 0 ? 1 : 0;\n"
+    }()
     private static let registerOperandProofKernels = [false, true].map { index32 in
         let source = index32 ? registerOperandProofSource
             .replacingOccurrences(of: "(size_t)", with: "(uint)")
@@ -4297,7 +4149,7 @@ enum PromptInt8Matmul {
             inputs = [codes, l0.weight, l1.weight, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims]
             outputShapes = [[m, n0], [m, n1]]
             outputDTypes = [.float32, .float32]
-        case 3:
+        default:
             let l0 = layers[0], l1 = layers[1], l2 = layers[2]
             let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0), n2 = l2.weight.dim(0)
             totalN = n0 + n1 + n2
@@ -4314,17 +4166,6 @@ enum PromptInt8Matmul {
             ]
             outputShapes = [[m, n0], [m, n1], [m, n2]]
             outputDTypes = [.float32, .float32, .float32]
-        default:
-            let ns = layers.map { $0.weight.dim(0) }
-            totalN = ns.reduce(0, +)
-            allNValid = ns.allSatisfy { n in
-                n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
-            }
-            dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
-            inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
-                + [ascale, rsb, dims]
-            outputShapes = ns.map { [m, $0] }
-            outputDTypes = ns.map { _ in .float32 }
         }
         let index32 = m > 0 && m % 64 == 0 && k >= 128 && k % 128 == 0
             && m <= limit / k && allNValid
@@ -5386,15 +5227,11 @@ extension PromptInt8Matmul {
     }
 }
 
-/// The prompt GDN z projection out of the qkv launch. In the record the
-/// prompt qkv and z run as one launch (one per layer on the plain route)
-/// before the convolution, the b/a GEMM and the fresh8 scan, though z feeds
-/// only the gated norm after the scan. Split, z runs in its own launch
-/// whose codes are ordered after the scan output, with no barrier between
-/// them, so z's weight stream overlaps the latency-bound scan. The split
-/// serves only after `PromptInt8Matmul.checkSplitPair` found every output
-/// equal, bit for bit, to the record route's; otherwise the record launch
-/// stays. `DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0` keeps the record launch.
+/// The prompt GDN z projection out of the qkv launch. The record runs prompt qkv and z as one launch (per layer on
+/// the plain route) before the convolution, the b/a GEMM and the fresh8 scan, though z feeds only the gated norm
+/// after the scan. Split, z runs in its own launch ordered after the scan output (no barrier), so its weight stream
+/// overlaps the latency-bound scan. It serves only after `PromptInt8Matmul.checkSplitPair` matched the record route
+/// bit for bit. `DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0` keeps the record launch.
 enum PromptSplitZ {
     static let offered: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_Z_SPLIT"]?
@@ -5432,26 +5269,19 @@ enum PromptSplitZ {
     }
 }
 
-/// Verify-width packed matmul (an MTP verify: 2 to 8 rows) on the int8
-/// activation codes of `PromptInt8Matmul`, split over K inside a threadgroup
-/// (27b 320ec19a's verify split-K on tensor units, built integer-exact).
+/// Verify-width packed matmul (an MTP verify: 2 to 8 rows) on `PromptInt8Matmul`'s int8 activation codes, split
+/// over K inside a threadgroup (27b 320ec19a's verify split-K on tensor units, built integer-exact).
 ///
-/// A threadgroup owns 32 output columns. Its four simdgroups take every fourth
-/// 128-group (simdgroup s takes g = s, s + 4, ...). Per group each computes
-/// `C[m, n] = sum_{k in g} q[m, k] * code[n, k]` (integer, |C| < 2^24, exact
-/// in int32 and in FP32 as `PromptInt8Matmul` shows) and folds it into its
-/// partial with `PromptInt8Matmul`'s epilogue, groups ascending from 0:
+/// A threadgroup owns 32 output columns; simdgroup s takes 128-groups g = s, s + 4, ... Per group it forms the exact
+/// integer `C[m, n] = sum_{k in g} q[m, k] * code[n, k]` (|C| < 2^24) and folds it in with `PromptInt8Matmul`'s
+/// epilogue, groups ascending from 0:
 ///
 ///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], s[n, g] * float(C), acc))
 ///
-/// The four partials are then summed in simdgroup order, `((p0 + p1) + p2) +
-/// p3`. `nax` gets C from one 16 x 32 x 128 int8 tensor op per group (the
-/// rows padded to 16 with zero codes, the 2-bit codes expanded to int8 in the
-/// simdgroup's threadgroup buffer) and finds each element's (m, n) through
-/// `get_multidimensional_index`, so it assumes no fragment layout. `plain`
-/// gets C from FP32 FMAs and lane shuffles. Same integers, same FP32 steps in
-/// the same order: the same bits, which `checkKernels` checks on the device
-/// before `nax` is used.
+/// The partials are summed as `((p0 + p1) + p2) + p3`. `nax` gets C from one 16 x 32 x 128 int8 tensor op per
+/// group (rows zero-padded to 16, codes expanded to int8 in threadgroup memory), locating (m, n) through
+/// `get_multidimensional_index`; `plain` uses FP32 FMAs and lane shuffles. Same integers, same FP32 steps in the same
+/// order, so the same bits, which `checkKernels` confirms on the device before `nax` is used.
 enum VerifyInt8Matmul {
     /// The canonical 2-bit codes remain model parameters.
     static let streamAllowed: Bool = {
@@ -5908,90 +5738,12 @@ enum VerifyInt8Matmul {
     // are multiples of 32), and with `NEG = 1` (offsets bit for bit the
     // negated scales, checked at init) each lane's offset is `-s` instead
     // of a second load, the same FP16 value.
-    static let naxVectorSource = """
-        #pragma clang fp contract(off)
-        #pragma clang fp reassociate(off)
-        const int K = ksz[0]; const int N = ksz[2];
-        const int Kg = K / 128;
-        const int KW = K / 16;
-        const int n0 = int(threadgroup_position_in_grid.x) * 32;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint tid = thread_position_in_threadgroup.x;
-        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
-        threadgroup uint32_t bs[4][32 * 32];
-        tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B((threadgroup int8_t*)bs[sg], dextents<int, 2>(128, 32));
-        auto tA0 = A.template slice<128, 16>(0, 0);
-        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
-        constexpr int CAP = 16;
-        const int cap = int(cT.get_capacity());
-        short em[CAP], en[CAP];
-        bool live[CAP];
-        float acc[CAP];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          em[i] = 16; en[i] = 0;
-          if (i < cap) {
-            auto ids = cT.get_multidimensional_index(i);
-            en[i] = short(ids[0]); em[i] = short(ids[1]);
-          }
-          live[i] = simd_any(em[i] < ROWS);
-          acc[i] = 0.0f;
-        }
-        const int j = int(lane & 7u);
-        const int c = int(lane >> 3);
-        const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;
-        threadgroup uint4* dst = (threadgroup uint4*)bs[sg] + c * 8 + j;
-        uint32_t wv[8];
-        #pragma clang loop unroll(full)
-        for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + int(sg) * 8]; }
-        for (int g = int(sg); g < Kg; g += 4) {
-          #pragma clang loop unroll(full)
-          for (int t = 0; t < 8; t++) {
-            const uint32_t v = wv[t];
-            dst[32 * t] = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);
-          }
-          const half sv = scalesT[(size_t)g * N + n0 + lane];
-          const half2 sb = half2(sv, NEG ? -sv : biasesT[(size_t)g * N + n0 + lane]);
-          const int lr = min(int(lane), ROWS - 1);
-          const float2 ar = lane < uint(ROWS) ? float2(ascale[lr * Kg + g], rsb[lr * Kg + g]) : float2(0.0f);
-          if (g + 4 < Kg) {
-            #pragma clang loop unroll(full)
-            for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + (g + 4) * 8]; }
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-          auto tA = A.template slice<128, 16>(g * 128, 0);
-          op.run(tA, B, cT);
-          #pragma clang loop unroll(full)
-          for (int i = 0; i < CAP; i++) {
-            if (live[i]) {
-              const half2 s2 = simd_shuffle(sb, ushort(en[i]));
-              const float2 a2 = simd_shuffle(ar, ushort(em[i] & 15));
-              const float t = float(s2.x) * float(cT[i]);
-              acc[i] = fma(float(s2.y), a2.y, fma(a2.x, t, acc[i]));
-            }
-          }
-          simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        threadgroup float* red = (threadgroup float*)bs[sg];
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < CAP; i++) {
-          if (em[i] < ROWS) { red[em[i] * 32 + en[i]] = acc[i]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const threadgroup float4* r0 = (const threadgroup float4*)bs[0];
-        const threadgroup float4* r1 = (const threadgroup float4*)bs[1];
-        const threadgroup float4* r2 = (const threadgroup float4*)bs[2];
-        const threadgroup float4* r3 = (const threadgroup float4*)bs[3];
-        for (int e = int(tid); e < ROWS * 8; e += 128) {
-          float4 v = r0[e] + r1[e];
-          v = v + r2[e];
-          v = v + r3[e];
-          *(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = cap == CAP ? v : float4(as_type<float>(0x7fc00000u));
-        }
-        """
+    static let naxVectorSource = naxSource
+        .replacingOccurrences(of: "const half2 sb = half2(scalesT[(size_t)g * N + n0 + lane], biasesT", with: "const half sv = scalesT[(size_t)g * N + n0 + lane];\n  const half2 sb = half2(sv, NEG ? -sv : biasesT")
+        .replacingOccurrences(of: "const threadgroup float* r", with: "const threadgroup float4* r")
+        .replacingOccurrences(of: "(const threadgroup float*)bs[", with: "(const threadgroup float4*)bs[")
+        .replacingOccurrences(of: "e < ROWS * 32; e += 128) {\n  float v", with: "e < ROWS * 8; e += 128) {\n  float4 v")
+        .replacingOccurrences(of: "out[(size_t)(e >> 5) * N + n0 + (e & 31)] = cap == CAP ? v : as_type<float>(0x7fc00000u);", with: "*(device float4*)(out + (size_t)(e >> 3) * N + n0 + 4 * (e & 7)) = cap == CAP ? v : float4(as_type<float>(0x7fc00000u));")
 
     // `naxVectorSource` with the destination layout fixed (tuned on the M5
     // Max). On the M5, element i of lane l is (row, column) = (mrow + 8 *
@@ -6725,7 +6477,7 @@ enum VerifyInt8Matmul {
             inputs = [codes, w0, w1, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims]
             outputShapes = [[m, n0], [m, n1]]
             outputDTypes = [.float32, .float32]
-        case 3:
+        default:
             let l0 = layers[0], l1 = layers[1], l2 = layers[2]
             let n0 = l0.weight.dim(0), n1 = l1.weight.dim(0), n2 = l2.weight.dim(0)
             totalN = n0 + n1 + n2
@@ -6741,14 +6493,6 @@ enum VerifyInt8Matmul {
             ]
             outputShapes = [[m, n0], [m, n1], [m, n2]]
             outputDTypes = [.float32, .float32, .float32]
-        default:
-            let ns = layers.map { $0.weight.dim(0) }
-            totalN = ns.reduce(0, +)
-            dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
-            let ws = (useForms ? streamedWeights : nil) ?? layers.map { $0.weight }
-            inputs = [codes] + ws + layers.map { $0.scalesT } + layers.map { $0.biasesT } + [ascale, rsb, dims]
-            outputShapes = ns.map { [m, $0] }
-            outputDTypes = ns.map { _ in .float32 }
         }
         if useForms {
             let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
@@ -7061,7 +6805,7 @@ enum VerifyInt8Matmul {
         let chosen: Route
         if ["0", "false", "no", "off"].contains(value ?? "") {
             chosen = .off
-        } else if value == "nax" || PromptInt8Matmul.architectureHasNAX(architecture) {
+        } else if PromptInt8Matmul.architectureHasNAX(architecture) {
             chosen = checkKernels(nax: true) ? .nax : .off
         } else {
             checkKernels(nax: false)
@@ -9426,52 +9170,12 @@ private enum DraftStepRowKernels {
     static let rescorePick = MLXFast.metalKernel(
         name: "draft_step_screen_rescore_pick",
         inputNames: ["x", "w", "scales", "biases", "partial"], outputNames: ["y", "row"],
-        source: """
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-            const int K = x_shape[1];
-            const int in_w = K / 4;
-            const int in_g = K / 128;
-            const int c = threadgroup_position_in_grid.y * 2 + simd_gid;
-            const float p = partial[c * 32 + simd_lid];
-            const float m = simd_max(p);
-            const uint pick = simd_min(p == m ? simd_lid : 32u);
-            const int r = c * 32 + int(min(pick, 31u));
-            const device uint8_t* ws = (const device uint8_t*)w + r * in_w + simd_lid * 4;
-            const device half* sc = scales + r * in_g + simd_lid / 8;
-            const device half* bi = biases + r * in_g + simd_lid / 8;
-            const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
-            float result = 0;
-            for (int k = 0; k < K; k += 512) {
-              float sum = 0;
-              float x_thread[16];
-              for (int i = 0; i < 4; ++i) {
-                const float4 xv = xp4[i];
-                sum += xv.x + xv.y + xv.z + xv.w;
-                x_thread[4 * i] = xv.x;
-                x_thread[4 * i + 1] = xv.y / 4.0f;
-                x_thread[4 * i + 2] = xv.z / 16.0f;
-                x_thread[4 * i + 3] = xv.w / 64.0f;
-              }
-              const uint packed_w = *(const device uint*)ws;
-              float accum = 0;
-              for (int i = 0; i < 4; i++) {
-                const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF;
-                accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c)
-                    + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0));
-              }
-              result += float(*sc) * accum + sum * float(*bi);
-              ws += 128;
-              sc += 4;
-              bi += 4;
-              xp4 += 128;
-            }
-            const float total = simd_sum(result);
-            if (simd_lid == 0) {
-              y[c] = total;
-              row[c] = r;
-            }
-            """)
+        source: DraftScreenQMV.rescoreSource
+            .replacingOccurrences(of: "const int r = c * CH + int(pick[c]);", with: "const float p = partial[c * 32 + simd_lid];\nconst float m = simd_max(p);\nconst uint pick = simd_min(p == m ? simd_lid : 32u);\nconst int r = c * 32 + int(min(pick, 31u));")
+            .replacingOccurrences(of: "xv.y * 0.25f", with: "xv.y / 4.0f")
+            .replacingOccurrences(of: "xv.z * 0.0625f", with: "xv.z / 16.0f")
+            .replacingOccurrences(of: "xv.w * 0.015625f", with: "xv.w / 64.0f")
+            .replacingOccurrences(of: "const float s = float(*sc);\n  const float b = NEG ? -s : float(*bi);\n  result += s * accum + sum * b;", with: "result += float(*sc) * accum + sum * float(*bi);"))
 
     /// First maximum over the rescored blocks; writes the winner's id and its
     /// row in the head.
