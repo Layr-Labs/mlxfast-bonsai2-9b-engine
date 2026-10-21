@@ -5676,6 +5676,8 @@ extension Qwen3NextMLP {
     /// projection is the gate/up product the matmul formed, two are the pair.
     func qwen35ProjectedGateUp(_ projections: [MLXArray], fold: PromptResidualFold? = nil) -> MLXArray {
         if projections.count == 1 {
+            if fold == nil, let down = downProj as? HadamardQuantizedLinear,
+                let output = FixedM5Product.down(down, projections[0]) { return output }
             if let down = downProj as? HadamardQuantizedLinear,
                 let output = down.callAfterPromptProduct(projections[0], fold: fold)
             {

@@ -908,7 +908,11 @@ public struct SignedBlockHadamard {
     /// not a verify-width FP32 block-4096 input.
     /// With `up`, the input is `silu(x) * up`, formed inside the rotation as
     /// in `quantizedForPrompt`.
-    public func quantizedForVerify(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
+    public static var fixedProductKernels: (MLXFast.MLXFastKernel, MLXFast.MLXFastKernel) {
+        (residualNormQuantized4096Kernel, quantized4096Kernel)
+    }
+
+    func quantizedForVerify(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
         validate(x)
         let rows = x.size / width
         guard blockSize == 4096, x.dtype == .float32, (2 ... 16).contains(rows),
@@ -1564,7 +1568,7 @@ extension SignedBlockHadamard {
 
     /// Runs the load check once, from the first prompt-width call of at least 1024 rows: the resident's boot warm,
     /// which runs before the socket serves and which no timed phase reaches (the timed prompts are 512 tokens).
-    public static func wideRowPrepareIfBoot(rows: Int) {
+    static func wideRowPrepareIfBoot(rows: Int) {
         guard rows >= 1024, wideRowEnabled, !wideRowReady else { return }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
@@ -3331,10 +3335,10 @@ extension SignedBlockHadamard {
 
 /// A rotated prompt-width activation quantized per row and 128-group by
 /// `SignedBlockHadamard.quantizedForPrompt`.
-public struct PromptInt8Activation {
-    public let codes: MLXArray
-    public let ascale: MLXArray
-    public let rsb: MLXArray
+struct PromptInt8Activation {
+    let codes: MLXArray
+    let ascale: MLXArray
+    let rsb: MLXArray
     let rows: Int
     let k: Int
 }
@@ -5634,7 +5638,7 @@ enum VerifyInt8Matmul {
         return prefix + body
     }
 
-    static let streamedKernels = (1 ... 3).map { layers in
+    private static let streamedKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_streamed_col\(layers)",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
@@ -6547,7 +6551,7 @@ enum VerifyInt8Matmul {
     }
 
     /// `naxFormsSource` for one, two and three layers (index `layers - 1`).
-    static let naxFormsKernels = (1 ... 3).map { layers in
+    private static let naxFormsKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_matmul_nax_forms\(layers)",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
@@ -6572,7 +6576,7 @@ enum VerifyInt8Matmul {
         return 0
     }
     @inline(__always)
-    static func hasMatchedForm(k: Int, layers: Int) -> Bool {
+    private static func hasMatchedForm(k: Int, layers: Int) -> Bool {
         (formsMatchedMask & formBit(k: k, layers: layers)) != 0
     }
     /// `DARKBLOOM_BONSAI_VERIFY_FORMS=0` keeps the record kernel everywhere.
@@ -6697,7 +6701,7 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil, streamedWeights: [MLXArray]? = nil, product: Bool = false
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil, streamedWeights: [MLXArray]? = nil
     ) -> [MLXArray] {
         let useForms = forms ?? usesForms(k: k, layers: layers)
         let dims: MLXArray
@@ -6752,8 +6756,6 @@ enum VerifyInt8Matmul {
         }
         if useForms {
             let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
-            if m == 16, k == 4096, outputShapes == [[16, 12288], [16, 12288]],
-                let a = HadamardQuantizedLinear.verifyK64Run?(inputs, negative, streamedWeights != nil, product) { return a }
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
             return kernels[layers.count - 1](
                 inputs, template: template,
@@ -6767,7 +6769,7 @@ enum VerifyInt8Matmul {
             outputShapes: outputShapes, outputDTypes: outputDTypes)
     }
 
-    private static func runNarrow(
+    static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
         scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil
     ) -> MLXArray {
@@ -7136,7 +7138,7 @@ enum VerifyInt8Matmul {
     static func matmul(
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
-        streamedWeights: [MLXArray]? = nil, product: Bool = false
+        streamedWeights: [MLXArray]? = nil
     ) -> [MLXArray]? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
@@ -7144,7 +7146,7 @@ enum VerifyInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights, product: product)
+                negative: negativeForms && layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights)
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
@@ -8204,21 +8206,22 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
-    nonisolated(unsafe) public static var verifyK64Prepare: (() -> Void)?
-    nonisolated(unsafe) public static var verifyK64Run: (([MLXArray], Bool, Bool, Bool) -> [MLXArray]?)?
-    public static func verifyK64Source(_ s: Bool) -> (String, MLXFast.MLXFastKernel)? {
-        guard VerifyInt8Matmul.route == .nax, VerifyInt8Matmul.hasMatchedForm(k: 4096, layers: 2),
-            !s || VerifyInt8Matmul.streamReady else { return nil }
-        return (s ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2),
-                (s ? VerifyInt8Matmul.streamedKernels : VerifyInt8Matmul.naxFormsKernels)[1])
+    nonisolated(unsafe) public static var fixedProduct: ((MLXArray, MLXArray, MLXArray, Float, [HadamardQuantizedLinear], HadamardQuantizedLinear) -> (residual: MLXArray, projections: [MLXArray])?)?
+
+    public func fixedProductDown(_ a: [MLXArray]) -> MLXArray {
+        let p = verifyOperands
+        return VerifyInt8Matmul.runNarrow(
+            codes: a[0], ascale: a[1], rsb: a[2], weight: p.weight,
+            scalesT: p.scalesT, biasesT: p.biasesT, m: 16, k: 12288,
+            negative: false, forms: true, compact: true)
     }
+
     /// Qualify the shared immutable weight layout before serving requests.
     /// Prefill and verify then consume the same copies; no allocator policy or
     /// request scratch is changed, and no request work is moved into begin.
     public static func prepareSharedVerifyWeights() {
         PromptInt8Matmul.prepareStreaming()
         PromptInt8Matmul.prepareSwiGLU()
-        verifyK64Prepare?()
     }
 
     public let transform: SignedBlockHadamard
@@ -8390,8 +8393,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         guard x.ndim >= 2, x.dim(-1) == 4096 else { return nil }
         let rows = x.size / 4096
         let quantized = PromptInt8Matmul.applies(rows: rows) && PromptInt8Matmul.route != .off
-        let verify = !quantized && x.dtype == .float32 && VerifyInt8Matmul.rowRange.contains(rows)
-            && VerifyInt8Matmul.route != .off
         guard (1 ... 16).contains(rows) || quantized else { return nil }
         let packed = projections.compactMap { $0 as? HadamardQuantizedLinear }
         guard packed.count == projections.count, let first = packed.first,
@@ -8400,6 +8401,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     && $0.weight.dim(0) % 64 == 0 && $0.transform.isIdentical(to: first.transform)
             })
         else { return nil }
+        if let residual, let swigluDown,
+            let result = fixedProduct?(x, residual, weight, eps, packed, swigluDown) { return result }
+        let verify = !quantized && x.dtype == .float32 && VerifyInt8Matmul.rowRange.contains(rows)
+            && VerifyInt8Matmul.route != .off
         let activation: [MLXArray]
         if let residual {
             guard let formed = first.transform.residualNorm(
@@ -8432,10 +8437,9 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             ? VerifyInt8Matmul.matmul(
                 PromptInt8Activation(
                     codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
-                layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed),
-                product: swigluDown != nil && packed.allSatisfy { $0.bias == nil })
+                layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
             : nil
-        let outputs = packed.prefix(verifyOutputs?.count == 1 ? 1 : packed.count).enumerated().map { index, layer in
+        let outputs = packed.enumerated().map { index, layer in
             if verify {
                 guard let output = verifyOutputs?[index] else {
                     let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
@@ -8851,7 +8855,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
 
     /// This layer's operands for `VerifyInt8Matmul.matmul(_:layers:)` and
     /// `PromptInt8Matmul.matmul(_:layers:)`.
-    private var verifyOperands: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool) {
+    public var verifyOperands: (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool) {
         let (scalesT, biasesT) = promptConstants.get(scales: scales, biases: biases!)
         return (weight, scalesT, biasesT, promptConstants.negative)
     }
