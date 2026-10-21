@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Dispatch
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1041,8 +1042,8 @@ private enum Qwen35Fresh8PromptGDN {
             outputDTypes: [.float32, .float32, .float32])
         let result = scanKernel(
             [q, k, v, prepared[0], prepared[1], prepared[2], rows],
-            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
-            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", scanNS)],
+            grid: (32, 16, 32), threadGroup: (32, scanNS, 1),
             outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -1075,8 +1076,8 @@ private enum Qwen35Fresh8PromptGDN {
             outputDTypes: [.float32, .float32, .float32])
         let result = convolvedValueScanKernel(
             [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
-            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
-            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", scanNS)],
+            grid: (32, 16, 32), threadGroup: (32, scanNS, 1),
             outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -1440,6 +1441,103 @@ private enum Qwen35Fresh8PromptGDN {
         .replacingOccurrences(
             of: "const float2 vv = *(const device float2*)(v_ + row * vs + fn);",
             with: "const float2 vv = float2(vconv(t0 + row, vcol0, vw0), vconv(t0 + row, vcol0 + 1u, vw1));")
+
+    /// Simdgroups per threadgroup for the two chunk scans. `r0` is
+    /// `thread_position_in_grid.y * 8`, so the block a simdgroup owns does not depend on
+    /// this count; only how many threadgroups share one staged chunk does. The check
+    /// below compares both launch shapes bit for bit and times them at the served shape,
+    /// and 8 serves only if it is at least 1% faster.
+    /// `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4; `=1` forces 8 after the bit check.
+    private static let scanNS: Int = resolveScanNS()
+
+    private static func resolveScanNS() -> Int {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSCAN8"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(raw ?? "") {
+            FileHandle.standardError.write(
+                Data("qwen35 prompt scan simdgroups: 4 (DARKBLOOM_BONSAI_PSCAN8=0)\n".utf8))
+            return 4
+        }
+        let forced = ["1", "true", "yes", "on"].contains(raw ?? "")
+        let verdict = scanShapeVerdict()
+        let ns = verdict.gain >= 0.01 || forced ? verdict.passed ? 8 : 4 : 4
+        let reason = verdict.passed
+            ? String(format: "%.1f%% faster than 4 at the served shape", verdict.gain * 100)
+            : "bit mismatch or error, 4 kept"
+        FileHandle.standardError.write(
+            Data("qwen35 prompt scan simdgroups: \(ns) (\(reason))\n".utf8))
+        return ns
+    }
+
+    private static func scanProbe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
+        let n = shape.reduce(1, *)
+        let i = MLXArray(0 ..< n).asType(.float32)
+        let amplitude = 1 + 0.5 * MLX.cos(i * 0.0031 + seed)
+        return (MLX.sin(i * 0.017 + seed) * amplitude * scale).reshaped(shape)
+    }
+
+    /// Runs both scans at the served shape (T = 512, 16 key heads, 32 value heads), compares
+    /// every output word, and times the value-folded scan, which is the prompt path used by the
+    /// timed prefill.
+    private static func scanShapeVerdict() -> (passed: Bool, gain: Double) {
+        let T = 512
+        let rows = MLXArray(Int32(T))
+        let q = scanProbe([1, T, 16, 128], seed: 0.01, scale: 0.5)
+        let k = scanProbe([1, T, 16, 128], seed: 0.02, scale: 0.5)
+        let v = scanProbe([1, T, 32, 128], seed: 0.03, scale: 0.5)
+        let ba = scanProbe([1, T, 64], seed: 0.04, scale: 0.2)
+        let aLog = scanProbe([32], seed: 0.05, scale: 0.1) - 0.5
+        let dtBias = scanProbe([32], seed: 0.06, scale: 0.5)
+        let convState = scanProbe([1, 3, 8192], seed: 0.07, scale: 0.5)
+        let qkv = scanProbe([1, T, 8192], seed: 0.08, scale: 0.5)
+        let weight = scanProbe([8192, 4, 1], seed: 0.09, scale: 0.1)
+        let prepared = prepKernel(
+            [q, k, ba, aLog, dtBias, rows],
+            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
+            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
+            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+            outputDTypes: [.float32, .float32, .float32])
+        func outputs(_ ns: Int) -> [MLXArray] {
+            convolvedValueScanKernel(
+                [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
+                template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
+                grid: (32, 16, 32), threadGroup: (32, ns, 1),
+                outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
+                outputDTypes: [.float32, .float32])
+        }
+        var passed = false
+        do {
+            passed = try withError {
+                let four = outputs(4)
+                let eight = outputs(8)
+                eval(four + eight)
+                for (a, b) in zip(four, eight) {
+                    let same = (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                        .item(Bool.self)
+                    if !same { return false }
+                }
+                return true
+            }
+        } catch {
+            FileHandle.standardError.write(Data("qwen35 prompt scan check error: \(error)\n".utf8))
+            return (false, 0)
+        }
+        guard passed else { return (false, 0) }
+        func chain(_ ns: Int) -> Double {
+            var best = Double.infinity
+            for _ in 0 ..< 3 {
+                let start = DispatchTime.now().uptimeNanoseconds
+                eval(outputs(ns))
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+                best = min(best, elapsed)
+            }
+            return best
+        }
+        let four = chain(4)
+        let eight = chain(8)
+        return (true, four > 0 ? 1 - eight / four : 0)
+    }
+
 }
 
 /// Prompt-width register recurrence: `qwen35_gdn_register_v3` (same per-lane
