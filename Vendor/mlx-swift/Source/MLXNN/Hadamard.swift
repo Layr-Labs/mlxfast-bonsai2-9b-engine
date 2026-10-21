@@ -2146,31 +2146,15 @@ private enum Float16ConstantQMV {
 /// Exact verify-head top-2 at 2 to 8 rows decided by float arithmetic only,
 /// at about the cost of one int8 head pass.
 ///
-/// The int8 verify route (`VerifyInt8Matmul`) computes the head logits L8
-/// from rounded activation codes, so a near tie can order two tokens
-/// differently than the float logits F that `Float16ConstantQMV.topTwo`
-/// reduces. Here L8 only screens: it picks the candidates, and float values
-/// with exactly the per-row arithmetic of `rowsAccumulate` decide.
-///
-/// For a row, `L8[n] = sum_k xhat_k w_nk` with `xhat = ascale * q` and
-/// `F[n] = sum_k v_k w_nk`, where v is the rotated row and `q = rint(v /
-/// ascale)` per 128-group. So `|F[n] - L8[n]| <= E` with
-///
-///     E = 1.001 * sum_g ascale_g * (Amax_g * (0.5 + 127 gf) + Bmax_g * gi)
-///
-/// `Amax_g = max_n sum_{k in g} |s_ng c_nk + b_ng|` bounds the rounding of
-/// the codes (`|v - xhat| <= ascale / 2`), `Bmax_g = max_n 127 (|s_ng| sum_k
-/// c_nk + 128 |b_ng|)` bounds the size of the int8 route's terms, and gf, gi
-/// cover the FP32 rounding of both sums with a wide margin. Amax and Bmax are
-/// properties of the head weights, computed once.
-///
-/// With i2 the second-largest L8 value of the row and `tau <= i2 - 2E`, every
-/// id outside `S = {n : L8[n] >= tau}` has `F[n] <= L8[n] + E < i2 - E`,
-/// while the two int8 leaders (both in S) have `F >= i2 - E`. So the float
-/// top-2 lies in S, and the top-2 of S's float values in the float top-2
-/// order (value descending, id ascending) is the float top-2. A row whose S
-/// holds more than `cap` ids, or that shows a non-finite value, runs the full
-/// float top-2 instead (`guardedPartial`, a no-op for every other row).
+/// The int8 route (`VerifyInt8Matmul`) computes logits L8 from rounded
+/// activation codes, so a near tie can order two tokens differently than the
+/// float logits F of `Float16ConstantQMV.topTwo`. Here L8 only screens, and
+/// float values with the per-row arithmetic of `rowsAccumulate` decide.
+/// `|F[n] - L8[n]| <= E`, with E from per-group maxima of the head weights
+/// (computed once). With i2 the second-largest L8 and `tau <= i2 - 2E`, the
+/// float top-2 lies in `S = {n : L8[n] >= tau}`. A row whose S holds more
+/// than `cap` ids, or that shows a non-finite value, runs the full float
+/// top-2 instead (`guardedPartial`).
 enum ExactVerifyHead {
     static let cap = 256
     static let threads = 512
@@ -3349,13 +3333,10 @@ struct PromptInt8Activation {
 ///     t   = s[n, g] * float(C)
 ///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], t, acc))
 ///
-/// `q` is in [-127, 127] and `code` in [0, 3], so |C| <= 128 * 127 * 3 =
-/// 48768 < 2^24: the integer is exact in int32 (the M5 tensor unit) and in
-/// FP32 (every partial sum of integer products is an integer below 2^24, so
-/// each FP32 multiply-add is exact whatever its order). `float(C)` is then the
-/// same number on both, and the epilogue is the same three roundings in the
-/// same order, with explicit `fma` so contraction cannot change it. The M2
-/// path (`plain`) therefore produces the M5 path's (`nax`) bits;
+/// `q` is in [-127, 127] and `code` in [0, 3], so |C| < 2^24 and the integer
+/// is exact in int32 (the M5 tensor unit) and in FP32 (the M2 path, `plain`),
+/// whatever the order. The epilogue is the same three roundings in the same
+/// order, with explicit `fma`, so `plain` produces `nax`'s bits;
 /// `checkKernels` confirms it on the device before `nax` is used.
 enum PromptInt8Matmul {
     enum Route { case nax, plain, off }
@@ -3688,14 +3669,11 @@ enum PromptInt8Matmul {
 
     // `naxVectorSource` re-tiled for the M5 (same bits): the 64 x 64 tile's
     // four 32 x 32 blocks each run their own per-simdgroup 32 x 32 x 128 int8
-    // tensor op (`execution_simdgroup`) on the shared double-buffered weights,
-    // and each lane applies the epilogue to its own 32 elements. The integer C
-    // per group is the same exact integer, the epilogue is the same three
-    // roundings in the same order with groups ascending from `acc = 0`, so
-    // every output is the vector kernel's bits. Lane layout of one block (row
-    // fm + 8 i2 + 16 i4, column fn + 16 i3 + (i & 3)) is the one measured on
-    // the M5; each simdgroup checks it against `get_multidimensional_index`
-    // and writes NaN on any mismatch, so the load-time check then fails.
+    // tensor op on the shared double-buffered weights, and each lane applies
+    // the epilogue to its own 32 elements, so every output is the vector
+    // kernel's bits. Each simdgroup checks the measured lane layout against
+    // `get_multidimensional_index` and writes NaN on any mismatch, so the
+    // load-time check then fails.
     // Body of `naxSgSource`: reads K, M, N, bx, w, scalesT, biasesT and out.
     static let naxSgBody = """
         using elem_index = metal::conditional_t<INDEX32, uint, size_t>;
@@ -4760,15 +4738,13 @@ enum PromptInt8Matmul {
 
 /// A prompt projection output with its residual stream added in the matmul's
 /// epilogue. In the record the out and down launches store `d` and the next
-/// quantizing kernel reads `x` and `d`, forms `x + d`, stores it as the new
-/// residual and quantizes the normalized sum. Here the register-weight forms
-/// read `x` beside the store and write `v + x` (`v` is the record's `d`, the
-/// same operand build and epilogue; the add is the quantizer's own fp32 add,
-/// taken under `fp contract(off)` and `reassociate(off)`), and the next kernel
-/// is the norm-only form that reads the stored sum. A fold serves only after
+/// quantizing kernel forms `x + d`. Here the register-weight forms read `x`
+/// beside the store and write `v + x` (`v` is the record's `d`; the add is the
+/// quantizer's own fp32 add under `fp contract(off)` and `reassociate(off)`),
+/// and the next kernel reads the stored sum. A fold serves only after
 /// `checkFold` found the fused output equal, bit for bit, to the record
-/// launch's output plus the residual; otherwise the record launches stay.
-/// `DARKBLOOM_BONSAI_PREFILL_RESFOLD=0` keeps them.
+/// launch's output plus the residual. `DARKBLOOM_BONSAI_PREFILL_RESFOLD=0`
+/// keeps the record launches.
 public final class PromptResidualFold {
     public let residual: MLXArray
     /// Set by the projection when its output already is `residual + projection`.
@@ -5437,21 +5413,14 @@ enum PromptSplitZ {
 /// (27b 320ec19a's verify split-K on tensor units, built integer-exact).
 ///
 /// A threadgroup owns 32 output columns. Its four simdgroups take every fourth
-/// 128-group (simdgroup s takes g = s, s + 4, ...). Per group each computes
-/// `C[m, n] = sum_{k in g} q[m, k] * code[n, k]` (integer, |C| < 2^24, exact
-/// in int32 and in FP32 as `PromptInt8Matmul` shows) and folds it into its
-/// partial with `PromptInt8Matmul`'s epilogue, groups ascending from 0:
-///
-///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], s[n, g] * float(C), acc))
-///
-/// The four partials are then summed in simdgroup order, `((p0 + p1) + p2) +
-/// p3`. `nax` gets C from one 16 x 32 x 128 int8 tensor op per group (the
-/// rows padded to 16 with zero codes, the 2-bit codes expanded to int8 in the
-/// simdgroup's threadgroup buffer) and finds each element's (m, n) through
-/// `get_multidimensional_index`, so it assumes no fragment layout. `plain`
-/// gets C from FP32 FMAs and lane shuffles. Same integers, same FP32 steps in
-/// the same order: the same bits, which `checkKernels` checks on the device
-/// before `nax` is used.
+/// 128-group (simdgroup s takes g = s, s + 4, ...) and fold each group's exact
+/// integer `C[m, n]` into a partial with `PromptInt8Matmul`'s epilogue, groups
+/// ascending from 0. The four partials are then summed in simdgroup order,
+/// `((p0 + p1) + p2) + p3`. `nax` gets C from one 16 x 32 x 128 int8 tensor op
+/// per group and finds each element's (m, n) through
+/// `get_multidimensional_index`; `plain` gets C from FP32 FMAs and lane
+/// shuffles. Same integers, same FP32 steps in the same order: the same bits,
+/// which `checkKernels` checks on the device before `nax` is used.
 enum VerifyInt8Matmul {
     /// The canonical 2-bit codes remain model parameters.
     static let streamAllowed: Bool = {
@@ -5621,6 +5590,23 @@ enum VerifyInt8Matmul {
         return result.replacingOccurrences(of: issue, with: issue + "\n" + prefetch)
     }
 
+    /// Narrow16 stream body with the weight words two groups ahead: `wn` holds group g + 4 while g + 8 loads.
+    private static func makeDeepNarrowBody(_ streamed: String) -> String? {
+        let load = streamLoad(columns: 16)
+        let ahead = load.replacingOccurrences(of: "wv[", with: "wn[")
+        let decl = "uint32_t wv[4];"
+        let head = "for (int g = int(sg); g < Kg; g += 4) {"
+        let loop = "}\n" + head
+        let parts = streamed.components(separatedBy: load)
+        guard parts.count == 3, streamed.components(separatedBy: decl).count == 2,
+            streamed.components(separatedBy: loop).count == 2 else { return nil }
+        let rotate = "for (int t = 0; t < 4; t++) { wv[t] = wn[t]; }\n    if (g + 8 < Kg) { const int gl = g + 8; " + ahead + " }"
+        let first = "if (int(sg) + 4 < Kg) { const int gl = int(sg) + 4; " + ahead + " }\n"
+        return (parts[0] + load + parts[1] + rotate + parts[2])
+            .replacingOccurrences(of: decl, with: "uint32_t wv[4], wn[4];")
+            .replacingOccurrences(of: loop, with: "}\n" + first + head)
+    }
+
     private static let streamedSourcesReady = makeStreamedBody(naxFastBody, columns: 32) != nil
         && makeStreamedBody(naxNarrow16Body, columns: 16) != nil
 
@@ -5650,12 +5636,26 @@ enum VerifyInt8Matmul {
             + streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)"),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
 
+    static let deepNarrowAllowed = !["0", "false", "no", "off"].contains(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VPRE2"]?.lowercased() ?? "")
+    nonisolated(unsafe) private static var deepNarrow = false
+    private static let deepNarrowBody = makeStreamedBody(naxNarrow16Body, columns: 16).flatMap(makeDeepNarrowBody)
+    private static let streamedNarrowDeepKernel = deepNarrowBody.map { body in
+        MLXFast.metalKernel(
+            name: "bonsai_q8_verify_streamed_col_n16_deep", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
+            outputNames: ["out"],
+            source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+                + body.replacingOccurrences(of: "(size_t)", with: "(uint)"),
+            header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+    }
+
     /// Input-independent guard at load, before any request. Compare new
     /// pipelines with the unchanged canonical forms, including dense b/a.
     private static func checkStreamed() -> Bool {
         guard streamAllowed, naxShared, formsAllowed, streamedSourcesReady else { return false }
         var matched = true
         streamFailed = false
+        var deepMatched = deepNarrowAllowed && streamedNarrowDeepKernel != nil
+        defer { deepNarrow = deepMatched }
         withErrorHandler({ _ in VerifyInt8Matmul.streamFailed = true }) {
             for k in formsK where matched {
                 let kg = k / 128, n = 64
@@ -5720,6 +5720,12 @@ enum VerifyInt8Matmul {
                             let a = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scales, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: true)
                             let b = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scales, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: true, streamedWeight: narrowWeight)
                             matched = equal([a], [b])
+                            if matched, k == 12288, deepMatched {
+                                let d = runNarrow(codes: codes, ascale: ascale, rsb: rsb, weight: weight, scalesT: scales, biasesT: offsets, m: m, k: k, negative: negative, forms: true, compact: true, streamedWeight: narrowWeight, deep: true)
+                                streamFailed = false
+                                deepMatched = equal([a], [d])
+                                streamFailed = false
+                            }
                         }
                     }
                 }
@@ -6767,13 +6773,13 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil, deep: Bool = false
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && hasNarrowForms(k: k, compact: compact) && formsFit(k: k, n: n)) {
             let stream = compact && streamedWeight != nil
-            let kernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            let kernel = stream ? (k == 12288 && (deep || deepNarrow) ? streamedNarrowDeepKernel! : streamedNarrowKernel) : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
             let kernelWeight = stream ? streamedWeight! : weight
             return kernel(
                 [codes, kernelWeight, scalesT, biasesT, ascale, rsb, dims],
@@ -7101,7 +7107,7 @@ enum VerifyInt8Matmul {
         }
         streamReady = chosen == .nax && naxFast && checkStreamed()
         FileHandle.standardError.write(
-            "int8 verify streamed: \(streamReady ? "on (M16 guard, fast/shared/N16/dense-b/a bit-identical)" : "off")\n".data(using: .utf8)!)
+            "int8 verify streamed: \(streamReady ? "on (M16 guard, fast/shared/N16/dense-b/a bit-identical\(deepNarrow ? "; down N16 two groups ahead" : ""))" : "off")\n".data(using: .utf8)!)
         return chosen
     }()
 
