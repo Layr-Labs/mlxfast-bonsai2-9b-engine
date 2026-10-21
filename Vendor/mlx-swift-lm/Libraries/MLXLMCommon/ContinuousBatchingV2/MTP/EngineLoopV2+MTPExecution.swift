@@ -31,6 +31,7 @@ struct CBv2MTPGraphBuild {
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
     let seedHidden: MLXArray?
     let seedPolicyTopTwoValues: MLXArray?
+    let greedySeedIDs: Set<CBv2RequestID>
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
     /// Prompt rows that sampled their first token in this step and can carry
@@ -140,6 +141,7 @@ extension EngineLoopV2 {
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
         var seedHidden: MLXArray?
         var seedPolicyTopTwoValues: MLXArray?
+        var greedySeedIDs: Set<CBv2RequestID> = []
         var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
         var committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow] = []
         var committedObservationEvalTargets: [MLXArray] = []
@@ -213,7 +215,13 @@ extension EngineLoopV2 {
                 Self.positionOffset(kvStates[$0.rec.id]!)
             }
             var diagnosticTopTwo: (ids: MLXArray, values: MLXArray)?
-            let logits: MLXArray
+            var greedySeedTopTwo: (ids: MLXArray, values: MLXArray)?
+            let greedySeedEligible =
+                decodeRows.count == 1 && decodeRows[0].isSeed
+                && mtpBasicEligible(decodeRows[0].rec)
+                && decodeRows[0].rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon
+                && sampler.supportsMTPTargetPrefix && logitDiagnostic == nil
+            let logits: MLXArray?
             let hidden: MLXArray
             if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
@@ -229,11 +237,23 @@ extension EngineLoopV2 {
                 let positionIds = CBv2PositionState.decodePositionIds(
                     states: decodeRows.map(\.rec.request.positionState),
                     cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                let output: (logits: MLXArray?, lastHidden: MLXArray) =
+                    try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
                     ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
-                    tokens: inputs, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                        ? .decode : .mixedFrontier)) {
+                    if greedySeedEligible,
+                        let seed = recurrentModel.forwardWithHiddenGreedySeed(
+                            tokens: inputs, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds)
+                    {
+                        greedySeedTopTwo = (seed.ids, seed.values)
+                        return (nil, seed.lastHidden)
+                    }
+                    let output = recurrentModel.forwardWithHidden(
+                        tokens: inputs, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds)
+                    return (output.logits, output.lastHidden)
+                }
                 logits = output.logits
                 hidden = output.lastHidden
                 for (row, evaluation) in zip(decodeRows, evaluations) {
@@ -252,15 +272,20 @@ extension EngineLoopV2 {
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
-            decodeSampled = sampler.sample(
-                logits: logits[0..., -1, 0...],
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            if let topTwo = greedySeedTopTwo {
+                decodeSampled = topTwo.ids[0..., 0, 0].asType(.int32)
+                greedySeedIDs.insert(decodeRows[0].rec.id)
+            } else {
+                decodeSampled = sampler.sample(
+                    logits: logits![0..., -1, 0...],
+                    params: decodeRows.map(\.rec.request.sampling),
+                    requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
             for (index, row) in decodeRows.enumerated() where row.isSeed {
                 seedRows.append((id: row.rec.id, decodeIndex: index))
@@ -270,9 +295,8 @@ extension EngineLoopV2 {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                     preconditionFailure("CBv2 adaptive seed target lacks top-two provider")
                 }
-                let vocabulary = logits.dim(-1)
-                let topTwo = provider.cbv2MTPTopTwo(
-                    logits.reshaped([1, decodeRows.count, vocabulary]))
+                let topTwo = greedySeedTopTwo ?? provider.cbv2MTPTopTwo(
+                    logits!.reshaped([1, decodeRows.count, logits!.dim(-1)]))
                 if logitDiagnostic != nil {
                     diagnosticTopTwo = (
                         topTwo.ids.reshaped([decodeRows.count, 2]),
@@ -282,7 +306,7 @@ extension EngineLoopV2 {
                     .reshaped([decodeRows.count, 1, 2])
                     .asType(.float32)
             }
-            if let diagnosticOffsets, let diagnostic = logitDiagnostic {
+            if let logits, let diagnosticOffsets, let diagnostic = logitDiagnostic {
                 for (index, row) in decodeRows.enumerated()
                 where row.rec.id.raw == diagnostic.configuration.requestID
                     && row.rec.generatedTokenCount == diagnostic.configuration.outputIndex {
@@ -491,6 +515,7 @@ extension EngineLoopV2 {
             seedRows: seedRows,
             seedHidden: seedHidden,
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
+            greedySeedIDs: greedySeedIDs,
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
             prefillCarries: prefillCarries)

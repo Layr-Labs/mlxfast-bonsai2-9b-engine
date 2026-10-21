@@ -441,6 +441,15 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
             positionIds: positionIds)
     }
 
+    public func forwardWithHiddenGreedySeed(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)? {
+        (model as? any CBv2RecurrentMTPForwardable)?.cbv2ForwardWithHiddenGreedySeed(
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+
     public var supportsCapturedVerifyWindow: Bool {
         model is any CBv2RecurrentCaptureMTPForwardable
     }
