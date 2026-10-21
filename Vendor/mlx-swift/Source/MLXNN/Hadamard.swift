@@ -1509,7 +1509,8 @@ extension SignedBlockHadamard {
     static let wideRowLean = flagOn("DARKBLOOM_BONSAI_WHT_LEAN")
     static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
     static let wideRowLeanThreads: [WideRowKind: Int] = [
-        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512,
+        .attentionGate: 512, .normNormed: flagOn("DARKBLOOM_BONSAI_WHT_LEAN_NN") ? 1024 : 0,
     ]
 
     private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
@@ -9522,8 +9523,7 @@ private enum DraftStepRowKernels {
 
 extension HadamardQuantizedEmbedding {
     /// Draft-only front row of an MTP head step: `[rmsNorm(self(token)) · embedNorm | rmsNorm(hidden) · hiddenNorm]`
-    /// as one FP32 `[2 * 4096]` row, computed in FP32 (the module path rounds the looked-up row to the FP16
-    /// constants' dtype first).
+    /// as one FP32 `[2 * 4096]` row, computed in FP32.
     public func draftFrontRow(
         token: MLXArray, embedNorm: MLXArray, hidden: MLXArray, hiddenNorm: MLXArray, eps: MLXArray
     ) -> MLXArray? {
