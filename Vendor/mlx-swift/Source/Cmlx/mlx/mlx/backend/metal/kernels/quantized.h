@@ -1325,7 +1325,7 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
-METAL_FUNC void qmm_t_impl(
+METAL_FUNC void qmm_t_base_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -1346,8 +1346,9 @@ METAL_FUNC void qmm_t_impl(
 
   (void)lid;
 
-  constexpr int WM = 2;
-  constexpr int WN = 2;
+  constexpr bool rect = bits == 2 && group_size == 128 && BM == 16 && BN == 64;
+  constexpr int WM = rect ? 1 : 2;
+  constexpr int WN = rect ? 4 : 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
@@ -1443,6 +1444,46 @@ METAL_FUNC void qmm_t_impl(
   } else {
     mma_op.store_result(y, N);
   }
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+METAL_FUNC void qmm_t_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& K_eff,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Match <=16 verification rows with a 16x64 tile and 1x4 SIMD groups.
+  // Pair adjacent original N grid tiles; all original K accumulation stays.
+  if constexpr (bits == 2 && group_size == 128 && aligned_N &&
+                BM == 32 && BK == 32 && BN == 32) {
+    if (M > 0 && M <= 16 && N % 64 == 0) {
+      if (tid.x % 2) return;
+      tid.x /= 2;
+      qmm_t_base_impl<T,group_size,bits,aligned_N,16,BK,64>(
+          w,scales,biases,x,y,Xs,Ws,K,N,M,K_eff,tid,lid,simd_gid,simd_lid);
+      return;
+    }
+  }
+  qmm_t_base_impl<T,group_size,bits,aligned_N,BM,BK,BN>(
+      w,scales,biases,x,y,Xs,Ws,K,N,M,K_eff,tid,lid,simd_gid,simd_lid);
 }
 
 template <
@@ -2053,8 +2094,14 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  constexpr bool rect_n = bits == 2 && group_size == 128 && aligned_N &&
+      BM == 32 && BK == 32 && BN == 32;
+  // Rectangular execution needs 16 X rows + 64 W rows. Its fallback needs
+  // 32 + 32, so one disjoint 80-row allocation covers both rather than 96.
+  threadgroup T tiles[(rect_n ? 80 : BM + BN) * BK_padded];
+  threadgroup T* Xs = tiles;
+  const bool rect_active = rect_n && M > 0 && M <= 16 && N % 64 == 0;
+  threadgroup T* Ws = tiles + (rect_active ? 16 : BM) * BK_padded;
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -2121,8 +2168,14 @@ template <
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  constexpr bool rect_n = bits == 2 && group_size == 128 && aligned_N &&
+      BM == 32 && BK == 32 && BN == 32;
+  // Rectangular execution needs 16 X rows + 64 W rows. Its fallback needs
+  // 32 + 32, so one disjoint 80-row allocation covers both rather than 96.
+  threadgroup T tiles[(rect_n ? 80 : BM + BN) * BK_padded];
+  threadgroup T* Xs = tiles;
+  const bool rect_active = rect_n && M > 0 && M <= 16 && N % 64 == 0;
+  threadgroup T* Ws = tiles + (rect_active ? 16 : BM) * BK_padded;
 
   const int k_start = tid.z * k_partition_size;
   x += k_start;
@@ -2438,8 +2491,14 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Xs[BM * BK_padded];
-  threadgroup T Ws[BN * BK_padded];
+  constexpr bool rect_n = bits == 2 && group_size == 128 && aligned_N &&
+      BM == 32 && BK == 32 && BN == 32;
+  // Rectangular execution needs 16 X rows + 64 W rows. Its fallback needs
+  // 32 + 32, so one disjoint 80-row allocation covers both rather than 96.
+  threadgroup T tiles[(rect_n ? 80 : BM + BN) * BK_padded];
+  threadgroup T* Xs = tiles;
+  const bool rect_active = rect_n && M > 0 && M <= 16 && N % 64 == 0;
+  threadgroup T* Ws = tiles + (rect_active ? 16 : BM) * BK_padded;
 
   adjust_matrix_offsets<T>(
       x,
