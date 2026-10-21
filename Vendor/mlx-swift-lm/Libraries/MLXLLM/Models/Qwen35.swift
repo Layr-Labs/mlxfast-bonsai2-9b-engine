@@ -2837,6 +2837,47 @@ enum Qwen35FusedGDNVerify {
         return ok ? s : nil
     }
 
+    /// Same saved-tree recurrence with the private snapshot retained by its owning thread.
+    static func registerSnapshotTreeSource(_ snapshot: String) -> String? {
+        var s = snapshot
+        func swap(_ old: String, _ new: String) -> Bool {
+            guard s.components(separatedBy: old).count == 2 else { return false }
+            s = s.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        let ok = swap("float qr[R];", "float qr[R];\nfloat sn_state[DVPL][R];")
+            && swap(
+                """
+                if (t == sn_row) {
+                  #pragma clang loop unroll(full)
+                  for (int d = 0; d < DVPL; ++d) {
+                    device float4* sn_out4 = (device float4*)(state_out + (n * Dv + dvbase + d) * Dk + dk0);
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < R / 4; ++j) {
+                      sn_out4[j] = float4(state[d][4 * j + 0], state[d][4 * j + 1], state[d][4 * j + 2], state[d][4 * j + 3]);
+                    }
+                  }
+                }
+                """,
+                """
+                if (t == sn_row) {
+                  #pragma clang loop unroll(full)
+                  for (int d = 0; d < DVPL; ++d) {
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < R; ++j) {
+                      sn_state[d][j] = state[d][j];
+                    }
+                  }
+                }
+                """)
+            && swap("const device float* sn_src = sn_use ? (const device float*)state_out : state_in;\n", "")
+            && swap("const device float4* s_re4 = (const device float4*)(sn_src + ",
+                "const device float4* s_re4 = (const device float4*)(state_in + ")
+            && swap("const float4 s4 = s_re4[j];",
+                "const float4 s4 = sn_use ? float4(sn_state[d][4 * j + 0], sn_state[d][4 * j + 1], sn_state[d][4 * j + 2], sn_state[d][4 * j + 3]) : s_re4[j];")
+        return ok ? s : nil
+    }
+
     static let fastTreeOffered =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_FAST"] != "0"
     static let snapshotOffered =
@@ -2883,7 +2924,7 @@ enum Qwen35FusedGDNVerify {
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS2"] != "0"
     nonisolated(unsafe) private static var chainStoresPassed = false
 
-    private static func treeVariant(tuned: Bool, delta: Bool, dead: Bool = false, chain: Bool = false)
+    private static func treeVariant(tuned: Bool, delta: Bool, dead: Bool = false, chain: Bool = false, registerSnapshot: Bool = false)
         -> MLXFast.MLXFastKernel?
     {
         guard !dead || (delta && deadOutputsOffered) else { return nil }
@@ -2909,6 +2950,10 @@ enum Qwen35FusedGDNVerify {
                 of: "{\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;",
                 with: "if (tid < 256u) {\n  const uint sn_s = tid >> 4, sn_t = tid & 15u;")
         }
+        if registerSnapshot {
+            guard snapshot != nil, let held = registerSnapshotTreeSource(text) else { return nil }
+            text = held
+        }
         if delta {
             guard let captured = capturingDelta(text, dead: dead) else { return nil }
             text = captured
@@ -2920,7 +2965,7 @@ enum Qwen35FusedGDNVerify {
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
         return MLXFast.metalKernel(
             name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : "")
-                + (dead ? "_nocv" : "") + (chain ? "_cs" : ""),
+                + (dead ? "_nocv" : "") + (chain ? "_cs" : "") + (registerSnapshot ? "_rs" : ""),
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
             outputNames: dead
                 ? ["k_out", "y", "state_out", "conv_tail", "delta_out"]
@@ -2941,6 +2986,97 @@ enum Qwen35FusedGDNVerify {
     private static let tunedDeltaTreeKernelChain = treeVariant(tuned: true, delta: true, chain: true)
     private static let deltaTreeKernelDeadChain = treeVariant(tuned: false, delta: true, dead: true, chain: true)
     private static let tunedDeltaTreeKernelDeadChain = treeVariant(tuned: true, delta: true, dead: true, chain: true)
+
+    private static let registerSnapshotKernel = treeVariant(
+        tuned: true, delta: true, dead: true, chain: true, registerSnapshot: true)
+    private static let registerSnapshotOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_REGISTER_SNAPSHOT"] != "0"
+    nonisolated(unsafe) private static var registerSnapshotPassed = false
+
+    private static func snapshotOutputs(_ inputs: [MLXArray], tree: MLXArray, held: Bool) -> [MLXArray]? {
+        guard let kernel = held ? registerSnapshotKernel : tunedDeltaTreeKernelDeadChain else { return nil }
+        return kernel(inputs + [tree],
+            template: [("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("CONV_DIM", 8192),
+                ("MAX_T", 16), ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)), ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (512, 1, 32), threadGroup: (512, 1, 1),
+            outputShapes: [[1, 16, 16, 128], [1, 16, 32, 128], [1, 32, 128, 128],
+                [1, 3, 8192], [1, 16, 32, 129]], outputDTypes: Array(repeating: .float32, count: 5))
+    }
+
+    /// Keep the checked current route unless the saved state is exact and every paired clock wins.
+    private static func prepareRegisterSnapshot() {
+        guard registerSnapshotOffered, tunePassed, deltaPassed, deadPassed, chainStoresPassed,
+            registerSnapshotKernel != nil, fastTreeOffered, snapshotOffered else { return }
+        let parents = [Array(-1..<15),
+            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
+            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [-1] + Array(repeating: 0, count: 15)]
+        let trees = parents.map { probeTree($0).0 }
+        var exact = true
+        var oldNS = [[UInt64]](), heldNS = [[UInt64]]()
+        do {
+            try withError {
+                for kind in 0..<3 {
+                    let inputs = snapshotInputs(kind)
+                    eval(inputs + trees)
+                    for (i, tree) in trees.enumerated() {
+                        guard let old = snapshotOutputs(inputs, tree: tree, held: false),
+                            let held = snapshotOutputs(inputs, tree: tree, held: true) else { exact = false; return }
+                        let live = i == 0 ? Array(0..<5) : [0, 1, 4]
+                        exact = sameBits(live.map { old[$0] }, live.map { held[$0] }) && exact
+                        if kind == 0 {
+                            let finite = live.flatMap { [MLX.all(MLX.isFinite(old[$0])), MLX.all(MLX.isFinite(held[$0]))] }
+                            eval(finite)
+                            exact = finite.allSatisfy { $0.item(Bool.self) } && exact
+                        }
+                    }
+                }
+                guard exact else { return }
+                let inputs = snapshotInputs(0)
+                eval(inputs)
+                func time(_ held: Bool, _ tree: MLXArray) -> UInt64? {
+                    Stream.gpu.synchronize()
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    guard let outputs = snapshotOutputs(inputs, tree: tree, held: held) else { return nil }
+                    eval(outputs)
+                    Stream.gpu.synchronize()
+                    let end = DispatchTime.now().uptimeNanoseconds
+                    withExtendedLifetime(outputs) {}
+                    return end > start ? end - start : nil
+                }
+                for tree in trees {
+                    guard time(false, tree) != nil, time(true, tree) != nil else { exact = false; return }
+                }
+                oldNS = Array(repeating: [], count: trees.count)
+                heldNS = Array(repeating: [], count: trees.count)
+                for _ in 0..<3 {
+                    for (i, tree) in trees.enumerated() {
+                        guard let a0 = time(false, tree), let b0 = time(true, tree),
+                            let b1 = time(true, tree), let a1 = time(false, tree) else { exact = false; return }
+                        oldNS[i].append(a0 + a1); heldNS[i].append(b0 + b1)
+                    }
+                }
+            }
+        } catch { exact = false }
+        let complete = exact && oldNS.count == trees.count && heldNS.count == trees.count
+            && (oldNS + heldNS).allSatisfy { $0.count == 3 }
+        let oldTotal = complete ? (0..<3).map { r in oldNS.reduce(UInt64(0)) { $0 + $1[r] } } : []
+        let heldTotal = complete ? (0..<3).map { r in heldNS.reduce(UInt64(0)) { $0 + $1[r] } } : []
+        registerSnapshotPassed = complete && zip(oldTotal, heldTotal).allSatisfy { $1 < $0 }
+        FileHandle.standardError.write(Data(
+            "gdn16 register snapshot: selected=\(registerSnapshotPassed) exact=\(exact) policy=all4trees_sum_all3_strict_ABBA old_ns=\(oldNS) register_ns=\(heldNS) old_total_ns=\(oldTotal) register_total_ns=\(heldTotal)\n".utf8))
+    }
+
+    private static func snapshotInputs(_ kind: Int) -> [MLXArray] {
+        [probeRows([1, 3, 8192], seed: 0.01, scale: 0.5),
+            kind == 2 ? probeWords([1, 16, 8192]) : probeRows([1, 16, 8192], seed: 0.02, scale: 0.5),
+            probeRows([8192, 4, 1], seed: 0.03, scale: 0.1),
+            probeRows([1, 16, 32], seed: 0.04, scale: 30),
+            probeRows([1, 16, 32], seed: 0.05, scale: 8),
+            probeRows([32], seed: 0.06, scale: 2), probeRows([32], seed: 0.07, scale: 3),
+            kind == 1 ? probeWords([1, 32, 128, 128]) : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)]
+    }
 
     /// `apply` for a draft tree window (`tree`: see `treeSource`); nil when `apply` would be.
     static func applyTree(
@@ -2984,7 +3120,9 @@ enum Qwen35FusedGDNVerify {
             ? (tuned ? stores(tunedDeltaTreeKernelDead, tunedDeltaTreeKernelDeadChain)
                 : stores(deltaTreeKernelDead, deltaTreeKernelDeadChain))
             : nil
-        guard let selected = deadKernel ?? selected else { return nil }
+        let heldKernel = tuned && captureDelta && deadKernel != nil && chainStoresPassed && registerSnapshotPassed
+            ? registerSnapshotKernel : nil
+        guard let selected = heldKernel ?? deadKernel ?? selected else { return nil }
         let qShape = [1, S, keyHeads, 128]
         let vShape = [1, S, valueHeads, 128]
         let shapes = deadKernel != nil
@@ -3109,6 +3247,7 @@ enum Qwen35FusedGDNVerify {
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
             + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed) dead2=\(chainStoresPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
+        prepareRegisterSnapshot()
     }
 
     private static func probeRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
