@@ -2649,8 +2649,10 @@ enum DF2Fast {
     // MARK: 4-bit drafter linears, re-quantized at load (drafter numerics only)
 
     /// Input columns per 4-bit group (64 or 128); nil (`DF2_W4=0`) keeps the pinned 8-bit g32 codes.
+    /// 128 halves the drafter's per-round scale and bias bytes against 64; both fold the same
+    /// 8-bit weights, and only proposals change, never a target token.
     static let w4Group: Int? = {
-        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "64"
+        let v = ProcessInfo.processInfo.environment["DF2_W4"] ?? "128"
         return v == "128" ? 128 : (v == "0" ? nil : 64)
     }()
 

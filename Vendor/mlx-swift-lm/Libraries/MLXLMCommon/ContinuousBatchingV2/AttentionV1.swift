@@ -1154,6 +1154,126 @@ enum CBv2VerifyVectorAttention {
             }
             """
 
+    /// The combine without the threadgroup transpose: each lane reads its own
+    /// partial straight from `part_o` (lane l holds partial l) instead of
+    /// copying every partial through `staged` and waiting on a barrier. The
+    /// staged path copies values without arithmetic, so the two forms compute
+    /// `simd_sum(part_o[base + simd_lid][...] * factor)` on the same words.
+    /// Kept only when a load-time bit check and a chain timing both accept it.
+    private static let combineDirect = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_combine_direct",
+        inputNames: ["part_o", "part_m", "part_s"],
+        outputNames: ["out"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr int v_per_thread = 16;
+            const uint head = threadgroup_position_in_grid.x / 2u;
+            const uint half_ = threadgroup_position_in_grid.x % 2u;
+            const uint t = threadgroup_position_in_grid.y;
+            const uint L = threadgroups_per_grid.y;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint base = (head * L + t) * 32u;
+            float max_score = part_m[base + simd_lid];
+            float new_max = simd_max(max_score);
+            float factor = fast::exp(max_score - new_max);
+            float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
+            const device float* po = part_o + (base + simd_lid) * 256u + half_ * 128u
+                + simd_gid * uint(v_per_thread);
+            float o[v_per_thread];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < v_per_thread; i++) {
+              o[i] = simd_sum(po[i] * factor);
+              o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
+            }
+            if (simd_lid == 0) {
+              device float* op = out + (head * L + t) * 256u + half_ * 128u
+                  + simd_gid * v_per_thread;
+              *((device packed_float4*)(op + 0)) = packed_float4(o[0], o[1], o[2], o[3]);
+              *((device packed_float4*)(op + 4)) = packed_float4(o[4], o[5], o[6], o[7]);
+              *((device packed_float4*)(op + 8)) = packed_float4(o[8], o[9], o[10], o[11]);
+              *((device packed_float4*)(op + 12)) = packed_float4(o[12], o[13], o[14], o[15]);
+            }
+            """)
+
+    /// `DARKBLOOM_BONSAI_VATTN_COMBINE_DIRECT=0` keeps the record combine.
+    private static let combineDirectSwitch = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_BONSAI_VATTN_COMBINE_DIRECT"] != "0"
+
+    /// Whether the direct combine gave the record combine's bits on fixed probes and timed at
+    /// least 2% faster on a chain, checked once at load. A slower or mismatching device keeps
+    /// the record combine.
+    private static let combineDirectVerdict: Bool = {
+        guard combineDirectSwitch else {
+            FileHandle.standardError.write(Data("vattn combine direct: off (switch)\n".utf8))
+            return false
+        }
+        var passed = false
+        do {
+            passed = try withError { checkCombineDirect() }
+        } catch {
+            FileHandle.standardError.write(Data("vattn combine direct check error: \(error)\n".utf8))
+        }
+        return passed
+    }()
+
+    private static var combineChosen: MLXFast.MLXFastKernel {
+        combineDirectVerdict ? combineDirect : combine
+    }
+
+    static func prepareCombine() { _ = combineDirectVerdict }
+
+    private static func checkCombineDirect() -> Bool {
+        var note = "record (no timing gain)"
+        for L in [16, 7] {
+            let slots = 16 * L * 32
+            let o = probe([slots, 256], seed: 0.11, scale: 1.0)
+            let m = probe([slots], seed: 0.12, scale: 2.0)
+            let s = probe([slots], seed: 0.13, scale: 3.0)
+            let record = combine(
+                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+            let direct = combineDirect(
+                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+            let same = (record.view(dtype: .uint32) .== direct.view(dtype: .uint32)).all()
+                .item(Bool.self)
+            guard same else {
+                FileHandle.standardError.write(
+                    Data("vattn combine direct: off (bits differ at L \(L))\n".utf8))
+                return false
+            }
+            if L == 16 {
+                note = timingNote(o: o, m: m, s: s)
+            }
+        }
+        FileHandle.standardError.write(Data("vattn combine direct: \(note)\n".utf8))
+        return note.hasPrefix("on")
+    }
+
+    private static func timingNote(o: MLXArray, m: MLXArray, s: MLXArray) -> String {
+        func chain(_ kernel: MLXFast.MLXFastKernel) -> Double {
+            var best = Double.infinity
+            for _ in 0 ..< 4 {
+                let start = DispatchTime.now().uptimeNanoseconds
+                let out = kernel(
+                    [o, m, s], grid: (32 * 256, 16, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1, 16, 16, 256]], outputDTypes: [.float32])[0]
+                eval(out)
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+                best = min(best, elapsed)
+            }
+            return best
+        }
+        let recordTime = chain(combine)
+        let directTime = chain(combineDirect)
+        let gain = recordTime > 0 ? 1 - directTime / recordTime : 0
+        return gain >= 0.02
+            ? "on (\(Int((gain * 100).rounded()))% faster than the record)"
+            : "record (\(Int((gain * 100).rounded()))% direct)"
+    }
+
     /// One threadgroup per (head, query, half of the output dims); the 32
     /// partials pass through threadgroup memory so lane l holds partial l.
     private static let combine = MLXFast.metalKernel(
@@ -1437,7 +1557,10 @@ enum CBv2VerifyVectorAttention {
         return passed
     }()
 
-    static func prepareLean() { _ = leanVerdict }
+    static func prepareLean() {
+        _ = leanVerdict
+        prepareCombine()
+    }
 
     private static func probe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
@@ -1518,7 +1641,7 @@ enum CBv2VerifyVectorAttention {
             queries: queries, keys: keys, values: values, params: params, tree: nil, L: L,
             lean: leanApplies(keys: keys, values: values, nKeys: nKeys))
         else { return nil }
-        return combine(
+        return combineChosen(
             CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
@@ -1546,7 +1669,7 @@ enum CBv2VerifyVectorAttention {
             queries: queries, keys: keys, values: values, params: params, tree: tree, L: L,
             lean: leanApplies(keys: keys, values: values, nKeys: kShape.2))
         else { return nil }
-        return combine(
+        return combineChosen(
             CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
