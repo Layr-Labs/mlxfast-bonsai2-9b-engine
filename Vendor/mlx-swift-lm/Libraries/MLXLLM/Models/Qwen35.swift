@@ -2785,11 +2785,13 @@ enum Qwen35FusedGDNVerify {
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS2"] != "0"
     nonisolated(unsafe) private static var chainStoresPassed = false
 
-    private static func treeVariant(tuned: Bool, delta: Bool, dead: Bool = false, chain: Bool = false)
+    private static func treeVariant(tuned: Bool, delta: Bool, dead: Bool = false, chain: Bool = false,
+        gates: Bool = false)
         -> MLXFast.MLXFastKernel?
     {
         guard !dead || (delta && deadOutputsOffered) else { return nil }
         guard !chain || chainStoresOffered else { return nil }
+        guard !gates || (tuned && gatesOffered) else { return nil }
         let record: String
         if tuned {
             guard let text = tunedSource else { return nil }
@@ -2819,10 +2821,14 @@ enum Qwen35FusedGDNVerify {
             guard let guarded = chainStores(text) else { return nil }
             text = guarded
         }
+        if gates {
+            guard let early = earlyGates(text) else { return nil }
+            text = early
+        }
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
         return MLXFast.metalKernel(
             name: "qwen35_gdn_verify_tree_" + route + (tuned ? "_sg16" : "") + (delta ? "_delta" : "")
-                + (dead ? "_nocv" : "") + (chain ? "_cs" : ""),
+                + (dead ? "_nocv" : "") + (chain ? "_cs" : "") + (gates ? "_gates" : ""),
             inputNames: ["conv_state", "qkv", "conv_weight", "a", "b", "a_log", "dt_bias", "state_in", "tree"],
             outputNames: dead
                 ? ["k_out", "y", "state_out", "conv_tail", "delta_out"]
@@ -2832,6 +2838,13 @@ enum Qwen35FusedGDNVerify {
             source: text, header: Qwen35RegisterGatedSIMD.gateHeader)
     }
 
+    private static let tunedTreeKernelGates = treeVariant(tuned: true, delta: false, gates: true)
+    private static let tunedDeltaTreeKernelGates = treeVariant(tuned: true, delta: true, gates: true)
+    private static let tunedDeltaTreeKernelDeadGates = treeVariant(tuned: true, delta: true, dead: true, gates: true)
+    private static let tunedTreeKernelChainGates = treeVariant(tuned: true, delta: false, chain: true, gates: true)
+    private static let tunedDeltaTreeKernelChainGates = treeVariant(tuned: true, delta: true, chain: true, gates: true)
+    private static let tunedDeltaTreeKernelDeadChainGates =
+        treeVariant(tuned: true, delta: true, dead: true, chain: true, gates: true)
     private static let deltaTreeKernel = treeVariant(tuned: false, delta: true)
     private static let tunedTreeKernel = treeVariant(tuned: true, delta: false)
     private static let tunedDeltaTreeKernel = treeVariant(tuned: true, delta: true)
@@ -2875,15 +2888,22 @@ enum Qwen35FusedGDNVerify {
         func stores(_ full: MLXFast.MLXFastKernel?, _ chain: MLXFast.MLXFastKernel?) -> MLXFast.MLXFastKernel? {
             chainStoresPassed ? (chain ?? full) : full
         }
+        func early(_ parent: MLXFast.MLXFastKernel?, _ gates: MLXFast.MLXFastKernel?) -> MLXFast.MLXFastKernel? {
+            gatesPassed ? (gates ?? parent) : parent
+        }
         let selected: MLXFast.MLXFastKernel?
         if tuned {
             selected = captureDelta
-                ? stores(tunedDeltaTreeKernel, tunedDeltaTreeKernelChain) : stores(tunedTreeKernel, tunedTreeKernelChain)
+                ? early(stores(tunedDeltaTreeKernel, tunedDeltaTreeKernelChain),
+                    stores(tunedDeltaTreeKernelGates, tunedDeltaTreeKernelChainGates))
+                : early(stores(tunedTreeKernel, tunedTreeKernelChain),
+                    stores(tunedTreeKernelGates, tunedTreeKernelChainGates))
         } else {
             selected = captureDelta ? stores(deltaTreeKernel, deltaTreeKernelChain) : stores(treeKernel, treeKernelChain)
         }
         let deadKernel = captureDelta && deadPassed
-            ? (tuned ? stores(tunedDeltaTreeKernelDead, tunedDeltaTreeKernelDeadChain)
+            ? (tuned ? early(stores(tunedDeltaTreeKernelDead, tunedDeltaTreeKernelDeadChain),
+                    stores(tunedDeltaTreeKernelDeadGates, tunedDeltaTreeKernelDeadChainGates))
                 : stores(deltaTreeKernelDead, deltaTreeKernelDeadChain))
             : nil
         guard let selected = deadKernel ?? selected else { return nil }
@@ -3008,8 +3028,18 @@ enum Qwen35FusedGDNVerify {
             }
         }
         chainStoresPassed = chainOK
+        var gatesOK = false
+        if gatesOffered {
+            do {
+                gatesOK = try withError { checkGates() }
+            } catch {
+                FileHandle.standardError.write(Data("gdn16 gates check error: \(error)\n".utf8))
+            }
+        }
+        gatesPassed = gatesOK
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
-            + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed) dead2=\(chainStoresPassed)\n"
+            + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed) dead2=\(chainStoresPassed)"
+            + " gates=\(gatesPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
     }
 
@@ -3051,6 +3081,101 @@ enum Qwen35FusedGDNVerify {
 
     private static func five(_ a: VerifyResult) -> [MLXArray] {
         [a.0, a.3, a.4, a.5, a.6]
+    }
+
+    /// The tree texts form the gates (16 threads of simdgroup 0, which also owns q/k columns 0-15) after the
+    /// descriptor table's barrier and before the convolution frontend, so on that simdgroup the gate loads and
+    /// transcendentals delay the frontend's window loads, and the norm barrier then waits on it. The twin forms
+    /// the gates inside the q/k frontend, after its window loads are issued and before their first use, so the
+    /// gate's load stall and math run under the window-load latency. The gates read only kernel inputs, and their
+    /// stores are first read behind a later barrier. A pure move: the twin's lines are the parent's in another
+    /// order. Chain texts have no table and get no twin. `DARKBLOOM_BONSAI_GDNNEXT2=0` keeps the parent kernels.
+    static func earlyGates(_ text: String) -> String? {
+        var s = text
+        guard s.components(separatedBy: "threadgroup int tb_desc[288];\n").count == 2 else { return nil }
+        guard let declRange = s.range(of: "threadgroup float gate_beta[MAX_T];\nif (tid < T) {\n") else { return nil }
+        let begin = s.index(declRange.lowerBound, offsetBy: "threadgroup float gate_beta[MAX_T];\n".count)
+        let frontend = "{\n  #pragma clang fp reassociate(off)\n  // Conv + SiLU"
+        guard let finishRange = s.range(of: frontend, range: begin..<s.endIndex) else { return nil }
+        let gates = String(s[begin..<finishRange.lowerBound])
+        s.removeSubrange(begin..<finishRange.lowerBound)
+        let taps = "const float w[4] = {w4.x, w4.y, w4.z, w4.w};\n    if (owns_qk) {\n"
+        guard s.components(separatedBy: taps).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: taps,
+            with: "const float w[4] = {w4.x, w4.y, w4.z, w4.w};\n" + gates + "    if (owns_qk) {\n")
+        guard s.split(separator: "\n", omittingEmptySubsequences: false).sorted()
+            == text.split(separator: "\n", omittingEmptySubsequences: false).sorted() else { return nil }
+        if gatesNegativeControl {
+            let bias = "const float bias = dt_bias[hv_idx];"
+            guard s.components(separatedBy: bias).count == 2 else { return nil }
+            return s.replacingOccurrences(of: bias, with: "const float bias = a_log[hv_idx];")
+        }
+        return s
+    }
+
+    static let gatesOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDNNEXT2"] != "0"
+    private static let gatesNegativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_GDNNEXT2_NEGCTL"] == "1"
+    nonisolated(unsafe) private static var gatesPassed = false
+
+    /// The tuned tree kernels the checked flags select against their early-gates twins: every output equal
+    /// on a chain descriptor and two branching descriptors, two input kinds. `state_out` and `conv_tail` of
+    /// a branching descriptor are compared only while the chain-store guard is off, because that guard leaves
+    /// them unwritten. `DARKBLOOM_BONSAI_GDNNEXT2_NEGCTL=1` corrupts the twins' gate bias, so the check fails
+    /// and the parents stay.
+    private static func checkGates() -> Bool {
+        let (tuned, delta, dead, chain) = (tunePassed, deltaPassed, deadPassed, chainStoresPassed)
+        defer {
+            (tunePassed, deltaPassed, deadPassed, chainStoresPassed) = (tuned, delta, dead, chain)
+            gatesPassed = false
+        }
+        guard tuned, tunedTreeKernelGates != nil, tunedDeltaTreeKernelGates != nil else { return false }
+        if dead { guard tunedDeltaTreeKernelDeadGates != nil else { return false } }
+        if chain {
+            guard tunedTreeKernelChainGates != nil, tunedDeltaTreeKernelChainGates != nil else { return false }
+            if dead { guard tunedDeltaTreeKernelDeadChainGates != nil else { return false } }
+        }
+        let identity = Array(-1..<15)
+        let parents: [[Int]] = [identity,
+            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
+            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+        var ok = true
+        for kind in 0..<2 {
+            let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
+            let qkv = probeRows([1, 16, 8192], seed: 0.02, scale: 0.5)
+            let weight = probeRows([8192, 4, 1], seed: 0.03, scale: 0.1)
+            let a = probeRows([1, 16, 32], seed: 0.04, scale: 30)
+            let b = probeRows([1, 16, 32], seed: 0.05, scale: 8)
+            let aLog = probeRows([32], seed: 0.06, scale: 2)
+            let bias = probeRows([32], seed: 0.07, scale: 3)
+            let state = kind == 1 ? probeWords([1, 32, 128, 128])
+                : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)
+            let inputs = [convState, qkv, weight, a, b, aLog, bias, state]
+            for parent in parents {
+                let tree = probeTree(parent).0
+                guard let full = probeForward(inputs, tuned: true, delta: delta, tree: tree, dead: dead, chain: chain),
+                    let twin = probeForward(inputs, tuned: true, delta: delta, tree: tree, dead: dead, chain: chain,
+                        gates: true)
+                else { return false }
+                var lhs = [full.0, full.1, full.2, full.3, full.4]
+                var rhs = [twin.0, twin.1, twin.2, twin.3, twin.4]
+                switch (full.7, twin.7) {
+                case let (fullTape?, twinTape?):
+                    lhs.append(fullTape)
+                    rhs.append(twinTape)
+                case (nil, nil):
+                    break
+                default:
+                    return false
+                }
+                if parent == identity || !chain {
+                    lhs += [full.5, full.6]
+                    rhs += [twin.5, twin.6]
+                }
+                ok = sameBits(lhs, rhs) && ok
+            }
+        }
+        return ok
     }
 
     /// The tree kernel the checked flags select, with and without `chainStores`, on a chain and two
@@ -3108,12 +3233,13 @@ enum Qwen35FusedGDNVerify {
 
     private static func probeForward(
         _ inputs: [MLXArray], tuned: Bool, delta: Bool, tree: MLXArray? = nil, dead: Bool = false,
-        chain: Bool = false
+        chain: Bool = false, gates: Bool = false
     ) -> VerifyResult? {
         tunePassed = tuned
         deltaPassed = delta
         deadPassed = dead
         chainStoresPassed = chain
+        gatesPassed = gates
         if let tree {
             return applyTree(convState: inputs[0], qkv: inputs[1], convWeight: inputs[2],
                 a: inputs[3], b: inputs[4], aLog: inputs[5], dtBias: inputs[6],
