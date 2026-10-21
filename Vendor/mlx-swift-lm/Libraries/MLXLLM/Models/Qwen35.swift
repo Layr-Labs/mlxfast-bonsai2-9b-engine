@@ -6244,8 +6244,9 @@ public class Qwen35TextModelInner: Module {
     /// documents why that matters.
     let dFlash2Tap = DFlash2TapSlot()
 
-    /// Layers per early verify submission.
-    static let verifySubmitEvery = 4
+    /// Coalesce later target-layer submissions while retaining the first-layer
+    /// handoff below. Only enqueue boundaries change; the dataflow is unchanged.
+    static let verifySubmitEvery = 8
 
     /// Verify: submit after the first layer, so the GPU starts on the round
     /// while the host builds the rest, then after every `verifySubmitEvery`
