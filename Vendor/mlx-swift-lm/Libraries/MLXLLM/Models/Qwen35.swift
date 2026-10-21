@@ -1030,19 +1030,33 @@ private enum Qwen35Fresh8PromptGDN {
             ba.dtype == .float32, aLog.dtype == .float32, dtBias.dtype == .float32,
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let T = q.dim(1)
-        let q = q.contiguous(), k = k.contiguous(), v = v.contiguous(), ba = ba.contiguous()
-        let rows = MLXArray(Int32(T))
-        let prepared = prepKernel(
+        return scan(
+            q: q.contiguous(), k: k.contiguous(), v: v.contiguous(), ba: ba.contiguous(),
+            aLog: aLog, dtBias: dtBias, simdgroups: scanSimdgroups)
+    }
+
+    private static func prepare(
+        q: MLXArray, k: MLXArray, ba: MLXArray, aLog: MLXArray, dtBias: MLXArray, rows: MLXArray
+    ) -> [MLXArray] {
+        prepKernel(
             [q, k, ba, aLog, dtBias, rows],
             template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
-            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
-            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+            grid: (32, q.dim(1) / 8, 16), threadGroup: (32, 1, 1),
+            outputShapes: [[1, 32, q.dim(1) / 8, 8, 8], [1, 32, q.dim(1) / 8, 8, 8], [1, 32, q.dim(1) / 8, 2, 8]],
             outputDTypes: [.float32, .float32, .float32])
+    }
+
+    private static func scan(
+        q: MLXArray, k: MLXArray, v: MLXArray, ba: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        simdgroups: Int
+    ) -> (MLXArray, MLXArray) {
+        let T = q.dim(1)
+        let rows = MLXArray(Int32(T))
+        let prepared = prepare(q: q, k: k, ba: ba, aLog: aLog, dtBias: dtBias, rows: rows)
         let result = scanKernel(
             [q, k, v, prepared[0], prepared[1], prepared[2], rows],
-            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
-            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", simdgroups)],
+            grid: (32, 16, 32), threadGroup: (32, simdgroups, 1),
             outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
@@ -1064,21 +1078,86 @@ private enum Qwen35Fresh8PromptGDN {
             aLog.dtype == .float32, dtBias.dtype == .float32,
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
+        return scanFolded(
+            q: q.contiguous(), k: k.contiguous(), convState: convState, qkv: qkv, weight: weight,
+            ba: ba.contiguous(), aLog: aLog, dtBias: dtBias, simdgroups: scanSimdgroups)
+    }
+
+    private static func scanFolded(
+        q: MLXArray, k: MLXArray, convState: MLXArray, qkv: MLXArray, weight: MLXArray,
+        ba: MLXArray, aLog: MLXArray, dtBias: MLXArray, simdgroups: Int
+    ) -> (MLXArray, MLXArray) {
         let T = q.dim(1)
-        let q = q.contiguous(), k = k.contiguous(), ba = ba.contiguous()
         let rows = MLXArray(Int32(T))
-        let prepared = prepKernel(
-            [q, k, ba, aLog, dtBias, rows],
-            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
-            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
-            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
-            outputDTypes: [.float32, .float32, .float32])
+        let prepared = prepare(q: q, k: k, ba: ba, aLog: aLog, dtBias: dtBias, rows: rows)
         let result = convolvedValueScanKernel(
             [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
-            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", 4)],
-            grid: (32, 16, 32), threadGroup: (32, 4, 1),
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", simdgroups)],
+            grid: (32, 16, 32), threadGroup: (32, simdgroups, 1),
             outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
+    }
+
+    /// 8 simdgroups per threadgroup share each chunk's K, Q, T' and P (each
+    /// simdgroup still owns its 8 state rows and runs the same operations in
+    /// the same order); 4 is the record. Decided once per process by a
+    /// bitwise check of both scan kernels at 8 against 4 on a synthetic chunk
+    /// set; a mismatch or error keeps 4. `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4.
+    private static let scanOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSCAN8"] != "0"
+    nonisolated(unsafe) private static var scanVerdict: Int?
+    private static let scanLock = NSLock()
+
+    private static var scanSimdgroups: Int {
+        scanLock.lock()
+        defer { scanLock.unlock() }
+        if let verdict = scanVerdict { return verdict }
+        var verdict = 4
+        var note = "off"
+        if scanOffered {
+            do {
+                if try withError({ scanBitsMatch() }) {
+                    verdict = 8
+                    note = "bitwise equal to 4 at 64 and 136 rows, plain and value-folded"
+                } else {
+                    note = "mismatch, keeping 4"
+                }
+            } catch {
+                note = "error, keeping 4: \(error)"
+            }
+        }
+        scanVerdict = verdict
+        FileHandle.standardError.write(
+            Data("qwen35 prompt scan simdgroups: \(verdict) (\(note))\n".utf8))
+        return verdict
+    }
+
+    private static func scanBitsMatch() -> Bool {
+        let parts = MLXRandom.split(key: MLXRandom.key(0x5ca8), into: 8)
+        let aLog = MLXRandom.uniform(low: -1, high: 1, [32], key: parts[0])
+        let dtBias = MLXRandom.uniform(low: -2, high: 2, [32], key: parts[1])
+        let convState = MLXRandom.uniform(low: -3, high: 3, [1, 3, 8192], key: parts[2])
+        let weight = MLXRandom.uniform(low: -0.7, high: 0.7, [8192, 4, 1], key: parts[3])
+        var same = MLXArray(true)
+        for T in [64, 136] {
+            let q = MLXRandom.uniform(low: -1, high: 1, [1, T, 16, 128], key: parts[4])
+            let k = MLXRandom.uniform(low: -1, high: 1, [1, T, 16, 128], key: parts[5])
+            let v = MLXRandom.uniform(low: -2, high: 2, [1, T, 32, 128], key: parts[6])
+            let ba = MLXRandom.uniform(low: -4, high: 4, [1, T, 64], key: parts[7])
+            let qkv = MLXRandom.uniform(low: -3, high: 3, [1, T, 8192], key: parts[6])
+            let plain = [4, 8].map { (ns: Int) -> (MLXArray, MLXArray) in
+                scan(q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias, simdgroups: ns)
+            }
+            let folded = [4, 8].map { (ns: Int) -> (MLXArray, MLXArray) in
+                scanFolded(
+                    q: q, k: k, convState: convState, qkv: qkv, weight: weight, ba: ba,
+                    aLog: aLog, dtBias: dtBias, simdgroups: ns)
+            }
+            for pair in [plain, folded] {
+                same = same .&& (pair[0].0.view(dtype: .uint32) .== pair[1].0.view(dtype: .uint32)).all()
+                same = same .&& (pair[0].1.view(dtype: .uint32) .== pair[1].1.view(dtype: .uint32)).all()
+            }
+        }
+        return same.item(Bool.self)
     }
 
     private static let prepKernel = MLXFast.metalKernel(
