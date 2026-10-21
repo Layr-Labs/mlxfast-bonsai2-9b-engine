@@ -1509,7 +1509,8 @@ extension SignedBlockHadamard {
     static let wideRowLean = flagOn("DARKBLOOM_BONSAI_WHT_LEAN")
     static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
     static let wideRowLeanThreads: [WideRowKind: Int] = [
-        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512,
+        .attentionGate: 512, .normNormed: flagOn("DARKBLOOM_BONSAI_WHT_LEAN_NN") ? 1024 : 0,
     ]
 
     private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
