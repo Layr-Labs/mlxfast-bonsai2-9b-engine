@@ -2767,6 +2767,86 @@ enum Qwen35FusedGDNVerify {
             && swap("acc = fma(xin[p + tap], w[tap], acc);", tap)
             && swap("const uint r = p + tap;", "const uint r = tb_tab[p * 4u + tap];")
             && swap("for (int t = 0; t < int(T); ++t) {", restart)
+        guard ok else { return nil }
+        return cachedTreeDeltas(s)
+    }
+
+    /// An ancestor's delta was already computed on exactly its own path. Cache
+    /// it in the consumed v_tile row (no extra shared memory), then replay
+    /// only state *= g; state = fma(k, delta, state). No ancestor dot is needed.
+    /// Each eight-lane group has one V-slot owner. Only that same lane reads
+    /// V, writes delta, and reloads it for replay; shuffles transport register
+    /// values to the other lanes, so no inter-row memory barrier is needed.
+    /// Non-tree scans are unchanged.
+    static func cachedTreeDeltas(_ fast: String) -> String? {
+        var s = fast
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let old = """
+              const float2 vu = *((threadgroup const float2*)(v_tile + dvlocal + u * DVPT));
+              const float vq[DVPL] = {vu.x, vu.y};
+              float kvq[DVPL];
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
+                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
+                  a0 = fma(state[d][4 * j], kq[4 * j], a0);
+                  a1 = fma(state[d][4 * j + 1], kq[4 * j + 1], a1);
+                  a2 = fma(state[d][4 * j + 2], kq[4 * j + 2], a2);
+                  a3 = fma(state[d][4 * j + 3], kq[4 * j + 3], a3);
+                }
+                kvq[d] = (a0 + a1) + (a2 + a3);
+              }
+              kvq[0] += simd_shuffle_xor(kvq[0], 4);
+              kvq[1] += simd_shuffle_xor(kvq[1], 4);
+              kvq[0] += simd_shuffle_xor(kvq[0], 2);
+              kvq[1] += simd_shuffle_xor(kvq[1], 2);
+              kvq[0] += simd_shuffle_xor(kvq[0], 1);
+              kvq[1] += simd_shuffle_xor(kvq[1], 1);
+          """
+        let update = """
+              #pragma clang loop unroll(full)
+              for (int d = 0; d < DVPL; ++d) {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < R / 4; ++j) {
+                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
+                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
+                }
+              }
+          """
+        let valueLoad = """
+          float vt[DVPL];
+          const float2 v2 = *((threadgroup const float2*)v_);
+          vt[0] = v2.x; vt[1] = v2.y;
+        """
+        let ownedValueLoad = """
+          float vt[DVPL] = {0.0f, 0.0f};
+          if (lane % LPD == 0) {
+            const float2 v2 = *((threadgroup const float2*)v_);
+            vt[0] = v2.x; vt[1] = v2.y;
+          }
+          vt[0] = simd_shuffle(vt[0], lane - lane % LPD);
+          vt[1] = simd_shuffle(vt[1], lane - lane % LPD);
+        """
+        let ownedDeltaLoad = """
+          float delta = 0.0f;
+          if (lane % LPD == 0) delta = v_tile[u * DVPT + dvlocal + d];
+          delta = simd_shuffle(delta, lane - lane % LPD);
+        """
+        let ok = swap(valueLoad, ownedValueLoad)
+            && swap(old, update)
+            && swap("const float bu = gate_beta[u];", "")
+            && swap("const float delta = (vq[d] - kvq[d]) * bu;", ownedDeltaLoad)
+            && swap("const float delta = (vt[d] - kv[d]) * bt;", """
+                const float delta = (vt[d] - kv[d]) * bt;
+                if (lane % LPD == 0) v_tile[t * DVPT + dvlocal + d] = delta;
+                """)
         return ok ? s : nil
     }
 
