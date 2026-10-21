@@ -2056,13 +2056,17 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
-        guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
+        let rows = targetHidden.dim(1)
+        let writeNorm = layers.contains { $0.selfAttn.slidingWindow.map { rows >= $0 } ?? false }
+        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group, writeNorm: writeNorm) else { return nil }
+        // Every precomputed K/V stays live when no layer drops context rows.
+        let context = writeNorm ? normed.0 : fcOut
+        guard let kv = contextKeysValues(normed.1, rows: rows) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
-            anchorEmbeddings: embeddings, context: context, contextKV: kv, lookupFCOutput: lookupFC)
+            anchorEmbeddings: embeddings, context: context, contextIsShapeOnly: !writeNorm,
+            contextKV: kv, lookupFCOutput: lookupFC)
     }
 
     /// Every layer's context keys and values from the context codes, in the
@@ -6507,16 +6511,19 @@ extension DF2Fast {
 public final class DFlash2ContextProjection {
     let anchorEmbeddings: MLXArray
     let context: MLXArray
+    let contextIsShapeOnly: Bool
     let contextKV: [(MLXArray, MLXArray)]
     let lookupFCOutput: MLXArray?
     var front: DFlash2LayerZeroFront?
 
     init(
-        anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)],
+        anchorEmbeddings: MLXArray, context: MLXArray, contextIsShapeOnly: Bool = false,
+        contextKV: [(MLXArray, MLXArray)],
         lookupFCOutput: MLXArray?
     ) {
         self.anchorEmbeddings = anchorEmbeddings
         self.context = context
+        self.contextIsShapeOnly = contextIsShapeOnly
         self.contextKV = contextKV
         self.lookupFCOutput = lookupFCOutput
     }
@@ -6547,7 +6554,9 @@ public final class DFlash2ContextProjection {
         let index = MLXArray(rows)
         return DFlash2ContextProjection(
             anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
-            context: context.take(index, axis: 1),
+            context: contextIsShapeOnly && rows.count <= self.rows
+                ? context[0..., 0 ..< rows.count, 0...] : context.take(index, axis: 1),
+            contextIsShapeOnly: contextIsShapeOnly,
             contextKV: contextKV.map { ($0.0.take(index, axis: 1), $0.1.take(index, axis: 1)) },
             lookupFCOutput: lookupFCOutput?.take(index, axis: 1))
     }
