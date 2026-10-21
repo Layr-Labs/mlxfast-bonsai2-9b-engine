@@ -1338,7 +1338,7 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
-METAL_FUNC void qmm_t_impl(
+METAL_FUNC void qmm_t_base_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -1456,6 +1456,43 @@ METAL_FUNC void qmm_t_impl(
   } else {
     mma_op.store_result(y, N);
   }
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 32,
+    const int BK = 32,
+    const int BN = 32>
+METAL_FUNC void qmm_t_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    const constant int& K_eff,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (bits == 2 && group_size == 128 && BM == 32 && BK == 32 && BN == 32) {
+    if (M > 0 && M <= 16) {
+      qmm_t_base_impl<T, group_size, bits, aligned_N, 16, BK, BN>(
+          w, scales, biases, x, y, Xs, Ws, K, N, M, K_eff,
+          tid, lid, simd_gid, simd_lid);
+      return;
+    }
+  }
+  qmm_t_base_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K_eff,
+      tid, lid, simd_gid, simd_lid);
 }
 
 template <
