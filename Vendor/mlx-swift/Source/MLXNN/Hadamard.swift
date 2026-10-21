@@ -1509,7 +1509,8 @@ extension SignedBlockHadamard {
     static let wideRowLean = flagOn("DARKBLOOM_BONSAI_WHT_LEAN")
     static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
     static let wideRowLeanThreads: [WideRowKind: Int] = [
-        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512,
+        .attentionGate: 512, .normNormed: flagOn("DARKBLOOM_BONSAI_WHT_LEAN_NN") ? 1024 : 0,
     ]
 
     private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
@@ -5634,7 +5635,7 @@ enum VerifyInt8Matmul {
         return prefix + body
     }
 
-    private static let streamedKernels = (1 ... 3).map { layers in
+    static let streamedKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_streamed_col\(layers)",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
@@ -6547,7 +6548,7 @@ enum VerifyInt8Matmul {
     }
 
     /// `naxFormsSource` for one, two and three layers (index `layers - 1`).
-    private static let naxFormsKernels = (1 ... 3).map { layers in
+    static let naxFormsKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_matmul_nax_forms\(layers)",
             inputNames: ["xq"] + (0 ..< layers).map { "w\($0)" } + (0 ..< layers).map { "s\($0)" }
@@ -6572,7 +6573,7 @@ enum VerifyInt8Matmul {
         return 0
     }
     @inline(__always)
-    private static func hasMatchedForm(k: Int, layers: Int) -> Bool {
+    static func hasMatchedForm(k: Int, layers: Int) -> Bool {
         (formsMatchedMask & formBit(k: k, layers: layers)) != 0
     }
     /// `DARKBLOOM_BONSAI_VERIFY_FORMS=0` keeps the record kernel everywhere.
@@ -6752,6 +6753,8 @@ enum VerifyInt8Matmul {
         }
         if useForms {
             let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
+            if m == 16, k == 4096, outputShapes == [[16, 12288], [16, 12288]],
+                let a = HadamardQuantizedLinear.verifyK64Run?(inputs, negative, streamedWeights != nil) { return a }
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
             return kernels[layers.count - 1](
                 inputs, template: template,
@@ -8202,12 +8205,21 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
+    nonisolated(unsafe) public static var verifyK64Prepare: (() -> Void)?
+    nonisolated(unsafe) public static var verifyK64Run: (([MLXArray], Bool, Bool) -> [MLXArray]?)?
+    public static func verifyK64Source(_ s: Bool) -> (String, MLXFast.MLXFastKernel)? {
+        guard VerifyInt8Matmul.route == .nax, VerifyInt8Matmul.hasMatchedForm(k: 4096, layers: 2),
+            !s || VerifyInt8Matmul.streamReady else { return nil }
+        return (s ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2),
+                (s ? VerifyInt8Matmul.streamedKernels : VerifyInt8Matmul.naxFormsKernels)[1])
+    }
     /// Qualify the shared immutable weight layout before serving requests.
     /// Prefill and verify then consume the same copies; no allocator policy or
     /// request scratch is changed, and no request work is moved into begin.
     public static func prepareSharedVerifyWeights() {
         PromptInt8Matmul.prepareStreaming()
         PromptInt8Matmul.prepareSwiGLU()
+        verifyK64Prepare?()
     }
 
     public let transform: SignedBlockHadamard
