@@ -2056,9 +2056,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
-        guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
+        let rows = targetHidden.dim(1)
+        let writeNorm = layers.contains { $0.selfAttn.slidingWindow.map { rows >= $0 } ?? false }
+        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group, writeNorm: writeNorm) else { return nil }
+        // Every precomputed K/V stays live when no layer drops context rows.
+        let context = writeNorm ? normed.0 : fcOut
+        guard let kv = contextKeysValues(normed.1, rows: rows) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
@@ -5885,13 +5888,12 @@ enum DF2Fast {
             """
     }
 
-    /// The tree's child softmax temperature, chosen per block from the anchor's own softmax at
-    /// temperature 1. When the top first-position candidate holds less than 0.8 of it, the block is
-    /// likely to stop early, so the tree keeps temperature 1 and spends nodes on side branches. Otherwise
-    /// it runs at temperature 0.8 (scores times 1.25, exact in float) and keeps a confident chain's full
-    /// depth. `DARKBLOOM_BONSAI_TREE_SPLIT=0` keeps 0.8 on every block;
-    /// `DARKBLOOM_BONSAI_TREE_SHARP=0` keeps 1 on every block.
-    static let treeSharp: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SHARP"] != "0"
+    /// The tree's child softmax temperature: 1 on every block (the drafter's own scores), so path
+    /// probabilities rank side branches and chain extensions on the same scale in every block.
+    /// `DARKBLOOM_BONSAI_TREE_SHARP=1` restores the per-block policy (0.8 when the top first-position
+    /// candidate holds at least 0.8 of the anchor's softmax, else 1); with it,
+    /// `DARKBLOOM_BONSAI_TREE_SPLIT=0` keeps 0.8 on every block.
+    static let treeSharp: Bool = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SHARP"] == "1"
     static let treeSplit: Bool = treeSharp
         && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_TREE_SPLIT"] != "0"
 
