@@ -172,6 +172,7 @@ final class CBv2MTPRoundInFlight {
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
     var finalizedSeedIDs: Set<CBv2RequestID> = []
+    var skippedNeuralDraftIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
     /// Outputs actually kept after common-width, EOS, stop and budget handling.
@@ -308,6 +309,7 @@ final class CBv2MTPRoundDriver {
     /// Plan-scoped: eligible rows without a valid carry — their decode step
     /// this plan is a SEED step (eager forwardWithHidden, hidden captured).
     private(set) var seedMarks: Set<CBv2RequestID> = []
+    private(set) var neuralSkipMarks: Set<CBv2RequestID> = []
     /// Step-global seed fallback without destroying persistent request
     /// history. Used when one rectangular row lacks a carry.
     private(set) var forceSeedPlan = false
@@ -502,6 +504,7 @@ final class CBv2MTPRoundDriver {
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
+        if !neuralSkipMarks.isEmpty { neuralSkipMarks = [] }
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
@@ -586,6 +589,14 @@ final class CBv2MTPRoundDriver {
         metrics.controllerFallbacks[reason, default: 0] += 1
         metricsLock.unlock()
     }
+
+    func shouldSkipNeuralDraft(for rec: CBv2ScheduledRequest) -> Bool {
+        guard let block = blockDrafter, let state = assistantStates[rec.id] else { return false }
+        block.prepareDraft(history: rec.tokens, depth: planDepth, requestState: state)
+        return !block.shouldProposeBlock(requestState: state)
+    }
+
+    func markNeuralSkip(_ id: CBv2RequestID) { neuralSkipMarks.insert(id) }
 
     func markRound(_ id: CBv2RequestID, k: Int) { roundMarks[id] = k }
     func markSeed(_ id: CBv2RequestID) { seedMarks.insert(id) }
@@ -928,6 +939,7 @@ final class CBv2MTPRoundDriver {
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
         seedMarks.remove(id)
+        neuralSkipMarks.remove(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
         lookupIndexes.removeValue(forKey: id)
@@ -966,6 +978,7 @@ final class CBv2MTPRoundDriver {
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
         roundMarks.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
+        neuralSkipMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
         lookupIndexes.removeAll(keepingCapacity: false)
@@ -973,7 +986,7 @@ final class CBv2MTPRoundDriver {
 
     var requestStateCountForTesting: Int {
         carries.count + assistantStates.count + requestAcceptance.count
-            + roundMarks.count + seedMarks.count + pendingSeedCosts.count
+            + roundMarks.count + seedMarks.count + neuralSkipMarks.count + pendingSeedCosts.count
             + lookupIndexes.count
     }
 

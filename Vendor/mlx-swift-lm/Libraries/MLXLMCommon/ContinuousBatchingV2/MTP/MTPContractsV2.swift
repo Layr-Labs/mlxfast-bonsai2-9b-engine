@@ -493,6 +493,12 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     func prepareDraft(
         history: [Int], depth: Int, requestState: any CBv2MTPRequestState)
 
+    /// Read after prepareDraft; a lookup hit remains eligible during neural cooldown.
+    func shouldProposeBlock(requestState: any CBv2MTPRequestState) -> Bool
+
+    /// One policy-marked target-only step completed at the existing commit fence.
+    func recordSkippedNeuralDraft(requestState: any CBv2MTPRequestState)
+
     /// One round, one proposal: `depth` draft token ids as `[1, depth]`
     /// int32, lazy. Row-local, like every other request-stateful call.
     func proposeBlock(
@@ -550,6 +556,10 @@ extension CBv2MTPBlockDrafter {
     public func prepareDraft(
         history: [Int], depth: Int, requestState: any CBv2MTPRequestState
     ) {}
+
+    public func shouldProposeBlock(requestState: any CBv2MTPRequestState) -> Bool { true }
+
+    public func recordSkippedNeuralDraft(requestState: any CBv2MTPRequestState) {}
 
     /// Lazy absorption is the default: the next `proposeBlock` projects the
     /// pending rows itself, the parent behavior.

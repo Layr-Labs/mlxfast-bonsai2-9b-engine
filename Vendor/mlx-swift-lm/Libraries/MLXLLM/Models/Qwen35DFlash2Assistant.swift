@@ -45,6 +45,28 @@ public enum Qwen35DFlash2Error: LocalizedError, Sendable, Equatable {
 }
 
 /// A DFlash 2 drafter bound to one Qwen 3.5 target, as the engine sees it.
+struct DFlash2NeuralRejectionPolicy {
+    private(set) var zeroStreak = 0
+    private(set) var remainingSkips = 0
+
+    func shouldPropose(lookup: Bool) -> Bool { lookup || remainingSkips == 0 }
+
+    mutating func observe(accepted: Int, lookup: Bool) {
+        guard !lookup else { return }
+        if accepted > 0 {
+            zeroStreak = 0
+            remainingSkips = 0
+        } else {
+            zeroStreak = min(3, zeroStreak + 1)
+            if zeroStreak == 3 { remainingSkips = 8 }
+        }
+    }
+
+    mutating func completeSkip() {
+        if remainingSkips > 0 { remainingSkips -= 1 }
+    }
+}
+
 public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Sendable {
 
     public let drafter: DFlash2DraftModel
@@ -178,6 +200,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         var absorbDeferred = false
         /// The newest proposal came from the committed-history lookup.
         var lastProposalLookup = false
+        var neuralRejection = DFlash2NeuralRejectionPolicy()
         var isReleased = false
 
         init(caches: [any KVCache]) { self.caches = caches }
@@ -236,6 +259,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
             lookupFC = nil
             absorbDeferred = false
             lastProposalLookup = false
+            neuralRejection = DFlash2NeuralRejectionPolicy()
             caches.removeAll(keepingCapacity: false)
             pending.removeAll(keepingCapacity: false)
             roots.removeAll(keepingCapacity: false)
@@ -302,6 +326,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         }
         state.promptDraft = DFlash2PromptLookup.continuation(history: history, depth: depth)
         state.preparedLookup = (history, depth)
+    }
+
+    public func shouldProposeBlock(requestState: any CBv2MTPRequestState) -> Bool {
+        let state = self.state(requestState)
+        return state.neuralRejection.shouldPropose(lookup: state.promptDraft != nil)
+    }
+
+    public func recordSkippedNeuralDraft(requestState: any CBv2MTPRequestState) {
+        state(requestState).neuralRejection.completeSkip()
     }
 
     public func proposeBlock(
@@ -392,7 +425,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) {
         let state = self.state(requestState)
-        guard state.prestaged == nil else { return }
+        guard state.prestaged == nil, shouldProposeBlock(requestState: requestState) else { return }
         let preparedLookup = state.preparedLookup
         guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
         else { return }
@@ -512,7 +545,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     public func recordValidatedAcceptance(
         _ accepted: Int, requestState: any CBv2MTPRequestState
     ) {
-        state(requestState).frontAccepted = accepted
+        let state = self.state(requestState)
+        state.frontAccepted = accepted
+        state.neuralRejection.observe(accepted: accepted, lookup: state.lastProposalLookup)
     }
 
     /// Build and return a lookup round's deferred absorption (see
