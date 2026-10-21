@@ -911,28 +911,42 @@ private enum Qwen35PromptConvQKNorm {
     private static let source = """
             #pragma clang fp reassociate(off)
             const uint groups = uint(2 * HK + HV);
-            const uint t = threadgroup_position_in_grid.y / groups;
+            const uint t0 = 2u * (threadgroup_position_in_grid.y / groups);
+            const uint T = qkv_shape[1];
             const uint gi = threadgroup_position_in_grid.y % groups;
             const uint lane = thread_index_in_simdgroup;
             const uint C = uint(CONV_DIM);
             const uint c0 = gi * 128u + lane * 4u;
-            float val[4];
+            float vals[2][4];
             for (int i = 0; i < 4; ++i) {
               const uint c = c0 + uint(i);
-              float acc = 0.0f;
-              for (uint tap = 0; tap < 4u; ++tap) {
-                const uint r = t + tap;
-                const float v = r < 3u ? state[r * C + c] : qkv[(r - 3u) * C + c];
-                acc = fma(v, conv_weight[c * 4u + tap], acc);
+              const float4 wt = ((const device float4*)conv_weight)[c];
+              float xv[5];
+              #pragma clang loop unroll(full)
+              for (uint j = 0; j < 5u; ++j) {
+                const uint rr = t0 + j;
+                xv[j] = rr < 3u ? state[rr * C + c] :
+                    (rr < T + 3u ? qkv[(rr - 3u) * C + c] : 0.0f);
               }
-              const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
-              const float sig = acc < 0.0f ? e : 1.0f - e;
-              val[i] = acc * sig;
+              float ac0 = 0.0f, ac1 = 0.0f;
+              #pragma clang loop unroll(full)
+              for (uint tap = 0; tap < 4u; ++tap) {
+                ac0 = fma(xv[tap], wt[tap], ac0);
+                ac1 = fma(xv[tap + 1u], wt[tap], ac1);
+              }
+              const float e0 = 1.0f / (1.0f + metal::exp(metal::abs(ac0)));
+              const float e1 = 1.0f / (1.0f + metal::exp(metal::abs(ac1)));
+              vals[0][i] = ac0 * (ac0 < 0.0f ? e0 : 1.0f - e0);
+              vals[1][i] = ac1 * (ac1 < 0.0f ? e1 : 1.0f - e1);
             }
+            for (uint dt = 0; dt < 2u; ++dt) {
+              const uint t = t0 + dt;
+              if (t >= T) break;
+              const float val[4] = {vals[dt][0], vals[dt][1], vals[dt][2], vals[dt][3]};
             if (gi >= uint(2 * HK)) {
               const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
               ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
-              return;
+              continue;
             }
             float sum = 0.0f;
             for (int i = 0; i < 4; ++i) {
@@ -949,6 +963,7 @@ private enum Qwen35PromptConvQKNorm {
               scale * (val[2] * inv),
               scale * (val[3] * inv)
             );
+            }
             """
 
     private static let kernel = MLXFast.metalKernel(
@@ -965,7 +980,7 @@ private enum Qwen35PromptConvQKNorm {
             if (gi >= uint(2 * HK)) {
               const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
               ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
-              return;
+              continue;
             }
 
             """, with: ""),
@@ -990,7 +1005,7 @@ private enum Qwen35PromptConvQKNorm {
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (32, S * (2 * keyHeads + (materializeValue ? valueHeads : 0)), 1), threadGroup: (32, 1, 1),
+            grid: (32, ((S + 1) / 2) * (2 * keyHeads + (materializeValue ? valueHeads : 0)), 1), threadGroup: (32, 1, 1),
             outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128]]
                 + (materializeValue ? [[1, S, valueHeads, 128]] : []),
             outputDTypes: Array(repeating: .float32, count: materializeValue ? 3 : 2))
