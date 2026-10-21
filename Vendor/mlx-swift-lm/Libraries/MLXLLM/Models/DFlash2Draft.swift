@@ -2194,6 +2194,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         let (hidden, finalCodes) = try hiddenStatesWithCodes(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1, projected: contextUse)
+        if ProcessInfo.processInfo.environment["DF2_FINITE_DIAGNOSTIC"] == "1" {
+            let values = hidden.asType(.float32).asArray(Float.self)
+            FileHandle.standardError.write(Data("DF2_FINITE_DIAGNOSTIC\t\(values.count)\t\(values.filter { $0.isFinite }.count)\n".utf8))
+        }
         if DF2Fast.on, anchor.count == 1 {
             let sel = candidateSelector
             let projected =
@@ -2373,11 +2377,25 @@ enum DF2Fast {
             auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[16], accb[16];
             for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
@@ -2404,7 +2422,7 @@ enum DF2Fast {
                 const float s = (i >> 3) ? s1v[j] : s0v[j];
                 const float b = (i >> 3) ? b1v[j] : b0v[j];
                 const bool hi = (i >> 2) & 1;
-                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 accb[i] = fma(b, hi ? x1 : x0, accb[i]);
               }
               simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -3775,7 +3793,7 @@ enum DF2Fast {
                   const float s = \(pickS);
                   const float b = \(pickB);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                   accb[i] = fma(b, hi ? x1 : x0, accb[i]);
                 }
 
@@ -3794,7 +3812,7 @@ enum DF2Fast {
                   const int j = (i & 3);
                   const float s = \(pickS);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 }
 
             """
@@ -3987,11 +4005,25 @@ enum DF2Fast {
             """ + operandB + """
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[\(ne)], accb[\(ne)];
             for (int i = 0; i < \(ne); i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
