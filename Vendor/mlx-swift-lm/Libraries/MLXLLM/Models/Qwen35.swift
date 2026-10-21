@@ -7230,6 +7230,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
             eval(fused.ids, fused.values, fused.residual)
         }
         HadamardQuantizedLinear.prepareSharedVerifyWeights()
+        Qwen35PromptInt4Trial.run(self)
     }
 }
 
@@ -7580,5 +7581,317 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+}
+
+
+/// Load-time trial of the int4 prompt operand (`PromptInt4Operand`). The int4 copy's code order is checked against
+/// the plain kernel's unpack order on every device. On the tensor route the int4 kernels' output words are then
+/// compared raw with the record kernels' at every prompt call shape (512 and 192 rows, both offset forms, the fold
+/// and the SwiGLU pair). Every module's copy is then built and the whole model runs the engine's own prompt
+/// forward (`cbv2ForwardWithHiddenForPrefill`, 512 fixed token ids, fresh KV and recurrent state per pass, so both
+/// legs do the same work): the two legs' logits and hidden words must be equal, then 5 interleaved pairs of passes
+/// are timed; the int4 kernels serve only at 0.98x the record's median or less, with an agreeing confirm set.
+/// Any error, mismatch or fallback keeps the record kernels and frees the copies. `DARKBLOOM_BONSAI_PFALU=0` skips.
+enum Qwen35PromptInt4Trial {
+    nonisolated(unsafe) private static var done = false
+    private static let rows = 512, pairs = 5, bar = 0.98
+    private typealias Layer = (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)
+    /// The tower's prompt call shapes: q/k/v, GDN qkv/z, gate/up, the last layer's k/v, out/o (K 4096) and down (K 12288).
+    private static let shapes: [(k: Int, ns: [Int])] = [
+        (4096, [8192, 1024, 1024]), (4096, [8192, 4096]), (4096, [12288, 12288]), (4096, [1024, 1024]), (4096, [4096]),
+        (12288, [4096]),
+    ]
+
+    static func run(_ model: Qwen35TextModel) {
+        guard !done else { return }
+        done = true
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PFALU"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(raw ?? "") {
+            log("int4 prompt operand: off (DARKBLOOM_BONSAI_PFALU=0)")
+            return
+        }
+        log("int4 prompt operand copy order: " + orderCheck(highFirst: false))
+        guard PromptInt4Operand.available else {
+            log("int4 prompt operand: off (record route, or not the 128-column register form)")
+            return
+        }
+        var verdict = "off"
+        var serving = false
+        do {
+            (verdict, serving) = try withError { () throws -> (String, Bool) in try trial(model) }
+        } catch {
+            verdict = "off (error: \(error); record kernels kept)"
+        }
+        PromptInt4Operand.serve(serving)
+        if !serving { release(model) }
+        log("int4 prompt operand: " + verdict)
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
+    private static func packedModules(_ model: Module) -> [HadamardQuantizedLinear] {
+        model.leafModules().flattened().compactMap { $0.1 as? HadamardQuantizedLinear }
+    }
+
+    private static func release(_ model: Module) {
+        for module in packedModules(model) { module.releaseInt4Operand() }
+    }
+
+    private static func hashed(_ count: Int, seed: Int) -> [UInt32] {
+        var words = [UInt32](repeating: 0, count: count)
+        for i in 0 ..< count {
+            let value: UInt64 = UInt64(i + 1 + seed) &* 2_654_435_761
+            words[i] = UInt32(truncatingIfNeeded: value)
+        }
+        return words
+    }
+
+    /// The copy's nibbles against the plain kernel's order: code p of word w sits at bits `8 * (p & 3) + 2 * (p >> 2)`
+    /// (`plainSource`), and nibble 16 w + p of the copy must hold it.
+    private static func orderCheck(highFirst: Bool) -> String {
+        var notes = [String]()
+        for k in [4096, 12288] {
+            let n = 128
+            let weight = MLXArray(hashed(n * k / 16, seed: 2), [n, k / 16])
+            var shifts = [UInt32](repeating: 0, count: 16)
+            for p in 0 ..< 16 { shifts[p] = UInt32(8 * (p & 3) + 2 * (p >> 2)) }
+            let expected = bitwiseAnd(
+                rightShift(weight.reshaped([n, k / 16, 1]), MLXArray(shifts).reshaped([1, 1, 16])), MLXArray(UInt32(3))
+            ).asType(.uint8).reshaped([n, k])
+            let copy = PromptInt4Operand.pack(weight, k: k).view(dtype: .uint8).reshaped([n, k / 2, 1])
+            let order: [UInt8] = highFirst ? [4, 0] : [0, 4]
+            let nibbles = bitwiseAnd(rightShift(copy, MLXArray(order).reshaped([1, 1, 2])), MLXArray(UInt8(15)))
+                .reshaped([n, k])
+            let same = (nibbles .== expected).all().item(Bool.self)
+            notes.append("K \(k) \(same ? "matches" : "DIFFERS")")
+        }
+        return notes.joined(separator: ", ")
+    }
+
+    private struct Probe {
+        let codes: MLXArray
+        let ascale: MLXArray
+        let rsb: MLXArray
+        /// The layers with offsets, the same layers with negated-scale offsets.
+        let layers: [Layer]
+        let negated: [Layer]
+        /// Keeps the int4 copies alive: the operand table holds them weakly.
+        let copies: [MLXArray]
+    }
+
+    private static func probe(k: Int, ns: [Int], m: Int) -> Probe {
+        let kg = k / 128
+        var codeValues = [Int8](repeating: 0, count: m * k)
+        for i in 0 ..< m * k {
+            let value: Int = (i &* 37 &+ 11) % 255 - 127
+            codeValues[i] = Int8(truncatingIfNeeded: value)
+        }
+        var ascaleValues = [Float](repeating: 0, count: m * kg)
+        var rsbValues = [Float](repeating: 0, count: m * kg)
+        for i in 0 ..< m * kg {
+            ascaleValues[i] = Float(i % 11 + 1) / 256
+            rsbValues[i] = Float(i % 17 - 8) / 64
+        }
+        var layers = [Layer](), negated = [Layer]()
+        var pending = [MLXArray](), copies = [MLXArray]()
+        for (index, n) in ns.enumerated() {
+            let weight = MLXArray(hashed(n * k / 16, seed: 104_729 * index + k), [n, k / 16])
+            var scaleValues = [Float16](repeating: 0, count: kg * n)
+            var offsetValues = [Float16](repeating: 0, count: kg * n)
+            for i in 0 ..< kg * n {
+                scaleValues[i] = Float16(Float(1 + (i + index) % 13) / 4096)
+                offsetValues[i] = Float16(-Float((i + 3 * index) % 7) / 2048)
+            }
+            let scalesT = MLXArray(scaleValues, [kg, n])
+            let negatedT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let copy = PromptInt4Operand.pack(weight, k: k)
+            PromptInt4Operand.alias(weight, copy: copy)
+            layers.append((weight, scalesT, MLXArray(offsetValues, [kg, n])))
+            negated.append((weight, scalesT, negatedT))
+            pending += [weight, copy, scalesT, negatedT]
+            copies.append(copy)
+        }
+        let codes = MLXArray(codeValues, [m, k]), ascale = MLXArray(ascaleValues), rsb = MLXArray(rsbValues)
+        eval(pending + [codes, ascale, rsb])
+        return Probe(codes: codes, ascale: ascale, rsb: rsb, layers: layers, negated: negated, copies: copies)
+    }
+
+    private static func residual(m: Int, n: Int) -> MLXArray {
+        var values = [Float](repeating: 0, count: m * n)
+        for i in 0 ..< m * n {
+            let h: UInt64 = UInt64(i + 17) &* 2_654_435_761
+            let bucket: Int = Int((h >> 7) & 0x7ff_ffff) % 200_003
+            let base: Float = Float(bucket) / 1009.0 - 99.0
+            values[i] = i % 5 == 0 ? base * 512.0 : i % 7 == 0 ? base / 4096.0 : base
+        }
+        return MLXArray(values, [m, n])
+    }
+
+    private static func sameWords(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            guard x.shape == y.shape, x.dtype == y.dtype else { return false }
+            let words: DType = x.dtype.size == 2 ? .uint16 : .uint32
+            guard (x.view(dtype: words) .== y.view(dtype: words)).all().item(Bool.self) else { return false }
+        }
+        return true
+    }
+
+    /// Record against int4 on `p`, both offset forms; the fold at a one-layer shape and the SwiGLU pair at the
+    /// gate/up shape. Nil when both agree; else what differed.
+    private static func mismatch(_ p: Probe, m: Int, k: Int, fold: Bool, swiglu: Bool) -> String? {
+        let n = p.layers[0].weight.dim(0)
+        let res = fold ? residual(m: m, n: n) : nil
+        for (layers, negative) in [(p.layers, false), (p.negated, true)] {
+            guard let record = PromptInt4Operand.run(
+                    int4: false, codes: p.codes, ascale: p.ascale, rsb: p.rsb, layers: layers, m: m, k: k,
+                    negative: negative, residual: res, swiglu: swiglu),
+                let int4 = PromptInt4Operand.run(
+                    int4: true, codes: p.codes, ascale: p.ascale, rsb: p.rsb, layers: layers, m: m, k: k,
+                    negative: negative, residual: res, swiglu: swiglu)
+            else { return "a launch did not serve" }
+            eval(record + int4)
+            if !sameWords(record, int4) { return "words differ (NEG \(negative ? 1 : 0))" }
+        }
+        return nil
+    }
+
+    /// Kernel-level compare at every prompt shape; nil when all agree, else why not.
+    private static func compare() -> (String?, Int) {
+        let small = probe(k: 512, ns: [128], m: 128)
+        if mismatch(small, m: 128, k: 512, fold: false, swiglu: false) != nil {
+            PromptInt4Operand.setHighFirst(true)
+            let flipped = probe(k: 512, ns: [128], m: 128)
+            if let why = mismatch(flipped, m: 128, k: 512, fold: false, swiglu: false) {
+                PromptInt4Operand.setHighFirst(false)
+                return ("\(why) at K 512 N 128 in both nibble orders", 0)
+            }
+            log("int4 prompt operand copy order: high nibble first; " + orderCheck(highFirst: true))
+        }
+        var cases = 0
+        for shape in shapes {
+            for m in [512, 192] {
+                let p = probe(k: shape.k, ns: shape.ns, m: m)
+                if let why = mismatch(p, m: m, k: shape.k, fold: false, swiglu: false) {
+                    return ("\(why) at K \(shape.k) N \(shape.ns) rows \(m)", cases)
+                }
+                cases += 2
+                if shape.ns == [4096] {
+                    if let why = mismatch(p, m: m, k: shape.k, fold: true, swiglu: false) {
+                        return ("fold: \(why) at K \(shape.k) rows \(m)", cases)
+                    }
+                    cases += 2
+                }
+                if shape.ns == [12288, 12288] {
+                    if let why = mismatch(p, m: m, k: shape.k, fold: false, swiglu: true) {
+                        return ("SwiGLU: \(why) at rows \(m)", cases)
+                    }
+                    cases += 2
+                }
+            }
+        }
+        return (nil, cases)
+    }
+
+    /// One whole-model prompt forward as the engine runs it at a seed prefill: fresh contiguous KV rows and recurrent
+    /// state, `cbv2ForwardWithHiddenForPrefill` over `tokens`, the logits, hidden, recurrent roots and KV evaluated
+    /// together, then the state committed and released. Returns the wall time and the outputs.
+    private static func pass(_ model: Qwen35TextModel, tokens: MLXArray, int4: Bool) throws -> (ns: Double, out: [MLXArray]) {
+        let backend = CBv2ContiguousKVBackend(config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
+        let kinds = model.cbv2LayerKinds
+        let layerCaches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
+        let bank = CBv2LayerCacheBank(caches: layerCaches)
+        let rowState = try backend.makeSequenceState(layerKinds: kinds, promptLength: 0, maxLength: rows)
+        let state = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+        defer {
+            if !state.isReleased { try? state.release() }
+            bank.releaseBoundRows()
+            backend.release(rowState)
+        }
+        let caches = bank.layerCaches(rowStates: [rowState]).compactMap { $0 as? KVCache }
+        guard caches.count == kinds.count else { throw Failure("a layer cache is not a KVCache") }
+        let tapped = model.dFlash2TappedHidden
+        defer { model.model.dFlash2Tap.tappedHidden = tapped }
+        PromptInt4Operand.serve(int4)
+        defer { PromptInt4Operand.serve(false) }
+        Stream.gpu.synchronize()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let evaluation = try state.bind()
+        let forward = model.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: [evaluation], positionIds: nil,
+            requirement: .lastPositionLogits)
+        let roots = try evaluation.evaluate()
+        eval([forward.logits, forward.lastHidden] + roots + caches.flatMap { $0.innerState() })
+        Stream.gpu.synchronize()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+        try evaluation.commit()
+        return (elapsed, [forward.logits, forward.lastHidden])
+    }
+
+    private struct Failure: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
+    /// Median whole-pass time of each leg over `pairs` interleaved pairs, the start leg alternating; every int4
+    /// pass's outputs must equal the record's words.
+    private static func timed(_ model: Qwen35TextModel, tokens: MLXArray, reference: [MLXArray]) throws -> (record: Double, int4: Double) {
+        var samples = [[Double]](repeating: [], count: 2)
+        for pair in 0 ..< pairs {
+            for offset in 0 ..< 2 {
+                let leg = (pair + offset) % 2
+                let result = try pass(model, tokens: tokens, int4: leg == 1)
+                if leg == 1, !sameWords(result.out, reference) { throw Failure("a timed int4 pass differs") }
+                samples[leg].append(result.ns)
+            }
+        }
+        return (samples[0].sorted()[pairs / 2], samples[1].sorted()[pairs / 2])
+    }
+
+    private static func trial(_ model: Qwen35TextModel) throws -> (String, Bool) {
+        let (why, cases) = compare()
+        if let why { return ("off (\(why); record kernels kept)", false) }
+        PromptInt4Operand.serve(true)
+        let start = DispatchTime.now().uptimeNanoseconds
+        let modules = packedModules(model)
+        for module in modules { module.prepareInt4Operand() }
+        PromptInt4Operand.serve(false)
+        let built = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+        log(String(format: "int4 prompt operand: %d module copies built in %.1f s", modules.count, built))
+        var ids = [Int32](repeating: 0, count: rows)
+        for i in 0 ..< rows {
+            let id: Int = (i &* 7919 &+ 13) % 151_643
+            ids[i] = Int32(id)
+        }
+        let tokens = MLXArray(ids).reshaped([1, rows])
+        let record = try pass(model, tokens: tokens, int4: false)
+        _ = PromptInt4Operand.launches(reset: true)
+        let int4 = try pass(model, tokens: tokens, int4: true)
+        let launched = PromptInt4Operand.launches(reset: true)
+        log("int4 prompt operand full pass: \(launched.int4) int4 launches, \(launched.fallback) fallbacks")
+        guard launched.int4 > 0, launched.fallback == 0 else {
+            return ("off (\(cases) compare cases equal; the full pass fell back to the record kernel; record kernels kept)", false)
+        }
+        guard sameWords(int4.out, record.out) else {
+            return ("off (\(cases) compare cases equal; full-pass logits or hidden words differ; record kernels kept)", false)
+        }
+        let line = { (v: (record: Double, int4: Double)) -> String in
+            String(format: "record %.2f ms, int4 %.2f ms (%.3fx)", v.record / 1e6, v.int4 / 1e6, v.int4 / v.record)
+        }
+        let first = try timed(model, tokens: tokens, reference: record.out)
+        log("int4 prompt operand full-pass medians: " + line(first))
+        guard first.int4 <= bar * first.record else {
+            return ("off (\(cases) compare cases and the full pass equal; \(line(first)), above the 0.98x bar)", false)
+        }
+        let second = try timed(model, tokens: tokens, reference: record.out)
+        log("int4 prompt operand confirm medians: " + line(second))
+        guard second.int4 <= bar * second.record else {
+            return ("off (\(cases) compare cases and the full pass equal; \(line(first)), the confirm set disagreed)", false)
+        }
+        return ("on (\(cases) compare cases and the full pass equal; \(line(first)); confirm \(line(second)))", true)
     }
 }
