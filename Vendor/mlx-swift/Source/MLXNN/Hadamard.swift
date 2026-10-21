@@ -685,11 +685,7 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `residualNorm` at verify width that also returns the normalized
-    /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
-    /// residual, weight)]`. The sum and the normalized values are the bits of
-    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify`
-    /// on the normalized rows.
+    /// `[codes, ascale, rsb, x + residual, rmsNorm(x + residual, weight)]` at verify width, in MLX's add and norm bits.
     func residualNormVerifyNormalized(
         _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
     ) -> [MLXArray]? {
@@ -1509,7 +1505,8 @@ extension SignedBlockHadamard {
     static let wideRowLean = flagOn("DARKBLOOM_BONSAI_WHT_LEAN")
     static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
     static let wideRowLeanThreads: [WideRowKind: Int] = [
-        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512,
+        .attentionGate: 512, .normNormed: flagOn("DARKBLOOM_BONSAI_WHT_LEAN_NN") ? 1024 : 0,
     ]
 
     private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
@@ -1573,10 +1570,7 @@ extension SignedBlockHadamard {
         for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
             let candidates = wideRowLaneCandidates(kind)
             for threads in candidates {
-                // An MLX error in the check (a pipeline that cannot run this
-                // many threads per threadgroup on this GPU, a compile error)
-                // falls to the next lane count, then to the record kernel,
-                // instead of stopping the process.
+                // An MLX error falls to the next lane count, then to the record kernel.
                 var note = "mismatch"
                 do {
                     if try withError({ wideRowCheck(kind, threads: threads) }) {
@@ -8571,6 +8565,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         public let residual: MLXArray
         /// `rmsNorm(x + delta, weight)`.
         public let normalized: MLXArray
+        public var outputs: [MLXArray] { [activation.codes, activation.ascale, activation.rsb, residual] }
     }
 
     /// `x`, its RMSNorm and the verify codes of the rotated norm in one kernel.
@@ -8598,10 +8593,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     /// `x + delta`, its RMSNorm and the verify codes of the rotated norm in one kernel, with the rotation of
-    /// `projections` (all must share it).
+    /// `projections` (all must share it). Without `normalized` the norm is not stored and `normalized` is the sum.
     public static func verifyBoundary(
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear]
+        projections: [Linear], normalized: Bool = true
     ) -> VerifyBoundary? {
         guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32, VerifyInt8Matmul.route != .off,
             VerifyInt8Matmul.rowRange.contains(x.size / 4096)
@@ -8613,14 +8608,15 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
                     && $0.transform.isIdentical(to: first.transform)
             }),
-            let outputs = first.transform.residualNormVerifyNormalized(
-                x, residual: delta, weight: weight, eps: eps)
+            let outputs = normalized ? first.transform.residualNormVerifyNormalized(
+                x, residual: delta, weight: weight, eps: eps) : first.transform.residualNorm(
+                x, residual: delta, weight: weight, eps: eps, quantized: true, verifyRows: x.size / 4096)
         else { return nil }
         let rows = x.size / 4096
         return VerifyBoundary(
             activation: PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
-            transform: first.transform, residual: outputs[3], normalized: outputs[4])
+            transform: first.transform, residual: outputs[3], normalized: outputs[outputs.count - 1])
     }
 
     /// `projections` applied to `boundary.normalized` from the boundary's
@@ -9522,8 +9518,7 @@ private enum DraftStepRowKernels {
 
 extension HadamardQuantizedEmbedding {
     /// Draft-only front row of an MTP head step: `[rmsNorm(self(token)) · embedNorm | rmsNorm(hidden) · hiddenNorm]`
-    /// as one FP32 `[2 * 4096]` row, computed in FP32 (the module path rounds the looked-up row to the FP16
-    /// constants' dtype first).
+    /// as one FP32 `[2 * 4096]` row, computed in FP32.
     public func draftFrontRow(
         token: MLXArray, embedNorm: MLXArray, hidden: MLXArray, hiddenNorm: MLXArray, eps: MLXArray
     ) -> MLXArray? {
