@@ -971,10 +971,8 @@ private enum Qwen35PromptConvQKNorm {
         inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out", "v_out"],
         source: source, ensureRowContiguous: true)
 
-    private static let qkOnlyKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prompt_conv_qk_only",
-        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
-        source: source.replacingOccurrences(
+    private static func qkOnly(_ text: String) -> String {
+        text.replacingOccurrences(
             of: "const uint groups = uint(2 * HK + HV);", with: "const uint groups = uint(2 * HK);")
             .replacingOccurrences(of: """
             if (gi >= uint(2 * HK)) {
@@ -983,12 +981,139 @@ private enum Qwen35PromptConvQKNorm {
               continue;
             }
 
-            """, with: ""),
-        ensureRowContiguous: true)
+            """, with: "")
+    }
 
+    private static let qkOnlyKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_only",
+        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
+        source: qkOnly(source), ensureRowContiguous: true)
+
+    /// The retained three-row conv tail: the last three rows of `qkv`, copied
+    /// by the threadgroup that already reads them, as plain float copies.
+    private static let tailSource = source.replacingOccurrences(
+        of: "if (t >= T) break;\n", with: """
+        if (t >= T) break;
+              if (t + 3u >= T) {
+                for (uint i = 0; i < 4u; ++i) {
+                  tail_out[(t + 3u - T) * C + c0 + i] = qkv[t * C + c0 + i];
+                }
+              }
+
+        """)
+
+    /// The q/k-only grid has no value-channel threadgroups, so it adds three
+    /// per value head that copy that head's channels of the tail rows.
+    private static let qkOnlyTailSource = qkOnly(tailSource).replacingOccurrences(
+        of: "const uint groups = uint(2 * HK);\n", with: """
+        const uint groups = uint(2 * HK);
+        const uint pairs = (qkv_shape[1] + 1u) / 2u;
+        if (threadgroup_position_in_grid.y >= pairs * groups) {
+          const uint e = threadgroup_position_in_grid.y - pairs * groups;
+          const uint cv = uint(2 * HK + e / 3u) * 128u + thread_index_in_simdgroup * 4u;
+          const uint src = (qkv_shape[1] - 3u + e % 3u) * uint(CONV_DIM) + cv;
+          const uint dst = (e % 3u) * uint(CONV_DIM) + cv;
+          for (uint i = 0; i < 4u; ++i) {
+            tail_out[dst + i] = qkv[src + i];
+          }
+          return;
+        }
+
+        """)
+
+    private static let tailKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_tail",
+        inputNames: ["state", "qkv", "conv_weight"],
+        outputNames: ["q_out", "k_out", "v_out", "tail_out"],
+        source: tailSource, ensureRowContiguous: true)
+
+    private static let qkOnlyTailKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_prompt_conv_qk_only_tail",
+        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out", "tail_out"],
+        source: qkOnlyTailSource, ensureRowContiguous: true)
+
+    private static func dispatch(
+        state: MLXArray, qkv: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int,
+        materializeValue: Bool, retainTail: Bool
+    ) -> [MLXArray] {
+        let C = qkv.dim(-1)
+        let S = qkv.dim(1)
+        let invScale = pow(Float(128), -0.5)
+        let function = retainTail
+            ? (materializeValue ? tailKernel : qkOnlyTailKernel)
+            : (materializeValue ? kernel : qkOnlyKernel)
+        // Without values the tail adds three threadgroups per value head.
+        let valueGroups = materializeValue ? valueHeads : 0
+        let rows = ((S + 1) / 2) * (2 * keyHeads + valueGroups)
+            + (retainTail && !materializeValue ? 3 * valueHeads : 0)
+        return function(
+            [state, qkv, weight],
+            template: [("HK", keyHeads), ("HV", valueHeads), ("CONV_DIM", C),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128]]
+                + (materializeValue ? [[1, S, valueHeads, 128]] : [])
+                + (retainTail ? [[1, 3, C]] : []),
+            outputDTypes: Array(
+                repeating: .float32,
+                count: 2 + (materializeValue ? 1 : 0) + (retainTail ? 1 : 0)))
+    }
+
+    /// Load-time check, once per process per head shape: both tail kernels
+    /// must write the bytes of `qkv`'s last three rows and leave q, k and v
+    /// at the bits of the kernels without the tail, on an even and an odd
+    /// row count. A mismatch keeps the separate copy.
+    /// `DARKBLOOM_BONSAI_CONVTAIL=0` disables the tail output.
+    nonisolated(unsafe) private static var tailVerdict: [String: Bool] = [:]
+    private static let tailLock = NSLock()
+    private static let tailOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_CONVTAIL"] != "0"
+
+    private static func tailMatches(keyHeads: Int, valueHeads: Int) -> Bool {
+        guard tailOffered else { return false }
+        let key = "\(keyHeads)x\(valueHeads)"
+        tailLock.lock()
+        defer { tailLock.unlock() }
+        if let verdict = tailVerdict[key] { return verdict }
+        let C = (2 * keyHeads + valueHeads) * 128
+        let parts = MLXRandom.split(key: MLXRandom.key(0x7a11), into: 3)
+        let state = MLXRandom.uniform(low: -3, high: 3, [1, 3, C], key: parts[0])
+        let weight = MLXRandom.uniform(low: -0.7, high: 0.7, [C, 4, 1], key: parts[1])
+        var verdict = true
+        for S in [16, 67] {
+            let qkv = MLXRandom.uniform(low: -3, high: 3, [1, S, C], key: parts[2])
+            let want = contiguous(qkv[0..., (S - 3)...]).view(dtype: .uint32)
+            for materializeValue in [true, false] {
+                let base = dispatch(
+                    state: state, qkv: qkv, weight: weight, keyHeads: keyHeads,
+                    valueHeads: valueHeads, materializeValue: materializeValue, retainTail: false)
+                let tailed = dispatch(
+                    state: state, qkv: qkv, weight: weight, keyHeads: keyHeads,
+                    valueHeads: valueHeads, materializeValue: materializeValue, retainTail: true)
+                guard tailed.count == base.count + 1 else { verdict = false; continue }
+                var same = (tailed[base.count].view(dtype: .uint32) .== want).all()
+                for (a, b) in zip(base, tailed) {
+                    same = same .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                }
+                if !same.item(Bool.self) { verdict = false }
+            }
+        }
+        tailVerdict[key] = verdict
+        if !verdict {
+            FileHandle.standardError.write(
+                Data("qwen35 gdn: prompt conv tail mismatch, falling back to the copy\n".utf8))
+        }
+        return verdict
+    }
+
+    /// q, k (and v when materialized), then the retained conv tail when
+    /// `retainTail` is set and the tail kernel passed its check. Callers read
+    /// the tail at index 2 (q/k only) or 3, and copy it themselves when the
+    /// array is one short.
     static func apply(
         state: MLXArray, qkv: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int,
-        materializeValue: Bool = true
+        materializeValue: Bool = true, retainTail: Bool = false
     ) -> [MLXArray]? {
         let C = qkv.dim(-1)
         guard state.ndim == 3, state.dim(0) == 1, state.dim(1) == 3, qkv.ndim == 3, qkv.dim(0) == 1,
@@ -997,18 +1122,10 @@ private enum Qwen35PromptConvQKNorm {
             weight.shape == [C, 4, 1], qkv.size <= Int(Int32.max),
             StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let S = qkv.dim(1)
-        let invScale = pow(Float(128), -0.5)
-        return (materializeValue ? kernel : qkOnlyKernel)(
-            [state, qkv, weight],
-            template: [("HK", keyHeads), ("HV", valueHeads), ("CONV_DIM", C),
-                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
-                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
-                ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (32, ((S + 1) / 2) * (2 * keyHeads + (materializeValue ? valueHeads : 0)), 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128]]
-                + (materializeValue ? [[1, S, valueHeads, 128]] : []),
-            outputDTypes: Array(repeating: .float32, count: materializeValue ? 3 : 2))
+        return dispatch(
+            state: state, qkv: qkv, weight: weight, keyHeads: keyHeads, valueHeads: valueHeads,
+            materializeValue: materializeValue,
+            retainTail: retainTail && tailMatches(keyHeads: keyHeads, valueHeads: valueHeads))
     }
 }
 
@@ -4014,17 +4131,18 @@ final class Qwen35GatedDeltaNet: Module {
             let foldWeight = conv1d.weight.contiguous()
             if let qk = Qwen35PromptConvQKNorm.apply(
                     state: foldState, qkv: foldQKV, weight: foldWeight,
-                    keyHeads: numKHeads, valueHeads: numVHeads, materializeValue: false),
+                    keyHeads: numKHeads, valueHeads: numVHeads, materializeValue: false,
+                    retainTail: true),
                 let folded = Qwen35Fresh8PromptGDN.runConvolvedValue(
                     q: qk[0], k: qk[1], convState: foldState, qkv: foldQKV, weight: foldWeight,
                     ba: ba, aLog: aLog, dtBias: dtBias)
             {
-                return (folded.0, contiguous(qkv[0..., (S - 3)...]), folded.1)
+                return (folded.0, qk.count > 2 ? qk[2] : contiguous(qkv[0..., (S - 3)...]), folded.1)
             }
         }
         guard let qkvOut = Qwen35PromptConvQKNorm.apply(
                 state: convState, qkv: qkv, weight: conv1d.weight,
-                keyHeads: numKHeads, valueHeads: numVHeads)
+                keyHeads: numKHeads, valueHeads: numVHeads, retainTail: true)
         else { return nil }
         let q = qkvOut[0], k = qkvOut[1], v = qkvOut[2]
         let fresh = freshState ? Qwen35Fresh8PromptGDN.run(
@@ -4034,7 +4152,7 @@ final class Qwen35GatedDeltaNet: Module {
         guard joined != nil || fresh != nil else { return nil }
         let (out, newSsmState) = fresh ?? Qwen35PromptGatedGDN.run(
             q: q, k: k, v: v, ba: ba, aLog: aLog, dtBias: dtBias, state: ssmState)
-        return (out, contiguous(qkv[0..., (S - 3)...]), newSsmState)
+        return (out, qkvOut.count > 3 ? qkvOut[3] : contiguous(qkv[0..., (S - 3)...]), newSsmState)
     }
 
     // MARK: - _processChunk (MTP helper)
