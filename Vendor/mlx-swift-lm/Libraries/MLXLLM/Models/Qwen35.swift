@@ -7230,6 +7230,184 @@ extension Qwen35TextModel: DFlash2TapTarget {
             eval(fused.ids, fused.values, fused.residual)
         }
         HadamardQuantizedLinear.prepareSharedVerifyWeights()
+        if rows == 16 { Qwen35VerifyBodyTrial.run() }
+    }
+}
+
+/// Load-time timed trial of the bit-identical 16-row verify bodies (`VerifyInt8Matmul.runBody`), one per verify
+/// shape: every body runs the same fixed probe operands as a dependent chain, the medians of two interleaved passes
+/// must both put one body 2% or more under the record's, and its output words must equal the record body's before
+/// `installBody` takes it. Any error or mismatch keeps the record dispatch. `DARKBLOOM_BONSAI_VTRIAL=0` skips it.
+enum Qwen35VerifyBodyTrial {
+    nonisolated(unsafe) private static var done = false
+    private static let rows = 16, reps = 8, sets = 4, rounds = 5, bar = 0.98
+    private static let shapes: [(name: String, ns: [Int], k: Int)] = [
+        ("gate|up", [12288, 12288], 4096), ("down", [4096], 12288), ("out", [4096], 4096),
+    ]
+
+    private struct Operands {
+        let codes: MLXArray
+        let ascale: MLXArray
+        let rsb: MLXArray
+        let layerSets: [[(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]]
+        let copySets: [[MLXArray]]
+    }
+
+    static func run() {
+        guard !done else { return }
+        done = true
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VTRIAL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(raw ?? "") {
+            log("verify body trial: off (DARKBLOOM_BONSAI_VTRIAL=0)")
+            return
+        }
+        for shape in shapes { log("verify body trial \(shape.name): " + trial(shape)) }
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
+    private static func probe(_ count: Int, seed: Int, modulus: Int, shift: Int, scale: Float) -> [Float] {
+        var values = [Float](repeating: 0, count: count)
+        for i in 0 ..< count {
+            let step: Int = (i &* 37 &+ seed) % modulus - shift
+            values[i] = Float(step) * scale
+        }
+        return values
+    }
+
+    private static func operands(ns: [Int], k: Int) -> Operands {
+        let kg = k / 128
+        var codeValues = [Int8](repeating: 0, count: rows * k)
+        for i in 0 ..< rows * k {
+            let value: Int = (i &* 37 &+ 11) % 255 - 127
+            codeValues[i] = Int8(truncatingIfNeeded: value)
+        }
+        let codes = MLXArray(codeValues, [rows, k])
+        let ascale = MLXArray(probe(rows * kg, seed: 1, modulus: 11, shift: -1, scale: 1 / 256), [rows * kg])
+        let rsb = MLXArray(probe(rows * kg, seed: 3, modulus: 17, shift: 8, scale: 1 / 64), [rows * kg])
+        var layerSets = [[(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]]()
+        var copySets = [[MLXArray]]()
+        var pending = [codes, ascale, rsb]
+        for set in 0 ..< sets {
+            var layers = [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)]()
+            var copies = [MLXArray]()
+            for (index, n) in ns.enumerated() {
+                var words = [UInt32](repeating: 0, count: n * k / 16)
+                for i in 0 ..< words.count {
+                    let value: UInt64 = UInt64(i + 1 + index + 7 * set) &* 2_654_435_761
+                    words[i] = UInt32(truncatingIfNeeded: value)
+                }
+                let weight = MLXArray(words, [n, k / 16])
+                var scaleValues = [Float16](repeating: 0, count: kg * n)
+                for i in 0 ..< kg * n {
+                    let value: Float = Float(1 + (i + set) % 13) / 1024
+                    scaleValues[i] = Float16(value)
+                }
+                let scalesT = MLXArray(scaleValues, [kg, n])
+                let biasesT = (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+                layers.append((weight, scalesT, biasesT))
+                copies.append(VerifyInt8Matmul.streamCopy(weight, k: k))
+            }
+            layerSets.append(layers)
+            copySets.append(copies)
+            pending += copies
+        }
+        eval(pending)
+        return Operands(codes: codes, ascale: ascale, rsb: rsb, layerSets: layerSets, copySets: copySets)
+    }
+
+    private static func outputs(_ body: Int, _ op: Operands, codes: MLXArray, k: Int, set: Int = 0) -> [MLXArray]? {
+        VerifyInt8Matmul.runBody(
+            body, codes: codes, ascale: op.ascale, rsb: op.rsb, layers: op.layerSets[set], m: rows, k: k,
+            negative: true, streamed: op.copySets[set])
+    }
+
+    /// `reps` launches of `body` in one dependent chain over `sets` distinct weights, so the reads are as cold as the
+    /// forward's: each next input carries a zero formed from the previous output.
+    private static func chain(_ body: Int, _ op: Operands, k: Int) -> [MLXArray]? {
+        var codes = op.codes
+        var last = [MLXArray]()
+        for rep in 0 ..< reps {
+            guard let out = outputs(body, op, codes: codes, k: k, set: rep % sets) else { return nil }
+            let tag = (out[0][0 ..< 1, 0 ..< 1] * 0).asType(.int8)
+            codes = codes + tag
+            last = out
+        }
+        return last
+    }
+
+    private static func time(_ body: Int, _ op: Operands, k: Int) -> Double? {
+        guard let last = chain(body, op, k: k) else { return nil }
+        Stream.gpu.synchronize()
+        let start = DispatchTime.now().uptimeNanoseconds
+        eval(last)
+        Stream.gpu.synchronize()
+        return Double(DispatchTime.now().uptimeNanoseconds - start)
+    }
+
+    /// Median chain time per body over `rounds` interleaved rounds, the start body rotating each round.
+    private static func medians(_ bodies: [Int], _ op: Operands, k: Int) -> [Int: Double]? {
+        var samples = [Int: [Double]]()
+        for round in 0 ..< rounds {
+            for offset in 0 ..< bodies.count {
+                let body = bodies[(round + offset) % bodies.count]
+                guard let t = time(body, op, k: k) else { return nil }
+                samples[body, default: []].append(t)
+            }
+        }
+        var result = [Int: Double]()
+        for (body, values) in samples { result[body] = values.sorted()[values.count / 2] }
+        return result
+    }
+
+    private static func percent(_ candidate: Double, under base: Double) -> String {
+        String(format: "%.1f%%", (1 - candidate / base) * 100)
+    }
+
+    private static func trial(_ shape: (name: String, ns: [Int], k: Int)) -> String {
+        var total = 0
+        for n in shape.ns { total += n }
+        let record = VerifyInt8Matmul.bodyDefault(layers: shape.ns.count, k: shape.k, n: total, streamed: true)
+        guard record >= 0 else { return "off (record route)" }
+        do {
+            return try withError { () -> String in
+                let op = operands(ns: shape.ns, k: shape.k)
+                var bodies = [Int]()
+                for body in 0 ..< 8 {
+                    guard let out = outputs(body, op, codes: op.codes, k: shape.k) else { continue }
+                    eval(out)
+                    bodies.append(body)
+                }
+                guard bodies.contains(record), bodies.count > 1 else { return "kept \(record) (no other body)" }
+                guard let first = medians(bodies, op, k: shape.k), let base = first[record] else {
+                    return "kept \(record) (timing error)"
+                }
+                var best = record
+                for (body, value) in first where value < first[best]! { best = body }
+                guard best != record, first[best]! <= bar * base else {
+                    return "kept \(record) (best other body \(best) at \(percent(first[best]!, under: base)))"
+                }
+                guard let second = medians([record, best], op, k: shape.k), let again = second[record],
+                    second[best]! <= bar * again
+                else {
+                    return "kept \(record) (body \(best) \(percent(first[best]!, under: base)) in pass 1, confirm run disagreed)"
+                }
+                guard let a = outputs(record, op, codes: op.codes, k: shape.k),
+                    let b = outputs(best, op, codes: op.codes, k: shape.k)
+                else { return "kept \(record) (compare error)" }
+                for (x, y) in zip(a, b) {
+                    let same = (x.view(dtype: .uint32) .== y.view(dtype: .uint32)).all().item(Bool.self)
+                    if !same { return "kept \(record) (body \(best) bits differ)" }
+                }
+                VerifyInt8Matmul.installBody(best, layers: shape.ns.count, k: shape.k, n: total)
+                return "body \(best) installed (\(percent(first[best]!, under: base)) and \(percent(second[best]!, under: again)) under body \(record), bits equal)"
+            }
+        } catch {
+            return "kept \(record) (error: \(error))"
+        }
     }
 }
 

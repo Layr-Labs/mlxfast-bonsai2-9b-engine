@@ -276,13 +276,9 @@ public struct SignedBlockHadamard {
 
     /// The forward transform of `fused4096Kernel` (same passes, same order, same 1/64 scale), quantized per row and
     /// 128-group for the prompt-width integer matmul (27b 5fbfa003 / 0e1314b2).
-    // GDN output gate formed inside the quantizing rotation: per-head (128
-    // wide) RMSNorm of `x` with the arithmetic of MLX `rms_single_row` at
-    // axis 128 (one simdgroup; lane l sums elements 4l..4l+3 in order, one
-    // `simd_sum`, `precise::rsqrt(total / 128 + eps)`, `w * (x * inv)`),
-    // times MLX `silu(gate)` (`gate * sigmoid(gate)` with MLX's stable
-    // sigmoid), the product taken as `silu * normed`. Each head's 32 lane
-    // partials are placed in the lanes MLX gives them before the `simd_sum`.
+    // GDN output gate formed inside the quantizing rotation: per-head (128 wide) RMSNorm of `x` with the arithmetic
+    // of MLX `rms_single_row` at axis 128, times MLX `silu(gate)`, the product taken as `silu * normed`; each head's
+    // 32 lane partials are placed in the lanes MLX gives them before the `simd_sum`.
     private static let gatedNormSource = """
 
             threadgroup float head_part[32 * 32];
@@ -1812,14 +1808,9 @@ public struct HadamardGDNLayout {
     }
 }
 
-/// Packed 2-bit, group-128 affine matmul of FP32 activations against F16 scales and biases read in place.
-/// `quantizedMM` would cast both constants to FP32 first, two extra kernels on each of the pack's 202 modules.
-///
-/// One row (decode) runs MLX's `qmv_fast` with each F16 constant widened in a register: exact, same arithmetic and
-/// order, so bit-identical to `quantizedMM`. Two to seven rows (verify) run `rows`, which is FMA-bound (four rows
-/// of the 14 MB gate projection: 24 us of reads, 26 us of FMAs on the M5 Max), so it dequantizes each weight once
-/// (`s * q + b`, as `qmv_wide` and `qmm` do) and does one FMA per weight per row, in `qmv_fast`'s lane layout.
-/// Its reduction order is not `qmv_fast`'s; a row's result does not depend on the other rows.
+/// Packed 2-bit, group-128 affine matmul of FP32 activations against F16 scales and biases read in place (no FP32
+/// constant casts). One row runs `qmv_fast` with each constant widened in a register (bit-identical to `quantizedMM`);
+/// two to seven rows run `rows`, FMA-bound, one dequantization per weight; its reduction order is not `qmv_fast`'s.
 private enum Float16ConstantQMV {
     /// MLX `qmv_fast_impl` for 2 bits: 16 values per lane, 4 rows per
     /// simdgroup, 2 simdgroups per threadgroup.
@@ -3686,17 +3677,9 @@ enum PromptInt8Matmul {
         header: naxHeader,
         ensureRowContiguous: true)
 
-    // `naxVectorSource` re-tiled for the M5 (same bits): the 64 x 64 tile's
-    // four 32 x 32 blocks each run their own per-simdgroup 32 x 32 x 128 int8
-    // tensor op (`execution_simdgroup`) on the shared double-buffered weights,
-    // and each lane applies the epilogue to its own 32 elements. The integer C
-    // per group is the same exact integer, the epilogue is the same three
-    // roundings in the same order with groups ascending from `acc = 0`, so
-    // every output is the vector kernel's bits. Lane layout of one block (row
-    // fm + 8 i2 + 16 i4, column fn + 16 i3 + (i & 3)) is the one measured on
-    // the M5; each simdgroup checks it against `get_multidimensional_index`
-    // and writes NaN on any mismatch, so the load-time check then fails.
-    // Body of `naxSgSource`: reads K, M, N, bx, w, scalesT, biasesT and out.
+    // `naxVectorSource` re-tiled for the M5 (same bits): four 32 x 32 blocks of a 64 x 64 tile, each its own
+    // per-simdgroup 32 x 32 x 128 int8 tensor op; the lane layout is checked against `get_multidimensional_index`
+    // and NaN on any mismatch fails the load-time check. Body of `naxSgSource`.
     static let naxSgBody = """
         using elem_index = metal::conditional_t<INDEX32, uint, size_t>;
         const int Kg = K / 128;
@@ -3944,16 +3927,8 @@ enum PromptInt8Matmul {
         }
     }
 
-    // `naxRegBody` on a 32 x 128 tile per threadgroup of four simdgroups, all
-    // on the same 32 rows, so one activation slice serves 128 columns instead
-    // of 64. Simdgroups 2 h and 2 h + 1 take the 64-column unit 2 x + h through
-    // `naxSgSource`'s layer pick, each its own 32-column half, so the pick's
-    // boundaries stay at N / 64: a threadgroup may span two layers, and a unit
-    // past the last layer (an odd unit count) returns before any access. Each
-    // simdgroup runs `naxRegBody`'s guard, operand build, op, epilogue and
-    // stores on its own 32 x 32 tile, so every output is `naxSgBody`'s bits
-    // (checked at load, `checkRegisterCols128`). grid (ceil(sum N / 128) *
-    // 128, M / 32).
+    // `naxRegBody` on a 32 x 128 tile per threadgroup of four simdgroups (one activation slice for 128 columns);
+    // every output is `naxSgBody`'s bits (checked at load, `checkRegisterCols128`). grid (ceil(sum N / 128) * 128, M / 32).
     static func naxRegCols128Source(layers: Int, operandBody: String = naxRegBody) -> String {
         let body = "using elem_index = metal::conditional_t<INDEX32, uint, size_t>;\n"
             + operandBody.replacingOccurrences(of: "(size_t)", with: "(elem_index)")
@@ -4514,16 +4489,11 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Runs the kernels on a fixed, input-independent 128 x 128 x 512
-    /// problem (2 x 2 tiles, 4 groups) and compares output bits. First the
-    /// plain kernel's `NEG = 1` form against its `NEG = 0` form on offsets
-    /// that are the negated scales. On a NAX device then the per-simdgroup
-    /// tensor kernel (both forms, and its two- and three-layer forms on
-    /// column slices) against the plain kernel; failing that the vector
-    /// tensor kernel (both forms), else the record tensor kernel. Sets
-    /// `naxSg`, `naxSgShared`, `naxVector` and `negativeForms`; false when no
-    /// tensor kernel matches. A compile error (caught by a
-    /// scoped MLX error handler) counts as a mismatch.
+    /// Runs the kernels on a fixed, input-independent 128 x 128 x 512 problem and compares output bits: the plain
+    /// `NEG = 1` form against `NEG = 0` on negated-scale offsets, then on a NAX device the per-simdgroup tensor
+    /// kernel (both forms, two- and three-layer forms on column slices), else the vector, else the record tensor
+    /// kernel, against the plain kernel. Sets `naxSg`, `naxSgShared`, `naxVector` and `negativeForms`; a compile
+    /// error counts as a mismatch.
     @discardableResult
     private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
@@ -4758,17 +4728,9 @@ enum PromptInt8Matmul {
     }
 }
 
-/// A prompt projection output with its residual stream added in the matmul's
-/// epilogue. In the record the out and down launches store `d` and the next
-/// quantizing kernel reads `x` and `d`, forms `x + d`, stores it as the new
-/// residual and quantizes the normalized sum. Here the register-weight forms
-/// read `x` beside the store and write `v + x` (`v` is the record's `d`, the
-/// same operand build and epilogue; the add is the quantizer's own fp32 add,
-/// taken under `fp contract(off)` and `reassociate(off)`), and the next kernel
-/// is the norm-only form that reads the stored sum. A fold serves only after
-/// `checkFold` found the fused output equal, bit for bit, to the record
-/// launch's output plus the residual; otherwise the record launches stay.
-/// `DARKBLOOM_BONSAI_PREFILL_RESFOLD=0` keeps them.
+/// A prompt projection output with its residual stream added in the matmul's epilogue (`v + x`, the quantizer's
+/// own fp32 add under `fp contract(off)`), then the norm-only quantizer reads the stored sum. A fold serves only
+/// after `checkFold` found it equal, bit for bit, to the record launch plus the residual. `DARKBLOOM_BONSAI_PREFILL_RESFOLD=0` keeps the record launches.
 public final class PromptResidualFold {
     public let residual: MLXArray
     /// Set by the projection when its output already is `residual + projection`.
@@ -5432,27 +5394,12 @@ enum PromptSplitZ {
     }
 }
 
-/// Verify-width packed matmul (an MTP verify: 2 to 8 rows) on the int8
-/// activation codes of `PromptInt8Matmul`, split over K inside a threadgroup
-/// (27b 320ec19a's verify split-K on tensor units, built integer-exact).
-///
-/// A threadgroup owns 32 output columns. Its four simdgroups take every fourth
-/// 128-group (simdgroup s takes g = s, s + 4, ...). Per group each computes
-/// `C[m, n] = sum_{k in g} q[m, k] * code[n, k]` (integer, |C| < 2^24, exact
-/// in int32 and in FP32 as `PromptInt8Matmul` shows) and folds it into its
-/// partial with `PromptInt8Matmul`'s epilogue, groups ascending from 0:
-///
-///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], s[n, g] * float(C), acc))
-///
-/// The four partials are then summed in simdgroup order, `((p0 + p1) + p2) +
-/// p3`. `nax` gets C from one 16 x 32 x 128 int8 tensor op per group (the
-/// rows padded to 16 with zero codes, the 2-bit codes expanded to int8 in the
-/// simdgroup's threadgroup buffer) and finds each element's (m, n) through
-/// `get_multidimensional_index`, so it assumes no fragment layout. `plain`
-/// gets C from FP32 FMAs and lane shuffles. Same integers, same FP32 steps in
-/// the same order: the same bits, which `checkKernels` checks on the device
-/// before `nax` is used.
-enum VerifyInt8Matmul {
+/// Verify-width packed matmul (2 to 16 rows) on the int8 activation codes of `PromptInt8Matmul`, split over K
+/// inside a threadgroup (27b 320ec19a, integer-exact): a threadgroup owns 32 output columns, simdgroup s takes
+/// groups g = s, s + 4, ... with `PromptInt8Matmul`'s epilogue, and the four partials sum as `((p0 + p1) + p2) + p3`.
+/// `nax` gets C from one 16 x 32 x 128 int8 tensor op per group, `plain` from FP32 FMAs: the same bits, which
+/// `checkKernels` checks on the device before `nax` is used.
+public enum VerifyInt8Matmul {
     /// The canonical 2-bit codes remain model parameters.
     static let streamAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_STREAM"]?.lowercased()
@@ -5993,17 +5940,10 @@ enum VerifyInt8Matmul {
         }
         """
 
-    // `naxVectorSource` with the destination layout fixed (tuned on the M5
-    // Max). On the M5, element i of lane l is (row, column) = (mrow + 8 *
-    // ((i >> 2) & 1), nb + (i & 3) + 16 * (i >> 3)) with mrow = ((l >> 1) & 3)
-    // + 4 * ((l >> 4) & 1) and nb = 4 * (l & 1) + 8 * ((l >> 3) & 1). Each
-    // simdgroup compares that layout with `get_multidimensional_index` once
-    // and writes NaN on any difference, so the load-time check rejects the
-    // kernel wherever the tensor is laid out otherwise. Rows 8 and up
-    // (elements 4-7 and 12-15) are padding for ROWS <= 8 and skipped. Each
-    // lane loads its own two four-column scale (and offset) vectors and its
-    // row's ascale/rsb a group ahead instead of two shuffles per element; the
-    // FP32 steps per element are the vector kernel's, in its order.
+    // `naxVectorSource` with the destination layout fixed (tuned on the M5 Max): each simdgroup compares the
+    // layout with `get_multidimensional_index` once and writes NaN on any difference, so the load-time check
+    // rejects the kernel wherever the tensor is laid out otherwise; the FP32 steps per element are the vector
+    // kernel's, in its order.
     static let naxFastBody = """
         const int Kg = K / 128;
         const int KW = K / 16;
@@ -7105,11 +7045,73 @@ enum VerifyInt8Matmul {
         return chosen
     }()
 
+    /// Bodies: 0 fast, 1 forms, 2 stream, 3 narrow, 4 narrowForms, 5 narrow16, 6 narrow16Forms, 7 streamNarrow.
+    /// `bodyChoice` holds the body a load-time trial installed per shape; empty keeps the record dispatch.
+    nonisolated(unsafe) static var bodyChoice = [Int: Int]()
+    public static func bodyKey(layers: Int, k: Int, n: Int) -> Int { (layers << 40) | (k << 20) | n }
+    public static func installBody(_ body: Int, layers: Int, k: Int, n: Int) {
+        bodyChoice[bodyKey(layers: layers, k: k, n: n)] = body
+    }
+    public static func streamCopy(_ weight: MLXArray, k: Int) -> MLXArray { streamPack(weight, k: k, columns: 16) }
+
+    /// The body the record dispatch takes at a shape (`n` the layers' total width), -1 off the tensor route.
+    public static func bodyDefault(layers: Int, k: Int, n: Int, streamed: Bool) -> Int {
+        guard route == .nax, naxFast, layers == 1 || (naxShared && layers <= 3) else { return -1 }
+        let stream = streamed && streamReady
+        if layers == 1, n <= narrowColumns, hasNarrow(k: k) {
+            let compact = hasNarrow16(k: k)
+            if formsAllowed, hasNarrowForms(k: k, compact: compact), formsFit(k: k, n: n) {
+                return stream && compact ? 7 : compact ? 6 : 4
+            }
+            return compact ? 5 : 3
+        }
+        let forms = formsAllowed && hasMatchedForm(k: k, layers: layers) && formsFit(k: k, n: n)
+        return forms ? (stream ? 2 : 1) : 0
+    }
+
+    /// Runs `body` on explicit operands; nil where that body does not serve the shape.
+    public static func runBody(
+        _ body: Int, codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
+        layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)], m: Int, k: Int, negative: Bool,
+        streamed: [MLXArray]?
+    ) -> [MLXArray]? {
+        let count = layers.count
+        guard route == .nax, naxFast, count == 1 || (naxShared && (2 ... 3).contains(count)) else { return nil }
+        let neg = negative && negativeForms
+        var fit = formsAllowed
+        for layer in layers where !formsFit(k: k, n: layer.weight.dim(0)) { fit = false }
+        if body >= 3 {
+            let layer = layers[0]
+            guard count == 1, layer.weight.dim(0) <= narrowColumns, hasNarrow(k: k) else { return nil }
+            let compact = body >= 5, forms = body == 4 || body >= 6
+            if compact, !hasNarrow16(k: k) { return nil }
+            if forms, !(fit && hasNarrowForms(k: k, compact: compact)) { return nil }
+            let copy = body == 7 ? streamed?.first : nil
+            if body == 7, copy == nil { return nil }
+            return [runNarrow(
+                codes: codes, ascale: ascale, rsb: rsb, weight: layer.weight, scalesT: layer.scalesT,
+                biasesT: layer.biasesT, m: m, k: k, negative: neg, forms: forms, compact: compact, streamedWeight: copy)]
+        }
+        if body >= 1, !(fit && hasMatchedForm(k: k, layers: count)) { return nil }
+        if body == 2, streamed?.count != count { return nil }
+        return runFast(
+            codes: codes, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k, negative: neg,
+            forms: body >= 1, streamedWeights: body == 2 ? streamed : nil)
+    }
+
     static func matmul(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool, streamedWeight: MLXArray? = nil
     ) -> MLXArray? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        if !bodyChoice.isEmpty, let body = bodyChoice[bodyKey(layers: 1, k: activation.k, n: weight.dim(0))],
+            let out = runBody(
+                body, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k, negative: negative,
+                streamed: streamedWeight.map { copy in [copy] })
+        {
+            return out[0]
+        }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, hasNarrow(k: activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
@@ -7137,6 +7139,18 @@ enum VerifyInt8Matmul {
         streamedWeights: [MLXArray]? = nil
     ) -> [MLXArray]? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        if !bodyChoice.isEmpty, layers.count > 1 {
+            var total = 0, negative = true
+            for layer in layers { total += layer.weight.dim(0); negative = negative && layer.negative }
+            if let body = bodyChoice[bodyKey(layers: layers.count, k: activation.k, n: total)],
+                let out = runBody(
+                    body, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
+                    layers: layers.map { layer in (layer.weight, layer.scalesT, layer.biasesT) },
+                    m: activation.rows, k: activation.k, negative: negative, streamed: streamedWeights)
+            {
+                return out
+            }
+        }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
