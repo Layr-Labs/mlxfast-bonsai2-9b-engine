@@ -468,7 +468,7 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
     /// next proposal reads the committed prefix of it.
     public func projectRoundContext(
         blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
+        treeParents: MLXArray?, requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         let state = self.state(requestState)
         state.projection = nil
@@ -485,10 +485,14 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         if let offset = frontCacheOffset(state),
             let front = drafter.projectLayerZeroFront(
                 projection, draftTokens: draftTokens, targetTokens: targetTokens,
-                cacheOffset: offset)
+                cacheOffset: offset, treeParents: treeParents)
         {
             projection.front = front
             arrays.append(contentsOf: front.evaluationTargets)
+            if let cache = state.caches.first {
+                arrays.append(
+                    contentsOf: drafter.projectWalkedLayerZero(projection, front: front, cache: cache))
+            }
         }
         return arrays
     }

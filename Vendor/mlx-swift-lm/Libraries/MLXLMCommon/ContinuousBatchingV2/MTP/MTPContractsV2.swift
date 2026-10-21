@@ -523,11 +523,13 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// every column (`[1 + k]` int32, lazy) and the round's draft ids (`[k]`
     /// int32, lazy) — and return the arrays the engine queues right behind
     /// the verify. The next proposal of the same request may read the
-    /// committed prefix of it; nothing else changes. A drafter that keeps the
-    /// default does all of its work after acceptance.
+    /// committed prefix of it; nothing else changes. A draft tree's rows are
+    /// in DFS order and `treeParents` (one int32 per verify column, lazy; the
+    /// root's is -1) names each column's parent; nil for a chain. A drafter that keeps the default
+    /// does all of its work after acceptance.
     func projectRoundContext(
         blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
+        treeParents: MLXArray?, requestState: any CBv2MTPRequestState
     ) -> [MLXArray]
 
     /// OPTIONAL (defaulted): the round's raw accepted draft count (its leading
@@ -563,7 +565,7 @@ extension CBv2MTPBlockDrafter {
 
     public func projectRoundContext(
         blockContext: MLXArray, targetTokens: MLXArray, draftTokens: MLXArray,
-        requestState: any CBv2MTPRequestState
+        treeParents: MLXArray?, requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
         []
     }

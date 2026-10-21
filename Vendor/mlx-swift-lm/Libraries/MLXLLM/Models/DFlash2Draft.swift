@@ -813,6 +813,52 @@ private final class DFlash2Attention: Module {
         return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(B, L, -1), oProj)
     }
 
+    /// `callAsFunction`'s fast path for a full block whose context width is the walk's
+    /// count, built before the readback: the front's projections rotate in the window form,
+    /// the window goes into the cache at its cursor, and the attention reads the cache up to
+    /// `base + C + L` by a device count. The o_proj input branch is the record's for a full
+    /// block. nil when the form does not apply; nothing is written then.
+    func walkWindowForward(
+        front: DFlash2LayerZeroFront, contextKV: (MLXArray, MLXArray),
+        cache: DFlash2LayerKVCache, window: DF2WalkWindow, hostRows: Int? = nil
+    ) -> MLXArray? {
+        let L: Int = 16
+        guard DF2Fast.on, DraftSDPA.enabled || hostRows != nil, heads == 32, kvHeads == 8, !isCausal,
+            front.h.dim(0) == 1, front.h.dim(1) == L, contextKV.0.dim(1) == 16,
+            cache.offset == front.cacheOffset, cache.windowFits(rows: 32),
+            let rotated = DF2Fast.qkvWalkNormRope(
+                q: front.queries, k: front.keys, v: front.values,
+                ck: contextKV.0, cv: contextKV.1,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: front.ropeSpec,
+                L: L, offset: cache.offset, base: cache.validRows,
+                path: window.path, count: window.count)
+        else { return nil }
+        let written = cache.writeWindow(keys: rotated.1, values: rotated.2)
+        let output: MLXArray
+        if DraftSDPA.enabled,
+            let counted = DraftSDPA.attention(
+                rotated.0, written.keys, written.values, scale: scale, count: rotated.3)
+        {
+            output = counted
+        } else if let hostRows {
+            // The load check on a machine without the device-count attention: the record's
+            // attention over the same first rows, cut by the host.
+            let n: Int = written.base + hostRows + L
+            output = MLXFast.scaledDotProductAttention(
+                queries: rotated.0, keys: written.keys[0..., 0..., 0 ..< n, 0...],
+                values: written.values[0..., 0..., 0 ..< n, 0...], scale: scale, mask: nil)
+        } else {
+            return nil
+        }
+        if DF2Fast.tokenMajorOProj {
+            return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(1, L, -1), oProj)
+        }
+        if let y = DF2Fast.linearHeadMajor(output, oProj, L: L) {
+            return y
+        }
+        return DF2Fast.linear(output.transposed(0, 2, 1, 3).reshaped(1, L, -1), oProj)
+    }
+
     /// The CONTEXT half of `callAsFunction`, with no block: the same sliding
     /// skip, the same k/v projections, norms, rotation at the cache's offset
     /// and `cache.update`, in the same order on the same operands. A later
@@ -1035,6 +1081,48 @@ private final class DFlash2LayerKVCache: KVCacheSimple {
             vBuf![.ellipsis, start ..< (end + L), 0...],
             cachedLength
         )
+    }
+
+    /// Rows already in the cache, `start ..< end`.
+    var validRows: Int { end - start }
+
+    /// Room for `rows` rows at the cursor, allocated ahead: the load check's fresh caches,
+    /// which at runtime the seed's absorption has already sized.
+    func reserve(rows: Int) {
+        ensureCapacity(
+            extra: rows, B: 1, kvHeads: 8, kDim: 128, vDim: 128, kDType: .float32, vDType: .float32)
+    }
+
+    /// A `rows`-row window at the cursor fits without a reallocation and without a trim, and
+    /// every context width up to `rows - 16` keeps the attention's whole-window mask.
+    func windowFits(rows: Int) -> Bool {
+        guard let kBuf, let vBuf, end + rows <= kBuf.dim(2), end + rows <= vBuf.dim(2) else {
+            return false
+        }
+        if let maxW = maxWindowSize, end - start + rows > maxW { return false }
+        return true
+    }
+
+    /// Write a window of keys and values at the cursor without moving it: the rows
+    /// `updateWithCombined` would write for any context width up to `rows - 16`, plus zeros.
+    /// Returns the cache's rows `start ..< end + rows`, the attention's key operand, and how
+    /// many rows precede the window.
+    func writeWindow(keys: MLXArray, values: MLXArray) -> (keys: MLXArray, values: MLXArray, base: Int) {
+        let rows = keys.dim(2)
+        kBuf![.ellipsis, end ..< (end + rows), 0...] = keys
+        vBuf![.ellipsis, end ..< (end + rows), 0...] = values
+        return (
+            kBuf![.ellipsis, start ..< (end + rows), 0...],
+            vBuf![.ellipsis, start ..< (end + rows), 0...],
+            end - start
+        )
+    }
+
+    /// Commit `C` context rows of a written window: the cursor moves as `updateWithCombined`
+    /// moves it, and the rows past `C + 16` are never read.
+    func adoptWindow(C: Int) {
+        end += C
+        offset += C
     }
 
     func updateWithCombined(
@@ -1261,6 +1349,35 @@ private final class DFlash2DecoderLayer: Module {
         }
         // Hand the attention half to the GPU while the rest is built.
         if submitAttention { asyncEval(attnOut) }
+        return finishFast(
+            x, p1: p1, attnOut: attnOut, leadShape: leadShape, nextNorm: nextNorm,
+            nextQStart: nextQStart)
+    }
+
+    /// Layer 0 of the next proposal before the readback: the walked front's block and the
+    /// window attention, then the record's tail. nil when the window form does not apply.
+    func forwardFastWalked(
+        front: DFlash2LayerZeroFront, contextKV: (MLXArray, MLXArray),
+        cache: DFlash2LayerKVCache, window: DF2WalkWindow, nextNorm: RMSNorm,
+        hostRows: Int? = nil
+    ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?)? {
+        guard DF2Fast.w4Group != nil,
+            let attnOut = selfAttn.walkWindowForward(
+                front: front, contextKV: contextKV, cache: cache, window: window,
+                hostRows: hostRows)
+        else { return nil }
+        return finishFast(
+            front.h, p1: front.p1, attnOut: attnOut,
+            leadShape: Array(front.normed.shape.dropLast()), nextNorm: nextNorm, nextQStart: 0)
+    }
+
+    /// `forwardFast` after the attention: the attention convolution's second half and the
+    /// post-attention norm, the MLP convolution, the MLP, and the next layer's norm.
+    private func finishFast(
+        _ x: MLXArray, p1: MLXArray, attnOut: MLXArray, leadShape: [Int],
+        nextNorm: RMSNorm?, nextQStart: Int
+    ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
+        let base1 = attentionConv.fastBase
         let attended: MLXArray
         let n2: MLXArray
         let n2Codes: DF2Fast.W4Codes?
@@ -1600,11 +1717,14 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let probe = MLXArray.zeros([1, 1, config.hiddenSize], dtype: .float32)
             eval(target.draftLogitsForDFlash2Hidden(probe, rows: rows))
         }
+        checkTreeWalk()
+        checkWalkWindow()
         if DF2Fast.on {
             DF2Fast.TreeWide.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
             DF2LeanIndex.prepare(selector: candidateSelector, vocabulary: config.vocabularySize)
             try prepareFirstRound(target)
             checkLayerZeroFront()
+            checkWalkedLayerZero()
         }
     }
 
@@ -1811,6 +1931,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 normed = DF2Fast.rms(h, layers[0].inputLayerNorm)
                 normedCodes = nil
             }
+            // Layer 0 ran before the readback on the walked path: start from its output.
+            let layerOne: DFlash2LayerZeroFront? = front.flatMap { f in
+                projected.flatMap { usableLayerOne(f, rows: $0.context.dim(1), cache: cache) }
+            }
+            if let layerOne, let fastCache = cache[0] as? DFlash2LayerKVCache {
+                fastCache.adoptWindow(C: context.dim(1))
+                h = layerOne.h
+                normed = layerOne.normed
+                normedCodes = nil
+            }
             var precomputedKV: [(MLXArray, MLXArray)]? = projected?.contextKV
             if let cCodes, layers.count == 6 {
                 let lead = [1, context.dim(1)]
@@ -1841,7 +1971,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     deferredContextNorm.input, hiddenNorm, group: deferredContextNorm.group)!.0
             }
             let blockLen = h.dim(1)
-            for (index, layer) in layers.enumerated() {
+            let firstLayer: Int = layerOne == nil ? 0 : 1
+            for (index, layer) in layers.enumerated() where index >= firstLayer {
                 let isLast = index + 1 == layers.count
                 let nextNorm = isLast ? norm : layers[index + 1].inputLayerNorm
                 let nextQStart = isLast ? logitsStart : 0
@@ -1851,8 +1982,8 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     context: context, rope: rope, cache: cache[index],
                     ropeSpec: rSpec, contextCodes: cCodes,
                     precomputedContextKV: precomputedKV?[index],
-                    submitAttention: index == 0 && projected != nil,
-                    front: index == 0 ? front : nil)
+                    submitAttention: index == firstLayer && projected != nil,
+                    front: index == 0 ? front : (index == 1 ? layerOne : nil))
                 h = step.h
                 normed = step.nextNormed
                 normedCodes = step.nextCodes
@@ -2104,15 +2235,18 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     }
 
     /// Layer 0's front of the next proposal from this round's verify, queued
-    /// with the context projection: the anchor row is `targetTokens[accepted]`'s
-    /// embedding, gathered on the GPU by the leading-match count of
-    /// `draftTokens` against `targetTokens`, so the host's acceptance is not
-    /// waited for. The phase table covers every context width up to `1 + k`,
-    /// each row a function of `cacheOffset + row` only. nil when the record
-    /// fast path the front mirrors would not run.
+    /// with the context projection: the anchor row is the accepted path's last
+    /// verify row's target token, gathered on the GPU, so the host's acceptance
+    /// is not waited for. With `treeParents` and the tree walk on, that row comes
+    /// from the host's own accept walk replayed over the tree (`DF2Fast.treeWalk`),
+    /// so the front holds on a branch commit too; otherwise it is the
+    /// leading-match count of `draftTokens` against `targetTokens` over the
+    /// tree's chain rows. The phase table covers every context width up to
+    /// `1 + k`, each row a function of `cacheOffset + row` only. nil when the
+    /// record fast path the front mirrors would not run.
     func projectLayerZeroFront(
         _ projection: DFlash2ContextProjection, draftTokens: MLXArray, targetTokens: MLXArray,
-        cacheOffset: Int, retainCodes: Bool = false
+        cacheOffset: Int, retainCodes: Bool = false, treeParents: MLXArray? = nil
     ) -> DFlash2LayerZeroFront? {
         let blockSize: Int = config.dflash.blockSize
         let k: Int = blockSize - 1
@@ -2126,10 +2260,35 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             maskEmbed.dtype == projection.anchorEmbeddings.dtype
         else { return nil }
         let drafts: MLXArray = draftTokens.reshaped([k])
-        let targets: MLXArray = targetTokens.reshaped([blockSize])[0 ..< k]
-        let matches: MLXArray = (drafts .== targets).asType(.int32)
-        let accepted: MLXArray = cumprod(matches, axis: 0).sum().asType(.int32)
-        let anchor: MLXArray = take(projection.anchorEmbeddings, accepted.reshaped([1]), axis: 1)
+        let allTargets: MLXArray = targetTokens.reshaped([blockSize])
+        let anchorRow: MLXArray
+        let walked: Bool
+        var walk: DF2WalkWindow?
+        if let treeParents, DF2Fast.walkEnabled, DF2Fast.walkMatched, !DF2Fast.walkFaulted,
+            let result = DF2Fast.guarded(
+                "walk",
+                { () -> (path: MLXArray, accepted: MLXArray, anchor: MLXArray) in
+                    if DF2Fast.negativeControl == "launch" { DF2Fast.injectFault() }
+                    return DF2Fast.treeWalk(drafts: drafts, targets: allTargets, parents: treeParents)
+                })
+        {
+            anchorRow = result.anchor
+            walk = DF2WalkWindow(path: result.path, count: result.accepted)
+            walked = true
+        } else {
+            // The chain's leading-match count: a tree's rows are in DFS order, so it runs only
+            // while row r's parent is row r - 1 (a branch path drops the front on the host).
+            var chainDrafts: MLXArray = drafts
+            if let treeParents {
+                let chainRows = treeParents[1 ..< 16] .== MLXArray(Array(Int32(0) ..< Int32(15)))
+                chainDrafts = which(chainRows, drafts, MLXArray(Int32(-1)))
+            }
+            let targets: MLXArray = allTargets[0 ..< k]
+            let matches: MLXArray = (chainDrafts .== targets).asType(.int32)
+            anchorRow = cumprod(matches, axis: 0).sum().asType(.int32)
+            walked = false
+        }
+        let anchor: MLXArray = take(projection.anchorEmbeddings, anchorRow.reshaped([1]), axis: 1)
         let h: MLXArray = concatenated([anchor, maskEmbed], axis: 1)
         let layer = layers[0]
         let attention = layer.selfAttn
@@ -2143,9 +2302,74 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             let qkv = DF2Fast.linearsConv0(
                 fused.0, dyn: p1, base: layer.attentionConv.fastBase, projections)
         else { return nil }
-        return DFlash2LayerZeroFront(
+        let front = DFlash2LayerZeroFront(
             cacheOffset: cacheOffset, h: h, normed: fused.0, codes: retainCodes ? fused.1 : nil, ropeSpec: fused.2,
-            p1: p1, queries: qkv[0], keys: qkv[1], values: qkv[2])
+            p1: p1, queries: qkv[0], keys: qkv[1], values: qkv[2], walked: walked)
+        front.walk = walk
+        return front
+    }
+
+    /// Layer 0 of the next proposal on the walked front, before the readback, into layer 0's
+    /// cache: the window attention over the walk's count, the record's tail, then layer 1's
+    /// input norm and projections as the new front (`front.layerOne`). The arrays to queue
+    /// behind the verify, or nothing when the form does not apply this round.
+    func projectWalkedLayerZero(
+        _ projection: DFlash2ContextProjection, front: DFlash2LayerZeroFront, cache: KVCache,
+        retainCodes: Bool = false, hostRows: Int? = nil
+    ) -> [MLXArray] {
+        guard DF2Fast.walkLayerZeroEnabled, DF2Fast.walkWindowMatched, !DF2Fast.walkFaulted,
+            retainCodes || !DF2Fast.walkLayerZeroValid.isEmpty, front.walked,
+            let walk = front.walk, layers.count == 6, projection.rows == 16,
+            let group = DF2Fast.w4Group, let fastCache = cache as? DFlash2LayerKVCache
+        else { return [] }
+        // The cache's buffers under handles of their own (a whole-range slice is the same array),
+        // so a build that MLX refuses after the window write can put them back.
+        let savedKeys: MLXArray? = fastCache.kBuf?[0...]
+        let savedValues: MLXArray? = fastCache.vBuf?[0...]
+        let queued: [MLXArray]? = DF2Fast.guarded("layer 0") { () -> [MLXArray] in
+            guard
+                let step = layers[0].forwardFastWalked(
+                    front: front, contextKV: projection.contextKV[0], cache: fastCache, window: walk,
+                    nextNorm: layers[1].inputLayerNorm, hostRows: hostRows),
+                let normed = step.nextNormed, let codes = step.nextCodes
+            else { return [] }
+            let layer = layers[1]
+            let attention = layer.selfAttn
+            guard group == codes.group,
+                let p1 = DF2Fast.w4LinearsFromCodes(
+                    codes, leadShape: [1, 16], [layer.attentionConv.kernelProjection])?.first,
+                let qkv = DF2Fast.linearsConv0(
+                    normed, dyn: p1, base: layer.attentionConv.fastBase,
+                    [attention.qProj, attention.kProj, attention.vProj])
+            else { return [] }
+            let layerOne = DFlash2LayerZeroFront(
+                cacheOffset: front.cacheOffset, h: step.h, normed: normed, codes: retainCodes ? codes : nil,
+                ropeSpec: front.ropeSpec, p1: p1, queries: qkv[0], keys: qkv[1], values: qkv[2],
+                walked: true)
+            front.layerOne = layerOne
+            front.layerOneCache = (ObjectIdentifier(fastCache), fastCache.end)
+            return [layerOne.h, layerOne.normed, layerOne.p1, layerOne.queries, layerOne.keys, layerOne.values]
+        }
+        if let queued { return queued }
+        front.layerOne = nil
+        front.layerOneCache = nil
+        fastCache.kBuf = savedKeys
+        fastCache.vBuf = savedValues
+        return []
+    }
+
+    /// The front's layer-1 front when this proposal is the one it was built for: the walk's
+    /// count equals the context width (the host validated it), that width passed the load
+    /// check, and layer 0's cache is the one it wrote to, at the cursor it saw.
+    private func usableLayerOne(
+        _ front: DFlash2LayerZeroFront, rows: Int, cache: [KVCache]
+    ) -> DFlash2LayerZeroFront? {
+        guard let layerOne = front.layerOne, let wrote = front.layerOneCache, !DF2Fast.walkFaulted,
+            DF2Fast.walkLayerZeroValid.contains(rows), let first = cache.first,
+            let fastCache = first as? DFlash2LayerKVCache, wrote.id == ObjectIdentifier(fastCache),
+            fastCache.end == wrote.end, fastCache.offset == front.cacheOffset
+        else { return nil }
+        return layerOne
     }
 
     // MARK: Proposing
@@ -6543,13 +6767,16 @@ public final class DFlash2ContextProjection {
     }
 
     /// The projection of the verify columns `rows` (a draft tree's accepted path), in order.
+    /// A front whose anchor came from the tree walk already holds that path's anchor.
     func gathered(_ rows: [Int32]) -> DFlash2ContextProjection {
         let index = MLXArray(rows)
-        return DFlash2ContextProjection(
+        let projection = DFlash2ContextProjection(
             anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
             context: context.take(index, axis: 1),
             contextKV: contextKV.map { ($0.0.take(index, axis: 1), $0.1.take(index, axis: 1)) },
             lookupFCOutput: lookupFCOutput?.take(index, axis: 1))
+        if let front, front.walked { projection.front = front }
+        return projection
     }
 
     func use(rows: Int) -> Use {
@@ -6572,6 +6799,17 @@ public final class DFlash2ContextProjection {
 /// whose caches all sit at `cacheOffset`.
 final class DFlash2LayerZeroFront {
     let cacheOffset: Int
+    /// The anchor row came from the tree walk, so the front holds on a branch commit.
+    let walked: Bool
+    /// The walk's path and count on the device, when the anchor came from it.
+    var walk: DF2WalkWindow?
+    /// Layer 1's front after layer 0 ran before the readback on the walked path
+    /// (`DFlash2DraftModel.projectWalkedLayerZero`): `h` is layer 0's output, `normed` and
+    /// `codes` layer 1's input norm, `p1` and q, k, v layer 1's projections. Valid only for
+    /// the cache it wrote the window to, at the cursor it saw, for a context width the load
+    /// check passed.
+    var layerOne: DFlash2LayerZeroFront?
+    var layerOneCache: (id: ObjectIdentifier, end: Int)?
     let h: MLXArray
     let normed: MLXArray
     /// Layer 0's input codes, kept only for the load check (p1 replaces them at runtime).
@@ -6584,9 +6822,11 @@ final class DFlash2LayerZeroFront {
 
     init(
         cacheOffset: Int, h: MLXArray, normed: MLXArray, codes: DF2Fast.W4Codes?,
-        ropeSpec: DF2Fast.RopeSpec, p1: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray
+        ropeSpec: DF2Fast.RopeSpec, p1: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
+        walked: Bool = false
     ) {
         self.cacheOffset = cacheOffset
+        self.walked = walked
         self.h = h
         self.normed = normed
         self.codes = codes
@@ -6758,6 +6998,724 @@ extension DFlash2DraftModel {
         let x: MLXArray = contiguous(a.asType(.float32)).view(dtype: .uint32)
         let y: MLXArray = contiguous(b.asType(.float32)).view(dtype: .uint32)
         return MLX.all(x .== y)
+    }
+}
+
+// MARK: - The accept walk over a draft tree, on the GPU
+
+extension DF2Fast {
+    /// `DARKBLOOM_BONSAI_DFWALK=0` keeps the chain-only acceptance count for the layer-0 front.
+    static let walkEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFWALK"] != "0"
+    /// Written once by `checkTreeWalk` at bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var walkMatched = false
+    /// `DARKBLOOM_BONSAI_DFWALK_NEGCTL=check` raises an MLX error inside each walk load check,
+    /// `=launch` inside the first proposal's walk: both must turn the lever off and leave the
+    /// record path running. Unset in every measured run.
+    static let negativeControl: String =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFWALK_NEGCTL"] ?? ""
+    /// Set by `guarded` when an MLX error was raised while a proposal's walk or walked layer 0
+    /// was being built; every later round takes the record path. Read-only elsewhere.
+    nonisolated(unsafe) static var walkFaulted = false
+
+    /// Run `body` with MLX errors routed to a handler instead of the process-ending default.
+    /// On the first error it sets `walkFaulted`, writes one stderr line and returns nil, so the
+    /// caller falls back to the record path for this round and every later one.
+    static func guarded<R>(_ what: String, _ body: () -> R) -> R? {
+        let fault = DF2WalkFault()
+        let result: R = withErrorHandler(
+            { (message: String) in fault.record(message) }, body)
+        guard let message = fault.message else { return result }
+        walkFaulted = true
+        FileHandle.standardError.write(
+            Data("DF2 walk fault: \(what): \(message.prefix(160)); record path kept\n".utf8))
+        return nil
+    }
+
+    /// An operation MLX refuses at graph build (a broadcast of [2, 5] against [3, 5]): the
+    /// negative control's error, raised inside whichever scope is active.
+    static func injectFault() {
+        _ = MLXArray(0 ..< 10, [2, 5]) + MLXArray(0 ..< 15, [3, 5])
+    }
+
+    /// One thread replays the host's accept walk (`EngineLoopV2+MTPFinalize`): from row 0,
+    /// the lowest-index row whose parent is the path's last row and whose draft is the
+    /// target's token at that row, until no row qualifies. `path` holds the rows in order
+    /// (-1 past the end), `accepted` their count minus one, `anchor` the last row.
+    static let treeWalkKernel = MLXFast.metalKernel(
+        name: "df2_tree_walk", inputNames: ["drafts", "targets", "parents"],
+        outputNames: ["path", "accepted", "anchor"],
+        source: """
+            if (thread_position_in_grid.x != 0) { return; }
+            int last = 0;
+            int count = 0;
+            path[0] = 0;
+            for (int step = 1; step < 16; step++) {
+              int next = -1;
+              for (int r = 1; r < 16; r++) {
+                if (parents[r] == last && drafts[r - 1] == targets[last]) { next = r; break; }
+              }
+              if (next < 0) { break; }
+              last = next;
+              count = step;
+              path[step] = next;
+            }
+            for (int d = count + 1; d < 16; d++) { path[d] = -1; }
+            accepted[0] = count;
+            anchor[0] = last;
+            """)
+
+    /// The accepted path of a draft tree: `drafts` [15] (row r's token at r - 1),
+    /// `targets` (the target's token at each verify row), `parents` (the root's is -1).
+    static func treeWalk(
+        drafts: MLXArray, targets: MLXArray, parents: MLXArray
+    ) -> (path: MLXArray, accepted: MLXArray, anchor: MLXArray) {
+        let outs = treeWalkKernel(
+            [drafts.asType(.int32), targets.asType(.int32), parents.asType(.int32)],
+            grid: (1, 1, 1), threadGroup: (1, 1, 1),
+            outputShapes: [[16], [1], [1]], outputDTypes: [.int32, .int32, .int32])
+        return (outs[0], outs[1], outs[2])
+    }
+
+    /// The host walk, as `EngineLoopV2+MTPFinalize` runs it, for the load-time check.
+    static func hostTreeWalk(drafts: [Int32], targets: [Int32], parents: [Int32]) -> [Int] {
+        var path: [Int] = [0]
+        while true {
+            let last: Int = path[path.count - 1]
+            var next: Int = -1
+            for row in 1 ..< 16 {
+                if Int(parents[row]) == last && drafts[row - 1] == targets[last] {
+                    next = row
+                    break
+                }
+            }
+            if next < 0 { return path }
+            path.append(next)
+        }
+    }
+}
+
+extension DFlash2DraftModel {
+    /// Resolve `DF2Fast.walkMatched` once at bind: on synthetic trees (a full chain, chains cut
+    /// at rows 0 and 7, paths that leave the chain at depths 1, 3 and 8, a later sibling that
+    /// matches where the chain child does not, and a tree with no accepted row) the kernel's
+    /// path, count and anchor must equal the host walk's.
+    func checkTreeWalk() {
+        var note = "off"
+        if DF2Fast.walkEnabled {
+            do {
+                note = try withError { try treeWalkMismatch() }.map { "failed (\($0))" } ?? "matched"
+            } catch {
+                note = "failed (\(error))"
+            }
+        }
+        DF2Fast.walkMatched = note == "matched"
+        FileHandle.standardError.write(Data("DF2 walk check: \(note)\n".utf8))
+    }
+
+    private func treeWalkMismatch() throws -> String? {
+        if DF2Fast.negativeControl == "check" { DF2Fast.injectFault() }
+        let chain: [Int32] = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        let bush: [Int32] = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 8, 7, 13, 14]
+        let fork: [Int32] = [-1, 0, 1, 1, 3, 3, 0, 6, 7, 8, 8, 10, 6, 12, 12, 14]
+        let targets: [Int32] = (0 ..< 16).map { index in Int32(5000 + 13 * index) }
+        var cases: [(String, [Int32], [Int32])] = []
+        // Row r's draft is `targets[parents[r]]` when it is meant to match.
+        func drafts(_ parents: [Int32], matching: Set<Int>) -> [Int32] {
+            (1 ..< 16).map { index in
+                matching.contains(index) ? targets[Int(parents[index])] : Int32(90000 + index)
+            }
+        }
+        cases.append(("full chain", chain, drafts(chain, matching: Set(1 ..< 16))))
+        cases.append(("chain cut at 7", chain, drafts(chain, matching: Set(1 ..< 8))))
+        cases.append(("chain cut at 0", chain, drafts(chain, matching: [])))
+        cases.append(("bush off at 8", bush, drafts(bush, matching: Set(1 ..< 9).union([12]))))
+        cases.append(("bush off at 9 then 14", bush, drafts(bush, matching: Set(1 ..< 10).union([11, 14, 15]))))
+        cases.append(("fork off at 1", fork, drafts(fork, matching: [1, 3, 5])))
+        cases.append(("fork off at root", fork, drafts(fork, matching: [6, 12, 14, 15])))
+        cases.append(("fork none", fork, drafts(fork, matching: [2, 7, 8])))
+        for (name, parents, draft) in cases {
+            let expected: [Int] = DF2Fast.hostTreeWalk(drafts: draft, targets: targets, parents: parents)
+            let got = DF2Fast.treeWalk(
+                drafts: MLXArray(draft), targets: MLXArray(targets), parents: MLXArray(parents))
+            eval(got.path, got.accepted, got.anchor)
+            let path: [Int32] = got.path.asArray(Int32.self)
+            let accepted: Int = Int(got.accepted.item(Int32.self))
+            let anchor: Int = Int(got.anchor.item(Int32.self))
+            guard path.count == 16, accepted == expected.count - 1, anchor == expected[expected.count - 1]
+            else { return "\(name): count \(accepted) anchor \(anchor) for \(expected)" }
+            for d in 0 ..< 16 {
+                let want: Int = d < expected.count ? expected[d] : -1
+                if Int(path[d]) != want { return "\(name): path[\(d)] \(path[d]) for \(expected)" }
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Layer 0 of the next proposal behind the verify, on the walked path
+
+/// The first MLX error message seen by one `DF2Fast.guarded` scope.
+final class DF2WalkFault: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first: String?
+    var message: String? { lock.withLock { first } }
+    func record(_ text: String) {
+        lock.withLock { if first == nil { first = text } }
+    }
+}
+
+/// The accept walk's outputs on the device: the path's verify rows (`[16]` int32, -1 past the
+/// end) and the accepted count (`[1]` int32), so the next block's context width is
+/// `count + 1` and its context rows `path[0 ..< count + 1]`.
+struct DF2WalkWindow {
+    let path: MLXArray
+    let count: MLXArray
+}
+
+extension DF2Fast {
+    /// `DARKBLOOM_BONSAI_DFWALK_L0=0` builds layer 0 of the proposal after acceptance (the walked
+    /// front of step 1 stays); `DARKBLOOM_BONSAI_DFWALK=0` turns both off.
+    static let walkLayerZeroEnabled =
+        walkEnabled && ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DFWALK_L0"] != "0"
+    /// Written once by `checkWalkWindow` at bind, before any proposal; read-only afterwards.
+    nonisolated(unsafe) static var walkWindowMatched = false
+    /// The context widths whose walked layer 0 equalled the record path at bind
+    /// (`checkWalkedLayerZero`); written once there, read-only afterwards.
+    nonisolated(unsafe) static var walkLayerZeroValid: Set<Int> = []
+
+    /// `df2_qkv_all_norm_rope` over a 32-row key and value window whose context width C is the
+    /// walk's count plus one: window row t < C takes context row `walk_path[t]`, rows C ..< C + L
+    /// the block, the rest zeros; the queries rotate at offset + C + s. Every floating-point
+    /// expression is the record kernel's; only the row index math and the trip count changed.
+    /// `n_out` is the attention's key count, params[2] + C + L.
+    static let qkvWalkNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_walk_norm_rope",
+        inputNames: [
+            "q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams", "walk_path",
+            "walk_count",
+        ],
+        outputNames: ["q_out", "k_out", "v_out", "n_out"],
+        source: """
+            const int L = params[0];
+            const int offset = params[1];
+            const int C = walk_count[0] + 1;
+            const int CL = C + L;
+            const int W = 32;
+            const float eps = fparams[0];
+            const float mscale = fparams[1];
+            const int vecIdx = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+            const uint lane = thread_index_in_simdgroup;
+            if (vecIdx == 0 && lane == 0) { n_out[0] = params[2] + CL; }
+            if (vecIdx >= 32 * L + 16 * W) return;
+            const int d0 = int(lane);
+            const int d1 = d0 + 32;
+            if (vecIdx >= 32 * L + 8 * W) {
+              const int vIdx = vecIdx - (32 * L + 8 * W);
+              const int h = vIdx / W;
+              const int t = vIdx % W;
+              const size_t dstBase = ((size_t)h * W + t) * 128;
+              if (t >= CL) {
+                v_out[dstBase + d0] = 0.0f;
+                v_out[dstBase + d0 + 64] = 0.0f;
+                v_out[dstBase + d1] = 0.0f;
+                v_out[dstBase + d1 + 64] = 0.0f;
+                return;
+              }
+              const device float* vsrc = (t < C) ? cv : bv;
+              const int s = (t < C) ? walk_path[t] : (t - C);
+              const size_t srcBase = ((size_t)s * 8 + h) * 128;
+              v_out[dstBase + d0] = float(vsrc[srcBase + d0]);
+              v_out[dstBase + d0 + 64] = float(vsrc[srcBase + d0 + 64]);
+              v_out[dstBase + d1] = float(vsrc[srcBase + d1]);
+              v_out[dstBase + d1 + 64] = float(vsrc[srcBase + d1 + 64]);
+              return;
+            }
+            const bool isK = vecIdx >= 32 * L;
+            int h, t, s, H, S_out;
+            const device float* src;
+            const device float* w;
+            device float* dst;
+            float pos;
+            int posRow;
+            if (!isK) {
+              h = vecIdx / L;
+              s = vecIdx % L;
+              t = s;
+              H = 32;
+              S_out = L;
+              src = q;
+              w = qw;
+              dst = q_out;
+              pos = float(offset + C + s);
+              posRow = C + s;
+            } else {
+              const int kIdx = vecIdx - 32 * L;
+              h = kIdx / W;
+              t = kIdx % W;
+              H = 8;
+              S_out = W;
+              w = kw;
+              dst = k_out;
+              pos = float(offset + t);
+              posRow = t;
+              if (t >= CL) {
+                const size_t zeroBase = ((size_t)h * S_out + t) * 128;
+                dst[zeroBase + d0] = 0.0f;
+                dst[zeroBase + d0 + 64] = 0.0f;
+                dst[zeroBase + d1] = 0.0f;
+                dst[zeroBase + d1 + 64] = 0.0f;
+                return;
+              }
+              src = (t < C) ? ck : bk;
+              s = (t < C) ? walk_path[t] : (t - C);
+            }
+            const size_t srcBase = ((size_t)s * H + h) * 128;
+            const size_t dstBase = ((size_t)h * S_out + t) * 128;
+            float acc = 0.0f;
+            for (int i = 0; i < 4; i++) {
+              const float xi = float(src[srcBase + 4 * int(lane) + i]);
+              acc += xi * xi;
+            }
+            const float inv_mean = metal::precise::rsqrt(simd_sum(acc) / 128u + eps);
+            const float x0 = float(src[srcBase + d0]);
+            const float y0 = float(src[srcBase + d0 + 64]);
+            const float x1 = float(src[srcBase + d1]);
+            const float y1 = float(src[srcBase + d1 + 64]);
+            const float nx0 = (w[d0] * (x0 * inv_mean)) * mscale;
+            const float ny0 = (w[d0 + 64] * (y0 * inv_mean)) * mscale;
+            const float nx1 = (w[d1] * (x1 * inv_mean)) * mscale;
+            const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
+            float c0, s0, c1, s1;
+            if (PHASES) {
+              const size_t phaseBase = ((size_t)posRow * 32 + lane) * 4;
+              c0 = freqs[phaseBase]; s0 = freqs[phaseBase + 1];
+              c1 = freqs[phaseBase + 2]; s1 = freqs[phaseBase + 3];
+            } else {
+              const float th0 = pos * (1.0f / freqs[d0]);
+              c0 = metal::fast::cos(th0); s0 = metal::fast::sin(th0);
+              const float th1 = pos * (1.0f / freqs[d1]);
+              c1 = metal::fast::cos(th1); s1 = metal::fast::sin(th1);
+            }
+            dst[dstBase + d0] = nx0 * c0 - ny0 * s0;
+            dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
+            dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
+            dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
+            """)
+
+    /// The window form of `qkvAllNormRope` with the walk's path and count on the device:
+    /// queries `[1, 32, L, 128]`, keys and values `[1, 8, 32, 128]` and the key count
+    /// `base + C + L` as `[1]` int32. nil unless the phase table covers the whole window at
+    /// `offset`, as the record form would use it for every context width.
+    static func qkvWalkNormRope(
+        q: MLXArray, k: MLXArray, v: MLXArray, ck: MLXArray, cv: MLXArray,
+        qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
+        L: Int, offset: Int, base: Int, path: MLXArray, count: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard on, L == 16, ck.dim(1) == 16, cv.dim(1) == 16, let phases = ropeSpec.phases,
+            ropeSpec.phaseOffset == offset, ropeSpec.phaseRows >= 32
+        else { return nil }
+        let outs = qkvWalkNormRopeKernel(
+            [
+                q, k, v, ck, cv, normWeight(qNorm), normWeight(kNorm), phases,
+                HostConstants.recentInt32([Int32(L), Int32(offset), Int32(base)]),
+                ropeSpec.floatParameters(eps: qNorm.eps), path, count,
+            ],
+            template: [("PHASES", true)],
+            grid: (256 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 32, L, 128], [1, 8, 32, 128], [1, 8, 32, 128], [1]],
+            outputDTypes: [.float32, .float32, .float32, .int32])
+        return (outs[0], outs[1], outs[2], outs[3])
+    }
+}
+
+extension DFlash2DraftModel {
+    /// Resolve `DF2Fast.walkWindowMatched` once at bind: on synthetic operands, for every
+    /// context width 1...16 along a chain path and for three paths that leave the chain, at
+    /// offsets 0 and 37, the window kernel's queries and its first C + L key and value rows
+    /// must equal the record kernel's over the path's gathered rows bit for bit, the rows past
+    /// them must be zero, and the key count must be base + C + 16. The kernels run on this
+    /// machine whatever `DF2_FAST` says, so the check runs here on every machine.
+    func checkWalkWindow() {
+        var note = "off"
+        if DF2Fast.walkLayerZeroEnabled {
+            do {
+                note = try withError { try walkWindowMismatch() }.map { "failed (\($0))" } ?? "matched"
+            } catch {
+                note = "failed (\(error))"
+            }
+        }
+        DF2Fast.walkWindowMatched = note == "matched"
+        FileHandle.standardError.write(Data("DF2 walk window check: \(note)\n".utf8))
+    }
+
+    private func walkWindowMismatch() throws -> String? {
+        if DF2Fast.negativeControl == "check" { DF2Fast.injectFault() }
+        let L: Int = 16
+        func wave(_ count: Int, _ seed: Float) -> MLXArray {
+            MLX.sin(MLXArray(0 ..< count).asType(.float32) * seed) * 2
+        }
+        let q: MLXArray = wave(L * 4096, 0.7548776).reshaped([1, L, 4096])
+        let bk: MLXArray = wave(L * 1024, 0.3819660).reshaped([1, L, 1024])
+        let bv: MLXArray = wave(L * 1024, 0.6180339).reshaped([1, L, 1024])
+        let ck: MLXArray = wave(16 * 1024, 0.4142135).reshaped([1, 16, 1024])
+        let cv: MLXArray = wave(16 * 1024, 0.7320508).reshaped([1, 16, 1024])
+        let qw: MLXArray = wave(128, 0.1234567) + 3
+        let kw: MLXArray = wave(128, 0.2345678) + 3
+        let phases: MLXArray = wave(32 * 32 * 4, 0.9876543).reshaped([32, 32, 4])
+        let fparams: MLXArray = MLXArray([Float(1e-6), Float(1.0)])
+        // The walk check's bush and fork trees give the three branch paths.
+        var paths: [[Int32]] = (1 ... 16).map { width in (0 ..< width).map { Int32($0) } }
+        paths.append([0, 1, 2, 3, 4, 5, 6, 7, 8, 12])
+        paths.append([0, 6, 12, 14, 15])
+        paths.append([0, 1, 3, 5])
+        func record(_ path: [Int32], C: Int, offset: Int) -> [MLXArray] {
+            let index = MLXArray(path)
+            let tgs: Int = (32 * L + 16 * (C + L) + 3) / 4
+            return DF2Fast.qkvAllNormRopeKernel(
+                [
+                    q, bk, bv, ck.take(index, axis: 1), cv.take(index, axis: 1), qw, kw, phases,
+                    MLXArray([Int32(L), Int32(C), Int32(offset)]), fparams,
+                ],
+                template: [("PHASES", true)],
+                grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[1, 32, L, 128], [1, 8, C + L, 128], [1, 8, C + L, 128]],
+                outputDTypes: [.float32, .float32, .float32])
+        }
+        func window(_ path: [Int32], count: Int, offset: Int, base: Int) -> [MLXArray] {
+            let padded: [Int32] = path + [Int32](repeating: 0, count: 16 - path.count)
+            return DF2Fast.qkvWalkNormRopeKernel(
+                [
+                    q, bk, bv, ck, cv, qw, kw, phases,
+                    MLXArray([Int32(L), Int32(offset), Int32(base)]), fparams,
+                    MLXArray(padded), MLXArray([Int32(count)]),
+                ],
+                template: [("PHASES", true)],
+                grid: (256 * 128, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[1, 32, L, 128], [1, 8, 32, 128], [1, 8, 32, 128], [1]],
+                outputDTypes: [.float32, .float32, .float32, .int32])
+        }
+        var names: [String] = []
+        var checks: [MLXArray] = []
+        for path in paths {
+            let C: Int = path.count
+            for offset in [0, 37] {
+                let base: Int = 100 + offset
+                let want = record(path, C: C, offset: offset)
+                let got = window(path, count: C - 1, offset: offset, base: base)
+                let rows: Int = C + L
+                let label = "width \(C) offset \(offset)"
+                names.append("\(label) q")
+                checks.append(Self.bitsEqual(got[0], want[0]))
+                names.append("\(label) k")
+                checks.append(Self.bitsEqual(got[1][0..., 0..., 0 ..< rows, 0...], want[1]))
+                names.append("\(label) v")
+                checks.append(Self.bitsEqual(got[2][0..., 0..., 0 ..< rows, 0...], want[2]))
+                names.append("\(label) tail")
+                checks.append(
+                    MLX.logicalAnd(
+                        MLX.all(got[1][0..., 0..., rows..., 0...] .== 0),
+                        MLX.all(got[2][0..., 0..., rows..., 0...] .== 0)))
+                names.append("\(label) count")
+                checks.append(got[3][0] .== MLXArray(Int32(base + rows)))
+            }
+        }
+        // Negative control: a window one row wider than the record's context must differ.
+        let control = paths[6]
+        let narrow = record(control, C: 7, offset: 0)
+        let wide = window(control + [7], count: 7, offset: 0, base: 100)
+        names.append("negative control")
+        checks.append(MLX.logicalNot(Self.bitsEqual(wide[1][0..., 0..., 0 ..< 23, 0...], narrow[1])))
+        eval(checks)
+        for (name, check) in zip(names, checks) where !check.item(Bool.self) {
+            return name
+        }
+        return nil
+    }
+}
+
+extension DFlash2DraftModel {
+    /// Resolve `DF2Fast.walkLayerZeroValid` once at bind, after the front check: for every
+    /// context width 1...16 along a chain and for three paths that leave the chain, at cache
+    /// offsets 0 and 37, a proposal whose layer 0 ran before the readback on the walked path
+    /// must equal the record path bit for bit: layer 0's output and layer 1's input pieces,
+    /// the draft ids, the final hidden state and codes, and every layer's cache rows and
+    /// cursor. A width that differs is left out of the valid set. At widths 1, 8 and 16 and
+    /// on the branch paths, a window that is then dropped (the record path over it, with and
+    /// without the front) and a following round on both caches must also match; a difference
+    /// there empties the set.
+    func checkWalkedLayerZero() {
+        var note = "off"
+        var valid: Set<Int> = []
+        if DF2Fast.walkLayerZeroEnabled, DF2Fast.walkWindowMatched, DF2Fast.frontMatched,
+            DF2Fast.walkMatched
+        {
+            do {
+                let result = try withError { try walkedLayerZeroMismatches() }
+                valid = result.valid
+                if result.failures.isEmpty {
+                    note = "matched (widths 1...16)"
+                } else if valid.isEmpty {
+                    note = "failed (\(result.failures.joined(separator: "; ")))"
+                } else {
+                    note = "partial (valid \(valid.sorted()); \(result.failures.joined(separator: "; ")))"
+                }
+            } catch {
+                note = "failed (\(error))"
+                valid = []
+            }
+            if !DraftSDPA.enabled {
+                // The check ran the record's attention over rows cut by the host; the device
+                // count that the proposal needs runs on the M5-generation GPU only.
+                note += "; off here (the device-count attention needs applegpu_g17)"
+                valid = []
+            }
+        }
+        DF2Fast.walkLayerZeroValid = valid
+        FileHandle.standardError.write(Data("DF2 walk layer0 check: \(note)\n".utf8))
+    }
+
+    private func walkedLayerZeroMismatches() throws -> (valid: Set<Int>, failures: [String]) {
+        if DF2Fast.negativeControl == "check" { DF2Fast.injectFault() }
+        let blockSize: Int = config.dflash.blockSize
+        guard blockSize == 16 else { return ([], ["block size \(blockSize)"]) }
+        let width: Int = config.targetHiddenSize
+        let targets: [Int32] = (0 ..< blockSize).map { index in Int32(1000 + 37 * index) }
+        let ramp: MLXArray = MLXArray(0 ..< (blockSize * width)).asType(.float32)
+        let hidden: MLXArray = (MLX.sin(ramp * 0.7548776) * 2).reshaped([1, blockSize, width]).asType(dtype)
+        let later: MLXArray = (MLX.cos(ramp * 0.3141592) * 2).reshaped([1, blockSize, width]).asType(dtype)
+        let chain: [Int32] = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        let bush: [Int32] = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 8, 7, 13, 14]
+        let fork: [Int32] = [-1, 0, 1, 1, 3, 3, 0, 6, 7, 8, 8, 10, 6, 12, 12, 14]
+        func drafts(_ parents: [Int32], matching: Set<Int>) -> [Int32] {
+            (1 ..< 16).map { index in
+                matching.contains(index) ? targets[Int(parents[index])] : Int32(90000 + index)
+            }
+        }
+        var cases: [(String, [Int32], [Int32])] = (1 ... 16).map { count in
+            ("chain \(count)", chain, drafts(chain, matching: Set(1 ..< count)))
+        }
+        cases.append(("bush off at 8", bush, drafts(bush, matching: Set(1 ..< 9).union([12]))))
+        cases.append(("fork off at root", fork, drafts(fork, matching: [6, 12, 14, 15])))
+        cases.append(("fork off at 1", fork, drafts(fork, matching: [1, 3, 5])))
+        // The proposal adopts layer 0's output only for a width in the valid set: every width
+        // qualifies while the check runs, and the result is installed afterwards.
+        DF2Fast.walkLayerZeroValid = Set(1 ... 16)
+        defer { DF2Fast.walkLayerZeroValid = [] }
+        var valid: Set<Int> = Set(1 ... 16)
+        var failures: [String] = []
+        var leaked = false
+        for (name, parents, draft) in cases {
+            let path: [Int] = DF2Fast.hostTreeWalk(drafts: draft, targets: targets, parents: parents)
+            let rows: Int = path.count
+            let dropWidths: Set<Int> = [1, 8, blockSize]
+            let deep: Bool = dropWidths.contains(path.count) || path != Array(0 ..< rows)
+            for offset in [0, 37] {
+                if let note = try walkedMismatch(
+                    hidden: hidden, later: later, targets: targets, drafts: draft, parents: parents,
+                    path: path, offset: offset, deep: deep)
+                {
+                    failures.append("\(name) offset \(offset): \(note)")
+                    if note.hasPrefix("leak") { leaked = true } else { valid.remove(rows) }
+                }
+            }
+        }
+        if leaked { valid = [] }
+        return (valid, failures)
+    }
+
+    /// The first output that differs between the record path and the walked layer 0, or nil.
+    private func walkedMismatch(
+        hidden: MLXArray, later: MLXArray, targets: [Int32], drafts: [Int32], parents: [Int32],
+        path: [Int], offset: Int, deep: Bool
+    ) throws -> String? {
+        let blockSize: Int = config.dflash.blockSize
+        let rows: Int = path.count
+        let anchor: Int = Int(targets[path[rows - 1]])
+        let isBranch: Bool = path != Array(0 ..< rows)
+        let index = MLXArray(path.map { Int32($0) })
+        let context: MLXArray = isBranch ? hidden.take(index, axis: 1) : hidden[0..., 0 ..< rows, 0...]
+        let targetArray = MLXArray(targets)
+        func caches() throws -> [KVCache] {
+            let made = try makeCache()
+            for layerCache in made {
+                (layerCache as? DFlash2LayerKVCache)?.reserve(rows: 64)
+                (layerCache as? BaseKVCache)?.offset = offset
+            }
+            return made
+        }
+        /// The projection with the walked front, as `projectRoundContext` builds them.
+        func projected() -> (DFlash2ContextProjection, DFlash2LayerZeroFront)? {
+            guard let projection = projectContext(targetHidden: hidden, anchors: targetArray),
+                let front = projectLayerZeroFront(
+                    projection, draftTokens: MLXArray(drafts), targetTokens: targetArray,
+                    cacheOffset: offset, retainCodes: true, treeParents: MLXArray(parents)),
+                front.walked, front.walk != nil
+            else { return nil }
+            projection.front = front
+            return (projection, front)
+        }
+        /// The projection the proposal reads: the host gather along a branch path.
+        func committed(_ projection: DFlash2ContextProjection) -> DFlash2ContextProjection {
+            isBranch ? projection.gathered(path.map { Int32($0) }) : projection
+        }
+        func states(_ cache: [KVCache]) -> [(String, MLXArray)] {
+            cache.enumerated().flatMap { item -> [(String, MLXArray)] in
+                let state = item.element.state
+                guard state.count == 2 else { return [] }
+                return [("cache \(item.offset) keys", state[0]), ("cache \(item.offset) values", state[1])]
+            }
+        }
+        func metaEqual(_ a: [KVCache], _ b: [KVCache]) -> Bool {
+            zip(a, b).allSatisfy { $0.metaState == $1.metaState && $0.state.count == $1.state.count }
+        }
+        var pairs: [(String, MLXArray, MLXArray)] = []
+
+        // The record path: step 1's walked front, the host gather on a branch commit.
+        guard let (recordProjection, recordFront) = projected() else { return "no walked front" }
+        let recordCaches = try caches()
+        let recordRun = try proposeWithHidden(
+            anchor: [anchor], targetHidden: context, cache: recordCaches, blockSize: blockSize,
+            projection: committed(recordProjection))
+
+        // Layer 0 alone on the record path, for the pieces the extension hands layer 1.
+        let use = committed(recordProjection).use(rows: rows)
+        let layerCache = try caches()[0]
+        let step = layers[0].forwardFast(
+            recordFront.h, normedInput: recordFront.normed, normedCodes: nil,
+            nextNorm: layers[1].inputLayerNorm, nextQStart: 0,
+            context: use.context, rope: rope, cache: layerCache,
+            ropeSpec: recordFront.ropeSpec, contextCodes: nil,
+            precomputedContextKV: use.contextKV[0], submitAttention: false, front: recordFront)
+        guard let stepNormed = step.nextNormed, let stepCodes = step.nextCodes else {
+            return "no record layer 0"
+        }
+        let layer = layers[1]
+        let attention = layer.selfAttn
+        guard
+            let stepP1 = DF2Fast.w4LinearsFromCodes(
+                stepCodes, leadShape: [1, blockSize], [layer.attentionConv.kernelProjection])?.first,
+            let stepQKV = DF2Fast.linearsConv0(
+                stepNormed, dyn: stepP1, base: layer.attentionConv.fastBase,
+                [attention.qProj, attention.kProj, attention.vProj])
+        else { return "no record layer 1 pieces" }
+
+        // The walked layer 0: built on the cache before the proposal, then adopted by it.
+        guard let (walkedProjection, walkedFront) = projected() else { return "no walked front" }
+        let walkedCaches = try caches()
+        let hostRows: Int? = DraftSDPA.enabled ? nil : rows
+        let queued = projectWalkedLayerZero(
+            walkedProjection, front: walkedFront, cache: walkedCaches[0], retainCodes: true,
+            hostRows: hostRows)
+        guard !queued.isEmpty, let layerOne = walkedFront.layerOne, let oneCodes = layerOne.codes
+        else { return "no extension" }
+        asyncEval(queued)
+        guard usableLayerOne(walkedFront, rows: rows, cache: walkedCaches) != nil else {
+            return "extension not consumed"
+        }
+        let walkedRun = try proposeWithHidden(
+            anchor: [anchor], targetHidden: context, cache: walkedCaches, blockSize: blockSize,
+            projection: committed(walkedProjection))
+        pairs.append(("layer 0 h", layerOne.h, step.h))
+        pairs.append(("layer 1 normed", layerOne.normed, stepNormed))
+        pairs.append(("layer 1 xq", oneCodes.xq, stepCodes.xq))
+        pairs.append(("layer 1 ascale", oneCodes.ascale, stepCodes.ascale))
+        pairs.append(("layer 1 xs", oneCodes.xs, stepCodes.xs))
+        pairs.append(("layer 1 p1", layerOne.p1, stepP1))
+        pairs.append(("layer 1 q", layerOne.queries, stepQKV[0]))
+        pairs.append(("layer 1 k", layerOne.keys, stepQKV[1]))
+        pairs.append(("layer 1 v", layerOne.values, stepQKV[2]))
+        pairs.append(("draft ids", walkedRun.tokens, recordRun.tokens))
+        pairs.append(("final hidden", walkedRun.hidden, recordRun.hidden))
+        switch (walkedRun.codes, recordRun.codes) {
+        case (.some(let a), .some(let b)):
+            pairs.append(("final xq", a.xq, b.xq))
+            pairs.append(("final ascale", a.ascale, b.ascale))
+            pairs.append(("final xs", a.xs, b.xs))
+        case (.none, .none):
+            break
+        default:
+            return "final codes"
+        }
+        guard metaEqual(walkedCaches, recordCaches) else { return "cache cursor" }
+        for (walked, record) in zip(states(walkedCaches), states(recordCaches)) {
+            pairs.append((walked.0, walked.1, record.1))
+        }
+        var checks: [MLXArray] = pairs.map { Self.bitsEqual($0.1, $0.2) }
+        eval(checks)
+        for (pair, check) in zip(pairs, checks) where !check.item(Bool.self) {
+            return pair.0
+        }
+        guard deep else { return nil }
+
+        // A written window that the round then drops: the record path over it, with no front
+        // (the host confirmed another width) and with step 1's front (a width the check
+        // refused), against clean caches.
+        pairs = []
+        let dropRows: Int = max(1, rows - 1)
+        let dropAnchor: Int = Int(targets[dropRows - 1])
+        let dropContext: MLXArray = hidden[0..., 0 ..< dropRows, 0...]
+        guard let (droppedProjection, droppedFront) = projected() else { return "no walked front" }
+        let droppedCaches = try caches()
+        asyncEval(
+            projectWalkedLayerZero(
+                droppedProjection, front: droppedFront, cache: droppedCaches[0], hostRows: hostRows))
+        droppedProjection.front = nil
+        let droppedRun = try proposeWithHidden(
+            anchor: [dropAnchor], targetHidden: dropContext, cache: droppedCaches, blockSize: blockSize,
+            projection: droppedProjection)
+        guard let cleanProjection = projectContext(targetHidden: hidden, anchors: targetArray) else {
+            return "no projection"
+        }
+        let cleanCaches = try caches()
+        let cleanRun = try proposeWithHidden(
+            anchor: [dropAnchor], targetHidden: dropContext, cache: cleanCaches, blockSize: blockSize,
+            projection: cleanProjection)
+        pairs.append(("leak: dropped draft ids", droppedRun.tokens, cleanRun.tokens))
+        pairs.append(("leak: dropped final hidden", droppedRun.hidden, cleanRun.hidden))
+        guard metaEqual(droppedCaches, cleanCaches) else { return "leak: dropped cache cursor" }
+        for (dropped, clean) in zip(states(droppedCaches), states(cleanCaches)) {
+            pairs.append(("leak: dropped " + dropped.0, dropped.1, clean.1))
+        }
+        guard let (refusedProjection, refusedFront) = projected() else { return "no walked front" }
+        let refusedCaches = try caches()
+        asyncEval(
+            projectWalkedLayerZero(
+                refusedProjection, front: refusedFront, cache: refusedCaches[0], hostRows: hostRows))
+        DF2Fast.walkLayerZeroValid = []
+        let refusedRun = try proposeWithHidden(
+            anchor: [anchor], targetHidden: context, cache: refusedCaches, blockSize: blockSize,
+            projection: committed(refusedProjection))
+        DF2Fast.walkLayerZeroValid = Set(1 ... 16)
+        pairs.append(("leak: refused draft ids", refusedRun.tokens, recordRun.tokens))
+        pairs.append(("leak: refused final hidden", refusedRun.hidden, recordRun.hidden))
+        guard metaEqual(refusedCaches, recordCaches) else { return "leak: refused cache cursor" }
+        for (refused, record) in zip(states(refusedCaches), states(recordCaches)) {
+            pairs.append(("leak: refused " + refused.0, refused.1, record.1))
+        }
+
+        // The following round on both caches, over new context rows with no projection.
+        let nextRows: Int = 3
+        let nextContext: MLXArray = later[0..., 0 ..< nextRows, 0...]
+        let nextAnchor: Int = Int(targets[0]) + 7
+        let walkedNext = try proposeWithHidden(
+            anchor: [nextAnchor], targetHidden: nextContext, cache: walkedCaches, blockSize: blockSize,
+            projection: nil)
+        let recordNext = try proposeWithHidden(
+            anchor: [nextAnchor], targetHidden: nextContext, cache: recordCaches, blockSize: blockSize,
+            projection: nil)
+        pairs.append(("leak: next draft ids", walkedNext.tokens, recordNext.tokens))
+        pairs.append(("leak: next final hidden", walkedNext.hidden, recordNext.hidden))
+        guard metaEqual(walkedCaches, recordCaches) else { return "leak: next cache cursor" }
+        for (walked, record) in zip(states(walkedCaches), states(recordCaches)) {
+            pairs.append(("leak: next " + walked.0, walked.1, record.1))
+        }
+        checks = pairs.map { Self.bitsEqual($0.1, $0.2) }
+        eval(checks)
+        for (pair, check) in zip(pairs, checks) where !check.item(Bool.self) {
+            return pair.0
+        }
+        return nil
     }
 }
 
@@ -7219,8 +8177,10 @@ private enum DraftSDPA {
     static let cachedQueries = ProcessInfo.processInfo.environment["DF2_SDPA16_CACHEQ"] != "0"
     static let limitedThreads = ProcessInfo.processInfo.environment["DF2_SDPA16_LIMIT"] != "0"
 
+    /// With `count`, the key count is read from that `[1]` int32 buffer instead of `k`'s
+    /// shape: the same loop over the same first `count` rows of a longer view.
     static func attention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray,
-                          scale: Float) -> MLXArray? {
+                          scale: Float, count: MLXArray? = nil) -> MLXArray? {
         guard enabled, q.dtype == .float32, k.dtype == .float32, v.dtype == .float32,
             q.ndim == 4, k.ndim == 4, v.ndim == 4,
             q.shape4 == (1, 32, 16, 128)
@@ -7232,7 +8192,8 @@ private enum DraftSDPA {
             v.hasNonNegativeUnitInnerStride4
         else { return nil }
         return run(q, k, v, scale: scale, columns: columns, cacheQueries: cachedQueries,
-                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads)
+                   queryRows: queryRows, headsPerGroup: groupedHeads, limitThreads: limitedThreads,
+                   count: count)
     }
 
     static let header = """
@@ -7392,9 +8353,16 @@ private enum DraftSDPA {
         }
         """
 
-    static func makeKernel(heads: Int, limitThreads: Bool) -> MLXFast.MLXFastKernel {
+    /// `source` with the key count read from the `n_in` buffer: one exact-once cut.
+    static let countedSource: String = {
+        let cut = "const int n = k_shape[2];"
+        precondition(source.components(separatedBy: cut).count == 2, "DraftSDPA: key count cut")
+        return source.replacingOccurrences(of: cut, with: "const int n = n_in[0];")
+    }()
+
+    static func makeKernel(heads: Int, limitThreads: Bool, counted: Bool = false) -> MLXFast.MLXFastKernel {
         var h = header
-        var s = source
+        var s = counted ? countedSource : source
         if limitThreads {
             // Scope the attribute to the definition; Metal rejects it when
             // repeated on MLX's following explicit instantiation declaration.
@@ -7402,8 +8370,9 @@ private enum DraftSDPA {
             s += "\n#pragma clang attribute pop\n"
         }
         return MLXFast.metalKernel(
-            name: "df2_sdpa16_h\(heads)_t\(limitThreads ? 32 * heads : 0)",
-            inputNames: ["q", "k", "v", "scale_in"], outputNames: ["out"],
+            name: "df2_sdpa16_h\(heads)_t\(limitThreads ? 32 * heads : 0)\(counted ? "_n" : "")",
+            inputNames: counted ? ["q", "k", "v", "scale_in", "n_in"] : ["q", "k", "v", "scale_in"],
+            outputNames: ["out"],
             source: s, header: h, ensureRowContiguous: false)
     }
     private static let plain1 = makeKernel(heads: 1, limitThreads: false)
@@ -7412,6 +8381,12 @@ private enum DraftSDPA {
     private static let limited1 = makeKernel(heads: 1, limitThreads: true)
     private static let limited2 = makeKernel(heads: 2, limitThreads: true)
     private static let limited4 = makeKernel(heads: 4, limitThreads: true)
+    private static let counted1 = makeKernel(heads: 1, limitThreads: false, counted: true)
+    private static let counted2 = makeKernel(heads: 2, limitThreads: false, counted: true)
+    private static let counted4 = makeKernel(heads: 4, limitThreads: false, counted: true)
+    private static let countedLimited1 = makeKernel(heads: 1, limitThreads: true, counted: true)
+    private static let countedLimited2 = makeKernel(heads: 2, limitThreads: true, counted: true)
+    private static let countedLimited4 = makeKernel(heads: 4, limitThreads: true, counted: true)
     private static let defaultScale: Float = Float(1.0 / Double(128).squareRoot())
     nonisolated(unsafe) private static let defaultScaleArray: MLXArray = {
         let a = MLXArray(defaultScale)
@@ -7422,18 +8397,25 @@ private enum DraftSDPA {
     static func run(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float,
                     columns: Int = 128, cacheQueries: Bool = false,
                     queryRows: Int = 16, headsPerGroup: Int = 1,
-                    limitThreads: Bool = false) -> MLXArray {
+                    limitThreads: Bool = false, count: MLXArray? = nil) -> MLXArray {
         let kernel: MLXFast.MLXFastKernel
-        switch (limitThreads, headsPerGroup) {
-        case (false, 1): kernel = plain1
-        case (false, 2): kernel = plain2
-        case (false, _): kernel = plain4
-        case (true, 1): kernel = limited1
-        case (true, 2): kernel = limited2
-        case (true, _): kernel = limited4
+        switch (count != nil, limitThreads, headsPerGroup) {
+        case (false, false, 1): kernel = plain1
+        case (false, false, 2): kernel = plain2
+        case (false, false, _): kernel = plain4
+        case (false, true, 1): kernel = limited1
+        case (false, true, 2): kernel = limited2
+        case (false, true, _): kernel = limited4
+        case (true, false, 1): kernel = counted1
+        case (true, false, 2): kernel = counted2
+        case (true, false, _): kernel = counted4
+        case (true, true, 1): kernel = countedLimited1
+        case (true, true, 2): kernel = countedLimited2
+        case (true, true, _): kernel = countedLimited4
         }
         let scaleArray = scale.bitPattern == defaultScale.bitPattern ? defaultScaleArray : MLXArray(scale)
-        return kernel([q, k, v, scaleArray],
+        let inputs: [MLXArray] = count.map { [q, k, v, scaleArray, $0] } ?? [q, k, v, scaleArray]
+        return kernel(inputs,
                template: [("DCS", columns), ("CACHE_Q", cacheQueries), ("Q_ROWS", queryRows), ("HCOUNT", headsPerGroup)],
                grid: (32 * headsPerGroup * (128 / columns), 32 / headsPerGroup, 16 / queryRows),
                threadGroup: (32 * headsPerGroup, 1, 1),
