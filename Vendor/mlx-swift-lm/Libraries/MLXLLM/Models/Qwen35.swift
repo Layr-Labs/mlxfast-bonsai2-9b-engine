@@ -6973,6 +6973,9 @@ extension Qwen35TextModel: DFlash2TapTarget {
         if rows == 16 {
             Qwen35FusedGDNVerify.prepare()
             CBv2VerifyAttentionPartial.prepareLean()
+            CBv2VerifyAttentionPartial.prepareQueryBlocks(
+                queryHeads: configuration.attentionHeads, kvHeads: configuration.kvHeads,
+                headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
         }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))

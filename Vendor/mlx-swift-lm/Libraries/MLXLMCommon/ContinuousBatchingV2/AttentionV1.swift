@@ -27,28 +27,118 @@ enum CBv2AttentionV1 {
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
-    /// the composed path is ~4-5 Metal dispatches per call, so very small
-    /// blocks trade GPU efficiency for FLOPs already saved.
+    /// the composed path is ~8 Metal dispatches per call at L > 8, D = 256.
     ///
-    /// 128 keeps >97% of the achievable work reduction at a quarter of the
-    /// launch overhead of 32. `0` disables blocking entirely (one call for the
-    /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
-    /// this is ever implicated in a numerics or latency regression.
-    static let queryBlockSize: Int = {
+    /// A 512-row prompt attends in one call per layer when the width is 512:
+    /// the masked upper triangle costs a little arithmetic and saves three
+    /// dispatch chains per layer. A width other than 128 is used only after
+    /// `resolveQueryBlock` found its outputs bitwise equal to 128's on this
+    /// device; before that (and on any difference) the width is 128. `0`
+    /// disables blocking entirely (one call for the whole chunk), and
+    /// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=128` restores the 128 path.
+    static var queryBlockSize: Int { checkedQueryBlock ?? queryBlockEnvironment ?? 128 }
+
+    private static let queryBlockEnvironment: Int? = {
         guard
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
-        else { return 128 }
+        else { return nil }
         return value
     }()
+
+    nonisolated(unsafe) private static var checkedQueryBlock: Int?
 
     /// Whether a chunk of `L` queries should be split into blocks. Single
     /// queries (decode) and chunks already at or below the block width take
     /// the unchanged single-call path, so decode is provably untouched.
     @inline(__always)
     static func shouldBlockQueries(_ L: Int) -> Bool {
-        queryBlockSize > 0 && L > queryBlockSize
+        let width = queryBlockSize
+        return width > 0 && L > width
+    }
+
+    /// Chooses the query-block width once, at load: the requested width
+    /// (env, else 512) when its outputs equal the 128-wide blocks' bit for bit
+    /// on synthetic prompts of the model's shapes, else 128.
+    static func resolveQueryBlock(queryHeads: Int, kvHeads: Int, headDim: Int) {
+        guard checkedQueryBlock == nil else { return }
+        let requested = queryBlockEnvironment ?? 512
+        var chosen = 128
+        if requested == 128 {
+            chosen = 128
+        } else {
+            var same = false
+            do {
+                same = try withError {
+                    queryBlockBitsMatch(
+                        width: requested, queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim)
+                }
+            } catch {
+                FileHandle.standardError.write(Data("attn query block check error: \(error)\n".utf8))
+            }
+            if same { chosen = requested }
+            FileHandle.standardError.write(
+                Data("attn query block \(requested): \(same ? "bitwise equal to 128" : "differs from 128, using 128")\n".utf8))
+        }
+        checkedQueryBlock = chosen
+    }
+
+    /// Mirrors the timed prompt call: `Qwen35Attention` hands `[1, heads, rows, D]`
+    /// queries (float32 from the fused Q/K norm + RoPE kernel, else the cache
+    /// dtype) to `cache.updateAndAttend`, which reaches `updateAndAttendRow`
+    /// and `attendQueryBlocks` with K/V gathered from the paged pool in the
+    /// pool dtype (`PagedSegmentTransfers.gatherCombined` returns two slices of
+    /// one `[2, 1, kvHeads, rows, D]` buffer; `PagedKVPool.gather` returns a
+    /// slice of a longer gathered sequence). Three K/V layouts are compared:
+    /// slices of a combined buffer, fresh contiguous arrays, and `rows`-long
+    /// slices of a 1024-long buffer.
+    /// `attend` then widens K/V to the query dtype and runs causal fused
+    /// attention with no window, sinks or softcap. Every (query dtype, pool dtype) pair is compared
+    /// in each layout.
+    private static func queryBlockBitsMatch(
+        width: Int, queryHeads: Int, kvHeads: Int, headDim: Int
+    ) -> Bool {
+        let scale = 1 / Float(headDim).squareRoot()
+        let pairs: [(query: DType, pool: DType)] = [
+            (.float32, .float32), (.float32, .bfloat16), (.float32, .float16),
+            (.bfloat16, .bfloat16), (.float16, .float16),
+        ]
+        for (queryType, poolType) in pairs {
+            let bits: DType = queryType == .float32 ? .uint32 : .uint16
+            for rows in [512, 192] {
+                let q = MLXRandom.normal(
+                    [1, queryHeads, rows, headDim], dtype: queryType, key: MLXRandom.key(0xA770))
+                let combined = MLXRandom.normal(
+                    [2, 1, kvHeads, rows, headDim], dtype: poolType, key: MLXRandom.key(0xA771))
+                let longer = MLXRandom.normal(
+                    [2, 1, kvHeads, 1024, headDim], dtype: poolType, key: MLXRandom.key(0xA772))
+                let gathered: [(MLXArray, MLXArray)] = [
+                    (combined[0], combined[1]), (combined[0] + 0, combined[1] + 0),
+                    (longer[0, 0..., 0..., 0 ..< rows, 0...], longer[1, 0..., 0..., 0 ..< rows, 0...]),
+                ]
+                for (k, v) in gathered {
+                    let record = attendChunk(q, k, v, scale: scale, rows: rows, width: 128)
+                    let candidate = attendChunk(q, k, v, scale: scale, rows: rows, width: width)
+                    let equal = MLX.all(record.view(dtype: bits) .== candidate.view(dtype: bits))
+                    if !equal.item(Bool.self) { return false }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func attendChunk(
+        _ q: MLXArray, _ k: MLXArray, _ v: MLXArray, scale: Float, rows: Int, width: Int
+    ) -> MLXArray {
+        if width > 0 && rows > width {
+            return attendQueryBlocks(
+                queries: q, keys: k, values: v, newTokenCount: rows, window: nil,
+                scale: scale, sinks: nil, softcap: nil, blockSize: width)
+        }
+        return attend(
+            queries: q, keys: k, values: v, scale: scale, L: rows, kL: rows, window: nil,
+            sinks: nil, softcap: nil)
     }
 
     /// The sink logits an `MLXFast.scaledDotProductAttention` call may be
@@ -1593,6 +1683,11 @@ public enum CBv2VerifyAttentionPartial {
 
     /// Runs the lean twins' one-time bit check at load.
     public static func prepareLean() { CBv2VerifyVectorAttention.prepareLean() }
+
+    /// Runs the prompt attention query-block width's one-time bit check at load.
+    public static func prepareQueryBlocks(queryHeads: Int, kvHeads: Int, headDim: Int) {
+        CBv2AttentionV1.resolveQueryBlock(queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim)
+    }
 }
 
 /// Draft tree verify: the round's tree descriptor (int32 [333], `DF2Fast.treeSource`) for
