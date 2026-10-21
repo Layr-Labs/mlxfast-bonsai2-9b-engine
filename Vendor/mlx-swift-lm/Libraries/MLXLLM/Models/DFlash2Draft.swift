@@ -486,6 +486,15 @@ public final class DFlash2TapSlot {
     /// The tapped layers of the last forward, fused along the feature axis.
     public var tappedHidden: MLXArray?
 
+    /// Armed for one forward: the drafter's context projection of the packed
+    /// taps, built inside that forward so the head's screen launch hides its
+    /// weight stream. The forward clears it.
+    public var projector: ((MLXArray) -> MLXArray?)?
+
+    /// That forward's packed taps and their projection, read by the round's
+    /// `projectRoundContext`; nil when nothing was armed.
+    public var projected: (input: MLXArray, output: MLXArray)?
+
     public init() {}
 }
 
@@ -506,6 +515,10 @@ public protocol DFlash2TapTarget: DFlash2Target {
     /// The tapped layers of the LAST forward, fused along the feature axis:
     /// `[B, L, taps * hidden]`. Nil when the tap was off for that forward.
     var dFlash2TappedHidden: MLXArray? { get }
+
+    /// `DFlash2TapSlot.projector` and `DFlash2TapSlot.projected`.
+    var dFlash2TapProjector: ((MLXArray) -> MLXArray?)? { get set }
+    var dFlash2ProjectedTap: (input: MLXArray, output: MLXArray)? { get }
 
     /// How many layers the tower has, so the ids can be checked before a run.
     var dFlash2LayerCount: Int { get }
@@ -2047,7 +2060,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// round that confirms `c` columns reads the first `c` rows of each and the
     /// anchor row `c - 1` instead of recomputing them. nil when the fast path
     /// does not apply.
-    public func projectContext(targetHidden: MLXArray, anchors: MLXArray) -> DFlash2ContextProjection? {
+    public func projectContext(
+        targetHidden: MLXArray, anchors: MLXArray, fcOutput: MLXArray? = nil
+    ) -> DFlash2ContextProjection? {
         guard let target, DF2Fast.on, fc is QuantizedLinear, layers.count == 6,
             let group = DF2Fast.w4Group, targetHidden.ndim == 3, targetHidden.dim(0) == 1,
             (1 ... 16).contains(targetHidden.dim(1)),
@@ -2055,7 +2070,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             anchors.size == targetHidden.dim(1)
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
-        let fcOut = DF2Fast.linear(fcInput, fc)
+        let fcOut = fcOutput ?? DF2Fast.linear(fcInput, fc)
         guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
         let context = normed.0
         guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
@@ -2063,6 +2078,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
             anchorEmbeddings: embeddings, context: context, contextKV: kv, lookupFCOutput: lookupFC)
+    }
+
+    /// The context `fc` launch of `projectContext` alone, the same call on the
+    /// same input, for the target forward that builds it ahead of the
+    /// projection (`DFlash2TapSlot.projector`); `projectContext` then takes it
+    /// as `fcOutput`. nil when `projectContext` would not run.
+    public func projectContextFC(_ targetHidden: MLXArray) -> MLXArray? {
+        guard target != nil, DF2Fast.on, fc is QuantizedLinear, layers.count == 6,
+            DF2Fast.w4Group != nil, targetHidden.ndim == 3, targetHidden.dim(0) == 1,
+            (1 ... 16).contains(targetHidden.dim(1)),
+            targetHidden.dim(-1) == config.targetHiddenSize
+        else { return nil }
+        return DF2Fast.linear(targetHidden.asType(dtype), fc)
     }
 
     /// Every layer's context keys and values from the context codes, in the

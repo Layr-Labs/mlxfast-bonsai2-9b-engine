@@ -535,6 +535,12 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     /// the round confirmed exactly `accepted + 1` columns.
     func recordValidatedAcceptance(_ accepted: Int, requestState: any CBv2MTPRequestState)
 
+    /// OPTIONAL (defaulted): called right before the round's verify forward
+    /// when the engine will queue `projectRoundContext` behind it, so the
+    /// drafter may build the acceptance-independent part of that projection
+    /// inside the forward. The default builds nothing early.
+    func armRoundContextProjection(requestState: any CBv2MTPRequestState)
+
     /// OPTIONAL (defaulted): committed-context work the drafter postponed
     /// while proposing this round (it needs none of it for this round's
     /// proposal). The engine queues the returned arrays right behind the
@@ -571,6 +577,8 @@ extension CBv2MTPBlockDrafter {
     public func recordValidatedAcceptance(
         _ accepted: Int, requestState: any CBv2MTPRequestState
     ) {}
+
+    public func armRoundContextProjection(requestState: any CBv2MTPRequestState) {}
 
     public func submitDeferredContext(
         requestState: any CBv2MTPRequestState, after: MLXArray

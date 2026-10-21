@@ -9047,7 +9047,7 @@ extension HadamardQuantizedLinear {
     /// `topTwoRows(rmsNorm(x + delta, weight))` with the residual add, RMSNorm,
     /// Hadamard rotation and int8 verify quantization fused into one kernel.
     public func topTwoRowsAfterResidualNorm(
-        _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float
+        _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float, beside: MLXArray? = nil
     ) -> (ids: MLXArray, values: MLXArray, residual: MLXArray)? {
         guard readsFloat16ConstantsInPlace, bias == nil,
             x.ndim >= 1, x.dim(-1) == transform.width
@@ -9060,7 +9060,7 @@ extension HadamardQuantizedLinear {
             let fused = transform.residualNormVerifyRotated(
                 x, residual: delta, weight: weight, eps: eps, headError2: needsHeadResidualL2(rows: rows)),
             let topTwo = exactHeadTopTwo(
-                activation: fused.activation, rotated: fused.rotated, rows: rows, error2: fused.error2)
+                activation: fused.activation, rotated: fused.rotated, rows: rows, error2: fused.error2, beside: beside)
         else { return nil }
         return (topTwo.ids, topTwo.values, fused.residual)
     }
@@ -9080,8 +9080,9 @@ extension HadamardQuantizedLinear {
         return exactHeadTopTwo(activation: activation, rotated: rotated, rows: rows, error2: error2)
     }
 
+    /// `beside`: submitted right behind the screen launch, in the command buffer after its weight commits it.
     private func exactHeadTopTwo(
-        activation: PromptInt8Activation, rotated: MLXArray, rows: Int, error2: MLXArray? = nil
+        activation: PromptInt8Activation, rotated: MLXArray, rows: Int, error2: MLXArray? = nil, beside: MLXArray? = nil
     ) -> (ids: MLXArray, values: MLXArray)? {
         var compactParallelCandidate: (ids: MLXArray, values: MLXArray)?
         var residualL2Candidate: (ids: MLXArray, values: MLXArray)?
@@ -9112,6 +9113,7 @@ extension HadamardQuantizedLinear {
                 }
                 summary = canonical
             }
+            if let beside { asyncEval([beside, summary.ids]) }
             let bounds = exactHeadBounds.get(weight: weight, scales: scales, biases: biases!)
             func parallel(tight: Bool = false, anchors: Bool = false, partitionL2: Bool = false) -> (ids: MLXArray, values: MLXArray) {
                 ExactVerifyHead.runCompactParallel(

@@ -765,6 +765,13 @@ extension EngineLoopV2 {
             ? [seedColumn]
             : ([seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) })
 
+        if let block = mtp.blockDrafter, verifyRows.count == 1, Self.mtpRoundContextProjectionEnabled,
+            mtp.lookupNgram == nil, rowMetadata[0].lookupCarry == nil,
+            let state = rowMetadata[0].assistantState,
+            verifyRows[0].rec.request.maxTokens - verifyRows[0].rec.generatedTokenCount > 1 + k
+        {
+            block.armRoundContextProjection(requestState: state)
+        }
         let target = try {
             CBv2BranchVerify.tree = treeDesc
             defer { CBv2BranchVerify.tree = nil }

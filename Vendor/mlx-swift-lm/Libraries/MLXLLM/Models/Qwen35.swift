@@ -6701,6 +6701,18 @@ public class Qwen35TextModelInner: Module {
                 dFlash2Tap.tappedHidden = concatenated(unpacked, axis: -1)
             }
         }
+        dFlash2Tap.projected = nil
+        if let projector = dFlash2Tap.projector {
+            dFlash2Tap.projector = nil
+            if let packed = dFlash2Tap.tappedHidden {
+                // Its own submission, so the launch that reads it waits on no
+                // fence of the head's command buffer.
+                asyncEval(packed)
+                if let output = projector(packed) {
+                    dFlash2Tap.projected = (packed, output)
+                }
+            }
+        }
         return (hiddenStates, pendingDelta)
     }
 
@@ -7122,7 +7134,8 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             Qwen35InlineMTPAssistant.shortlistSize == nil,
             Qwen35TextModel.mtpDiagnosticsOff(),
             let fusedTopTwo = head.topTwoRowsAfterResidualNorm(
-                hiddenRaw, delta: delta, weight: model.norm.weight, eps: model.norm.eps)
+                hiddenRaw, delta: delta, weight: model.norm.weight, eps: model.norm.eps,
+                beside: model.dFlash2Tap.projected?.output)
         {
             verifyHeadTopTwo.value = (fusedTopTwo.ids, fusedTopTwo.values)
             let hidden = fusedTopTwo.residual
@@ -7189,6 +7202,13 @@ extension Qwen35TextModel: DFlash2TapTarget {
     }
 
     public var dFlash2TappedHidden: MLXArray? { model.dFlash2Tap.tappedHidden }
+
+    public var dFlash2TapProjector: ((MLXArray) -> MLXArray?)? {
+        get { model.dFlash2Tap.projector }
+        set { model.dFlash2Tap.projector = newValue }
+    }
+
+    public var dFlash2ProjectedTap: (input: MLXArray, output: MLXArray)? { model.dFlash2Tap.projected }
 
     public func embedTokensForDFlash2(_ tokens: MLXArray) -> MLXArray {
         model.embedTokens(tokens)
@@ -7505,6 +7525,13 @@ extension Qwen35Model: DFlash2TapTarget {
     }
 
     public var dFlash2TappedHidden: MLXArray? { languageModel.dFlash2TappedHidden }
+
+    public var dFlash2TapProjector: ((MLXArray) -> MLXArray?)? {
+        get { languageModel.dFlash2TapProjector }
+        set { languageModel.dFlash2TapProjector = newValue }
+    }
+
+    public var dFlash2ProjectedTap: (input: MLXArray, output: MLXArray)? { languageModel.dFlash2ProjectedTap }
 
     public func embedTokensForDFlash2(_ tokens: MLXArray) -> MLXArray {
         languageModel.embedTokensForDFlash2(tokens)

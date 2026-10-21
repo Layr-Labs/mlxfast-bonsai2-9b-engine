@@ -137,6 +137,21 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         target.dFlash2TappedHidden
     }
 
+    /// `DARKBLOOM_BONSAI_CTXCHAIN=0` builds the context `fc` projection after
+    /// the acceptance packet, with the rest of `projectRoundContext`.
+    static let contextChainEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_CTXCHAIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    public func armRoundContextProjection(requestState: any CBv2MTPRequestState) {
+        let state = self.state(requestState)
+        guard Self.contextChainEnabled, !state.lastProposalLookup else { return }
+        let drafter = self.drafter
+        target.dFlash2TapProjector = { (tap: MLXArray) -> MLXArray? in drafter.projectContextFC(tap) }
+    }
+
     // MARK: - Request state
 
     /// One request's drafter cache and the committed context rows it has not
@@ -476,9 +491,15 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         state.frontAccepted = nil
         // Lookup rounds come in runs, and the next lookup round would only
         // queue unused work in front of its verify.
+        // The verify forward's own `fc` launch, when it projected this very tap.
+        var fcOutput: MLXArray?
+        if let pair = target.dFlash2ProjectedTap, pair.input === blockContext {
+            fcOutput = pair.output
+        }
         guard !state.lastProposalLookup, blockContext.ndim == 3, blockContext.dim(0) == 1,
             let projection = drafter.projectContext(
-                targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens)
+                targetHidden: blockContext.asType(drafter.dtype), anchors: targetTokens,
+                fcOutput: fcOutput)
         else { return [] }
         state.projection = projection
         var arrays = projection.evaluationTargets
