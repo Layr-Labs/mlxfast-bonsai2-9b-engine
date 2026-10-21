@@ -5806,9 +5806,10 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             x, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
+            swigluDown: dense.downProj as? HadamardQuantizedLinear)
         {
-            return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+            return (post.residual, dense.qwen35ProjectedGateUp(post.projections))
         }
         let h = x + r
         return (h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
@@ -5856,11 +5857,12 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             boundary.residual, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
+            swigluDown: dense.downProj as? HadamardQuantizedLinear)
         {
             return (
                 boundary.residual, post.residual,
-                dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
+                dense.qwen35ProjectedGateUp(post.projections))
         }
         let h = boundary.residual + r
         return (boundary.residual, h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
