@@ -552,13 +552,9 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, attentionGate: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `forward(attention * sigmoid(gate))` quantized for `VerifyInt8Matmul`,
-    /// for a gated full-attention output: `attention` is the `[1, 16, rows,
-    /// 256]` attention result in its head-major layout and the gate is the
-    /// second half of each 512-wide head of the `[1, rows, 8192]` query
-    /// projection. The kernel reads both in place, so the head transpose and
-    /// the gate slice need no copies, and forms MLX's `x * sigmoid(gate)`
-    /// (stable sigmoid) bit for bit. Nil when the shapes do not qualify.
+    /// `forward(attention * sigmoid(gate))` quantized for `VerifyInt8Matmul`: `attention` `[1, 16, rows, 256]` head-major,
+    /// the gate the second half of each 512-wide head of the `[1, rows, 8192]` query projection, both read in place;
+    /// MLX's `x * sigmoid(gate)` (stable sigmoid) bit for bit. Nil when the shapes do not qualify.
     func quantizedForVerifyAttentionGate(
         _ attention: MLXArray, queryProjection: MLXArray
     ) -> PromptInt8Activation? {
@@ -572,8 +568,7 @@ public struct SignedBlockHadamard {
         let rows = attention.dim(2)
         let outputs = Self.wideRowVerify(
             .attentionGate, [attention, queryProjection.reshaped([rows, 8192]), signs], rows: rows)
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
     private static let attentionGatePromptQuantized4096Kernel = MLXFast.metalKernel(
@@ -584,11 +579,8 @@ public struct SignedBlockHadamard {
             of: "* uint(VERIFY_ROWS) + ag_row", with: "* uint(ATTENTION_ROWS) + ag_row"),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `quantizedForVerifyAttentionGate` at prompt width: the same kernel
-    /// arithmetic, with the head-major attention rows given by
-    /// `ATTENTION_ROWS`, the codes `[rows, width]` and the constants in the
-    /// row-tiled order `PromptInt8Matmul` reads. Nil when the shapes do not
-    /// qualify.
+    /// `quantizedForVerifyAttentionGate` at prompt width: the same arithmetic with the head-major attention rows given by
+    /// `ATTENTION_ROWS`, codes `[rows, width]`, constants in `PromptInt8Matmul`'s row-tiled order. Nil when shapes do not qualify.
     func quantizedForPromptAttentionGate(
         _ attention: MLXArray, queryProjection: MLXArray
     ) -> PromptInt8Activation? {
@@ -607,8 +599,7 @@ public struct SignedBlockHadamard {
             grid: (256, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
             outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
     /// `quantizedForPromptAttentionGate` for a single last-query prefill row (`rows == 1`),
@@ -627,16 +618,11 @@ public struct SignedBlockHadamard {
             grid: (256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 4096], [64 * 32], [64 * 32]],
             outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: 1, k: 4096)
+        return PromptInt8Activation(outputs, rows: 1, k: 4096)
     }
 
-    /// `forward(silu(gate) * rmsNorm(x, weight))` quantized for
-    /// `VerifyInt8Matmul`, with the RMSNorm over 128-wide heads: the GDN
-    /// output gate, its norm and the out-projection rotation in one kernel.
-    /// The values entering the rotation are bit-identical to MLX `rmsNorm`,
-    /// `silu` and the multiply. Nil when the shape is not a verify-width
-    /// FP32 4096-wide input.
+    /// `forward(silu(gate) * rmsNorm(x, weight))` quantized for `VerifyInt8Matmul`, RMSNorm over 128-wide heads: the GDN
+    /// output gate, its norm and the rotation in one kernel, bit-identical to MLX `rmsNorm`, `silu` and the multiply.
     func quantizedForVerifyGatedNorm(
         _ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
     ) -> PromptInt8Activation? {
@@ -650,14 +636,11 @@ public struct SignedBlockHadamard {
             .gatedNorm,
             [x.reshaped([rows, width]), gate.reshaped([rows, width]), weight, HostConstants.float32([eps]), signs],
             rows: rows)
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
-    /// `quantizedForVerifyGatedNorm` at prompt width: the same kernel and
-    /// values, with the codes `[rows, width]` and the constants in the
-    /// row-tiled order `PromptInt8Matmul` reads (`quantizedForPrompt`). Nil
-    /// when the shape is not a prompt-width FP32 4096-wide input.
+    /// `quantizedForVerifyGatedNorm` at prompt width: the same kernel and values, codes `[rows, width]` and constants in
+    /// the row-tiled order `PromptInt8Matmul` reads. Nil when the shape is not a prompt-width FP32 4096-wide input.
     func quantizedForPromptGatedNorm(
         _ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float
     ) -> PromptInt8Activation? {
@@ -674,8 +657,7 @@ public struct SignedBlockHadamard {
             grid: (256, rows, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
             outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
     private static let residualNormNormedQuantized4096Kernel = MLXFast.metalKernel(
@@ -685,11 +667,8 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `residualNorm` at verify width that also returns the normalized
-    /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
-    /// residual, weight)]`. The sum and the normalized values are the bits of
-    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify`
-    /// on the normalized rows.
+    /// `residualNorm` at verify width that also returns the normalized (unrotated) rows: `[codes, ascale, rsb, x +
+    /// residual, rmsNorm(x + residual, weight)]`, the bits of MLX's add and `rmsNorm`; codes as `quantizedForVerify`.
     func residualNormVerifyNormalized(
         _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
     ) -> [MLXArray]? {
@@ -759,8 +738,7 @@ public struct SignedBlockHadamard {
         let outputs = Self.wideRowVerify(
             .residualNormRot, [x, residual, weight, HostConstants.float32([eps]), signs], rows: rows, headError2: headError2 && rows == 16)
         return (
-            PromptInt8Activation(
-                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            PromptInt8Activation(outputs, rows: rows, k: width),
             outputs[3], outputs[4], headError2 && rows == 16 ? outputs[5] : nil)
     }
 
@@ -883,8 +861,7 @@ public struct SignedBlockHadamard {
             grid: (256, rows * (width / 4096), 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, width], [groups], [groups]],
             outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
     /// Prompt codes for one consumed row; unused metadata lanes are not read.
@@ -898,16 +875,11 @@ public struct SignedBlockHadamard {
             grid: (256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 4096], [64 * 32], [64 * 32]],
             outputDTypes: [.int8, .float32, .float32])
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: 1, k: 4096)
+        return PromptInt8Activation(outputs, rows: 1, k: 4096)
     }
 
-    /// `forward(x)` quantized for `VerifyInt8Matmul`, with the codes and
-    /// constants of `quantizedForPrompt`: codes `[16, width]` (rows past
-    /// `rows` zero) and constants `[rows, width / 128]`. Nil when the shape is
-    /// not a verify-width FP32 block-4096 input.
-    /// With `up`, the input is `silu(x) * up`, formed inside the rotation as
-    /// in `quantizedForPrompt`.
+    /// `forward(x)` quantized for `VerifyInt8Matmul` with `quantizedForPrompt`'s codes `[16, width]` (rows past `rows`
+    /// zero) and constants `[rows, width / 128]`; with `up`, the input is `silu(x) * up` formed inside the rotation.
     func quantizedForVerify(_ x: MLXArray, up: MLXArray? = nil) -> PromptInt8Activation? {
         validate(x)
         let rows = x.size / width
@@ -924,8 +896,7 @@ public struct SignedBlockHadamard {
             kind,
             [x.reshaped([rows, width])] + (up.map { [$0.reshaped([rows, width])] } ?? []) + [signs],
             rows: rows, blocks: blocks)
-        return PromptInt8Activation(
-            codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width)
+        return PromptInt8Activation(outputs, rows: rows, k: width)
     }
 
     /// `quantizedForVerify` that also emits the exact FP32 rotated tensor
@@ -944,8 +915,7 @@ public struct SignedBlockHadamard {
             .plainRot, [x.reshaped([rows, width]), signs], rows: rows, blocks: blocks,
             sideShape: x.shape, headError2: headError2 && rows == 16)
         return (
-            PromptInt8Activation(
-                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
+            PromptInt8Activation(outputs, rows: rows, k: width),
             outputs[3], headError2 && rows == 16 ? outputs[4] : nil)
     }
 
@@ -974,35 +944,18 @@ public struct SignedBlockHadamard {
 }
 
 // WIDEROW-GEN BEGIN
-/// The verify-width forms of `quantized4096Source` (`VERIFY_ROWS > 0`), each
-/// with `threads` lanes per 4096-wide row (512 or 1024) instead of 256, so
-/// every row's threadgroup carries 2x or 4x the threads. Lane `i` holds the
-/// `4096 / threads` consecutive elements from `i * (4096 / threads)`. The
-/// arithmetic is the record kernel's, operand for operand:
-/// - the 12 butterfly stages run in the record's bit order 0 ... 11 (the
-///   record's three radix-16 passes are stages 0-3, 4-7 and 8-11), as
-///   radix-8 or radix-4 passes over the same threadgroup values, with the
-///   1/64 scale on the last store; each stage forms `a + b` and `a - b` from
-///   the same two values, so every intermediate keeps its bits;
-/// - the row RMS partials: lane `i`, part `p` sums the squares of float4 `f =
-///   i + p * threads` in order, and the `simd_sum` of simdgroup `f >> 5`
-///   holds float4 `f` in lane `f & 31`, as in the record, so both `simd_sum`
-///   steps see the same values in the same lanes;
-/// - the 128-wide head partials of the gated norm sit in `head_part[f]` and
-///   are reduced over the same 32 lanes;
-/// - the per-element value formulas are the record's text;
-/// - the 128-group max and the sum of the integer codes are exact in any
-///   order (|sum| <= 128 * 127).
-/// `VERIFY_ROWS` is read from the last input, so one pipeline serves every
-/// verify row count.
+/// The verify-width forms of `quantized4096Source` (`VERIFY_ROWS > 0`) with `threads` lanes per 4096-wide row (512 or
+/// 1024) instead of 256; lane `i` holds `4096 / threads` consecutive elements. The arithmetic is the record kernel's,
+/// operand for operand: the 12 butterfly stages in the record's bit order as radix-8 or radix-4 passes (same `a + b`,
+/// `a - b`, 1/64 scale on the last store), the row RMS and gated-norm head partials in the record's lanes before each
+/// `simd_sum`, the per-element formulas as the record text, and the exact 128-group max and code sum. `VERIFY_ROWS` is
+/// read from the last input, so one pipeline serves every verify row count.
 enum WideRowSource {
     struct Form: Hashable {
         var swiglu = false, residualNorm = false, normOnly = false, gatedNorm = false
         var attentionGate = false, normalizedOutput = false, rotatedOutput = false, headError2 = false
-        /// The norm forms' main-phase loads (x, residual, gate, norm weight,
-        /// signs) issued into registers before the norm reduction's barrier
-        /// (`DARKBLOOM_BONSAI_LOAD_HOIST=0` keeps the parent text). Same
-        /// addresses, same values, same arithmetic text: only the loads move.
+        /// The norm forms' main-phase loads issued into registers before the norm reduction's barrier
+        /// (`DARKBLOOM_BONSAI_LOAD_HOIST=0` keeps the parent text): same addresses, values and arithmetic text.
         var hoist = false
         var promptLayout = false
     }
@@ -1512,7 +1465,7 @@ extension SignedBlockHadamard {
         .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
     ]
 
-    private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
+    private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false, half: Bool = false)
         -> [WideRowKind: MLXFast.MLXFastKernel]
     {
         var kernels: [WideRowKind: MLXFast.MLXFastKernel] = [:]
@@ -1530,10 +1483,11 @@ extension SignedBlockHadamard {
                 else { continue }
                 source = text
             }
+            if half { guard let text = WideRowHalf.patch(source) else { continue }; source = text }
             kernels[kind] = MLXFast.metalKernel(
-                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")",
+                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")\(half ? "_h16" : "")",
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
-                outputNames: wideRowOutputNames(kind) + (headError2 ? ["qerror2"] : []),
+                outputNames: wideRowOutputNames(kind) + (headError2 ? ["qerror2"] : []) + (half ? ["codes_h"] : []),
                 source: source,
                 header: WideRowSource.header(threads: threads) + (headError2 ? ExactVerifyHead.l2Header : ""), ensureRowContiguous: true)
         }
@@ -1552,6 +1506,11 @@ extension SignedBlockHadamard {
         512: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 512, lean: true),
         1024: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 1024, lean: true),
     ]
+    private static let wideRowHalfKernels: [[Int: [WideRowKind: MLXFast.MLXFastKernel]]] = [false, true].map { (lean: Bool) in
+        [512: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 512, lean: lean, half: true),
+         1024: wideRowMakeKernels(hoist: wideRowLoadHoist, threads: 1024, lean: lean, half: true)]
+    }
+    nonisolated(unsafe) private static var wideRowResolvedHalf: [MLXFast.MLXFastKernel?] = [MLXFast.MLXFastKernel?](repeating: nil, count: 9)
 
     /// The lane count each form serves (absent: the record kernel).
     nonisolated(unsafe) private static var wideRowVerdict: [WideRowKind: Int] = [:]
@@ -1564,7 +1523,7 @@ extension SignedBlockHadamard {
 
     /// Runs the load check once, from the first prompt-width call of at least 1024 rows: the resident's boot warm,
     /// which runs before the socket serves and which no timed phase reaches (the timed prompts are 512 tokens).
-    static func wideRowPrepareIfBoot(rows: Int) {
+    public static func wideRowPrepareIfBoot(rows: Int) {
         guard rows >= 1024, wideRowEnabled, !wideRowReady else { return }
         wideRowLock.lock()
         defer { wideRowLock.unlock() }
@@ -1573,10 +1532,8 @@ extension SignedBlockHadamard {
         for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
             let candidates = wideRowLaneCandidates(kind)
             for threads in candidates {
-                // An MLX error in the check (a pipeline that cannot run this
-                // many threads per threadgroup on this GPU, a compile error)
-                // falls to the next lane count, then to the record kernel,
-                // instead of stopping the process.
+                // An MLX error (a pipeline that cannot run this many threads on this GPU, a compile error) falls to the
+                // next lane count, then to the record kernel, instead of stopping the process.
                 var note = "mismatch"
                 do {
                     if try withError({ wideRowCheck(kind, threads: threads) }) {
@@ -1599,6 +1556,7 @@ extension SignedBlockHadamard {
                 if note == "on" { wideRowResolvedKernels[kind.index] = lean }
                 FileHandle.standardError.write(Data("hadamard wide rows lean: \(kind.rawValue) w\(threads) \(note) (rows 1-\(VerifyInt8Matmul.tileRows) bitwise)\n".utf8))
             }
+            if VerifyInt8Matmul.halfAllowed, let threads = wideRowVerdict[kind] { wideRowResolveHalf(kind, threads: threads) }
         }
         wideRowReady = true
     }
@@ -1615,13 +1573,10 @@ extension SignedBlockHadamard {
         return wideRowVerdict[kind] ?? 0
     }
 
-    /// The record kernel's outputs bit for bit (`WideRowSource`): codes,
-    /// constants and every FP32 side output, on synthetic rows (one all-zero
-    /// row, one at 30x scale) at 3, 11 and 16 verify rows, at each form's
-    /// real shapes (the SwiGLU input 12288 wide, the attention output in its
-    /// `[1, 16, rows, 256]` head-major layout beside the `[rows, 8192]`
-    /// query projection).
-    private static func wideRowCheck(_ kind: WideRowKind, threads: Int, lean: MLXFast.MLXFastKernel? = nil) -> Bool {
+    /// The record kernel's outputs bit for bit (`WideRowSource`): codes, constants and every FP32 side output on
+    /// synthetic rows (one all-zero, one at 30x) at 3, 11 and 16 verify rows, at each form's real shapes (SwiGLU input
+    /// 12288 wide; attention output `[1, 16, rows, 256]` head-major beside the `[rows, 8192]` query projection).
+    private static func wideRowCheck(_ kind: WideRowKind, threads: Int, lean: MLXFast.MLXFastKernel? = nil, half: Bool = false) -> Bool {
         var same: [MLXArray] = []
         for rows in lean == nil ? [3, 11, 16] : Array(1 ... VerifyInt8Matmul.tileRows) {
             let parts = MLXRandom.split(key: MLXRandom.key(UInt64(0x4163_7400 + rows)), into: 5)
@@ -1652,8 +1607,11 @@ extension SignedBlockHadamard {
             let record = wideRowDispatch(
                 kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: lean == nil ? 0 : threads)
             let wide = wideRowDispatch(
-                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads, kernel: lean)
+                kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads, kernel: lean, half: half)
             same.append(MLX.all(record[0] .== wide[0]))
+            if half, let h = wide.last {
+                same.append(MLX.all(h.view(dtype: .uint16) .== wide[0].asType(.float16).view(dtype: .uint16)))
+            }
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
             }
@@ -1666,18 +1624,21 @@ extension SignedBlockHadamard {
     /// ascale, rsb, side outputs shaped as x]` (or as `sideShape`).
     private static func wideRowDispatch(
         _ kind: WideRowKind, _ inputs: [MLXArray], rows: Int, blocks: Int = 1,
-        sideShape: [Int]? = nil, lanes: Int, headError2: Bool = false, kernel: MLXFast.MLXFastKernel? = nil
+        sideShape: [Int]? = nil, lanes: Int, headError2: Bool = false, kernel: MLXFast.MLXFastKernel? = nil, half: Bool = false
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
             + Array(
                 repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
         if headError2 { shapes.append([rows * 32 * blocks]) }
-        let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
+        var dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
+        let halfKernel: MLXFast.MLXFastKernel? = half ? kernel
+            : lanes > 0 && !headError2 && wideRowReady && VerifyInt8Matmul.halfLive ? wideRowResolvedHalf[kind.index] : nil
+        if halfKernel != nil { shapes.append([tile, 4096 * blocks]); dtypes.append(.float16) }
         let resolvedKernel: MLXFast.MLXFastKernel? = wideRowReady
             ? (headError2 ? wideRowResolvedHeadKernels[kind.index] : wideRowResolvedKernels[kind.index])
             : (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind]
-        if lanes > 0, let kernel = kernel ?? resolvedKernel {
+        if lanes > 0, let kernel = halfKernel ?? kernel ?? resolvedKernel {
             return kernel(
                 inputs + [HostConstants.int32([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
@@ -1701,11 +1662,8 @@ extension SignedBlockHadamard {
     }
 }
 
-/// The version-1 `prism.hadamard.*` metadata exported as a JSON object.
-///
-/// This decodes extracted metadata, not GGUF bytes. Tensor names remain in the
-/// source namespace. A model loader must map them to its modules and honor
-/// `gdnVGrouped` when arranging GDN values before an output projection.
+/// The version-1 `prism.hadamard.*` metadata exported as a JSON object (extracted metadata, not GGUF bytes). Tensor
+/// names stay in the source namespace; a loader maps them to its modules and honors `gdnVGrouped` for GDN values.
 public struct PrismHadamardConfiguration: Decodable {
     public let blockSize: Int
     public let weightNames: [String]
@@ -1783,12 +1741,8 @@ private func validateHadamardWeights(
     else { throw HadamardError.incompatibleShape }
 }
 
-/// Reorders tiled GDN values into the grouped order of folded output weights.
-///
-/// The final axis changes from `[repeat, keyHead, headDimension]` to
-/// `[keyHead, repeat, headDimension]` before signs and Hadamard are applied.
-/// Use only when the upstream GDN produces tiled values; already grouped values
-/// must not be permuted again.
+/// Reorders tiled GDN values into the grouped order of folded output weights: the final axis goes from `[repeat,
+/// keyHead, headDimension]` to `[keyHead, repeat, headDimension]` before signs and Hadamard. Only for tiled values.
 public struct HadamardGDNLayout {
     public let width: Int
     public let keyHeads: Int
@@ -2143,34 +2097,12 @@ private enum Float16ConstantQMV {
     }
 }
 
-/// Exact verify-head top-2 at 2 to 8 rows decided by float arithmetic only,
-/// at about the cost of one int8 head pass.
-///
-/// The int8 verify route (`VerifyInt8Matmul`) computes the head logits L8
-/// from rounded activation codes, so a near tie can order two tokens
-/// differently than the float logits F that `Float16ConstantQMV.topTwo`
-/// reduces. Here L8 only screens: it picks the candidates, and float values
-/// with exactly the per-row arithmetic of `rowsAccumulate` decide.
-///
-/// For a row, `L8[n] = sum_k xhat_k w_nk` with `xhat = ascale * q` and
-/// `F[n] = sum_k v_k w_nk`, where v is the rotated row and `q = rint(v /
-/// ascale)` per 128-group. So `|F[n] - L8[n]| <= E` with
-///
-///     E = 1.001 * sum_g ascale_g * (Amax_g * (0.5 + 127 gf) + Bmax_g * gi)
-///
-/// `Amax_g = max_n sum_{k in g} |s_ng c_nk + b_ng|` bounds the rounding of
-/// the codes (`|v - xhat| <= ascale / 2`), `Bmax_g = max_n 127 (|s_ng| sum_k
-/// c_nk + 128 |b_ng|)` bounds the size of the int8 route's terms, and gf, gi
-/// cover the FP32 rounding of both sums with a wide margin. Amax and Bmax are
-/// properties of the head weights, computed once.
-///
-/// With i2 the second-largest L8 value of the row and `tau <= i2 - 2E`, every
-/// id outside `S = {n : L8[n] >= tau}` has `F[n] <= L8[n] + E < i2 - E`,
-/// while the two int8 leaders (both in S) have `F >= i2 - E`. So the float
-/// top-2 lies in S, and the top-2 of S's float values in the float top-2
-/// order (value descending, id ascending) is the float top-2. A row whose S
-/// holds more than `cap` ids, or that shows a non-finite value, runs the full
-/// float top-2 instead (`guardedPartial`, a no-op for every other row).
+/// Exact verify-head top-2 at 2 to 8 rows by float arithmetic only, at about the cost of one int8 head pass. The int8
+/// logits L8 (`VerifyInt8Matmul`) only screen: with i2 the row's second-largest L8 and E a bound on |F - L8| from the
+/// head weights' per-group Amax/Bmax terms and FP32 margins (computed once), every id outside S = {n : L8[n] >= i2
+/// - 2E} has F below both leaders, so the float top-2 lies in S and the top-2 of S's float values (value descending,
+/// id ascending, `rowsAccumulate`'s per-row arithmetic) is the float top-2. A row whose S holds more than `cap` ids,
+/// or shows a non-finite value, runs the full float top-2 (`guardedPartial`).
 enum ExactVerifyHead {
     static let cap = 256
     static let threads = 512
@@ -3115,10 +3047,8 @@ private enum DraftScreenQMV {
             }
             """)
 
-    /// Fused `argMax(partial.reshaped([blocks, 32]), axis: -1)` + `rescore`
-    /// when `CH == 32` and `biases == -scales`: each 32-lane simdgroup reduces
-    /// its 32 `partial` values in registers via 5 `simd_shuffle_xor` steps and
-    /// immediately rescores the winning row `r` without reading `biases`.
+    /// Fused `argMax(partial.reshaped([blocks, 32]), axis: -1)` + `rescore` when `CH == 32` and `biases == -scales`: each
+    /// simdgroup reduces its 32 `partial` values in registers (5 `simd_shuffle_xor`) and rescores row `r` without `biases`.
     static let rescoreFast32 = MLXFast.metalKernel(
         name: "hadamard_qmv_screen_rescore_fast32_f16",
         inputNames: ["x", "w", "scales", "partial"], outputNames: ["y", "row"],
@@ -3273,7 +3203,7 @@ extension SignedBlockHadamard {
     private static let pwLock = NSLock()
 
     /// Checks once, from the boot warm's 1024-row prompt.
-    private static func pwPrepareIfBoot(rows: Int) {
+    public static func pwPrepareIfBoot(rows: Int) {
         guard rows >= 1024, pwEnabled, !pwReady else { return }
         pwLock.lock()
         defer { pwLock.unlock() }
@@ -3337,26 +3267,14 @@ struct PromptInt8Activation {
     let rsb: MLXArray
     let rows: Int
     let k: Int
+    var codesH: MLXArray? = nil
 }
 
-/// Prompt-width packed matmul on int8 activation codes (27b 5fbfa003, with
-/// 31a73441's row-tiled constants and 0e1314b2's signed codes).
-///
-/// For output (m, n) the kernels compute, per 128-group g in ascending order
-/// from `acc = 0`:
-///
-///     C   = sum_{k in g} q[m, k] * code[n, k]          (integer)
-///     t   = s[n, g] * float(C)
-///     acc = fma(b[n, g], rsb[m, g], fma(ascale[m, g], t, acc))
-///
-/// `q` is in [-127, 127] and `code` in [0, 3], so |C| <= 128 * 127 * 3 =
-/// 48768 < 2^24: the integer is exact in int32 (the M5 tensor unit) and in
-/// FP32 (every partial sum of integer products is an integer below 2^24, so
-/// each FP32 multiply-add is exact whatever its order). `float(C)` is then the
-/// same number on both, and the epilogue is the same three roundings in the
-/// same order, with explicit `fma` so contraction cannot change it. The M2
-/// path (`plain`) therefore produces the M5 path's (`nax`) bits;
-/// `checkKernels` confirms it on the device before `nax` is used.
+/// Prompt-width packed matmul on int8 activation codes (27b 5fbfa003, 31a73441's row-tiled constants, 0e1314b2's
+/// signed codes). Per 128-group g ascending from `acc = 0`: `C = sum_k q[m,k] code[n,k]` (integer; |C| <= 128 * 127
+/// * 3 = 48768 < 2^24, exact in int32 on the M5 tensor unit and in FP32 in any order), `t = s[n,g] * float(C)`,
+/// `acc = fma(b[n,g], rsb[m,g], fma(ascale[m,g], t, acc))` with explicit `fma`. So the M2 path (`plain`) gives the
+/// M5 path's (`nax`) bits; `checkKernels` confirms it on the device before `nax` is used.
 enum PromptInt8Matmul {
     enum Route { case nax, plain, off }
 
@@ -3372,13 +3290,9 @@ enum PromptInt8Matmul {
 
         """
 
-    // 32 x 32 outputs per threadgroup of four simdgroups (2 x 2, 16 x 16
-    // each). Per 128-group: the codes and the unpacked 2-bit weights are
-    // staged as FP32 in threadgroup memory 64 k at a time and multiplied on
-    // FP32 simdgroup matrices (exact, see above); the epilogue reads each
-    // lane's two elements per fragment in place (MLX steel's fragment
-    // layout, `BaseMMAFrag::get_coord`). The weight codes are unpacked in
-    // the staged order the activation codes use.
+    // 32 x 32 outputs per threadgroup of four simdgroups (2 x 2, 16 x 16 each). Per 128-group the codes and the
+    // unpacked 2-bit weights are staged as FP32 64 k at a time and multiplied on FP32 simdgroup matrices (exact); the
+    // epilogue reads each lane's fragment elements in place (MLX steel's `BaseMMAFrag::get_coord` layout).
     private static let plainSource = """
         const int K = ksz[0]; const int N = ksz[2];
         const int Kg = K / 128;
@@ -3504,11 +3418,9 @@ enum PromptInt8Matmul {
 
         """
 
-    // The 27b staged8 prompt kernel (b402ddf2, SIGNED = 1, MPERM = 1): 64 x 64
-    // outputs per threadgroup of four simdgroups, one 64 x 64 x 128 int8
-    // tensor op per group into an int32 cooperative tensor, the 2-bit codes
-    // expanded to int8 bytes in threadgroup memory (double-buffered, staged
-    // order), the epilogue above per element. grid (N / 64 * 128, M / 64).
+    // The 27b staged8 prompt kernel (b402ddf2, SIGNED = 1, MPERM = 1): 64 x 64 outputs per threadgroup of four
+    // simdgroups, one 64 x 64 x 128 int8 tensor op per group into an int32 cooperative tensor, 2-bit codes expanded to
+    // int8 bytes in double-buffered threadgroup memory, the epilogue above per element. grid (N / 64 * 128, M / 64).
     static let naxSource = """
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
@@ -3586,14 +3498,9 @@ enum PromptInt8Matmul {
         }
         """
 
-    // `naxSource` with the same values reached by fewer instructions: each
-    // word's four planes go to threadgroup memory as one uint4 (the base is
-    // 16-word aligned; the same bytes at the same addresses), the four
-    // consecutive outputs i ... i + 3 of one row (c = 0 ... 3) leave as one
-    // float4 (nb and N are multiples of 4), and with `NEG = 1` (a module
-    // whose FP16 offsets are bit for bit its negated scales, checked at
-    // init) the offsets are `-s` instead of a second load, the same FP32
-    // value. The epilogue's arithmetic and order are unchanged.
+    // `naxSource` with the same values by fewer instructions: one uint4 per word's four planes, one float4 per four
+    // consecutive outputs of a row (nb and N multiples of 4), and with `NEG = 1` (offsets bit for bit the negated
+    // scales, checked at init) the offset is `-s` instead of a second load. Epilogue arithmetic and order unchanged.
     static let naxVectorSource = """
         const int K = ksz[0]; const int M = ksz[1]; const int N = ksz[2];
         const int Kg = K / 128;
@@ -3842,11 +3749,8 @@ enum PromptInt8Matmul {
         auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(aT)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
         const int nb = ns + fn;
         const int mb = ms + fm;
-        // The operand words are written straight into bT's storage, so the
-        // storage must be 128 int8 elements at consecutive bytes in index
-        // order from a 4-byte-aligned address; the destination must have the
-        // element layout the stores assume. Otherwise the simdgroup stores
-        // NaN (failing the load check) and touches no tensor.
+        // The operand words are written straight into bT's storage: 128 int8 elements at consecutive bytes from a
+        // 4-byte-aligned address in the stores' element layout, else the simdgroup stores NaN (failing the load check).
         thread int8_t* b0p = &bT[0];
         bool ok = int(bT.get_capacity()) == 128 && int(cT.get_capacity()) == 32
             && ((uintptr_t)(b0p) & 3ul) == 0;
@@ -3978,11 +3882,9 @@ enum PromptInt8Matmul {
             ensureRowContiguous: true)
     }
 
-    /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody`, and its register-weight forms `naxRegBody` and
-    /// `naxRegCols128Source`.
-    // Read the same immutable C16 copies as verify. Each uint4 still expands
-    // into exactly the canonical staged B bytes. Independent allocations keep
-    // MLX's command-buffer grouping by input buffer unchanged.
+    /// The per-simdgroup kernel forms `runSg` launches: `naxSgBody` and its register-weight forms `naxRegBody` and
+    /// `naxRegCols128Source`. They read the same immutable C16 copies as verify (each uint4 expands to the canonical
+    /// staged B bytes); independent allocations keep MLX's command-buffer grouping unchanged.
     private static let streamedSgBody: String? = {
         guard naxSgBody.components(separatedBy: "const int sc =").count == 2,
             naxSgBody.components(separatedBy: "const int nb =").count == 2,
@@ -4254,11 +4156,9 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var naxSgShared = false
     nonisolated(unsafe) private static var sgForm = SgForm.staged
 
-    /// Launch order of `runSg`'s threadgroups: M-first (consecutive threadgroups
-    /// take the same weight columns on successive 32 or 64 row tiles, so the
-    /// packed weights stream through the caches once) instead of N-first. The
-    /// tile each threadgroup computes is unchanged; only which threadgroup
-    /// position computes it. Set by `checkTraversal` and `prepareStreaming`.
+    /// Launch order of `runSg`'s threadgroups: M-first (consecutive threadgroups take the same weight columns on
+    /// successive row tiles, so the packed weights stream through the caches once) instead of N-first; the tile each
+    /// threadgroup computes is unchanged. Set by `checkTraversal` and `prepareStreaming`.
     nonisolated(unsafe) private static var traversalMFirst = false
 
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
@@ -4381,12 +4281,9 @@ enum PromptInt8Matmul {
 
     nonisolated(unsafe) private static var registerFailed = false
 
-    /// `form` against `naxSgBody` (the kernel the prompt route runs) at
-    /// `registerCheckRows` rows on every `registerCheckShapes` call, on fixed
-    /// synthetic operands, `NEG = 0` and, where the offset skip is on,
-    /// `NEG = 1`; every output bit compared. A compile or run error counts as
-    /// a mismatch. Returns whether every bit matched, and the detail for the
-    /// stderr line.
+    /// `form` against `naxSgBody` (the prompt route's kernel) at `registerCheckRows` rows on every `registerCheckShapes`
+    /// call, fixed synthetic operands, `NEG = 0` and (offset skip on) `NEG = 1`, every output bit; a compile or run error
+    /// counts as a mismatch. Returns whether every bit matched and the stderr detail.
     private static func matchesStaged(
         _ form: SgForm, streamed: Bool = false, rows: Int = registerCheckRows, traversal: Bool = false
     ) -> (same: Bool, detail: String) {
@@ -4482,10 +4379,8 @@ enum PromptInt8Matmul {
         return same ? "on (\(detail))" : "off (\(detail); the \(sgForm) form is kept)"
     }
 
-    /// M-first launch order against the record's N-first order, bit for bit, on
-    /// every `registerCheckShapes` call at the 512-row prompt and at 192 rows (a
-    /// tile count that is no power of two), in the form the prompt route runs.
-    /// `DARKBLOOM_BONSAI_PREFILL_TRAVERSAL=0` keeps the record order.
+    /// M-first launch order against the record's N-first order, bit for bit, on every `registerCheckShapes` call at 512
+    /// and 192 rows, in the form the prompt route runs. `DARKBLOOM_BONSAI_PREFILL_TRAVERSAL=0` keeps the record order.
     private static func checkTraversal() -> String {
         traversalMFirst = false
         if switchedOff("DARKBLOOM_BONSAI_PREFILL_TRAVERSAL") { return "off (DARKBLOOM_BONSAI_PREFILL_TRAVERSAL=0)" }
@@ -4621,10 +4516,8 @@ enum PromptInt8Matmul {
         return matched
     }
 
-    /// Decided once, at the first packed module's init. A NAX device takes
-    /// the tensor kernel only when it compiles and matches the plain kernel
-    /// bit for bit; otherwise it keeps the record's float path. Any other
-    /// device takes the plain kernel. `DARKBLOOM_BONSAI_INT8_PREFILL=0` keeps
+    /// Decided once, at the first packed module's init: a NAX device takes the tensor kernel only when it compiles and
+    /// matches the plain kernel bit for bit, any other device the plain kernel; `DARKBLOOM_BONSAI_INT8_PREFILL=0` keeps
     /// the record's float path everywhere.
     static let route: Route = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_INT8_PREFILL"]?
@@ -4709,11 +4602,8 @@ enum PromptInt8Matmul {
             vector: naxVector, negative: negative && negativeForms)
     }
 
-    /// `matmul` for sibling projections of one activation (two or three):
-    /// one dispatch when the per-simdgroup kernel's shared forms matched at
-    /// load, else one call per layer. Each output is that layer's `matmul`
-    /// output bit for bit (`NEG = 0` reads offsets that are bit for bit the
-    /// negated scales wherever `NEG = 1` would apply).
+    /// `matmul` for sibling projections of one activation (two or three): one dispatch when the shared forms matched at
+    /// load, else one call per layer; each output is that layer's `matmul` output bit for bit.
     static func matmul(
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
@@ -4853,10 +4743,8 @@ extension PromptInt8Matmul {
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
-    /// `residual + matmul(activation, ...)` for one projection, in the kernel
-    /// form and word layout `matmul` takes. Nil when that launch is not a
-    /// register-weight form, the fold did not qualify, or the shapes differ;
-    /// the caller then runs `matmul` and adds the residual itself.
+    /// `residual + matmul(activation, ...)` for one projection in `matmul`'s kernel form and word layout. Nil when that
+    /// launch is not a register-weight form, the fold did not qualify, or the shapes differ (caller adds the residual).
     static func matmulFold(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool, streamedWeight: MLXArray? = nil, residual: MLXArray, qualifying: Bool = false
@@ -4888,11 +4776,9 @@ extension PromptInt8Matmul {
             form: sgForm, streamed: false)
     }
 
-    /// The fold's output against `matmul`'s plus the residual (MLX add), on
-    /// fixed synthetic operands, every bit, for the tower's out and down shapes
-    /// (N 4096; K 4096 at 512, 192 and 128 rows, K 12288 at 512 and 128), the offset
-    /// forms the projections can take, residuals of mixed sign and magnitude.
-    /// Returns the number of cases, nil when one differed or failed to compile.
+    /// The fold's output against `matmul`'s plus the residual (MLX add) on fixed synthetic operands, every bit, for the
+    /// tower's out and down shapes (N 4096; K 4096 at 512, 192, 128 rows; K 12288 at 512, 128), each offset form and
+    /// mixed residuals. Returns the number of cases, nil when one differed or failed to compile.
     static func checkFold(streamed: Bool) -> Int? {
         guard route == .nax, naxSg, sgForm != .staged, !streamed || (streamPromptReady && streamedForm != .staged)
         else { return nil }
@@ -5000,12 +4886,9 @@ extension PromptInt8Matmul {
 }
 
 extension PromptInt8Matmul {
-    /// `matmul(_:layers:)` of a pair in two launches, each in the kernel
-    /// form, word layout and offset form the pair's own launch takes, one
-    /// layer each: `first` now, and `second(activation)`. Nil when the pair
-    /// would not run, or would read streamed words `streamedQualified` does
-    /// not admit. The per-layer fallback runs only while no streamed words
-    /// serve, since its one-layer calls may find registered copies.
+    /// `matmul(_:layers:)` of a pair in two launches, one layer each (`first` now, `second(activation)`), in the pair's
+    /// own kernel form, word layout and offset form. Nil when the pair would not run, or would read streamed words
+    /// `streamedQualified` does not admit. The per-layer fallback runs only while no streamed words serve.
     static func splitPair(
         _ activation: PromptInt8Activation,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray, negative: Bool)],
@@ -5057,12 +4940,9 @@ extension PromptInt8Matmul {
 
     nonisolated(unsafe) private static var splitCheckFailed = false
 
-    /// `splitPair`, its second launch ordered after its first, against
-    /// `matmul(_:layers:)` on fixed synthetic operands: every output bit at
-    /// 512, 192 and 128 rows, for each pair of offset forms, on the
-    /// canonical words or, with `streamed`, on their streamed copies. A
-    /// compile or run error counts as a mismatch. Returns the number of
-    /// cases, nil when one differed.
+    /// `splitPair` (second launch ordered after its first) against `matmul(_:layers:)` on fixed synthetic operands, every
+    /// output bit at 512, 192 and 128 rows, each pair of offset forms, canonical or streamed words; a compile or run
+    /// error counts as a mismatch. Returns the number of cases, nil when one differed.
     static func checkSplitPair(streamed: Bool) -> Int? {
         let k = 4096, kg = k / 128, maxRows = 512
         let codeValues: [Int8] = (0 ..< maxRows * k).map { (i: Int) -> Int8 in
@@ -5132,12 +5012,10 @@ extension PromptInt8Matmul {
     }
 }
 
-/// (kaankolcu, 3ad3962) The MLP gate/up pair with SwiGLU formed in the matmul epilogue: the gate and up
-/// simdgroups of one register-weight threadgroup run the record's operation chain on the same tile (so each `g`
-/// and `u` is the record's bits), up parks its values in threadgroup memory, and gate stores `(g * sigmoid(g)) * u`
-/// with the quantizer's statements. The rotation's plain read of the product then forms the SwiGLU read's bits, and
-/// the 2 x 24 MiB gate/up store and reload per layer at 512 rows go away. Serves only after `checkSwiGLU` matched
-/// the record chain bit for bit; `DARKBLOOM_BONSAI_PREFILL_SWIGLU=0` keeps the record chain.
+/// (kaankolcu, 3ad3962) The MLP gate/up pair with SwiGLU formed in the matmul epilogue: the gate and up simdgroups of
+/// one register-weight threadgroup run the record chain on the same tile, up parks its values in threadgroup memory,
+/// gate stores `(g * sigmoid(g)) * u` with the quantizer's statements; the 2 x 24 MiB store and reload per layer at
+/// 512 rows go away. Serves only after `checkSwiGLU` matched bit for bit; `DARKBLOOM_BONSAI_PREFILL_SWIGLU=0` keeps the record chain.
 extension PromptInt8Matmul {
     static let swigluOffered: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_SWIGLU"]?
@@ -5386,15 +5264,9 @@ extension PromptInt8Matmul {
     }
 }
 
-/// The prompt GDN z projection out of the qkv launch. In the record the
-/// prompt qkv and z run as one launch (one per layer on the plain route)
-/// before the convolution, the b/a GEMM and the fresh8 scan, though z feeds
-/// only the gated norm after the scan. Split, z runs in its own launch
-/// whose codes are ordered after the scan output, with no barrier between
-/// them, so z's weight stream overlaps the latency-bound scan. The split
-/// serves only after `PromptInt8Matmul.checkSplitPair` found every output
-/// equal, bit for bit, to the record route's; otherwise the record launch
-/// stays. `DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0` keeps the record launch.
+/// The prompt GDN z projection split out of the qkv launch into its own launch, ordered after the scan output with no
+/// barrier, so z's weight stream overlaps the latency-bound scan. Serves only after `PromptInt8Matmul.checkSplitPair`
+/// found every output bit-equal to the record route; `DARKBLOOM_BONSAI_PROMPT_Z_SPLIT=0` keeps the record launch.
 enum PromptSplitZ {
     static let offered: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PROMPT_Z_SPLIT"]?
@@ -5452,7 +5324,7 @@ enum PromptSplitZ {
 /// gets C from FP32 FMAs and lane shuffles. Same integers, same FP32 steps in
 /// the same order: the same bits, which `checkKernels` checks on the device
 /// before `nax` is used.
-enum VerifyInt8Matmul {
+public enum VerifyInt8Matmul {
     /// The canonical 2-bit codes remain model parameters.
     static let streamAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_STREAM"]?.lowercased()
@@ -5473,7 +5345,7 @@ enum VerifyInt8Matmul {
             packed[i] = w[col * (K / 16) + g * 8 + j];
             """, ensureRowContiguous: true)
 
-    static func streamPack(_ weight: MLXArray, k: Int, columns: Int) -> MLXArray {
+    public static func streamPack(_ weight: MLXArray, k: Int, columns: Int) -> MLXArray {
         let n = weight.dim(0)
         return streamRepack(
             [weight], template: [("K", k), ("N", n), ("C", columns)],
@@ -5732,7 +5604,7 @@ enum VerifyInt8Matmul {
 
     // The plain kernel maps one row to lane & 7.
     static var rowRange: ClosedRange<Int> { 2 ... (route == .plain ? 8 : 16) }
-    static let tileRows = 16
+    public static let tileRows = 16
 
     private static let plainSource = """
         #pragma clang fp contract(off)
@@ -5902,12 +5774,8 @@ enum VerifyInt8Matmul {
         }
         """
 
-    // `naxSource` with the same values reached by fewer instructions: the
-    // simdgroup partials are summed and stored four columns at a time (the
-    // same `((p0 + p1) + p2) + p3` per element, contraction off; n0 and N
-    // are multiples of 32), and with `NEG = 1` (offsets bit for bit the
-    // negated scales, checked at init) each lane's offset is `-s` instead
-    // of a second load, the same FP16 value.
+    // `naxSource` with the same values by fewer instructions: simdgroup partials summed and stored four columns at a
+    // time (the same `((p0 + p1) + p2) + p3`, contraction off), and with `NEG = 1` the offset is `-s` (checked at init).
     static let naxVectorSource = """
         #pragma clang fp contract(off)
         #pragma clang fp reassociate(off)
@@ -6210,10 +6078,8 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }()
 
-    /// The compact head on the stream copy: the streamed one-layer body (`streamedFormsSource(layers: 1)`, which
-    /// `checkStreamed` matches against the canonical form: 16-B word loads and, once the staging twin passed, 32-B
-    /// tile stores) with the compact head's epilogue in place of the store, as `compactHeadKernel` does on the
-    /// canonical body.
+    /// The compact head on the stream copy: the streamed one-layer body (`streamedFormsSource(layers: 1)`, matched by
+    /// `checkStreamed`) with the compact head's epilogue in place of the store, as `compactHeadKernel` does.
     private static let compactHeadStreamedKernel: MLXFast.MLXFastKernel? = {
         guard let body = makeStreamedBody(naxFastBody, columns: 32),
             body.components(separatedBy: compactHeadStore).count == 2 else { return nil }
@@ -6251,11 +6117,9 @@ enum VerifyInt8Matmul {
         return ready
     }()
 
-    /// Input-independent: synthetic codes (rows of -128, 127 and both),
-    /// words (all-ones and zero columns) and constants at 16 rows (the only
-    /// row count this head takes), K 4096, N 512 (16 threadgroups), both
-    /// offset forms (NEG 0 and 1); any launch error fails it; canonical and
-    /// streamed compact heads compared on ids, values, omitted and flags.
+    /// Input-independent: synthetic codes (rows of -128, 127 and both), words (all-ones and zero columns) and constants
+    /// at 16 rows, K 4096, N 512, both offset forms; any launch error fails it; canonical and streamed compact heads
+    /// compared on ids, values, omitted and flags.
     private static func checkStreamedHead() -> Bool {
         let k = 4096, n = 512, kg = k / 128, rows = tileRows
         guard compactHeadAvailable(rows: rows, k: k, n: n) else { return false }
@@ -6388,12 +6252,9 @@ enum VerifyInt8Matmul {
         return pick
     }
 
-    // `naxFastBody` over 16 columns per threadgroup instead of 32, for one
-    // layer at most `narrowColumns` wide: an N = 4096 call then launches 256
-    // threadgroups (6.4 per core on the M5 Max's 40) instead of 128 (3.2).
-    // The tensor op, its layout guard and the FP32 steps per output, in
-    // order, are `naxFastBody`'s; columns 16-31 of the B tile and their
-    // destination elements (8-15) are dead.
+    // `naxFastBody` over 16 columns per threadgroup instead of 32, for one layer at most `narrowColumns` wide (an
+    // N = 4096 call launches 256 threadgroups instead of 128). Tensor op, layout guard and FP32 steps per output are
+    // `naxFastBody`'s; B columns 16-31 and destination elements 8-15 are dead.
     static let naxNarrowBody = """
         const int Kg = K / 128;
         const int KW = K / 16;
@@ -6560,7 +6421,7 @@ enum VerifyInt8Matmul {
 
     /// The model's verify K values (hidden 4096, MLP 12288); each gets its own compile-time form, used only after
     /// `checkForms` matched it at that K.
-    static let formsK = [4096, 12288]
+    public static let formsK = [4096, 12288]
     /// Bitmask for fast hot-path lookup without string formatting:
     /// bit `(layers - 1)` for `k == 4096`, bit `(layers + 3)` for `k == 12288`.
     nonisolated(unsafe) private static var formsMatchedMask: UInt32 = 0
@@ -6866,13 +6727,9 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Runs the kernels on a fixed, input-independent 4 x 64 x 1024 problem
-    /// (two threadgroups, two groups per simdgroup) and compares output
-    /// bits, as `PromptInt8Matmul.checkKernels`: the plain `NEG = 1` form
-    /// against `NEG = 0` on negated-scale offsets, then on a NAX device the
-    /// fast tensor kernel (both forms, then its two- and three-layer forms on
-    /// column slices), else the vector tensor kernel (both forms), else the
-    /// record tensor kernel, against the plain kernel.
+    /// Fixed, input-independent 4 x 64 x 1024 problem, output bits compared as `PromptInt8Matmul.checkKernels`: plain
+    /// `NEG = 1` against `NEG = 0` on negated-scale offsets, then on a NAX device the fast tensor kernel (both forms,
+    /// two- and three-layer forms on column slices), else the vector, else the record tensor kernel, against plain.
     @discardableResult
     private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
@@ -6974,10 +6831,9 @@ enum VerifyInt8Matmul {
 
     nonisolated(unsafe) private static var formsFailed = false
 
-    /// Runs each compile-time form against the record's fast kernel on a fixed, input-independent 16 x 64 x K problem
-    /// at each real K (16 rows, the verify width, so these pipelines are also built here, before any timed work) and
-    /// compares output bits: one layer with `NEG = 0` and, where the offset skip is on, `NEG = 1`; two and three
-    /// layers on column slices where the shared forms are on.
+    /// Each compile-time form against the record's fast kernel on a fixed 16 x 64 x K problem at each real K (pipelines
+    /// built here before any timed work): one layer with `NEG = 0` and, with the offset skip on, `NEG = 1`; two and
+    /// three layers on column slices where the shared forms are on.
     private static func checkForms() -> String {
         formsMatchedMask = 0
         guard formsAllowed else { return "off (DARKBLOOM_BONSAI_VERIFY_FORMS=0)" }
@@ -7110,6 +6966,7 @@ enum VerifyInt8Matmul {
         negative: Bool, streamedWeight: MLXArray? = nil
     ) -> MLXArray? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        if let out = halfServe(activation, layers: [(weight, scalesT, biasesT)], negative: negative, streamedWeights: streamedWeight.map { [$0] }) { return out[0] }
         if route == .nax, naxFast, weight.dim(0) <= narrowColumns, hasNarrow(k: activation.k) {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
@@ -7137,6 +6994,7 @@ enum VerifyInt8Matmul {
         streamedWeights: [MLXArray]? = nil
     ) -> [MLXArray]? {
         guard route != .off, route != .plain || activation.rows <= 8 else { return nil }
+        if let out = halfServe(activation, layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) }, negative: layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights) { return out }
         if route == .nax, naxFast, naxShared, (2 ... 3).contains(layers.count) {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -7197,12 +7055,9 @@ enum VerifyInt8Matmul {
             outputShapes: [[activation.rows, n]], outputDTypes: [.float32])[0]
     }
 
-    /// One simdgroup per (row, id) over canonical words, on the ALU. Lanes
-    /// 8s ..< 8s + 8 hold chain s (groups s, s + 4, ... below `GL`), lane & 7
-    /// a word of each group. The group sum is an integer (|C| < 2^16), so its
-    /// order is free; the FP32 steps per group, the four chains and their
-    /// final order are `naxFastBody`'s, so at `GL = Kg` a value is that
-    /// kernel's output bit for bit. `ALL` scores every row (`ids` unused).
+    /// One simdgroup per (row, id) over canonical words on the ALU: lanes 8s ..< 8s + 8 hold chain s (groups s, s + 4,
+    /// ... below `GL`), lane & 7 a word per group. The group sum is an integer (|C| < 2^16), and the FP32 steps, four
+    /// chains and final order are `naxFastBody`'s, so at `GL = Kg` the value is that kernel's bits. `ALL` scores every row.
     static let headGatherSource = """
         #pragma clang fp contract(off)
         #pragma clang fp reassociate(off)
@@ -7254,13 +7109,10 @@ enum VerifyInt8Matmul {
         inputNames: ["xq", "w", "scales", "biases", "ascale", "rsb", "ids", "ksz"], outputNames: ["out"],
         source: headGatherSource, ensureRowContiguous: true)
 
-    /// `headGatherSource` with each lane's integer group sum taken in FP16 pairs. An activation
-    /// byte and a 2-bit code each become an exact half through the 1024 exponent
-    /// (`0x6400 | byte`), and each half lane sums the four products of two `u` steps, at most
-    /// 4 x 128 x 3 = 1536 < 2048 in magnitude, so every FP16 result is an exact integer and `d`
-    /// is the record's integer. A lane's 16 activation bytes load as one `packed_uint4`, which
-    /// needs only the 4-byte alignment of the record's `char4` loads. The FP32 steps per group,
-    /// the four chains and their final order are the record text. Nil unless the cut matches once.
+    /// `headGatherSource` with each lane's integer group sum in FP16 pairs: bytes and codes become exact halves through
+    /// the 1024 exponent (`0x6400 | byte`), partial sums stay below 2048, so every FP16 result is an exact integer and
+    /// `d` is the record's integer; 16 activation bytes load as one `packed_uint4` (4-byte aligned). The FP32 steps,
+    /// chains and order are the record text. Nil unless the cut matches once.
     static let headGatherFastSource: String? = {
         let dot = """
               int d = 0;
@@ -7309,10 +7161,8 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) static var gatherFastPassed = false
     nonisolated(unsafe) private static var gatherFastPrepared = false
 
-    /// Runs once at drafter bind, before any request: `headGatherFastKernel` against
-    /// `headGatherKernel` at 32 and 16 groups, `NEG` on and off, on `gatherCheckInputs`.
-    /// `gatherFastPassed` is set only when every output bit matched; a mismatch or an MLX error
-    /// keeps the record kernel. Only gathers at `ids` take the fast kernel.
+    /// Runs once at drafter bind: `headGatherFastKernel` against `headGatherKernel` at 32 and 16 groups, `NEG` on and
+    /// off, on `gatherCheckInputs`; `gatherFastPassed` only when every bit matched. Only gathers at `ids` take it.
     static func prepareGatherFast() {
         guard !gatherFastPrepared else { return }
         gatherFastPrepared = true
@@ -7356,10 +7206,9 @@ enum VerifyInt8Matmul {
         return nil
     }
 
-    /// 15 rows of int8 codes (11 hashed over -128 ... 127, then all -128, all 127, alternating
-    /// -128 and 127, all 0), 512 weight rows (row 0 all codes 3, row 1 all 0, the rest hashed),
-    /// FP16 scales and biases over [-2, 2) with zeros, and 128 ids per row with -1, 512, 0, 511
-    /// and a repeated id among hashed ones.
+    /// 15 rows of int8 codes (11 hashed, then all -128, all 127, alternating, all 0), 512 weight rows (row 0 all
+    /// codes 3, row 1 all 0, the rest hashed), FP16 scales and biases over [-2, 2) with zeros, 128 ids per row
+    /// including -1, 512, 0, 511 and a repeat.
     private static func gatherCheckInputs() -> (PromptInt8Activation, MLXArray, MLXArray, MLXArray, MLXArray) {
         let k = 4096, kg = k / 128, n = 512, rows = 15, p = 128
         func hash(_ i: Int, _ salt: Int) -> Int {
@@ -7441,15 +7290,10 @@ enum VerifyInt8Matmul {
 
 // MARK: - The dense GDN b/a projection in the qkv/z verify dispatch
 
-/// The dense FP32 `in_proj_b` / `in_proj_a` of a few-row verify window. Each
-/// simdgroup owns one output column (the b columns, then the a columns),
-/// reads that weight row once for all `ROWS` rows with FP32 FMAs, then
-/// `simd_sum`. The model's standalone kernel (`qwen35_gdn_dense_ba_rows`)
-/// compiles `standaloneSource`; the two-layer verify form below runs the same
-/// `columnBody` in leading threadgroups of the qkv/z dispatch, which saves
-/// one launch per GDN layer per round. The fused form is used only where it
-/// matched both the standalone kernel and the two-layer form bit for bit at
-/// load (`fusedMatched`).
+/// Dense FP32 `in_proj_b` / `in_proj_a` of a few-row verify window: one simdgroup per output column reads its weight
+/// row once for all `ROWS` rows with FP32 FMAs, then `simd_sum`. `standaloneSource` is the model's
+/// `qwen35_gdn_dense_ba_rows`; the two-layer verify form runs `columnBody` in leading threadgroups of the qkv/z
+/// dispatch (one launch fewer per GDN layer per round), used only where both matched bit for bit at load (`fusedMatched`).
 public enum VerifyDenseBA {
     /// Needs `lane`, `n`, `K`, `N`, inputs `x`, `wb`, `wa`, outputs `ob`, `oa`.
     static let columnBody = """
@@ -7611,11 +7455,9 @@ public enum VerifyDenseBA {
     /// after the compile-time forms check and before any timed work.
     nonisolated(unsafe) static var fusedMatched = false
 
-    /// Fixed, input-independent problems at K 4096 with N 32 b/a columns and
-    /// 64 matmul columns as two layers, at every verify row count 2 ... 16
-    /// (each its own pipeline, all built here) and both offset forms: every
-    /// output of the fused kernel must equal, bit for bit, the two-layer
-    /// form's outputs and the standalone b/a kernel's outputs.
+    /// Fixed, input-independent problems at K 4096 (N 32 b/a columns, 64 matmul columns as two layers) at every verify
+    /// row count 2 ... 16 and both offset forms: every fused output must equal the two-layer form's and the standalone
+    /// b/a kernel's outputs bit for bit.
     static func check(eligible: Bool, negativeForms: Bool) -> String {
         fusedMatched = false
         guard allowed else { return "off (DARKBLOOM_BONSAI_VERIFY_DENSE_BA=0)" }
@@ -7822,7 +7664,8 @@ enum VerifySplitZ {
     static func ordered(_ activation: PromptInt8Activation, after dependency: MLXArray) -> PromptInt8Activation {
         PromptInt8Activation(
             codes: depends(input: activation.codes, dependencies: [dependency]),
-            ascale: activation.ascale, rsb: activation.rsb, rows: activation.rows, k: activation.k)
+            ascale: activation.ascale, rsb: activation.rsb, rows: activation.rows, k: activation.k,
+            codesH: activation.codesH.map { (h: MLXArray) -> MLXArray in depends(input: h, dependencies: [dependency]) })
     }
 
     private static func check() -> (Bool, String) {
@@ -8363,15 +8206,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return bias.map { output + $0 } ?? output
     }
 
-    /// Share the residual, RMSNorm and rotation for an eligible projection group.
-    ///
-    /// With `swigluDown`, the MLP's down projection, a prompt-width gate/up pair that
-    /// `PromptInt8Matmul.matmulSwiGLU` serves returns one projection, `silu(gate) * up`,
-    /// for `callAfterPromptProduct`; otherwise the pair as before.
-    ///
-    /// A nil `residual` means `x` already is the residual stream (a projection's
-    /// epilogue added it, `PromptResidualFold`): the prompt width forms the norm
-    /// and the codes from `x` alone and returns `x` as the residual.
+    /// Share the residual, RMSNorm and rotation for an eligible projection group. With `swigluDown`, a prompt-width
+    /// gate/up pair that `PromptInt8Matmul.matmulSwiGLU` serves returns one projection, `silu(gate) * up`, for
+    /// `callAfterPromptProduct`. A nil `residual` means `x` already is the residual stream (`PromptResidualFold`):
+    /// the norm and the codes form from `x` alone and `x` returns as the residual.
     public static func sharedResidualNormProjections(
         _ x: MLXArray, residual: MLXArray?, weight: MLXArray, eps: Float,
         projections: [Linear], swigluDown: HadamardQuantizedLinear? = nil
@@ -8405,30 +8243,26 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         if quantized, !verify, let swigluDown, packed.count == 2, packed.allSatisfy({ $0.bias == nil }),
             swigluDown.acceptsPromptProduct(rows: rows, width: packed[0].weight.dim(0)),
             let product = PromptInt8Matmul.matmulSwiGLU(
-                PromptInt8Activation(
-                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+                PromptInt8Activation(activation, rows: rows, k: 4096),
                 layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
         {
             return (activation.last!, [product.reshaped(Array(x.shape.dropLast()) + [packed[0].weight.dim(0)])])
         }
         let promptOutputs = quantized && !verify
             ? PromptInt8Matmul.matmul(
-                PromptInt8Activation(
-                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+                PromptInt8Activation(activation, rows: rows, k: 4096),
                 layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
             : nil
         let verifyOutputs = verify
             ? VerifyInt8Matmul.matmul(
-                PromptInt8Activation(
-                    codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096),
+                PromptInt8Activation(activation, rows: rows, k: 4096),
                 layers: packed.map(\.verifyOperands), streamedWeights: Self.streamedWeights(packed))
             : nil
         let outputs = packed.enumerated().map { index, layer in
             if verify {
                 guard let output = verifyOutputs?[index] else {
                     let (scalesT, biasesT) = layer.promptConstants.get(scales: layer.scales, biases: layer.biases!)
-                    let codes = PromptInt8Activation(
-                        codes: activation[0], ascale: activation[1], rsb: activation[2], rows: rows, k: 4096)
+                    let codes = PromptInt8Activation(activation, rows: rows, k: 4096)
                     let single = VerifyInt8Matmul.matmul(
                         codes, weight: layer.weight, scalesT: scalesT, biasesT: biasesT,
                         negative: layer.promptConstants.negative, streamedWeight: layer.streamedVerifyWeight)!
@@ -8443,7 +8277,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 .reshaped(Array(x.shape.dropLast()) + [layer.weight.dim(0)])
             return layer.bias.map { output + $0 } ?? output
         }
-        return (activation.last!, outputs)
+        return (verify ? activation[3] : activation.last!, outputs)
     }
 
     /// `sharedPromptProjections(rmsNorm(x + delta, weight), projections)` with the
@@ -8468,8 +8302,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                 x, residual: delta, weight: weight, eps: eps, normalized: normalized)
         else { return nil }
         let rows = x.size / 4096
-        let activation = PromptInt8Activation(
-            codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
+        let activation = PromptInt8Activation(codes, rows: rows, k: 4096)
         let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
         if deferLast, !firstProjectionLastRow,
             let split = splitPromptPair(activation, full, shape: Array(x.shape.dropLast()))
@@ -8507,8 +8340,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
             let codes = first.transform.normPrompt(x, weight: weight, eps: eps, normalized: normalized)
         else { return nil }
         let rows = x.size / 4096
-        let activation = PromptInt8Activation(
-            codes: codes[0], ascale: codes[1], rsb: codes[2], rows: rows, k: 4096)
+        let activation = PromptInt8Activation(codes, rows: rows, k: 4096)
         let full = firstProjectionLastRow ? Array(packed.dropFirst()) : packed
         if deferLast, !firstProjectionLastRow,
             let split = splitPromptPair(activation, full, shape: Array(x.shape.dropLast()))
@@ -8580,8 +8412,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let rows = x.size / 4096
         return VerifyBoundary(
-            activation: PromptInt8Activation(
-                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
+            activation: PromptInt8Activation(outputs, rows: rows, k: 4096),
             transform: first.transform, residual: x, normalized: outputs[3])
     }
 
@@ -8606,8 +8437,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         else { return nil }
         let rows = x.size / 4096
         return VerifyBoundary(
-            activation: PromptInt8Activation(
-                codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
+            activation: PromptInt8Activation(outputs, rows: rows, k: 4096),
             transform: first.transform, residual: outputs[3], normalized: outputs[4])
     }
 
@@ -8904,11 +8734,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return picked
     }
 
-    /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify-width GDN
-    /// output with 128-wide norm heads, with the gate, the norm and the input
-    /// rotation formed in one quantizing kernel. Nil when the route, the
-    /// packing or the shapes do not qualify; the caller then runs the
-    /// separate operations.
+    /// `self(silu(gate) * rmsNorm(x, normWeight))` for a verify-width GDN output with 128-wide norm heads, gate, norm
+    /// and rotation in one quantizing kernel. Nil when route, packing or shapes do not qualify (caller runs them apart).
     public func callAfterGatedNorm(
         _ x: MLXArray, gate: MLXArray, normWeight: MLXArray, eps: Float
     ) -> MLXArray? {
@@ -8926,10 +8753,8 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return bias.map { shaped + $0 } ?? shaped
     }
 
-    /// `callAfterGatedNorm` at prompt width (`PromptInt8Matmul` rows): the
-    /// GDN output gate and norm formed in the quantizing rotation, then the
-    /// prompt integer matmul, as `self(norm(x, gate))` computes it. Nil when
-    /// the route, the packing or the shapes do not qualify.
+    /// `callAfterGatedNorm` at prompt width (`PromptInt8Matmul` rows): gate and norm formed in the quantizing rotation,
+    /// then the prompt integer matmul, as `self(norm(x, gate))` computes it. Nil when route, packing or shapes do not qualify.
     public func callAfterGatedNormPrompt(
         _ x: MLXArray, gate: MLXArray, normWeight: MLXArray, eps: Float, fold: PromptResidualFold? = nil
     ) -> MLXArray? {
@@ -9684,5 +9509,123 @@ extension HadamardQuantizedLinear {
         ]
         eval(checks.map { $0.1 })
         return checks.first { !$0.1.item(Bool.self) }?.0
+    }
+}
+
+enum WideRowHalf {
+    static func patch(_ s: String) -> String? {
+        let pad = "pad[r] = char(0);"
+        let decl = "device char* dst = (device char*)(codes + batch_idx + (base0 & ~15u));"
+        let store = "dst[4u * (c & 3u) + (c >> 2)] = char(q[r]);"
+        guard [pad, decl, store].allSatisfy({ (t: String) -> Bool in s.components(separatedBy: t).count == 2 }) else { return nil }
+        return s.replacingOccurrences(of: pad, with: "{ pad[r] = char(0); ((device half*)(codes_h + batch_idx + base0))[r] = half(0); }")
+            .replacingOccurrences(of: decl, with: decl + " device half* dsth = (device half*)(codes_h + batch_idx + (base0 & ~15u));")
+            .replacingOccurrences(of: store, with: store + " dsth[4u * (c & 3u) + (c >> 2)] = half(q[r]);")
+    }
+}
+
+extension SignedBlockHadamard {
+    public static var wideRowHalfReady: Bool { wideRowReady && wideRowResolvedHalf.contains { $0 != nil } }
+    static func wideRowResolveHalf(_ kind: WideRowKind, threads: Int) {
+        let lean = wideRowResolvedKernels[kind.index] !== wideRowWideKernels[threads]?[kind]
+        guard let twin = wideRowHalfKernels[lean ? 1 : 0][threads]?[kind] else { return }
+        let note = checkNote { wideRowCheck(kind, threads: threads, lean: twin, half: true) }
+        if note == "on" { wideRowResolvedHalf[kind.index] = twin }
+        FileHandle.standardError.write(Data("hadamard wide rows half: \(kind.rawValue) w\(threads)\(lean ? " lean" : "") \(note)\n".utf8))
+    }
+}
+
+public typealias VerifyLayer = (weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)
+
+extension PromptInt8Activation {
+    init(_ o: [MLXArray], rows: Int, k: Int) {
+        self.init(codes: o[0], ascale: o[1], rsb: o[2], rows: rows, k: k, codesH: o.last?.dtype == .float16 ? o.last : nil)
+    }
+}
+
+extension VerifyInt8Matmul {
+    static let halfAllowed = !["0", "false", "no", "off"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VFALU"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+
+    static func halfBody(streamed: Bool) -> String? {
+        let swaps: [(String, String)] = [
+            ("tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));",
+             "tensor<device half, dextents<int, 2>, tensor_inline> A((device half*)xq, dextents<int, 2>(K, 16));"),
+            ("metal::remove_addrspace_t<decltype(B)>, int32_t>();", "metal::remove_addrspace_t<decltype(B)>, float>();"),
+            ("float(cT[e])", "cT[e]"), ("float(cT[8 + e])", "cT[8 + e]"), ("float(cT[4 + e])", "cT[4 + e]"), ("float(cT[12 + e])", "cT[12 + e]"),
+        ]
+        var body = naxFastBody
+        for (old, new) in swaps {
+            guard body.components(separatedBy: old).count == 2 else { return nil }
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        if streamed {
+            guard let text = makeStreamedBody(body, columns: 32) else { return nil }
+            body = text
+        }
+        return body.replacingOccurrences(of: "(size_t)", with: "(uint)")
+    }
+
+    private static let halfKernels: [[MLXFast.MLXFastKernel?]] = [false, true].map { (streamed: Bool) -> [MLXFast.MLXFastKernel?] in
+        (1 ... 3).map { (layers: Int) -> MLXFast.MLXFastKernel? in
+            guard let body = halfBody(streamed: streamed) else { return nil }
+            let tags = Array(0 ..< layers)
+            return MLXFast.metalKernel(
+                name: "bonsai_q8_verify_half_a_\(streamed ? "streamed" : "forms")\(layers)",
+                inputNames: ["xq"] + tags.map { "w\($0)" } + tags.map { "s\($0)" } + tags.map { "b\($0)" } + ["ascale", "rsb", "ksz"],
+                outputNames: tags.map { "out\($0)" },
+                source: naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;") + body,
+                header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+        }
+    }
+
+    nonisolated(unsafe) public static var halfProbe: ((Int, Bool) -> Void)?
+    nonisolated(unsafe) public static var halfPoison = false
+    nonisolated(unsafe) private static var halfShapes = Set<Int>()
+    nonisolated(unsafe) public private(set) static var halfLive = false
+    public static var halfEligible: Bool { halfAllowed && route == .nax && naxFast && formsAllowed }
+    public static var halfNegative: Bool { negativeForms }
+    public static var halfShared: Bool { naxShared }
+    public static var halfStreamed: Bool { streamReady }
+    public static func halfKey(layers: Int, k: Int, n: Int, streamed: Bool) -> Int { layers | (streamed ? 8 : 0) | k << 4 | n << 20 }
+    public static func halfActivate(_ keys: [Int]) {
+        halfShapes = Set(keys)
+        halfLive = !keys.isEmpty
+    }
+
+    public static func halfRun(
+        codesH: MLXArray, ascale: MLXArray, rsb: MLXArray, layers: [VerifyLayer], m: Int, k: Int, negative: Bool, streamedWeights: [MLXArray]?
+    ) -> [MLXArray]? {
+        guard (1 ... 3).contains(layers.count), let kernel = halfKernels[streamedWeights == nil ? 0 : 1][layers.count - 1] else { return nil }
+        let ns = layers.map { (l: VerifyLayer) -> Int in l.weight.dim(0) }
+        let dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { (n: Int) -> Int32 in Int32(n) })
+        let inputs = [codesH] + (streamedWeights ?? layers.map { $0.weight }) + layers.map { $0.scalesT } + layers.map { $0.biasesT } + [ascale, rsb, dims]
+        return kernel(
+            inputs, template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
+            grid: (ns.reduce(0, +) / 32 * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: ns.map { (n: Int) -> [Int] in [m, n] }, outputDTypes: ns.map { (_: Int) -> DType in .float32 })
+    }
+
+    public static func recordMatmul(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, rows: Int, k: Int, layers: [VerifyLayer], negative: Bool, streamedWeights: [MLXArray]?
+    ) -> [MLXArray]? {
+        let a = PromptInt8Activation(codes: codes, ascale: ascale, rsb: rsb, rows: rows, k: k)
+        if layers.count == 1 {
+            return matmul(a, weight: layers[0].weight, scalesT: layers[0].scalesT, biasesT: layers[0].biasesT, negative: negative, streamedWeight: streamedWeights?[0]).map { [$0] }
+        }
+        return matmul(a, layers: layers.map { (weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: negative) }, streamedWeights: streamedWeights)
+    }
+
+    static func halfServe(_ a: PromptInt8Activation, layers: [VerifyLayer], negative: Bool, streamedWeights: [MLXArray]?) -> [MLXArray]? {
+        guard halfLive || halfProbe != nil, usesForms(k: a.k, layers: layers) else { return nil }
+        let n = layers.reduce(0) { (sum: Int, l: VerifyLayer) -> Int in sum + l.weight.dim(0) }
+        let key = halfKey(layers: layers.count, k: a.k, n: n, streamed: streamedWeights != nil)
+        var out: [MLXArray]? = nil
+        if var codesH = a.codesH, halfLive, halfShapes.contains(-1) || halfShapes.contains(key) {
+            if halfPoison { halfPoison = false; codesH = -codesH }
+            out = halfRun(codesH: codesH, ascale: a.ascale, rsb: a.rsb, layers: layers, m: a.rows, k: a.k, negative: negative && negativeForms, streamedWeights: streamedWeights)
+        }
+        halfProbe?(key, out != nil)
+        return out
     }
 }

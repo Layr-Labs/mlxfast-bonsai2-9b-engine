@@ -6098,7 +6098,7 @@ enum Qwen35Layer0FP32 {
     /// Written once by `prepareIfBoot` before the resident serves; read-only afterwards.
     nonisolated(unsafe) static var promptPassed = false
     nonisolated(unsafe) static var verifyPassed = false
-    nonisolated(unsafe) private static var prepared = false
+    nonisolated(unsafe) static var prepared = false
 
     /// Runs from the first prompt forward of at least 1024 rows: the boot
     /// warm, which no timed phase reaches (the timed prompts are 512 rows).
@@ -7110,6 +7110,16 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
+        let outerHalf = VerifyInt8Matmul.halfLive
+        let checkedHalf = (Qwen35HalfA.enabled || outerHalf)
+            && tokens.dim(0) == 1 && tokens.dim(1) == 16 && model.dFlash2Tap.layerIds == Qwen35HalfA.tapIds
+            && positionIds == nil && !caches.isEmpty
+            && caches.allSatisfy {
+                guard let cache = $0 as? CBv2LayerCache else { return false }
+                return cache.mtpSerializesRectangularAttention && !cache.mtpBatchesRectangularAttention
+            }
+        VerifyInt8Matmul.halfActivate(checkedHalf ? [-1] : [])
+        defer { VerifyInt8Matmul.halfActivate(outerHalf ? [-1] : []) }
         let canDeferFinal = !model.exactTargetVerify && (lmHead is HadamardQuantizedLinear)
         let (hiddenRaw, pendingDelta) = model.cbv2ForwardSplitFinal(
             tokens, inputEmbeddings: nil, caches: attending,
@@ -7230,6 +7240,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
             eval(fused.ids, fused.values, fused.residual)
         }
         HadamardQuantizedLinear.prepareSharedVerifyWeights()
+        if rows == 16 { Qwen35HalfA.run(self) }
     }
 }
 
@@ -7580,5 +7591,326 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+}
+
+// MARK: - Half-A verify body: load-time check and timed trial (`VerifyInt8Matmul.halfRun`)
+
+/// Decides `VerifyInt8Matmul.halfLive` at load, after the int8 verify route: the half-A kernels must match the record
+/// dispatch bit for bit on fixed probe operands (rows of 127 and -127 against a column of code 3, the largest sums) at
+/// every verify row count, both offset forms, each real K, one to three layers, stored and streamed words; then a
+/// timed trial of the whole tapped 16-row target forward on this GPU decides. Any error or mismatch keeps the record bodies.
+/// `DARKBLOOM_BONSAI_VFALU=0` skips it; no setting forces the body past the check or the trial.
+enum Qwen35HalfA {
+    nonisolated(unsafe) static var enabled = false
+    /// The tap layers the trial qualified; serving keeps the record bodies under any other tap configuration.
+    nonisolated(unsafe) private(set) static var tapIds: [Int]?
+    nonisolated(unsafe) private static var failed = false
+    private static func note(_ text: String) { FileHandle.standardError.write(Data("int8 verify half-A body: \(text)\n".utf8)) }
+
+    private static func prepareColdBoot(_ model: Qwen35TextModel) {
+        let restoreBranchState = CBv2BranchVerify.preserveTrialState()
+        let outerTap = model.model.dFlash2Tap.tappedHidden
+        let outerTop = model.verifyHeadTopTwo.value
+        let outerProbe = VerifyInt8Matmul.halfProbe
+        defer {
+            restoreBranchState()
+            model.model.dFlash2Tap.tappedHidden = outerTap
+            model.verifyHeadTopTwo.value = outerTop
+            VerifyInt8Matmul.halfActivate([])
+            VerifyInt8Matmul.halfProbe = outerProbe
+            VerifyInt8Matmul.halfPoison = false
+        }
+        VerifyInt8Matmul.halfActivate([])
+        VerifyInt8Matmul.halfProbe = nil
+        VerifyInt8Matmul.halfPoison = false
+        CBv2BranchVerify.tree = nil
+        SignedBlockHadamard.wideRowPrepareIfBoot(rows: 1024)
+        SignedBlockHadamard.pwPrepareIfBoot(rows: 1024)
+        Qwen35Layer0FP32.prepareIfBoot(model.model, promptRows: 1024)
+    }
+
+    static func run(_ model: Qwen35TextModel) {
+        enabled = false
+        VerifyInt8Matmul.halfActivate([])
+        guard VerifyInt8Matmul.halfEligible else {
+            note(ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VFALU"] == "0" ? "off (DARKBLOOM_BONSAI_VFALU=0)" : "off (record route)")
+            return
+        }
+        // This runs at drafter bind, before the resident's 1024-row boot warm. The trial must see the serving verify
+        // kernels, so the boot checks that warm would trigger run here first, in its order; the warm then finds them done.
+        prepareColdBoot(model)
+        guard SignedBlockHadamard.wideRowHalfReady else {
+            note("off (cold boot: no wide-row half quantizer resolved, record bodies kept)")
+            return
+        }
+        guard Qwen35Layer0FP32.prepared else {
+            note("off (cold boot: layer0 entry not prepared, record bodies kept)")
+            return
+        }
+        guard check() else { note("off (probe mismatch or error, record bodies kept)"); return }
+        let verdict = trial(model)
+        enabled = verdict.on
+        VerifyInt8Matmul.halfActivate([])
+        note(verdict.on ? "on (\(verdict.report))" : "off (\(verdict.report), record bodies kept)")
+    }
+
+    private static func negated(_ scalesT: MLXArray) -> MLXArray {
+        (scalesT.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+    }
+
+    private static func check() -> Bool {
+        let rows = VerifyInt8Matmul.tileRows, n = 64
+        let negatives = VerifyInt8Matmul.halfNegative ? [false, true] : [false]
+        let streams = VerifyInt8Matmul.halfStreamed ? [false, true] : [false]
+        var ok = true
+        failed = false
+        withErrorHandler({ _ in Qwen35HalfA.failed = true }) {
+            for k in VerifyInt8Matmul.formsK where ok {
+                let kg = k / 128
+                var q: [Int8] = (0 ..< rows * k).map { (i: Int) -> Int8 in Int8(truncatingIfNeeded: (i * 37 + 11) % 255 - 127) }
+                for i in 0 ..< k {
+                    q[i] = 127
+                    q[k + i] = -127
+                    q[2 * k + i] = 0
+                    q[3 * k + i] = i % 2 == 0 ? 127 : -127
+                }
+                var words: [UInt32] = (0 ..< n * k / 16).map { (i: Int) -> UInt32 in UInt32(truncatingIfNeeded: UInt64(i + 1) &* 2_654_435_761) }
+                for i in 0 ..< k / 16 { words[i] = 0xFFFF_FFFF }
+                let codes = MLXArray(q, [rows, k])
+                let codesH = codes.asType(.float16)
+                let weight = MLXArray(words, [n, k / 16])
+                let scalesT = MLXArray((0 ..< kg * n).map { (i: Int) -> Float16 in Float16(Float(1 + i % 13) / 1024) }, [kg, n])
+                let biasesT = MLXArray((0 ..< kg * n).map { (i: Int) -> Float16 in Float16(-Float(i % 7) / 512) }, [kg, n])
+                let negatedT = negated(scalesT)
+                let ascale = MLXArray((0 ..< rows * kg).map { (i: Int) -> Float in Float(1 + i % 11) / 256 }, [rows * kg])
+                let rsb = MLXArray((0 ..< rows * kg).map { (i: Int) -> Float in Float(i % 17 - 8) / 64 }, [rows * kg])
+                let slices: [[Range<Int>]] = VerifyInt8Matmul.halfShared ? [[0 ..< n], [0 ..< 32, 32 ..< n], [0 ..< 32, 32 ..< n, 0 ..< 32]] : [[0 ..< n]]
+                var same: [MLXArray] = []
+                for columns in slices {
+                    let copies = columns.map { (c: Range<Int>) -> MLXArray in VerifyInt8Matmul.streamPack(weight[c], k: k, columns: 16) }
+                    for negative in negatives {
+                        let layers = columns.map { (c: Range<Int>) -> VerifyLayer in (weight[c], scalesT[0..., c], negative ? negatedT[0..., c] : biasesT[0..., c]) }
+                        for streamed in streams {
+                            for m in 2 ... rows {
+                                guard let record = VerifyInt8Matmul.recordMatmul(
+                                        codes: codes, ascale: ascale, rsb: rsb, rows: m, k: k, layers: layers, negative: negative,
+                                        streamedWeights: streamed ? copies : nil),
+                                    let mine = VerifyInt8Matmul.halfRun(
+                                        codesH: codesH, ascale: ascale, rsb: rsb, layers: layers, m: m, k: k,
+                                        negative: negative && VerifyInt8Matmul.halfNegative, streamedWeights: streamed ? copies : nil)
+                                else {
+                                    ok = false
+                                    return
+                                }
+                                same.append(MLX.all(concatenated(record, axis: 1).view(dtype: .uint32) .== concatenated(mine, axis: 1).view(dtype: .uint32)))
+                            }
+                        }
+                    }
+                }
+                let all = MLX.all(MLX.stacked(same))
+                eval(all)
+                ok = ok && !failed && all.item(Bool.self)
+            }
+        }
+        return ok && !failed
+    }
+
+    private struct Failure: Error {
+        let reason: String
+        init(_ reason: String) { self.reason = reason }
+    }
+
+    private struct Pass {
+        let ns: Double
+        let out: [MLXArray]
+        let eligible: [Int: Int]
+        let dispatched: [Int: Int]
+    }
+
+    private static func sameWords(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+        guard !a.isEmpty, a.count == b.count else { return false }
+        var checks: [MLXArray] = []
+        for i in a.indices {
+            guard a[i].shape == b[i].shape, a[i].dtype == b[i].dtype else { return false }
+            checks.append(MLX.all(contiguous(a[i]).view(dtype: .uint8) .== contiguous(b[i]).view(dtype: .uint8)))
+        }
+        let same = MLX.all(MLX.stacked(checks))
+        eval(same)
+        return !failed && same.item(Bool.self)
+    }
+
+    private static func branchDescriptor() -> MLXArray {
+        var desc = [Int32](repeating: -1, count: 336)
+        for row in 0 ..< 16 {
+            let parent = row == 0 ? -1 : (row - 1) / 2
+            desc[row] = Int32(parent)
+            let depth = row == 0 ? 0 : Int(desc[16 + parent]) + 1
+            desc[16 + row] = Int32(depth)
+            var node = row
+            for d in stride(from: depth, through: 0, by: -1) {
+                desc[32 + 16 * row + d] = Int32(node)
+                node = Int(desc[node])
+            }
+        }
+        return MLXArray(desc)
+    }
+
+    // Each leg owns all mutable state. Prefill and allocations finish before the verify clock.
+    private static func pass(_ model: Qwen35TextModel, tree: MLXArray?, half: Bool,
+                             observe: Bool = false, poison: Bool = false) throws -> Pass {
+        let restoreDescriptors = CBv2BranchVerify.preserveTrialState()
+        let savedTap = model.model.dFlash2Tap.tappedHidden
+        let savedTop = model.verifyHeadTopTwo.value
+        defer {
+            restoreDescriptors()
+            model.model.dFlash2Tap.tappedHidden = savedTap
+            model.verifyHeadTopTwo.value = savedTop
+        }
+        let backend = CBv2ContiguousKVBackend(config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
+        let kinds = model.cbv2LayerKinds
+        let layerCaches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
+        let bank = CBv2LayerCacheBank(caches: layerCaches)
+        let rows = try backend.makeSequenceState(layerKinds: kinds, promptLength: 256, maxLength: 272)
+        let state = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+        defer {
+            bank.releaseBoundRows()
+            backend.release(rows)
+            if !state.isReleased { try? state.release() }
+        }
+        let caches = bank.layerCaches(rowStates: [rows]).compactMap { $0 as? KVCache }
+        guard caches.count == kinds.count else { throw Failure("cache factory coverage") }
+        func ids(_ count: Int, _ salt: Int) -> MLXArray {
+            MLXArray((0 ..< count).map { (i: Int) -> Int32 in
+                let value: Int = (i * 7919 + salt) % model.vocabularySize
+                return Int32(value)
+            }, [1, count])
+        }
+        func kvWords() -> [MLXArray] {
+            rows.compactMap { $0 }.flatMap { row -> [MLXArray] in
+                let snap = row.snapshot()
+                return [snap.keys, snap.values, MLXArray(Int32(snap.offset))]
+            }
+        }
+        VerifyInt8Matmul.halfActivate([])
+        VerifyInt8Matmul.halfProbe = nil
+        CBv2BranchVerify.tree = nil
+        let seed = try state.bind()
+        let prefill = model.cbv2ForwardWithHiddenForPrefill(ids(256, 13), caches: caches,
+            recurrentState: [seed], positionIds: nil, requirement: .lastPositionLogits)
+        let seedRoots = try seed.evaluate()
+        eval([prefill.logits, prefill.lastHidden] + seedRoots + caches.flatMap { $0.innerState() })
+        try seed.commit()
+        guard !failed else { throw Failure("prefill error") }
+        for cache in layerCaches {
+            guard let cache = cache as? CBv2LayerCache else { throw Failure("cache policy coverage") }
+            cache.mtpSerializesRectangularAttention = true
+            cache.mtpBatchesRectangularAttention = false
+        }
+        let block = ids(16, 101)
+        let positions = CBv2PositionState.decodePositionIds(states: [nil], cacheOffsets: [256], length: 16)
+        var eligible: [Int: Int] = [:], dispatched: [Int: Int] = [:]
+        if observe {
+            VerifyInt8Matmul.halfProbe = { (key: Int, didDispatch: Bool) -> Void in
+                eligible[key, default: 0] += 1
+                if didDispatch { dispatched[key, default: 0] += 1 }
+            }
+        }
+        VerifyInt8Matmul.halfActivate(half ? [-1] : [])
+        // The negative control negates the FP16 codes the first candidate dispatch consumes; int8 codes stay intact.
+        VerifyInt8Matmul.halfPoison = poison
+        CBv2BranchVerify.tree = tree
+        model.model.dFlash2Tap.tappedHidden = nil
+        defer {
+            VerifyInt8Matmul.halfProbe = nil
+            VerifyInt8Matmul.halfPoison = false
+            VerifyInt8Matmul.halfActivate([])
+            CBv2BranchVerify.tree = nil
+        }
+        for row in rows.compactMap({ $0 }) { row.beginSpeculativeWrite() }
+        let evaluation = try state.bind()
+        var evaluated = false
+        defer { if evaluated { try? evaluation.rollback() } }
+        Stream.gpu.synchronize()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let forward = model.cbv2ForwardWithHiddenCaptured(block, caches: caches,
+            recurrentState: [evaluation], positionIds: positions)
+        let roots = try evaluation.evaluate()
+        evaluated = true
+        guard let taps = model.dFlash2TappedHidden else { throw Failure("tap capture incomplete") }
+        var out = [forward.logits, forward.lastHidden] + roots + kvWords() + [taps]
+        if let top = model.verifyHeadTopTwo.value { out += [top.ids, top.values] }
+        eval(out + caches.flatMap { $0.innerState() })
+        Stream.gpu.synchronize()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+        guard !failed, evaluation.isCaptured else { throw Failure("capture forward incomplete") }
+        if VerifyInt8Matmul.halfPoison { throw Failure("negative control missed candidate") }
+        return Pass(ns: elapsed, out: out, eligible: eligible, dispatched: dispatched)
+    }
+
+    private static func trial(_ model: Qwen35TextModel) -> (on: Bool, report: String) {
+        let restoreBranchState = CBv2BranchVerify.preserveTrialState()
+        let outerTapIds = model.dFlash2TapLayerIds
+        let outerTap = model.model.dFlash2Tap.tappedHidden
+        let outerTop = model.verifyHeadTopTwo.value
+        let outerProbe = VerifyInt8Matmul.halfProbe
+        defer {
+            restoreBranchState()
+            model.dFlash2TapLayerIds = outerTapIds
+            model.model.dFlash2Tap.tappedHidden = outerTap
+            model.verifyHeadTopTwo.value = outerTop
+            VerifyInt8Matmul.halfActivate([])
+            VerifyInt8Matmul.halfProbe = outerProbe
+            VerifyInt8Matmul.halfPoison = false
+        }
+        // Drafter bind precedes the engine arming its taps, and serving packs them. Qualify with the armed layers, or
+        // the public drafter fixture's target_layer_ids when none are armed yet.
+        tapIds = outerTapIds ?? [2, 6, 10, 14, 18, 22, 26, 30]
+        model.dFlash2TapLayerIds = tapIds
+        var result: (on: Bool, report: String) = (false, "full-pass error")
+        failed = false
+        withErrorHandler({ _ in Qwen35HalfA.failed = true }) {
+            do {
+                guard SignedBlockHadamard.wideRowHalfReady, Qwen35Layer0FP32.prepared
+                else { throw Failure("cold boot prerequisites incomplete") }
+                CBv2BranchVerify.committedRows = nil
+                let descriptors: [MLXArray?] = [nil, branchDescriptor()]
+                var reports: [String] = []
+                for (index, tree) in descriptors.enumerated() {
+                    let label = index == 0 ? "chain" : "branch"
+                    let record = try pass(model, tree: tree, half: false, observe: true)
+                    let mine = try pass(model, tree: tree, half: true, observe: true)
+                    guard !record.eligible.isEmpty, record.dispatched.isEmpty,
+                        record.eligible == mine.eligible, mine.dispatched == record.eligible
+                    else { throw Failure("\(label) dispatch coverage incomplete") }
+                    guard sameWords(record.out, mine.out) else { throw Failure("\(label) full-pass word mismatch") }
+                    let wrong = try pass(model, tree: tree, half: true, observe: true, poison: true)
+                    guard wrong.dispatched == mine.dispatched, !sameWords(record.out, wrong.out), !failed
+                    else { throw Failure("\(label) negative control not detected") }
+                    note("coverage \(label) eligible=\(record.eligible.values.reduce(0, +)) candidate=\(mine.dispatched.values.reduce(0, +)) shapes=\(mine.dispatched.count) record=0 negative-control=caught")
+                    func timed() throws -> Double {
+                        var samples = [[Double]](repeating: [], count: 2)
+                        for pair in 0 ..< 5 {
+                            for offset in 0 ..< 2 {
+                                let leg = (pair + offset) % 2
+                                let value = try pass(model, tree: tree, half: leg == 1)
+                                guard sameWords(record.out, value.out) else { throw Failure("\(label) timed word mismatch") }
+                                samples[leg].append(value.ns)
+                            }
+                        }
+                        return samples[1].sorted()[2] / samples[0].sorted()[2]
+                    }
+                    let first = try timed(), confirm = try timed()
+                    reports.append(String(format: "\(label) full 16-row pass %.3fx, confirm %.3fx", first, confirm))
+                    guard !failed, first <= 0.98, confirm <= 0.98 else {
+                        result.report = reports.joined(separator: "; ")
+                        return
+                    }
+                }
+                result = (true, reports.joined(separator: "; "))
+            } catch let error as Failure { result.report = error.reason }
+            catch { result.report = "full-pass lifecycle error" }
+        }
+        return failed ? (false, "full-pass error") : result
     }
 }

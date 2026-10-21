@@ -1743,6 +1743,20 @@ public enum CBv2BranchVerify {
     /// and the engine finds the descriptor of the block it verifies by identity.
     nonisolated(unsafe) private static var proposals: [(tokens: MLXArray, desc: MLXArray)] = []
 
+    public static func preserveTrialState() -> () -> Void {
+        let savedTree = tree, savedRows = committedRows
+        let savedArray = committedRowsArray, savedIsBranch = committedRowsIsBranch
+        let savedProposals = proposals, savedHost = hostDesc
+        return {
+            tree = savedTree
+            committedRows = savedRows
+            committedRowsArray = savedArray
+            committedRowsIsBranch = savedIsBranch
+            proposals = savedProposals
+            hostDesc = savedHost
+        }
+    }
+
     public static func register(tokens: MLXArray, desc: MLXArray) {
         proposals.append((tokens, desc))
         if proposals.count > 4 { proposals.removeFirst() }
