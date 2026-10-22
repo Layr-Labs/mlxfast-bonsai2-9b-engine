@@ -44,6 +44,8 @@ private enum VerifyK64 {
     nonisolated(unsafe) private static var prepared = false
 
     static let install: Void = {
+        SignedBlockHadamard.headTail = HeadQuantRowBounds.tail
+        HadamardQuantizedLinear.verifyHeadRescore = M5HeadGroupedRescore.make
         HadamardQuantizedLinear.verifyK64Prepare = { prepare() }
         HadamardQuantizedLinear.verifyK64Run = { inputs, negative, streamed, product in
             let bit = UInt8(1 << ((streamed ? 2 : 0) + (negative ? 1 : 0)))
@@ -608,5 +610,249 @@ private enum VerifyK64 {
                 }
             }
         }
+    }
+}
+
+private enum M5HeadGroupedRescore {
+    static func make(_ original: String, _ header: String) -> (MLXFast.MLXFastKernel, Int) {
+        let arch = GPU.deviceInfo().architecture
+        let grouped = arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+        let body = grouped ? HeadQuantRowBounds.rescore(source(original)) : original
+            .replacingOccurrences(of: "if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);", with: "float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);")
+            .replacingOccurrences(of: "const float anchor_t = anchor_floor - e;", with: "const float anchor_t = anchor_floor - local_e;")
+        return (MLXFast.metalKernel(
+            name: "bonsai_verify_head_partition_rescore_group2_shared_error_v1",
+            inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
+            outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
+            source: body, header: header), grouped ? 512 : 256)
+    }
+
+    static func source(_ original: String) -> String {
+        var text = original
+        func replace(_ old: String, _ new: String, count: Int = 1) {
+            precondition(text.components(separatedBy: old).count == count + 1)
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        replace("const uint block = threadgroup_position_in_grid.x;", """
+            const uint partition = thread_position_in_threadgroup.x / uint(THREADS);
+            const uint block = threadgroup_position_in_grid.x * 2u + partition;
+            """)
+        replace("const uint lane = thread_position_in_threadgroup.x;",
+            "const uint lane = thread_position_in_threadgroup.x % uint(THREADS);")
+        replace("const uint simd_gid = simdgroup_index_in_threadgroup;",
+            "const uint simd_gid = simdgroup_index_in_threadgroup % uint(THREADS / 32);")
+        replace("""
+            threadgroup atomic_int cand_count; threadgroup atomic_int omitted_overflow;
+            threadgroup int cand_ids[CAP];
+            threadgroup float cand_values[CAP];
+            threadgroup float shared_tau[2];
+            threadgroup int shared_bad;
+            """, """
+            threadgroup atomic_int counts2[2], overflows2[2];
+            threadgroup int ids2[2 * CAP], bads2[2];
+            threadgroup float values2[2 * CAP], taus2[4];
+            threadgroup float leaders[2], leader_second;
+            threadgroup uint leader_ok[2], leader_count;
+            threadgroup int leader_bad;
+            threadgroup atomic_int* cand_count = counts2 + partition;
+            threadgroup atomic_int* omitted_overflow = overflows2 + partition;
+            threadgroup int* cand_ids = ids2 + partition * uint(CAP);
+            threadgroup float* cand_values = values2 + partition * uint(CAP);
+            threadgroup float* shared_tau = taus2 + partition * 2u;
+            threadgroup int* shared_bad = bads2 + partition;
+            """)
+        replace("&cand_count", "cand_count", count: 3)
+        replace("&omitted_overflow", "omitted_overflow", count: 3)
+        replace("for (int anchor = 0; anchor < 2; anchor++) {", "{ const int anchor = int(partition);")
+        replace("""
+              if (simd_lid == 0) {
+                float e = 0.0f;
+                for (int g = 0; g < in_g; g++) {
+                  e += ascale[row * uint(in_g) + uint(g)]
+                      * (bounds[g] * (0.5f + 127.0f * 3.0e-5f) + bounds[in_g + g] * 1.0e-5f);
+                }
+                e *= 1.001f; if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);
+            """, """
+              if (simd_lid == 0) {
+                leaders[partition] = anchor_floor;
+                leader_ok[partition] = anchor_ok ? 1u : 0u;
+                if (partition == 0) {
+                  leader_second = local.second_value;
+                  leader_count = local.count;
+                  leader_bad = pbad;
+                }
+                float e = 0.0f;
+                for (int g = 0; g < in_g; g++) {
+                  e += ascale[row * uint(in_g) + uint(g)]
+                      * (bounds[g] * (0.5f + 127.0f * 3.0e-5f) + bounds[in_g + g] * 1.0e-5f);
+                }
+                e *= 1.001f; float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);
+                shared_tau[0] = e;
+                shared_tau[1] = local_e;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float cutoff_tau = 0.0f;
+            if (simd_lid == 0) {
+              const bool anchor_ok = leader_ok[0] != 0u && leader_ok[1] != 0u;
+              const float anchor_floor = min(min(INFINITY, leaders[0]), leaders[1]);
+              const float e = shared_tau[0];
+              const float local_e = shared_tau[1];
+            """)
+        replace("const float base_t = local.second_value - 2.0f * e;",
+            "const float base_t = leader_second - 2.0f * e;")
+        replace("const float anchor_t = anchor_floor - e;", "const float anchor_t = anchor_floor - local_e;")
+        replace("""
+                shared_tau[0] = t - (fabs(t) * 2.4e-7f + 1.0e-30f);
+                shared_tau[1] = e;
+                shared_bad = (pbad != 0 || local.count < 2 || !isfinite(e) || !isfinite(t)) ? 1 : 0;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float tau = shared_tau[0];
+            """, """
+              cutoff_tau = t - (fabs(t) * 2.4e-7f + 1.0e-30f);
+              if (simd_gid == 0) {
+                shared_bad[0] = (leader_bad != 0 || leader_count < 2 || !isfinite(e) || !isfinite(t)) ? 1 : 0;
+              }
+            }
+            const float tau = simd_shuffle(cutoff_tau, ushort(0));
+            """)
+        replace("= shared_bad |", "= shared_bad[0] |")
+        replace("if (block == 0) row_e[row] = shared_tau[1];", "if (block == 0) row_e[row] = shared_tau[0];")
+        replace("""
+            for (int q = int(lane); q < quads; q += THREADS) {
+              const vec<float,V> v4 = lq[q]; if (omitted[row * uint(NV / 2) + first / 2u + uint(q)] >= tau) atomic_store_explicit(omitted_overflow, 1, memory_order_relaxed);
+              for (int i = 0; i < V; i++) {
+                if (v4[i] >= tau) {
+                  const int slot = atomic_fetch_add_explicit(cand_count, 1, memory_order_relaxed);
+                  if (slot < CAP) cand_ids[slot] = head_id(compact_ids,row,NV,first+2*q+i);
+                }
+              }
+            }
+            """, """
+            for (int q = int(lane); q < quads; q += THREADS) {
+              const uint tile = first / 2u + uint(q);
+              if (omitted[row * uint(NV / 2) + tile] >= tau) {
+                const int slot = atomic_fetch_add_explicit(cand_count, 32, memory_order_relaxed);
+                if (slot + 32 > CAP) atomic_store_explicit(omitted_overflow, 1, memory_order_relaxed);
+                for (int i = 0; i < 32; i++) {
+                  if (slot + i < CAP) cand_ids[slot + i] = int(tile * 32u + uint(i));
+                }
+              } else {
+                const vec<float,V> v4 = lq[q];
+                for (int i = 0; i < V; i++) {
+                  if (v4[i] >= tau) {
+                    const int slot = atomic_fetch_add_explicit(cand_count, 1, memory_order_relaxed);
+                    if (slot < CAP) cand_ids[slot] = head_id(compact_ids,row,NV,first+2*q+i);
+                  }
+                }
+              }
+            }
+            """)
+        return text
+    }
+}
+
+private enum HeadQuantRowBounds {
+    static let tail = """
+        threadgroup_barrier(mem_flags::mem_device);
+        if (i < 32) {
+          const uint row = block_idx;
+          const uint bound_lane = thread_index_in_simdgroup;
+          constexpr int in_g = 32;
+          const float group_a = ascale[row * uint(in_g) + bound_lane];
+          const float group_amax = head_bounds[bound_lane];
+          const float group_bmax = head_bounds[uint(in_g) + bound_lane];
+          const float group_d2 = qerror2[row * uint(in_g) + bound_lane];
+          const float group_c2 = head_bounds[2u * uint(in_g) + bound_lane];
+          const float group_inner = group_amax * (0.5f + 127.0f * 3.0e-5f) + group_bmax * 1.0e-5f;
+          float group_term = 0.0f;
+          uint group_ok = 0u;
+          if (head_l2_safe(group_d2) && head_l2_safe(group_c2)) {
+            const float radius = head_l2_root(head_l2_mul(group_d2, group_c2));
+            if (head_l2_safe(radius)) {
+              const float worst = head_l2_mul(head_l2_mul(0.5f, group_a), group_amax);
+              const float rounding = head_l2_mul(group_a, head_l2_add(
+                  head_l2_mul(head_l2_mul(127.0f, 3.0e-5f), group_amax),
+                  head_l2_mul(1.0e-5f, group_bmax)));
+              group_term = head_l2_add(min(worst, radius), rounding);
+              group_ok = 1u;
+            }
+          }
+          float e = 0.0f;
+          for (int g = 0; g < in_g; g++) {
+            const float a = simd_shuffle(group_a, ushort(g));
+            const float inner = simd_shuffle(group_inner, ushort(g));
+            if (bound_lane == 0u) {
+              e += a * inner;
+            }
+          }
+          e *= 1.001f;
+          const float raw_e = e;
+          float total = 0.0f;
+          uint status = 0u;
+          bool safe = true;
+          for (int g = 0; g < in_g; g++) {
+            const float term = simd_shuffle(group_term, ushort(g));
+            const uint ok = simd_shuffle(group_ok, ushort(g));
+            if (bound_lane == 0u && safe) {
+              if (ok == 0u) safe = false;
+              else total = head_l2_add(total, term);
+            }
+          }
+          if (bound_lane == 0u) {
+            if (safe) {
+              const float upper = head_l2_mul(total, 1.001f);
+              status = head_l2_safe(upper) ? 2u : 1u;
+              e = status == 2u ? min(raw_e, upper) : raw_e;
+            }
+            const uint at = uint(VERIFY_ROWS) * 32u + row * 3u;
+            qerror2[at] = raw_e;
+            qerror2[at + 1u] = e;
+            qerror2[at + 2u] = float(status);
+          }
+        }
+        """
+    static func rescore(_ original: String) -> String {
+        let old = """
+            float e = 0.0f;
+            for (int g = 0; g < in_g; g++) {
+              e += ascale[row * uint(in_g) + uint(g)]
+                  * (bounds[g] * (0.5f + 127.0f * 3.0e-5f) + bounds[in_g + g] * 1.0e-5f);
+            }
+            e *= 1.001f; float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);
+            shared_tau[0] = e;
+            shared_tau[1] = local_e;
+        """
+        let new = """
+            const uint bound_at = uint(x_shape[0]) * uint(in_g) + row * 3u;
+            const float e = error2[bound_at + 1u];
+            float local_e = e;
+            if (error2[bound_at + 2u] == 2.0f) {
+              float part_total = 0.0f;
+              bool part_ok = true;
+              for (int g = 0; g < in_g; g++) {
+                const float a = ascale[row * uint(in_g) + uint(g)];
+                const float d2 = error2[row * uint(in_g) + uint(g)];
+                const float worst = head_l2_mul(head_l2_mul(0.5f, a), bounds[g]);
+                const float rounding = head_l2_mul(a, head_l2_add(
+                    head_l2_mul(head_l2_mul(127.0f, 3.0e-5f), bounds[g]),
+                    head_l2_mul(1.0e-5f, bounds[in_g + g])));
+                const float part_c2 = bounds[(3 + int(block)) * in_g + g];
+                const float part_radius = head_l2_root(head_l2_mul(d2, part_c2));
+                if (!head_l2_safe(part_c2) || !head_l2_safe(part_radius)) { part_ok = false; break; }
+                part_total = head_l2_add(part_total, head_l2_add(min(worst, part_radius), rounding));
+              }
+              if (part_ok) {
+                const float part_upper = head_l2_mul(part_total, 1.001f);
+                if (head_l2_safe(part_upper)) local_e = min(e, part_upper);
+              }
+            }
+            shared_tau[0] = e;
+            shared_tau[1] = local_e;
+        """
+        precondition(original.components(separatedBy: old).count == 2)
+        return original.replacingOccurrences(of: old, with: new)
     }
 }
