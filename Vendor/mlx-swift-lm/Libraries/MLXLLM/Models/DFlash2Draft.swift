@@ -6544,6 +6544,26 @@ public final class DFlash2ContextProjection {
 
     /// The projection of the verify columns `rows` (a draft tree's accepted path), in order.
     func gathered(_ rows: [Int32]) -> DFlash2ContextProjection {
+        let count = rows.count
+        func supportsPrefix(_ array: MLXArray) -> Bool {
+            array.ndim == 3 && array.dim(0) == 1 && count <= array.dim(1)
+        }
+        if count > 0,
+            rows.enumerated().allSatisfy({ Int($0.element) == $0.offset }),
+            supportsPrefix(anchorEmbeddings), supportsPrefix(context),
+            contextKV.allSatisfy({ supportsPrefix($0.0) && supportsPrefix($0.1) }),
+            lookupFCOutput.map(supportsPrefix) ?? true
+        {
+            // Construct a new projection to clear front, including for a full prefix.
+            // A leading accepted path needs only views of the existing row buffers.
+            func prefix(_ array: MLXArray) -> MLXArray {
+                array[0..., 0 ..< count, 0...]
+            }
+            return DFlash2ContextProjection(
+                anchorEmbeddings: prefix(anchorEmbeddings), context: prefix(context),
+                contextKV: contextKV.map { (prefix($0.0), prefix($0.1)) },
+                lookupFCOutput: lookupFCOutput.map(prefix))
+        }
         let index = MLXArray(rows)
         return DFlash2ContextProjection(
             anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
