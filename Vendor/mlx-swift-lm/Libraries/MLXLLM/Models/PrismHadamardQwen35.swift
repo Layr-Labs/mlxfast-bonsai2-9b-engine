@@ -25,11 +25,381 @@ public final class PrismHadamardQwen35TextModel: Qwen35Model, PrismHadamardLoadi
     public init(configurationData: Data) throws {
         _ = VerifyK64.install
         prismCheckpoint = try JSONDecoder().decode(PrismHadamardCheckpointConfiguration.self, from: configurationData)
+        _ = M5K128Product.install
         super.init(try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData))
     }
     public func shouldLoadWeight(named name: String) -> Bool {
         !name.hasPrefix("vision_tower.")
     }
+}
+
+enum M5K128Product {
+    private static let m5: Bool = {
+        let arch = GPU.deviceInfo().architecture
+        return arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+    }()
+
+    static let install: Void = {
+        guard m5 else { return }
+        HadamardQuantizedLinear.verifyTile = { M5Int4Tile.make($0) }
+        HadamardQuantizedLinear.verifyHeadRescore = M5HeadGroupedRescore.make
+    }()
+}
+
+enum M5Int4Tile {
+    static func make(_ source: String) -> String {
+        let start = source.range(of: "constexpr auto desc =")!
+        let end = source.range(of: "threadgroup_barrier(mem_flags::mem_threadgroup);", options: .backwards)!
+        let alignment = source.contains("alignas(32) threadgroup uint32_t bs") ? 32 : 4
+        var old = String(source[start.lowerBound ..< end.lowerBound])
+        old = old.replacingOccurrences(of: "alignas(32) ", with: "")
+            .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];", with: "")
+            .replacingOccurrences(of: "const bool good = simd_all(ok);", with: "good = simd_all(ok);")
+        let streamed = source.contains("w + (size_t)bx * (2) * Kg * 128")
+        let pointer = streamed ? "const device uint32_t* wcol = w + (size_t)bx * (2) * Kg * 128;"
+                : "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
+        let load = streamed ? "for (int t = 0; t < 8; t += 4) { const uint4 u = *((const device uint4*)(wcol + (t / 4) * Kg * 128 + gl * 128 + lane * 4)); wv[t] = u.x; wv[t + 1] = u.y; wv[t + 2] = u.z; wv[t + 3] = u.w; }"
+                : "for (int t = 0; t < 8; t++) { wv[t] = wcol[(size_t)(4 * t) * KW + gl * 8]; }"
+        let address = streamed
+            ? "const int col = int(lane >> 1) + 16 * (t / 4);\nconst int word = int(lane & 1u) * 4 + t % 4;"
+            : "const int col = c + 4 * t;\nconst int word = j;"
+        let metadata = "const half s = scalesT[(size_t)g * N + n0 + col];\nconst half b = NEG ? -s : biasesT[(size_t)g * N + n0 + col];"
+        let body = """
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 128, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, 16));
+        tensor<threadgroup int4b_format, extents<int, 128, 32>, tensor_inline> B((threadgroup uchar*)bs[sg], extents<int, 128, 32>{}, array<int, 2>{1, 256});
+        auto tA0 = A.template slice<128, 16>(0, 0);
+        auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
+        auto accT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(B)>, int32_t>();
+        const int cap = int(cT.get_capacity());
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < cap; i++) {
+          if (cT.is_valid_element(ushort(i))) accT[i] = as_type<int32_t>(0.0f);
+        }
+        const int j = int(lane & 7u);
+        const int c = int(lane >> 3);
+        \(pointer)
+        uint32_t wv[8];
+        {
+          const int gl = int(sg);
+          \(load)
+        }
+        for (int g = int(sg); g < Kg; g += 4) {
+          #pragma clang loop unroll(full)
+          for (int t = 0; t < 8; t++) {
+            const uint32_t v = wv[t];
+            \(address)
+            uint2 packed = uint2(0u);
+            #pragma clang loop unroll(full)
+            for (int u = 0; u < 16; u++) packed[u >> 3] |= ((v >> (2 * (u / 4) + 8 * (u % 4))) & 3u) << (4 * (u & 7));
+            *(threadgroup uint2*)((threadgroup uchar*)bs[sg] + col * 128 + word * 8) = packed;
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          auto tA = A.template slice<128, 16>(g * 128, 0);
+          op.run(tA, B, cT);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < cap; i++) {
+            if (cT.is_valid_element(ushort(i))) {
+              const auto ids = cT.get_multidimensional_index(i);
+              const int col = int(ids[0]);
+              const int row = int(ids[1]);
+              \(metadata)
+              const float t = float(s) * float(cT[i]);
+              const float a = ascale[row * Kg + g], rb = rsb[row * Kg + g];
+              accT[i] = as_type<int32_t>(fma(float(b), rb, fma(a, t, as_type<float>(accT[i]))));
+            }
+          }
+          if (g + 4 < Kg) {
+            const int gl = g + 4;
+            \(load)
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        tensor<threadgroup int32_t, extents<int, 32, 16>, tensor_inline> R((threadgroup int32_t*)bs[sg], extents<int, 32, 16>{});
+        accT.store(R);
+        """
+        return String(source[..<start.lowerBound]) + "alignas(ROWS == 16 ? 128 : \(alignment)) threadgroup uint32_t bs[4][32 * 32];\nbool good = true;\nif constexpr (ROWS == 16) {\n" + body + "\n} else {\n" + old + "\n}\n" + String(source[end.lowerBound...])
+    }
+}
+
+/// Current one-row float head law with32 vocabulary outputs per group.
+enum M5R1Head {
+    private static let m5: Bool = {
+        let arch = GPU.deviceInfo().architecture
+        return arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+    }()
+
+    static func accepts(_ head: HadamardQuantizedLinear) -> Bool {
+        m5 && StreamOrDevice.default == StreamOrDevice.gpu
+            && head.bits == 2 && head.groupSize == 128 && head.bias == nil && head.gdnLayout == nil
+            && head.transform.width == 4096 && head.transform.blockSize == 4096
+            && head.transform.signs.dtype == .float32 && head.transform.signs.shape == [4096]
+            && head.weight.dtype == .uint32 && head.weight.shape == [248320, 256]
+            && head.scales.dtype == .float16 && head.scales.shape == [248320, 32]
+            && head.biases?.dtype == .float16 && head.biases?.shape == [248320, 32]
+    }
+
+    static func run(_ head: HadamardQuantizedLinear, _ normalized: MLXArray)
+        -> (ids: MLXArray, values: MLXArray)
+    {
+        let partials = producer(
+            [head.transform(normalized), head.weight, head.scales, head.biases!],
+            template: [("NEG", head.neg ? 1 : 0)],
+            grid: (32, 15520, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 7760, 2], [1, 7760, 2]], outputDTypes: [.int32, .float32])
+        let top = Float16ConstantQMV.topTwoFinalize(
+            partials, grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 2], [1, 2]], outputDTypes: [.int32, .float32])
+        return (top[0], top[1])
+    }
+
+    private static let producer = MLXFast.metalKernel(
+        name: "bonsai_head_r1_fast32_top2",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: #"""
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const uint3 tid = threadgroup_position_in_grid;
+        const int K = x_shape[x_ndim - 1];
+        const int in_w = K / 4;
+        const int in_g = K / 128;
+        const int out_row = tid.y * 32 + simd_gid * 4;
+        const device uint8_t* ws = (const device uint8_t*)w + out_row * in_w + simd_lid * 4;
+        const device half* sc = scales + out_row * in_g + simd_lid / 8;
+        const device half* bi = biases + out_row * in_g + simd_lid / 8;
+        const device float4* xp4 = (const device float4*)(x + simd_lid * 16);
+        float x_thread[16];
+        float r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+        #define HEAD_ONE(RESULT, COL) { \
+          const uint packed_w = *(const device uint*)(ws + (COL) * in_w); \
+          const float s = float(sc[(COL) * in_g]); \
+          const float b = NEG ? -s : float(bi[(COL) * in_g]); \
+          float accum = 0; \
+          for (int i = 0; i < 4; i++) { \
+            const uint8_t w_byte = (packed_w >> (8 * i)) & 0xFF; \
+            accum += (x_thread[4 * i] * (w_byte & 0x03) + x_thread[4 * i + 1] * (w_byte & 0x0c) \
+                + x_thread[4 * i + 2] * (w_byte & 0x30) + x_thread[4 * i + 3] * (w_byte & 0xc0)); \
+          } \
+          RESULT += s * accum + sum * b; \
+        }
+        for (int k = 0; k < K; k += 512) {
+          float sum = 0;
+          for (int i = 0; i < 4; ++i) {
+            const float4 xv = xp4[i];
+            sum += float(xv.x) + float(xv.y) + float(xv.z) + float(xv.w);
+            x_thread[4 * i] = xv.x;
+            x_thread[4 * i + 1] = xv.y * 0.25f;
+            x_thread[4 * i + 2] = xv.z * 0.0625f;
+            x_thread[4 * i + 3] = xv.w * 0.015625f;
+          }
+          HEAD_ONE(r0, 0)
+          HEAD_ONE(r1, 1)
+          HEAD_ONE(r2, 2)
+          HEAD_ONE(r3, 3)
+          HEAD_ONE(r4, 8)
+          HEAD_ONE(r5, 9)
+          HEAD_ONE(r6, 10)
+          HEAD_ONE(r7, 11)
+          HEAD_ONE(r8, 16)
+          HEAD_ONE(r9, 17)
+          HEAD_ONE(r10, 18)
+          HEAD_ONE(r11, 19)
+          HEAD_ONE(r12, 24)
+          HEAD_ONE(r13, 25)
+          HEAD_ONE(r14, 26)
+          HEAD_ONE(r15, 27)
+          ws += 128;
+          sc += 4;
+          bi += 4;
+          xp4 += 128;
+        }
+        #undef HEAD_ONE
+        hadamard_top2 best = hadamard_top2_empty();
+        const float total0 = simd_sum(r0);
+        if (simd_lid == 0) hadamard_top2_insert(best, total0, uint(out_row + 0));
+        const float total1 = simd_sum(r1);
+        if (simd_lid == 0) hadamard_top2_insert(best, total1, uint(out_row + 1));
+        const float total2 = simd_sum(r2);
+        if (simd_lid == 0) hadamard_top2_insert(best, total2, uint(out_row + 2));
+        const float total3 = simd_sum(r3);
+        if (simd_lid == 0) hadamard_top2_insert(best, total3, uint(out_row + 3));
+        const float total4 = simd_sum(r4);
+        if (simd_lid == 0) hadamard_top2_insert(best, total4, uint(out_row + 8));
+        const float total5 = simd_sum(r5);
+        if (simd_lid == 0) hadamard_top2_insert(best, total5, uint(out_row + 9));
+        const float total6 = simd_sum(r6);
+        if (simd_lid == 0) hadamard_top2_insert(best, total6, uint(out_row + 10));
+        const float total7 = simd_sum(r7);
+        if (simd_lid == 0) hadamard_top2_insert(best, total7, uint(out_row + 11));
+        const float total8 = simd_sum(r8);
+        if (simd_lid == 0) hadamard_top2_insert(best, total8, uint(out_row + 16));
+        const float total9 = simd_sum(r9);
+        if (simd_lid == 0) hadamard_top2_insert(best, total9, uint(out_row + 17));
+        const float total10 = simd_sum(r10);
+        if (simd_lid == 0) hadamard_top2_insert(best, total10, uint(out_row + 18));
+        const float total11 = simd_sum(r11);
+        if (simd_lid == 0) hadamard_top2_insert(best, total11, uint(out_row + 19));
+        const float total12 = simd_sum(r12);
+        if (simd_lid == 0) hadamard_top2_insert(best, total12, uint(out_row + 24));
+        const float total13 = simd_sum(r13);
+        if (simd_lid == 0) hadamard_top2_insert(best, total13, uint(out_row + 25));
+        const float total14 = simd_sum(r14);
+        if (simd_lid == 0) hadamard_top2_insert(best, total14, uint(out_row + 26));
+        const float total15 = simd_sum(r15);
+        if (simd_lid == 0) hadamard_top2_insert(best, total15, uint(out_row + 27));
+        threadgroup hadamard_top2 scratch;
+        if (simd_gid == 1 && simd_lid == 0) scratch = best;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 0 && simd_lid == 0) {
+          hadamard_top2_merge(best, scratch);
+          const uint base = tid.y * 2;
+          partial_ids[base] = int(best.first_id);
+          partial_ids[base + 1] = int(best.second_id);
+          partial_values[base] = best.first_value;
+          partial_values[base + 1] = best.second_value;
+        }
+        """#,
+        header: Float16ConstantQMV.topTwoHeader)
+}
+
+enum M5HeadGroupedRescore {
+    static func make(_ original: String, _ header: String) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "bonsai_verify_head_partition_rescore_group4_v1",
+            inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
+            outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
+            source: source(original), header: header)
+    }
+
+    static func source(_ original: String) -> String {
+        var text = original
+        func replace(_ old: String, _ new: String, count: Int = 1) {
+            precondition(text.components(separatedBy: old).count == count + 1)
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        replace("const uint block = threadgroup_position_in_grid.x;", """
+            const uint partition = thread_position_in_threadgroup.x / uint(THREADS);
+            const uint block = threadgroup_position_in_grid.x * 4u + partition;
+            """)
+        replace("const uint lane = thread_position_in_threadgroup.x;",
+            "const uint lane = thread_position_in_threadgroup.x % uint(THREADS);")
+        replace("const uint simd_gid = simdgroup_index_in_threadgroup;",
+            "const uint simd_gid = simdgroup_index_in_threadgroup % uint(THREADS / 32);")
+        replace("""
+            threadgroup atomic_int cand_count; threadgroup atomic_int omitted_overflow;
+            threadgroup int cand_ids[CAP];
+            threadgroup float cand_values[CAP];
+            threadgroup float shared_tau[2];
+            threadgroup int shared_bad;
+            """, """
+            threadgroup atomic_int counts4[4], overflows4[4];
+            threadgroup int ids4[4 * CAP], bads4[4];
+            threadgroup float values4[4 * CAP], taus4[8];
+            threadgroup atomic_int* cand_count = counts4 + partition;
+            threadgroup atomic_int* omitted_overflow = overflows4 + partition;
+            threadgroup int* cand_ids = ids4 + partition * uint(CAP);
+            threadgroup float* cand_values = values4 + partition * uint(CAP);
+            threadgroup float* shared_tau = taus4 + partition * 2u;
+            threadgroup int* shared_bad = bads4 + partition;
+            """)
+        replace("&cand_count", "cand_count", count: 3)
+        replace("&omitted_overflow", "omitted_overflow", count: 3)
+        replace("if (simd_gid == 0) {", "if (simdgroup_index_in_threadgroup == 0) {")
+        replace("""
+              if (simd_lid == 0) {
+                float e = 0.0f;
+            """, """
+              const float leader_second = simd_shuffle(local.second_value, ushort(0));
+              const uint leader_count = simd_shuffle(local.count, ushort(0));
+              if (simd_lid < 4) {
+                const uint cutoff_block = threadgroup_position_in_grid.x * 4u + simd_lid;
+                float e = 0.0f;
+            """)
+        replace("if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);",
+            "float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, cutoff_block, local_e);")
+        replace("const float base_t = local.second_value - 2.0f * e;",
+            "const float base_t = leader_second - 2.0f * e;")
+        replace("const float anchor_t = anchor_floor - e;", "const float anchor_t = anchor_floor - local_e;")
+        replace("shared_tau[0] =", "taus4[simd_lid * 2u] =")
+        replace("shared_tau[1] =", "taus4[simd_lid * 2u + 1u] =")
+        replace("shared_bad = (pbad != 0 || local.count < 2",
+            "bads4[simd_lid] = (pbad != 0 || leader_count < 2")
+        replace("= shared_bad |", "= shared_bad[0] |")
+        return text
+    }
+}
+
+/// Fixed loaded9B M5 one-row GDN input norm and shared rotation.
+enum M5R1GDNInput {
+    private static let m5: Bool = {
+        let arch = GPU.deviceInfo().architecture
+        return arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+    }()
+
+    static func apply(_ x: MLXArray, weight: MLXArray, eps: Float, qkv: Linear, z: Linear)
+        -> (normalized: MLXArray, projections: [MLXArray])?
+    {
+        guard m5, StreamOrDevice.default == StreamOrDevice.gpu,
+            x.dtype == .float32, x.shape == [1, 1, 4096],
+            weight.dtype == .float32, weight.shape == [4096],
+            let first = qkv as? HadamardQuantizedLinear, let second = z as? HadamardQuantizedLinear,
+            first.weight.shape == [8192, 256], second.weight.shape == [4096, 256]
+        else { return nil }
+        let projections: [HadamardQuantizedLinear] = [first, second]
+        for projection in projections {
+            guard projection.bits == 2, projection.groupSize == 128,
+                projection.bias == nil, projection.gdnLayout == nil,
+                projection.weight.dtype == .uint32
+            else { return nil }
+            guard projection.transform.width == 4096, projection.transform.blockSize == 4096,
+                projection.transform.signs.dtype == .float32,
+                projection.transform.signs.shape == [4096]
+            else { return nil }
+            let metadataShape: [Int] = [projection.weight.dim(0), 32]
+            guard projection.scales.dtype == .float16, projection.scales.shape == metadataShape,
+                let offsets = projection.biases, offsets.dtype == .float16,
+                offsets.shape == metadataShape
+            else { return nil }
+        }
+        guard first.transform.isIdentical(to: second.transform) else { return nil }
+        let output = prepare([x, weight, HostConstants.float32([eps]), first.transform.signs],
+            template: [("T", DType.float32), ("BLOCKS_PER_ROW", 1), ("INVERSE", false)],
+            grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [x.shape, x.shape], outputDTypes: [.float32, .float32])
+        return (output[1], [first.forwardRotated(output[0]), second.forwardRotated(output[0])])
+    }
+
+    private static let prepare: MLXFast.MLXFastKernel = {
+        var source = SignedBlockHadamard.fused4096Source(residualNorm: true)
+        let oldNorm = """
+        const float4 value = *((const device float4*)(x + at))
+              + *((const device float4*)(residual + at));
+        """
+        let newNorm = "const float4 value = *((const device float4*)(x + at));"
+        let oldRead = """
+        const float4 raw = in4[v] + *((const device float4*)(residual + in_offset) + v);
+        *((device float4*)(residual_out + in_offset) + v) = raw;
+        const float4 weight = *((const device float4*)(norm_weight + s_offset) + v);
+        float4 val = (weight * (raw * norm_inv)) * s4[v];
+        """
+        let newRead = """
+        const float4 raw = in4[v];
+        const float4 weight = *((const device float4*)(norm_weight + s_offset) + v);
+        const float4 normed = weight * (raw * norm_inv);
+        *((device float4*)(normed_out + in_offset) + v) = normed;
+        float4 val = normed * s4[v];
+        """
+        precondition(source.components(separatedBy: oldNorm).count == 2)
+        precondition(source.components(separatedBy: oldRead).count == 2)
+        source = source.replacingOccurrences(of: oldNorm, with: newNorm)
+            .replacingOccurrences(of: oldRead, with: newRead)
+        return MLXFast.metalKernel(
+            name: "bonsai_m5_r1_gdn_norm_rotation_v1",
+            inputNames: ["x", "norm_weight", "epsilon", "signs"], outputNames: ["y", "normed_out"],
+            source: source, header: SignedBlockHadamard.fused4096Header)
+    }()
 }
 
 private enum VerifyK64 {

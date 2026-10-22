@@ -106,6 +106,9 @@ extension EngineLoopV2 {
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                 committedObservationRows: graph.committedObservationRows,
                 prefillCarries: graph.prefillCarries)
+            step.mtpRound?.greedySeedIDs = graph.greedySeedIDs
+            step.mtpRound?.skippedNeuralDraftIDs = mtp.neuralSkipMarks.intersection(
+                Set(graph.seedRows.map { $0.id }))
         }
         step.forwardShapes = shapes
         shapes?.attach()

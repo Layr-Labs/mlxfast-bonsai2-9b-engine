@@ -98,10 +98,20 @@ public protocol CBv2RecurrentMTPForwardable:
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Ordinary R1 state/taps with exact current-head top-two [1, 1, 2].
+    /// Nil must precede any target forward or cache/state mutation.
+    func cbv2ForwardWithHiddenGreedySeed(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)?
 }
 
 extension CBv2RecurrentMTPForwardable {
     public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+    public func cbv2ForwardWithHiddenGreedySeed(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)? { nil }
 }
 
 /// Capture-verify refinement of `CBv2RecurrentMTPForwardable` (MTPLX GDN
@@ -171,6 +181,11 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Same ordinary transaction; nil must leave caches/state untouched.
+    func forwardWithHiddenGreedySeed(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)?
     /// True only when `forwardWithHiddenCaptured` stages per-position
     /// captured recurrent stacks (MTP capture-verify). Without it,
     /// rectangular verification over a recurrent target is impossible and
@@ -185,6 +200,11 @@ public protocol CBv2RecurrentMTPSteppableModel:
 }
 
 extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenGreedySeed(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)? { nil }
+
     public func forwardWithHiddenForPrefill(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
@@ -493,6 +513,12 @@ public protocol CBv2MTPBlockDrafter: CBv2MTPRequestStatefulDrafter {
     func prepareDraft(
         history: [Int], depth: Int, requestState: any CBv2MTPRequestState)
 
+    /// Read after prepareDraft; a lookup hit remains eligible during neural cooldown.
+    func shouldProposeBlock(requestState: any CBv2MTPRequestState) -> Bool
+
+    /// One policy-marked target-only step completed at the existing commit fence.
+    func recordSkippedNeuralDraft(requestState: any CBv2MTPRequestState)
+
     /// One round, one proposal: `depth` draft token ids as `[1, depth]`
     /// int32, lazy. Row-local, like every other request-stateful call.
     func proposeBlock(
@@ -550,6 +576,10 @@ extension CBv2MTPBlockDrafter {
     public func prepareDraft(
         history: [Int], depth: Int, requestState: any CBv2MTPRequestState
     ) {}
+
+    public func shouldProposeBlock(requestState: any CBv2MTPRequestState) -> Bool { true }
+
+    public func recordSkippedNeuralDraft(requestState: any CBv2MTPRequestState) {}
 
     /// Lazy absorption is the default: the next `proposeBlock` projects the
     /// pending rows itself, the parent behavior.

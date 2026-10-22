@@ -107,7 +107,7 @@ public struct SignedBlockHadamard {
     /// Check serialized signs against the independently decoded metadata.
     public func matches(signs values: [Float]) -> Bool { values == signValues }
 
-    func isIdentical(to other: SignedBlockHadamard) -> Bool {
+    public func isIdentical(to other: SignedBlockHadamard) -> Bool {
         blockSize == other.blockSize && width == other.width && signValues == other.signValues
     }
 
@@ -1820,7 +1820,7 @@ public struct HadamardGDNLayout {
 /// of the 14 MB gate projection: 24 us of reads, 26 us of FMAs on the M5 Max), so it dequantizes each weight once
 /// (`s * q + b`, as `qmv_wide` and `qmm` do) and does one FMA per weight per row, in `qmv_fast`'s lane layout.
 /// Its reduction order is not `qmv_fast`'s; a row's result does not depend on the other rows.
-private enum Float16ConstantQMV {
+public enum Float16ConstantQMV{
     /// MLX `qmv_fast_impl` for 2 bits: 16 values per lane, 4 rows per
     /// simdgroup, 2 simdgroups per threadgroup.
     static let fast = MLXFast.metalKernel(
@@ -1950,7 +1950,7 @@ private enum Float16ConstantQMV {
     static func outputsPerSimdgroup(rows: Int) -> Int { rows <= 4 ? 4 : 2 }
 
     /// Top-2 order: value descending, token id ascending on exact ties, NaNs last.
-    static let topTwoHeader = """
+    public static let topTwoHeader = """
         struct hadamard_top2 {
           float first_value;
           float second_value;
@@ -2084,7 +2084,7 @@ private enum Float16ConstantQMV {
             }
             """
 
-    static let topTwoFinalize = MLXFast.metalKernel(
+    public static let topTwoFinalize = MLXFast.metalKernel(
         name: "hadamard_qmv_top2_finalize",
         inputNames: ["partial_ids", "partial_values"],
         outputNames: ["top_ids", "top_values"],
@@ -2863,10 +2863,6 @@ enum ExactVerifyHead {
             .replacingOccurrences(of: originalTau, with: anchoredTau)
     }()
 
-    static let compactParallelPartitionRescoreSource = compactParallelAnchorRescoreSource
-        .replacingOccurrences(of: "if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);", with: "float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);")
-        .replacingOccurrences(of: "const float anchor_t = anchor_floor - e;", with: "const float anchor_t = anchor_floor - local_e;")
-
     static let compactParallelScan = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_parallel_scan16", inputNames: ["logits", "compact_ids", "compact_bad"],
         outputNames: ["part_ids", "part_values", "part_meta"],
@@ -2881,11 +2877,8 @@ enum ExactVerifyHead {
         inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
         outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         source: compactParallelAnchorRescoreSource, header: Float16ConstantQMV.topTwoHeader + l2Header)
-    static let compactParallelPartitionRescore = MLXFast.metalKernel(
-        name: "hadamard_xhead_compact_parallel_rescore16_partition_l2_anchors_v1",
-        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
-        outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
-        source: compactParallelPartitionRescoreSource, header: Float16ConstantQMV.topTwoHeader + partitionL2Header)
+    static let compactParallelPartitionRescore = HadamardQuantizedLinear.verifyHeadRescore?(
+        compactParallelAnchorRescoreSource, Float16ConstantQMV.topTwoHeader + partitionL2Header)
     static let compactParallelMerge = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_parallel_merge16", inputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         outputNames: ["sel_ids", "sel_values", "flag", "info"],
@@ -2907,13 +2900,13 @@ enum ExactVerifyHead {
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b]], outputDTypes: [.int32, .float32, .int32])
         let local = partitionL2 && anchors && error2 != nil && rows == 16 && b == 16
             && x.dim(1) == 4096 && scales.dim(1) == 32 && weight.dim(0) % 512 == 0
-            && n == weight.dim(0) / 8 && bounds.size == 19 * 32
-        let kernel = local ? compactParallelPartitionRescore
+            && n == weight.dim(0) / 8 && bounds.size == 19 * 32 && compactParallelPartitionRescore != nil
+        let kernel = local ? compactParallelPartitionRescore!
             : (anchors ? compactParallelAnchorRescore : compactParallelRescore)
         let blk = kernel(
             [values, ascale, bounds, x, weight, scales, biases, parts[0], parts[1], parts[2], ids, summary.omitted, error2 ?? ascale],
             template: [("CAP", cap), ("THREADS", blockThreads), ("BLOCKS", b), ("NV", n), ("NEG", negative ? 1 : 0), ("USE_L2", error2 != nil)],
-            grid: (b * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
+            grid: (b * blockThreads, rows, 1), threadGroup: (local ? 4 * blockThreads : blockThreads, 1, 1),
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b, 4], [rows]], outputDTypes: [.int32, .float32, .int32, .float32])
         return compactParallelMerge(
             blk, template: [("CAP", cap), ("BLOCKS", b)],
@@ -5630,7 +5623,7 @@ enum VerifyInt8Matmul {
 
     static func streamedFormsSource(layers: Int) -> String {
         let prefix = naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-        let body = streamedBody(naxFastBody, columns: 32).replacingOccurrences(of: "(size_t)", with: "(uint)")
+        let body = tile(streamedBody(naxFastBody, columns: 32)).replacingOccurrences(of: "(size_t)", with: "(uint)")
         return prefix + body
     }
 
@@ -6218,7 +6211,7 @@ enum VerifyInt8Matmul {
         guard let body = makeStreamedBody(naxFastBody, columns: 32),
             body.components(separatedBy: compactHeadStore).count == 2 else { return nil }
         let prefix = naxFastPick(layers: 1).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-        let source = prefix + body.replacingOccurrences(of: compactHeadStore, with: compactHeadEpilogue)
+        let source = prefix + tile(body).replacingOccurrences(of: compactHeadStore, with: compactHeadEpilogue)
             .replacingOccurrences(of: "(size_t)", with: "(uint)")
         return MLXFast.metalKernel(
             name: "bonsai_q8_verify_head_top4_streamed_v2",
@@ -6358,16 +6351,20 @@ enum VerifyInt8Matmul {
 
     /// `naxFastBody` for `layers` sibling projections of one activation in one dispatch: threadgroups x < N0 / 32
     /// take layer 0, the next N1 / 32 layer 1, and so on, each running the one-layer body unchanged.
+    private static func tile(_ s: String) -> String { HadamardQuantizedLinear.verifyTile?(s) ?? s }
+
     static func naxFastSource(layers: Int) -> String {
-        naxFastPick(layers: layers) + naxFastBody
+        naxFastPick(layers: layers) + tile(naxFastBody)
     }
 
     /// `naxFastSource` with K a compile-time constant (template `KC`, the loop bound and the word and group strides)
     /// and every `size_t` index computed in 32 bits.
     static func naxFormsSource(layers: Int) -> String {
         naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + naxFastBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
+            + tile(naxFastBody).replacingOccurrences(of: "(size_t)", with: "(uint)")
     }
+
+    static func rawForms2(_ s:Bool)->String{(naxFastPick(layers:2)+(s ? streamedBody(naxFastBody,columns:32):naxFastBody)).replacingOccurrences(of:"ksz[0]",with:"KC").replacingOccurrences(of:"(size_t)",with:"(uint)")}
 
     private static func naxFastPick(layers: Int) -> String {
         var pick = """
@@ -6675,6 +6672,7 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var naxVector = false
     nonisolated(unsafe) private static var negativeForms = false
     nonisolated(unsafe) private static var naxFast = false
+    static var productReady: Bool { route == .nax && naxFast }
     nonisolated(unsafe) private static var naxShared = false
 
     private static func run(
@@ -7166,7 +7164,7 @@ enum VerifyInt8Matmul {
             ("if (g + 4 < Kg) {", "if (g + 4 < SG) {"),
         ]
         for (old, new) in swaps {
-            guard source.components(separatedBy: old).count == 2 else { return nil }
+            guard (2...3).contains(source.components(separatedBy: old).count) else { return nil }
             source = source.replacingOccurrences(of: old, with: new)
         }
         return source
@@ -8204,12 +8202,17 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
+    public static var verifyProductReady: Bool { VerifyInt8Matmul.productReady }
+    nonisolated(unsafe) public static var verifyTile: ((String) -> String)?
+    nonisolated(unsafe) public static var verifyHeadRescore: ((String, String) -> MLXFast.MLXFastKernel)?
+
+
     nonisolated(unsafe) public static var verifyK64Prepare: (() -> Void)?
     nonisolated(unsafe) public static var verifyK64Run: (([MLXArray], Bool, Bool, Bool) -> [MLXArray]?)?
     public static func verifyK64Source(_ s: Bool) -> (String, MLXFast.MLXFastKernel)? {
         guard VerifyInt8Matmul.route == .nax, VerifyInt8Matmul.hasMatchedForm(k: 4096, layers: 2),
             !s || VerifyInt8Matmul.streamReady else { return nil }
-        return (s ? VerifyInt8Matmul.streamedFormsSource(layers: 2) : VerifyInt8Matmul.naxFormsSource(layers: 2),
+        return (VerifyInt8Matmul.rawForms2(s),
                 (s ? VerifyInt8Matmul.streamedKernels : VerifyInt8Matmul.naxFormsKernels)[1])
     }
     /// Qualify the shared immutable weight layout before serving requests.
@@ -8222,6 +8225,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public let transform: SignedBlockHadamard
+    public var neg:Bool{promptConstants.negative}
     public let gdnLayout: HadamardGDNLayout?
     private static let reuseFloat16Constants = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_F16_CONSTANT_CACHE"] == "1"
@@ -9015,7 +9019,7 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return forwardRotated(transform(gdnLayout.map { $0(x) } ?? x))
     }
 
-    private func forwardRotated(_ rotated: MLXArray) -> MLXArray {
+    public func forwardRotated(_ rotated: MLXArray) -> MLXArray {
         if readsFloat16ConstantsInPlace, rotated.dtype == .float32,
             (1 ... Float16ConstantQMV.maximumRows).contains(rotated.size / rotated.dim(-1))
         {

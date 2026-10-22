@@ -4639,7 +4639,8 @@ final class Qwen35GatedDeltaNet: Module {
                 try recurrentState[0].stage(
                     modelLayerIndex: modelLayerIndex,
                     conv: newConvState,
-                    ssm: newSsmState, ssmIsRowContiguous: middle != nil)
+                    ssm: S == 1 ? contiguous(newSsmState) : newSsmState,
+                    ssmIsRowContiguous: middle != nil || S == 1)
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
@@ -5754,6 +5755,36 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+private enum Qwen35M5R1MLP {
+    private static let supported: Bool = {
+        let arch = GPU.deviceInfo().architecture
+        return arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+    }()
+
+    static func run(
+        _ mlp: Qwen3NextMLP, x: MLXArray, residual: MLXArray, norm: RMSNorm
+    ) -> MLXArray? {
+        guard supported, StreamOrDevice.default == StreamOrDevice.gpu,
+            x.shape == [1, 1, 4096], residual.shape == x.shape,
+            norm.weight.dtype == .float32, norm.weight.shape == [4096],
+            mlp.gateProj.weight.dim(0) == 12288, mlp.upProj.weight.dim(0) == 12288,
+            let down = mlp.downProj as? HadamardQuantizedLinear,
+            down.transform.width == 12288, down.weight.dim(0) == 4096,
+            HadamardQuantizedLinear.verifyProductReady
+        else { return nil }
+        let h = x + residual
+        guard h.dtype == .float32,
+            let boundary = HadamardQuantizedLinear.verifyNormBoundary(
+                broadcast(h, to: [1, 2, 4096]), weight: norm.weight, eps: norm.eps,
+                projections: [mlp.gateProj, mlp.upProj]),
+            let pair = HadamardQuantizedLinear.boundaryProjections(
+                boundary, [mlp.gateProj, mlp.upProj]),
+            let output = down.callAfterSwiGLU(gate: pair[0], up: pair[1])
+        else { return nil }
+        return h + output[0..., 0..<1, 0...]
+    }
+}
+
 extension Qwen3NextMLP {
     func qwen35ProjectedGateUp(_ gate: MLXArray, _ up: MLXArray, fold: PromptResidualFold? = nil) -> MLXArray {
         if let down = downProj as? HadamardQuantizedLinear,
@@ -5893,6 +5924,14 @@ final class Qwen35DecoderLayer: Module {
                     normalized, modelLayerIndex: modelLayerIndex,
                     recurrentState: recurrentState, promptProjections: prompt.projections,
                     promptZ: prompt.deferred)
+            } else if let linear = linearAttn,
+                let input = M5R1GDNInput.apply(
+                    x, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
+                    qkv: linear.inProjQKV, z: linear.inProjZ)
+            {
+                r = linear.cbv2Forward(
+                    input.normalized, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState, promptProjections: input.projections)
             } else {
                 r = linearAttn!.cbv2Forward(
                     inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
@@ -5926,13 +5965,21 @@ final class Qwen35DecoderLayer: Module {
             ? x[0..., (x.dim(1) - 1)..., 0...] : x
         let rPost = lastPositionOnly && r.dim(1) > 1
             ? r[0..., (r.dim(1) - 1)..., 0...] : r
+        if !captureRecurrentWindow, !exactTargetVerify, x.shape == [1, 1, 4096],
+            let dense = mlp as? Qwen3NextMLP,
+            let output = Qwen35M5R1MLP.run(
+                dense, x: xPost, residual: rPost, norm: postAttentionLayerNorm)
+        {
+            return output
+        }
         if let dense = mlp as? Qwen3NextMLP,
             let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
                 xPost, residual: rPost, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
                 projections: [dense.gateProj, dense.upProj],
                 swigluDown: xPost.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
         {
-            return boundary.residual + dense.qwen35ProjectedGateUp(boundary.projections)
+            return boundary.residual + dense.qwen35ProjectedGateUp(
+                boundary.projections)
         }
         let h = xPost + rPost
         let normalized = postAttentionLayerNorm(h)
@@ -7126,6 +7173,27 @@ extension Qwen35TextModel: CBv2RecurrentLanguageModelPrefillForwardable {
 }
 
 extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
+    public func cbv2ForwardWithHiddenGreedySeed(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)? {
+        guard let head = lmHead as? HadamardQuantizedLinear, M5R1Head.accepts(head),
+            tokens.shape == [1, 1], model.norm.weight.dtype == .float32,
+            model.norm.weight.shape == [4096]
+        else { return nil }
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        let top = M5R1Head.run(head, model.norm(hidden))
+        return (top.ids.reshaped([1, 1, 2]), top.values.reshaped([1, 1, 2]), hidden)
+    }
+
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
@@ -7317,6 +7385,27 @@ extension Qwen35TextModel: DFlash2TapTarget {
         }
         guard let head = lmHead as? HadamardQuantizedLinear else { return }
         let x = MLXRandom.normal([1, rows, configuration.hiddenSize], key: MLXRandom.key(0xDF2))
+        if rows > 0, let layer = model.layers.dropFirst().first(where: { $0.isLinear }),
+            let linear = layer.linearAttn,
+            let input = M5R1GDNInput.apply(
+                x[0..., 0..<1, 0...], weight: layer.inputLayerNorm.weight, eps: layer.inputLayerNorm.eps,
+                qkv: linear.inProjQKV, z: linear.inProjZ)
+        {
+            eval(input.normalized, input.projections[0], input.projections[1])
+        }
+        if rows > 0, M5R1Head.accepts(head), model.norm.weight.dtype == .float32,
+            model.norm.weight.shape == [4096]
+        {
+            let top = M5R1Head.run(head, model.norm(x[0..., 0..<1, 0...]))
+            eval(top.ids, top.values)
+        }
+        if rows > 0, let layer = model.layers.first, let dense = layer.mlp as? Qwen3NextMLP,
+            let output = Qwen35M5R1MLP.run(
+                dense, x: x[0..., 0..<1, 0...], residual: x[0..., 0..<1, 0...],
+                norm: layer.postAttentionLayerNorm)
+        {
+            eval(output)
+        }
         if let topTwo = head.topTwoRows(model.norm(x)) { eval(topTwo.ids, topTwo.values) }
         if let fused = head.topTwoRowsAfterResidualNorm(
             x, delta: x, weight: model.norm.weight, eps: model.norm.eps)
@@ -7563,6 +7652,14 @@ extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
 }
 
 extension Qwen35Model: CBv2RecurrentMTPForwardable {
+    public func cbv2ForwardWithHiddenGreedySeed(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (ids: MLXArray, values: MLXArray, lastHidden: MLXArray)? {
+        languageModel.cbv2ForwardWithHiddenGreedySeed(
+            tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
+    }
+
     public var cbv2MTPTargetIdentity: ObjectIdentifier {
         ObjectIdentifier(languageModel)
     }
