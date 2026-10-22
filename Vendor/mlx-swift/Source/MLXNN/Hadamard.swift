@@ -4245,11 +4245,7 @@ enum PromptInt8Matmul {
     nonisolated(unsafe) private static var naxSgShared = false
     nonisolated(unsafe) private static var sgForm = SgForm.staged
 
-    /// Launch order of `runSg`'s threadgroups: M-first (consecutive threadgroups
-    /// take the same weight columns on successive 32 or 64 row tiles, so the
-    /// packed weights stream through the caches once) instead of N-first. The
-    /// tile each threadgroup computes is unchanged; only which threadgroup
-    /// position computes it. Set by `checkTraversal` and `prepareStreaming`.
+    /// M-first visits consecutive row tiles for each weight tile.
     nonisolated(unsafe) private static var traversalMFirst = false
 
     /// The per-simdgroup tensor kernel over `layers` (one to three) sharing
@@ -4319,6 +4315,10 @@ enum PromptInt8Matmul {
         }
         let index32 = m > 0 && m % 64 == 0 && k >= 128 && k % 128 == 0
             && m <= limit / k && allNValid
+        let form = form == .registerCols128 && index32 && m == 512 && k == 4096
+            && (streamed ? streamPromptReady : sgForm == .registerCols128)
+            && (outputShapes == [[m, 8192]] || outputShapes == [[m, 4096]]
+                || outputShapes == [[m, 8192], [m, 4096]]) ? SgForm.staged : form
         let mFirstOrder = mFirst ?? traversalMFirst
         let template: [(String, any KernelTemplateArg)] =
             (form == .staged || form == .registerCols128)
