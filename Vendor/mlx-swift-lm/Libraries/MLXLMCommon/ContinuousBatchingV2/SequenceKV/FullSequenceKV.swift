@@ -95,6 +95,10 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+    /// True while no view of the stored buffers is out except the ones a graph in flight reads:
+    /// the buffers were produced by a slice update (donated or copied, so held by no snapshot)
+    /// and `snapshot()` has not been called since.
+    private var ownsStorage = false
 
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial
@@ -152,7 +156,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         if keys == nil, absoluteOffset == 0, Self.firstFillVerified,
             let (filledKeys, filledValues) = Self.firstFill(
-                newKeys, newValues, capacity: min(maxLength, max(capacity, n)))
+                newKeys, newValues, capacity: min(maxLength, max(capacity, n)), heads: kvHeads)
         {
             capacity = min(maxLength, max(capacity, n))
             keys = filledKeys
@@ -169,6 +173,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             }
         }
         absoluteOffset += n
+        ownsStorage = true
 
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
@@ -176,7 +181,30 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// The stored rows `[..., ..<absoluteOffset, :]` for an attention whose launch stores the
+    /// `newKeys` rows behind them itself (`commitStoredRows` then books them). Makes the room an
+    /// `update` would. nil, with nothing changed, when this storage is not ours alone to write:
+    /// no 4-D storage, or a snapshot of it was handed out since the last slice update, which
+    /// replaces the buffer (a view of the old one keeps it from being donated).
+    func prefixViews(appending newKeys: MLXArray, _ newValues: MLXArray) -> (MLXArray, MLXArray)? {
+        guard ownsStorage, let k = keys, let v = values, k.ndim == 4, v.ndim == 4,
+            newKeys.ndim == 4, newValues.ndim == 4, absoluteOffset > 0, newKeys.dim(0) == 1,
+            newKeys.dim(1) == kvHeads, newValues.dim(2) == newKeys.dim(2),
+            absoluteOffset + newKeys.dim(2) <= maxLength
+        else { return nil }
+        ensureCapacity(absoluteOffset + newKeys.dim(2), keyTemplate: newKeys, valueTemplate: newValues)
+        return (
+            keys![.ellipsis, ..<absoluteOffset, 0...],
+            values![.ellipsis, ..<absoluteOffset, 0...]
+        )
+    }
+
+    func commitStoredRows(_ n: Int) {
+        absoluteOffset += n
+    }
+
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        ownsStorage = false
         guard let keys, let values else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
@@ -218,6 +246,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         let range = base ..< (base + rows.count)
         keys = Self.sliceUpdate(k, k.take(index, axis: 2), range)
         values = Self.sliceUpdate(v, v.take(index, axis: 2), range)
+        ownsStorage = true
     }
 
     func cbv2InnerState() -> [MLXArray] {
@@ -255,13 +284,54 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         ensureRowContiguous: false)
 
     private static func firstFill(
-        _ newKeys: MLXArray, _ newValues: MLXArray, capacity: Int
+        _ newKeys: MLXArray, _ newValues: MLXArray, capacity: Int, heads: Int
     ) -> (MLXArray, MLXArray)? {
+        let handed = takeHandedKeys(newKeys, capacity: capacity, heads: heads)
         guard StreamOrDevice.default == StreamOrDevice.gpu else { return nil }
-        guard let filledKeys = fill(newKeys, capacity: capacity),
+        guard let filledKeys = handed ?? fill(newKeys, capacity: capacity),
             let filledValues = fill(newValues, capacity: capacity)
         else { return nil }
+        if handed != nil { keyHandoffAdopted += 1 }
         return (filledKeys, filledValues)
+    }
+
+    // MARK: - Keys written in the cache layout
+
+    /// Counts the first fills that took a handed buffer, for the boot check.
+    nonisolated(unsafe) public private(set) static var keyHandoffAdopted = 0
+    nonisolated(unsafe) private static var handedKeys: (view: MLXArray, buffer: MLXArray)? = nil
+
+    /// The `[1, heads, capacity, headDim]` buffer a first fill of `rows` rows would allocate, with `view` its first
+    /// rows, the array the caller passes to `update` as the keys. A buffer the fold kernel wrote (rows, then zeros)
+    /// replaces the key fill when `update` gets that same `view` on a fresh row; anything else fills as before.
+    public static func handKeys(view: MLXArray, buffer: MLXArray) {
+        handedKeys = (view, buffer)
+    }
+
+    public static func withdrawHandedKeys() {
+        handedKeys = nil
+    }
+
+    /// Consumed by the next first fill whatever it decides.
+    private static func takeHandedKeys(_ newKeys: MLXArray, capacity: Int, heads: Int) -> MLXArray? {
+        guard let handed = handedKeys else { return nil }
+        handedKeys = nil
+        guard handed.view === newKeys, handed.buffer.dtype == .float32,
+            handed.buffer.shape == [1, heads, capacity, newKeys.dim(3)], newKeys.dim(2) <= capacity
+        else { return nil }
+        return handed.buffer
+    }
+
+    /// The capacity of this row's first fill of `n` rows, or nil once the row holds anything.
+    public func firstFillCapacity(rows n: Int) -> Int? {
+        guard keys == nil, absoluteOffset == 0, Self.firstFillVerified else { return nil }
+        return min(maxLength, max(capacity, n))
+    }
+
+    /// The stored buffers, for the boot check.
+    public var storedBuffers: (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys, values)
     }
 
     private static func fill(_ source: MLXArray, capacity: Int) -> MLXArray? {
