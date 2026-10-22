@@ -5647,7 +5647,7 @@ enum VerifyInt8Matmul {
         name: "bonsai_q8_verify_streamed_col_n16", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
         source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)"),
+            + twoSimdNarrow(streamedBody(naxNarrow16Body, columns: 16)).replacingOccurrences(of: "(size_t)", with: "(uint)"),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
 
     /// Input-independent guard at load, before any request. Compare new
@@ -6509,6 +6509,36 @@ enum VerifyInt8Matmul {
         .replacingOccurrences(of: "for (int i = 0; i < 16; i++) {", with: "for (int i = 0; i < 8; i++) {")
         .replacingOccurrences(of: "  #pragma clang loop unroll(full)\n  for (int e = 0; e < 4; e++) {\n    const float t0 = float(cA[e]) * float(cT[e]);\n    acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n    if (ROWS > 8) {\n      const float t2 = float(cA[e]) * float(cT[4 + e]);\n      acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n    }\n  }\n", with: "  if (good) {\n    #pragma clang loop unroll(full)\n    for (int e = 0; e < 4; e++) {\n      const float t0 = float(cA[e]) * float(cT[e]);\n      acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n      if (ROWS > 8) {\n        const float t2 = float(cA[e]) * float(cT[4 + e]);\n        acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n      }\n    }\n  }\n")
 
+    /// Two physical simdgroups retain the four canonical K chains. Each
+    /// simdgroup computes chains s and s+2 in separate passes, then publishes
+    /// both partials into the shared tile for the unchanged ordered reduction.
+    /// Staging drops from 8 KiB to 4 KiB; no FP32 accumulation is regrouped.
+    private static func twoSimdNarrow(_ body: String) -> String {
+        var result = body.replacingOccurrences(of: "alignas(32) threadgroup", with: "threadgroup")
+        let replacements: [(String, String)] = [
+            ("const uint sg = simdgroup_index_in_threadgroup;", "const uint physical = simdgroup_index_in_threadgroup;"),
+            ("constexpr auto desc =", "float partials[2][8];\n  bool allGood = true;\n  alignas(32) threadgroup uint32_t bs[2][16 * 32];\n  for (uint pass = 0; pass < 2; ++pass) {\n  const uint sg = physical + pass * 2;\n  constexpr auto desc ="),
+            ("threadgroup uint32_t bs[4][16 * 32];", ""),
+            ("bs[sg]", "bs[physical]"),
+            ("const bool good = simd_all(ok);", "const bool good = simd_all(ok);\n  allGood = allGood && good;"),
+            ("threadgroup float* red = (threadgroup float*)bs[physical];", "#pragma clang loop unroll(full)\n  for (int e = 0; e < 8; ++e) { partials[pass][e] = acc[e]; }\n  }\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n  for (uint pass = 0; pass < 2; ++pass) {\n  const uint sg = physical + pass * 2;\n  const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);\n  const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);\n  threadgroup float* red = (threadgroup float*)bs + sg * 256;"),
+            ("red[mrow * 16 + nb + e] = acc[e];", "red[mrow * 16 + nb + e] = partials[pass][e];"),
+            ("red[(mrow + 8) * 16 + nb + e] = acc[4 + e];", "red[(mrow + 8) * 16 + nb + e] = partials[pass][4 + e];"),
+            ("threadgroup_barrier(mem_flags::mem_threadgroup);\nconst threadgroup float4* r0", "}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nconst threadgroup float4* r0"),
+            ("(const threadgroup float4*)bs[1]", "(const threadgroup float4*)((threadgroup float*)bs + 256)"),
+            ("(const threadgroup float4*)bs[2]", "(const threadgroup float4*)((threadgroup float*)bs + 512)"),
+            ("(const threadgroup float4*)bs[3]", "(const threadgroup float4*)((threadgroup float*)bs + 768)"),
+            ("e += 128", "e += 64"),
+            ("= good ? v :", "= allGood ? v :"),
+        ]
+        for (old, new) in replacements {
+            guard result.contains(old) else { return body }
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
+    }
+    static let naxNarrowTwoBody = twoSimdNarrow(naxNarrow16Body)
+
     static let naxNarrowPick = """
         #pragma clang fp contract(off)
         #pragma clang fp reassociate(off)
@@ -6621,7 +6651,7 @@ enum VerifyInt8Matmul {
         name: "bonsai_q8_verify_matmul_nax_narrow16",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
-        source: naxNarrowPick + naxNarrow16Body,
+        source: naxNarrowPick + naxNarrowTwoBody,
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -6630,7 +6660,7 @@ enum VerifyInt8Matmul {
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
         source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + naxNarrow16Body.replacingOccurrences(of: "(size_t)", with: "(uint)"),
+            + naxNarrowTwoBody.replacingOccurrences(of: "(size_t)", with: "(uint)"),
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -6780,14 +6810,14 @@ enum VerifyInt8Matmul {
             return kernel(
                 [codes, kernelWeight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
-                grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+                grid: (n / 16 * (compact ? 64 : 128), 1, 1), threadGroup: (compact ? 64 : 128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
         }
         let kernel = compact ? naxNarrow16Kernel : naxNarrowKernel
         return kernel(
             [codes, weight, scalesT, biasesT, ascale, rsb, dims],
             template: [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
-            grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+            grid: (n / 16 * (compact ? 64 : 128), 1, 1), threadGroup: (compact ? 64 : 128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
