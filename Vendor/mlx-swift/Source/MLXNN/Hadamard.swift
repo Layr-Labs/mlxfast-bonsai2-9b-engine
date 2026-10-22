@@ -86,6 +86,7 @@ public enum HostConstants {
 /// Forward evaluation computes `(x * signs) H`; inverse evaluation computes
 /// `(x H) * signs`. Signs cover the entire final dimension, not just one block.
 public struct SignedBlockHadamard {
+    nonisolated(unsafe) public static var headTail=""
     public let blockSize: Int
     public let width: Int
     public let signs: MLXArray
@@ -474,7 +475,7 @@ public struct SignedBlockHadamard {
               rsb[qidx] = qs * part;
               \(headError2 ? "qerror2[qidx] = head_error2;" : "")
             }
-            """
+            """ + (headError2 ? headTail : "")
     }
 
     /// The residual-norm form of `quantized4096Source` without the residual: the input RMSNorm (MLX `rms_single_row`
@@ -727,12 +728,12 @@ public struct SignedBlockHadamard {
 
     private static let headResidualNormRotatedKernel = MLXFast.metalKernel(
         name: "signed_block_hadamard_head_residual_rot_error2_v1",
-        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs"],
+        inputNames: ["x", "residual", "norm_weight", "epsilon", "signs", "head_bounds"],
         outputNames: ["codes", "ascale", "rsb", "residual_out", "rotated_out", "qerror2"],
         source: quantized4096Source(swiglu: false, residualNorm: true, rotatedOutput: true, headError2: true),
         header: quantized4096Header + ExactVerifyHead.l2Header, ensureRowContiguous: true)
     private static let headRotatedKernel = MLXFast.metalKernel(
-        name: "signed_block_hadamard_head_rot_error2_v1", inputNames: ["x", "signs"],
+        name: "signed_block_hadamard_head_rot_error2_v1", inputNames: ["x", "signs", "head_bounds"],
         outputNames: ["codes", "ascale", "rsb", "rotated_out", "qerror2"],
         source: quantized4096Source(swiglu: false, rotatedOutput: true, headError2: true),
         header: quantized4096Header + ExactVerifyHead.l2Header, ensureRowContiguous: true)
@@ -740,7 +741,7 @@ public struct SignedBlockHadamard {
     /// `residualNorm` at verify width that also returns the rotated normalized
     /// rows: `[codes, ascale, rsb, x + residual, transform(rmsNorm(x + residual, weight))]`.
     func residualNormVerifyRotated(
-        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float, headError2: Bool = false
+        _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float, headError2: MLXArray? = nil
     ) -> (activation: PromptInt8Activation, residual: MLXArray, rotated: MLXArray, error2: MLXArray?)? {
         guard blockSize == 4096, width == 4096, x.dtype == .float32,
             residual.dtype == .float32, residual.shape == x.shape,
@@ -750,11 +751,11 @@ public struct SignedBlockHadamard {
         let rows = x.size / width
         guard VerifyInt8Matmul.rowRange.contains(rows) else { return nil }
         let outputs = Self.wideRowVerify(
-            .residualNormRot, [x, residual, weight, HostConstants.float32([eps]), signs], rows: rows, headError2: headError2 && rows == 16)
+            .residualNormRot, [x, residual, weight, HostConstants.float32([eps]), signs] + (rows == 16 ? headError2.map{[$0]} ?? [] : []), rows: rows, headError2: headError2 != nil && rows == 16)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
-            outputs[3], outputs[4], headError2 && rows == 16 ? outputs[5] : nil)
+            outputs[3], outputs[4], headError2 != nil && rows == 16 ? outputs[5] : nil)
     }
 
     /// `normPrompt` at verify width that also returns the normalized (unrotated)
@@ -923,7 +924,7 @@ public struct SignedBlockHadamard {
 
     /// `quantizedForVerify` that also emits the exact FP32 rotated tensor
     /// `[rows, width]` from the same 3-pass Hadamard butterfly.
-    func quantizedForVerifyWithRotated(_ x: MLXArray, headError2: Bool = false) -> (activation: PromptInt8Activation, rotated: MLXArray, error2: MLXArray?)? {
+    func quantizedForVerifyWithRotated(_ x: MLXArray, headError2: MLXArray? = nil) -> (activation: PromptInt8Activation, rotated: MLXArray, error2: MLXArray?)? {
         validate(x)
         let rows = x.size / width
         guard blockSize == 4096, x.dtype == .float32, (2 ... 16).contains(rows),
@@ -934,12 +935,12 @@ public struct SignedBlockHadamard {
             || VerifyInt8Matmul.rowRange.contains(rows)
         else { return nil }
         let outputs = Self.wideRowVerify(
-            .plainRot, [x.reshaped([rows, width]), signs], rows: rows, blocks: blocks,
-            sideShape: x.shape, headError2: headError2 && rows == 16)
+            .plainRot, [x.reshaped([rows, width]), signs] + (rows == 16 ? headError2.map{[$0]} ?? [] : []), rows: rows, blocks: blocks,
+            sideShape: x.shape, headError2: headError2 != nil && rows == 16)
         return (
             PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: width),
-            outputs[3], headError2 && rows == 16 ? outputs[4] : nil)
+            outputs[3], headError2 != nil && rows == 16 ? outputs[4] : nil)
     }
 
     /// Transform activations before multiplication by folded weights.
@@ -1292,7 +1293,7 @@ enum WideRowSource {
               rsb[qidx] = qs * part;
               \(f.headError2 ? "qerror2[qidx] = head_error2;" : "")
             }
-            """
+            """ + (f.headError2 ? SignedBlockHadamard.headTail : "")
     }
 }
 // WIDEROW-GEN END
@@ -1526,7 +1527,7 @@ extension SignedBlockHadamard {
             }
             kernels[kind] = MLXFast.metalKernel(
                 name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")",
-                inputNames: wideRowInputNames(kind) + ["verify_rows"],
+                inputNames: wideRowInputNames(kind) + (headError2 ? ["head_bounds"] : []) + ["verify_rows"],
                 outputNames: wideRowOutputNames(kind) + (headError2 ? ["qerror2"] : []),
                 source: source,
                 header: WideRowSource.header(threads: threads) + (headError2 ? ExactVerifyHead.l2Header : ""), ensureRowContiguous: true)
@@ -1663,7 +1664,7 @@ extension SignedBlockHadamard {
         var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
             + Array(
                 repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
-        if headError2 { shapes.append([rows * 32 * blocks]) }
+        if headError2 { shapes.append([rows * 32 * blocks + (headTail.isEmpty ? 0 : rows * 3)]) }
         let dtypes = [DType.int8] + Array(repeating: DType.float32, count: shapes.count - 1)
         let resolvedKernel: MLXFast.MLXFastKernel? = wideRowReady
             ? (headError2 ? wideRowResolvedHeadKernels[kind.index] : wideRowResolvedKernels[kind.index])
@@ -1949,6 +1950,10 @@ private enum Float16ConstantQMV {
           uint second_id;
           uint count;
         };
+
+        inline int head_id(const device int*p, uint r, uint n, uint i) {
+          return int(i/2*32 + ((uint(p[(r*n+i)/2]) >> ((i%2)*8)) & 31));
+        }
 
         inline hadamard_top2 hadamard_top2_empty() {
           hadamard_top2 state;
@@ -2461,34 +2466,34 @@ enum ExactVerifyHead {
         header: Float16ConstantQMV.topTwoHeader)
 
 
-    /// Four values per 32-column tile.
+    /// Two values per 32-column tile.
     static let compactSelectSource = selectSource
-        .replacingOccurrences(of: "const int N = w_shape[0];", with: "const int N = logits_shape[1]; const int TILES = N / 4;")
+        .replacingOccurrences(of: "const int N = w_shape[0];", with: "const int N = logits_shape[1]; const int TILES = N / 2;")
         .replacingOccurrences(of: "threadgroup atomic_int any_bad;", with: "threadgroup atomic_int any_bad; threadgroup atomic_int omitted_overflow;")
         .replacingOccurrences(of: "atomic_store_explicit(&any_bad, 0, memory_order_relaxed);", with: "atomic_store_explicit(&any_bad, 0, memory_order_relaxed); atomic_store_explicit(&omitted_overflow, 0, memory_order_relaxed);")
-        .replacingOccurrences(of: "bool bad = false;", with: "bool bad = false; for (int tile = int(lane); tile < TILES; tile += THREADS) bad = bad || part_bad[row * uint(TILES) + uint(tile)] != 0;")
-        .replacingOccurrences(of: "hadamard_top2_insert(local, v, uint(n));", with: "hadamard_top2_insert(local, v, uint(part_ids[row * uint(N) + uint(n)]));")
-        .replacingOccurrences(of: "if (local.count == 2 && !(v > local.second_value)) continue;", with: "if (local.count == 2 && !hadamard_top2_better(v, uint(part_ids[row * uint(N) + uint(n)]), local.second_value, local.second_id)) continue;")
+        .replacingOccurrences(of: "bool bad = false;", with: "bool bad = false; for (int tile = int(lane); tile < TILES; tile += THREADS) bad = bad || part_ids[row * uint(TILES) + uint(tile)] < 0;")
+        .replacingOccurrences(of: "hadamard_top2_insert(local, v, uint(n));", with: "hadamard_top2_insert(local, v, head_id(part_ids,row,N,n));")
+        .replacingOccurrences(of: "if (local.count == 2 && !(v > local.second_value)) continue;", with: "if (local.count == 2 && !hadamard_top2_better(v, head_id(part_ids,row,N,n), local.second_value, local.second_id)) continue;")
         .replacingOccurrences(of: "const float tau = shared_tau[0];", with: "const float tau = shared_tau[0]; for (int tile = int(lane); tile < TILES; tile += THREADS) { if (omitted[row * uint(TILES) + uint(tile)] >= tau) atomic_store_explicit(&omitted_overflow, 1, memory_order_relaxed); }")
-        .replacingOccurrences(of: "if (slot < CAP) cand_ids[slot] = n;", with: "if (slot < CAP) cand_ids[slot] = part_ids[row * uint(N) + uint(n)];")
+        .replacingOccurrences(of: "if (slot < CAP) cand_ids[slot] = n;", with: "if (slot < CAP) cand_ids[slot] = head_id(part_ids,row,N,n);")
         .replacingOccurrences(of: "|| count > CAP || nonfinite || best.count < 2;", with: "|| atomic_load_explicit(&omitted_overflow, memory_order_relaxed) != 0 || count > CAP || nonfinite || best.count < 2;")
         .replacingOccurrences(of: "info[row * 2 + 1] = float(count);", with: "info[row * 2 + 1] = atomic_load_explicit(&omitted_overflow, memory_order_relaxed) != 0 ? -1.0f : float(count);")
 
     static let compactSelect = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_select",
-        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "omitted", "part_bad"],
+        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "omitted"],
         outputNames: ["sel_ids", "sel_values", "flag", "info"],
         source: compactSelectSource, header: Float16ConstantQMV.topTwoHeader)
 
     static func runCompact(
-        rotated: MLXArray, summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray),
+        rotated: MLXArray, summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray),
         ascale: MLXArray, bounds: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         rows: Int, negative: Bool
     ) -> (ids: MLXArray, values: MLXArray) {
         let x = rotated.reshaped([rows, rotated.dim(-1)])
         let selected = compactSelect(
             [summary.values.reshaped([rows, -1]), ascale, bounds, x, weight, scales, biases,
-             summary.ids.reshaped([rows, -1]), summary.omitted, summary.bad],
+             summary.ids.reshaped([rows, -1]), summary.omitted],
             template: [("CAP", cap), ("THREADS", threads), ("NEG", negative ? 1 : 0)],
             grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, 2], [rows, 2], [rows], [rows, 2]],
@@ -2555,20 +2560,21 @@ enum ExactVerifyHead {
             const uint lane = thread_position_in_threadgroup.x;
             const uint simd_lid = thread_index_in_simdgroup;
             const uint simd_gid = simdgroup_index_in_threadgroup;
-            const int quads = NV / (4 * BLOCKS);
-            const uint first = block * uint(quads) * 4u;
-            const device float4* lq = (const device float4*)(logits + size_t(row) * size_t(NV) + first);
+            constexpr int V = 4;
+            const int quads = NV / (V * BLOCKS);
+            const uint first = block * uint(quads) * uint(V);
+            const device vec<float,V>* lq = (const device vec<float,V>*)(logits + size_t(row) * size_t(NV) + first);
             threadgroup hadamard_top2 scratch[THREADS / 32];
             threadgroup int scratch_bad[THREADS / 32];
             hadamard_top2 local = hadamard_top2_empty();
             bool bad = false;
             for (int q = int(lane); q < quads; q += THREADS) {
-              const float4 v4 = lq[q];
-              for (int i = 0; i < 4; i++) {
+              const vec<float,V> v4 = lq[q];
+              for (int i = 0; i < V; i++) {
                 const float v = v4[i];
                 bad = bad || !isfinite(v);
                 if (local.count == 2 && !(v > local.second_value)) continue;
-                hadamard_top2_insert(local, v, first + uint(q) * 4u + uint(i));
+                hadamard_top2_insert(local, v, first + uint(q) * uint(V) + uint(i));
               }
             }
             for (uint stride = 16; stride > 0; stride >>= 1) {
@@ -2663,15 +2669,16 @@ enum ExactVerifyHead {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const float tau = shared_tau[0];
-            const int quads = NV / (4 * BLOCKS);
-            const uint first = block * uint(quads) * 4u;
-            const device float4* lq = (const device float4*)(logits + size_t(row) * size_t(NV) + first);
+            constexpr int V = 4;
+            const int quads = NV / (V * BLOCKS);
+            const uint first = block * uint(quads) * uint(V);
+            const device vec<float,V>* lq = (const device vec<float,V>*)(logits + size_t(row) * size_t(NV) + first);
             for (int q = int(lane); q < quads; q += THREADS) {
-              const float4 v4 = lq[q];
-              for (int i = 0; i < 4; i++) {
+              const vec<float,V> v4 = lq[q];
+              for (int i = 0; i < V; i++) {
                 if (v4[i] >= tau) {
                   const int slot = atomic_fetch_add_explicit(&cand_count, 1, memory_order_relaxed);
-                  if (slot < CAP) cand_ids[slot] = int(first + uint(q) * 4u + uint(i));
+                  if (slot < CAP) cand_ids[slot] = int(first + uint(q) * uint(V) + uint(i));
                 }
               }
             }
@@ -2797,19 +2804,21 @@ enum ExactVerifyHead {
     }
 
 
-    /// 31,040 retained values at the target geometry: 16 fixed blocks give 1,940 values per block.
+    /// 15,520 retained values in 16 fixed blocks.
     static let compactBlocks = 16
     static let compactParallelScanSource = selectScanSource
-        .replacingOccurrences(of: "const float4 v4 = lq[q];", with: "const float4 v4 = lq[q]; bad = bad || compact_bad[row * uint(NV / 4) + first / 4u + uint(q)] != 0;")
-        .replacingOccurrences(of: "if (local.count == 2 && !(v > local.second_value)) continue;", with: "if (local.count == 2 && !hadamard_top2_better(v, uint(compact_ids[row * uint(NV) + first + uint(q) * 4u + uint(i)]), local.second_value, local.second_id)) continue;")
-        .replacingOccurrences(of: "hadamard_top2_insert(local, v, first + uint(q) * 4u + uint(i));", with: "hadamard_top2_insert(local, v, uint(compact_ids[row * uint(NV) + first + uint(q) * 4u + uint(i)]));")
+        .replacingOccurrences(of: "int V = 4", with: "int V = 2")
+        .replacingOccurrences(of: "const vec<float,V> v4 = lq[q];", with: "const vec<float,V> v4 = lq[q]; bad = bad || compact_ids[row * uint(NV / 2) + first / 2u + uint(q)] < 0;")
+        .replacingOccurrences(of: "if (local.count == 2 && !(v > local.second_value)) continue;", with: "if (local.count == 2 && !hadamard_top2_better(v, head_id(compact_ids,row,NV,first+2*q+i), local.second_value, local.second_id)) continue;")
+        .replacingOccurrences(of: "hadamard_top2_insert(local, v, first + uint(q) * uint(V) + uint(i));", with: "hadamard_top2_insert(local, v, head_id(compact_ids,row,NV,first+2*q+i));")
 
     static let compactParallelRescoreSource = selectRescoreSource
+        .replacingOccurrences(of: "int V = 4", with: "int V = 2")
         .replacingOccurrences(of: "e *= 1.001f;", with: "e *= 1.001f; if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);")
         .replacingOccurrences(of: "threadgroup atomic_int cand_count;", with: "threadgroup atomic_int cand_count; threadgroup atomic_int omitted_overflow;")
         .replacingOccurrences(of: "if (lane == 0) atomic_store_explicit(&cand_count, 0, memory_order_relaxed);", with: "if (lane == 0) { atomic_store_explicit(&cand_count, 0, memory_order_relaxed); atomic_store_explicit(&omitted_overflow, 0, memory_order_relaxed); }")
-        .replacingOccurrences(of: "const float4 v4 = lq[q];", with: "const float4 v4 = lq[q]; if (omitted[row * uint(NV / 4) + first / 4u + uint(q)] >= tau) atomic_store_explicit(&omitted_overflow, 1, memory_order_relaxed);")
-        .replacingOccurrences(of: "if (slot < CAP) cand_ids[slot] = int(first + uint(q) * 4u + uint(i));", with: "if (slot < CAP) cand_ids[slot] = compact_ids[row * uint(NV) + first + uint(q) * 4u + uint(i)];")
+        .replacingOccurrences(of: "const vec<float,V> v4 = lq[q];", with: "const vec<float,V> v4 = lq[q]; if (omitted[row * uint(NV / 2) + first / 2u + uint(q)] >= tau) atomic_store_explicit(&omitted_overflow, 1, memory_order_relaxed);")
+        .replacingOccurrences(of: "if (slot < CAP) cand_ids[slot] = int(first + uint(q) * uint(V) + uint(i));", with: "if (slot < CAP) cand_ids[slot] = head_id(compact_ids,row,NV,first+2*q+i);")
         .replacingOccurrences(of: "blk_meta[p * 4 + 3] = shared_bad;", with: "blk_meta[p * 4 + 3] = shared_bad | (atomic_load_explicit(&omitted_overflow, memory_order_relaxed) != 0 ? 2 : 0);")
 
     /// Two distinct exact leader scores lower-bound the true second score.
@@ -2854,12 +2863,8 @@ enum ExactVerifyHead {
             .replacingOccurrences(of: originalTau, with: anchoredTau)
     }()
 
-    static let compactParallelPartitionRescoreSource = compactParallelAnchorRescoreSource
-        .replacingOccurrences(of: "if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);", with: "float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);")
-        .replacingOccurrences(of: "const float anchor_t = anchor_floor - e;", with: "const float anchor_t = anchor_floor - local_e;")
-
     static let compactParallelScan = MLXFast.metalKernel(
-        name: "hadamard_xhead_compact_parallel_scan16", inputNames: ["logits", "compact_ids", "compact_bad"],
+        name: "hadamard_xhead_compact_parallel_scan16", inputNames: ["logits", "compact_ids"],
         outputNames: ["part_ids", "part_values", "part_meta"],
         source: compactParallelScanSource, header: Float16ConstantQMV.topTwoHeader)
     static let compactParallelRescore = MLXFast.metalKernel(
@@ -2872,11 +2877,8 @@ enum ExactVerifyHead {
         inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
         outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         source: compactParallelAnchorRescoreSource, header: Float16ConstantQMV.topTwoHeader + l2Header)
-    static let compactParallelPartitionRescore = MLXFast.metalKernel(
-        name: "hadamard_xhead_compact_parallel_rescore16_partition_l2_anchors_v1",
-        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
-        outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
-        source: compactParallelPartitionRescoreSource, header: Float16ConstantQMV.topTwoHeader + partitionL2Header)
+    static let compactParallelPartitionRescore = HadamardQuantizedLinear.verifyHeadRescore?(
+        compactParallelAnchorRescoreSource, Float16ConstantQMV.topTwoHeader + partitionL2Header)
     static let compactParallelMerge = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_parallel_merge16", inputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         outputNames: ["sel_ids", "sel_values", "flag", "info"],
@@ -2884,7 +2886,7 @@ enum ExactVerifyHead {
         header: Float16ConstantQMV.topTwoHeader)
 
     static func compactParallelSelect(
-        summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray),
+        summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray),
         ascale: MLXArray, bounds: MLXArray, x: MLXArray,
         weight: MLXArray, scales: MLXArray, biases: MLXArray, rows: Int, negative: Bool, error2: MLXArray? = nil, anchors: Bool = false, partitionL2: Bool = false
     ) -> [MLXArray] {
@@ -2893,18 +2895,18 @@ enum ExactVerifyHead {
         let n = values.dim(1)
         let b = compactBlocks
         let parts = compactParallelScan(
-            [values, ids, summary.bad], template: [("THREADS", blockThreads), ("BLOCKS", b), ("NV", n)],
+            [values, ids], template: [("THREADS", blockThreads), ("BLOCKS", b), ("NV", n)],
             grid: (b * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b]], outputDTypes: [.int32, .float32, .int32])
         let local = partitionL2 && anchors && error2 != nil && rows == 16 && b == 16
             && x.dim(1) == 4096 && scales.dim(1) == 32 && weight.dim(0) % 512 == 0
-            && n == weight.dim(0) / 8 && bounds.size == 19 * 32
-        let kernel = local ? compactParallelPartitionRescore
+            && n == weight.dim(0) / 16 && bounds.size == 19 * 32 && compactParallelPartitionRescore != nil
+        let kernel = local ? compactParallelPartitionRescore!.0
             : (anchors ? compactParallelAnchorRescore : compactParallelRescore)
         let blk = kernel(
             [values, ascale, bounds, x, weight, scales, biases, parts[0], parts[1], parts[2], ids, summary.omitted, error2 ?? ascale],
             template: [("CAP", cap), ("THREADS", blockThreads), ("BLOCKS", b), ("NV", n), ("NEG", negative ? 1 : 0), ("USE_L2", error2 != nil)],
-            grid: (b * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
+            grid: (b * blockThreads, rows, 1), threadGroup: (local ? compactParallelPartitionRescore!.1 : blockThreads, 1, 1),
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b, 4], [rows]], outputDTypes: [.int32, .float32, .int32, .float32])
         return compactParallelMerge(
             blk, template: [("CAP", cap), ("BLOCKS", b)],
@@ -2913,7 +2915,7 @@ enum ExactVerifyHead {
     }
 
     static func runCompactParallel(
-        rotated: MLXArray, summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray),
+        rotated: MLXArray, summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray),
         ascale: MLXArray, bounds: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         rows: Int, negative: Bool, error2: MLXArray? = nil, anchors: Bool = false, partitionL2: Bool = false
     ) -> (ids: MLXArray, values: MLXArray) {
@@ -6150,8 +6152,8 @@ enum VerifyInt8Matmul {
           if (hadamard_top2_better(v2, i2, v1, i1)) {
             const float t = v1; v1 = v2; v2 = t; const uint j = i1; i1 = i2; i2 = j;
           }
-          uint remaining = 4;
-          for (int rank = 0; rank < 5; rank++) {
+          uint remaining = 3, packed = 0;
+          for (int rank = 0; rank < 3; rank++) {
             bool have = remaining != 0;
             float best_value = v0;
             uint best_id = i0;
@@ -6165,12 +6167,12 @@ enum VerifyInt8Matmul {
             }
             if (sublane == 0) {
               const uint p = row * tiles + tile;
-              if (rank < 4) { out0[p * 4 + uint(rank)] = best_value; part_ids[p * 4 + uint(rank)] = int(best_id); }
-              else { omitted[p] = best_value; part_bad[p] = bad ? 1 : 0; }
+              if (rank < 2) { out0[p * 2 + uint(rank)] = best_value; packed |= (best_id & 31u) << (8u * uint(rank)); }
+              else { part_ids[p] = as_type<int>(packed | (bad << 31)); omitted[p] = best_value; }
             }
             if (remaining != 0 && best_id == i0) {
-              v0 = v1; v1 = v2; v2 = v3;
-              i0 = i1; i1 = i2; i2 = i3;
+              v0 = v1; v1 = v2;
+              i0 = i1; i1 = i2;
               remaining--;
             }
           }
@@ -6196,15 +6198,12 @@ enum VerifyInt8Matmul {
         return MLXFast.metalKernel(
             name: "bonsai_q8_verify_head_top4_nax_front_v1_forms",
             inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"],
-            outputNames: ["out0", "part_ids", "omitted", "part_bad"], source: source,
+            outputNames: ["out0", "part_ids", "omitted"], source: source,
             header: PromptInt8Matmul.naxHeader + Float16ConstantQMV.topTwoHeader,
             ensureRowContiguous: true)
     }()
 
-    /// The compact head on the stream copy: the streamed one-layer body (`streamedFormsSource(layers: 1)`, which
-    /// `checkStreamed` matches against the canonical form: 16-B word loads and, once the staging twin passed, 32-B
-    /// tile stores) with the compact head's epilogue in place of the store, as `compactHeadKernel` does on the
-    /// canonical body.
+    /// The qualified streamed body with the shared two-winner epilogue in place of its output store.
     private static let compactHeadStreamedKernel: MLXFast.MLXFastKernel? = {
         guard let body = makeStreamedBody(naxFastBody, columns: 32),
             body.components(separatedBy: compactHeadStore).count == 2 else { return nil }
@@ -6214,7 +6213,7 @@ enum VerifyInt8Matmul {
         return MLXFast.metalKernel(
             name: "bonsai_q8_verify_head_top4_streamed_v2",
             inputNames: ["xq", "w0", "s0", "b0", "ascale", "rsb", "ksz"],
-            outputNames: ["out0", "part_ids", "omitted", "part_bad"], source: source,
+            outputNames: ["out0", "part_ids", "omitted"], source: source,
             header: PromptInt8Matmul.naxHeader + Float16ConstantQMV.topTwoHeader,
             ensureRowContiguous: true)
     }()
@@ -6306,10 +6305,10 @@ enum VerifyInt8Matmul {
     }
 
     static func sameCompactBits(
-        _ a: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray),
-        _ b: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)
+        _ a: (ids: MLXArray, values: MLXArray, omitted: MLXArray),
+        _ b: (ids: MLXArray, values: MLXArray, omitted: MLXArray)
     ) -> Bool {
-        let pairs: [(MLXArray, MLXArray)] = [(a.ids, b.ids), (a.values, b.values), (a.omitted, b.omitted), (a.bad, b.bad)]
+        let pairs: [(MLXArray, MLXArray)] = [(a.ids, b.ids), (a.values, b.values), (a.omitted, b.omitted)]
         let checks: [MLXArray] = pairs.map { (pair: (MLXArray, MLXArray)) -> MLXArray in
             MLX.all(pair.0.view(dtype: .uint32) .== pair.1.view(dtype: .uint32))
         }
@@ -6327,7 +6326,7 @@ enum VerifyInt8Matmul {
     static func compactHead(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool, streamedWeight: MLXArray? = nil, checking: Bool = false
-    ) -> (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)? {
+    ) -> (ids: MLXArray, values: MLXArray, omitted: MLXArray)? {
         guard compactHeadAvailable(rows: activation.rows, k: activation.k, n: weight.dim(0))
         else { return nil }
         let tiles = weight.dim(0) / 32
@@ -6342,9 +6341,9 @@ enum VerifyInt8Matmul {
              HostConstants.int32([Int32(activation.k), Int32(activation.rows), Int32(weight.dim(0))])],
             template: [("ROWS", 16), ("NEG", negative && negativeForms ? 1 : 0), ("KC", activation.k)],
             grid: (tiles * 128, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [[16, tiles, 4], [16, tiles, 4], [16, tiles], [16, tiles]],
-            outputDTypes: [.float32, .int32, .float32, .int32])
-        return (result[1], result[0], result[2], result[3])
+            outputShapes: [[16, tiles, 2], [16, tiles], [16, tiles]],
+            outputDTypes: [.float32, .int32, .float32])
+        return (result[1], result[0], result[2])
     }
 
     /// `naxFastBody` for `layers` sibling projections of one activation in one dispatch: threadgroups x < N0 / 32
@@ -8195,6 +8194,7 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
+    nonisolated(unsafe) public static var verifyHeadRescore: ((String, String) -> (MLXFast.MLXFastKernel, Int))?
     nonisolated(unsafe) public static var verifyK64Prepare: (() -> Void)?
     nonisolated(unsafe) public static var verifyK64Run: (([MLXArray], Bool, Bool, Bool) -> [MLXArray]?)?
     public static func verifyK64Source(_ s: Bool) -> (String, MLXFast.MLXFastKernel)? {
@@ -9042,11 +9042,12 @@ extension HadamardQuantizedLinear {
             rotated, weight: weight, scales: scales, biases: biases!)
     }
 
-    private func needsHeadResidualL2(rows: Int) -> Bool {
-        exactHeadBounds.compactVerified != false
+    private func headL2Bounds(rows: Int) -> MLXArray? {
+        (exactHeadBounds.compactVerified != false
             && exactHeadBounds.compactParallelVerified != false && exactHeadBounds.residualL2Verified != false
             && weight.dim(0) % 512 == 0
-            && VerifyInt8Matmul.compactHeadAvailable(rows: rows, k: transform.width, n: weight.dim(0))
+            && VerifyInt8Matmul.compactHeadAvailable(rows: rows, k: transform.width, n: weight.dim(0)))
+            ? exactHeadBounds.get(weight: weight, scales: scales, biases: biases!) : nil
     }
 
     /// `topTwoRows(rmsNorm(x + delta, weight))` with the residual add, RMSNorm,
@@ -9063,7 +9064,7 @@ extension HadamardQuantizedLinear {
             gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
             self.weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
             let fused = transform.residualNormVerifyRotated(
-                x, residual: delta, weight: weight, eps: eps, headError2: needsHeadResidualL2(rows: rows)),
+                x, residual: delta, weight: weight, eps: eps, headError2: headL2Bounds(rows: rows)),
             let topTwo = exactHeadTopTwo(
                 activation: fused.activation, rotated: fused.rotated, rows: rows, error2: fused.error2)
         else { return nil }
@@ -9080,7 +9081,7 @@ extension HadamardQuantizedLinear {
             gdnLayout == nil, transform.blockSize == 4096, transform.width == 4096,
             weight.dim(0) % 64 == 0, x.dtype == .float32, VerifyInt8Matmul.route != .off,
             let (activation, rotated, error2) = transform.quantizedForVerifyWithRotated(
-                x, headError2: needsHeadResidualL2(rows: rows))
+                x, headError2: headL2Bounds(rows: rows))
         else { return nil }
         return exactHeadTopTwo(activation: activation, rotated: rotated, rows: rows, error2: error2)
     }
@@ -9102,7 +9103,7 @@ extension HadamardQuantizedLinear {
                     activation, weight: weight, scalesT: scalesT, biasesT: biasesT,
                     negative: promptConstants.negative, streamedWeight: words)
             }
-            let summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray, bad: MLXArray)
+            let summary: (ids: MLXArray, values: MLXArray, omitted: MLXArray)
             if let streamed, exactHeadBounds.streamHeadVerified == true {
                 summary = streamed
             } else {
@@ -9124,7 +9125,7 @@ extension HadamardQuantizedLinear {
                     weight: weight, scales: scales, biases: biases!, rows: rows,
                     negative: promptConstants.negative, error2: tight ? error2 : nil, anchors: anchors, partitionL2: partitionL2)
             }
-            let canUseParallel = summary.values.size / rows % (4 * ExactVerifyHead.compactBlocks) == 0
+            let canUseParallel = summary.values.size / rows % (2 * ExactVerifyHead.compactBlocks) == 0
             if canUseParallel, exactHeadBounds.compactParallelVerified == true {
                 return parallel(tight: exactHeadBounds.residualL2Verified == true,
                     anchors: exactHeadBounds.exactAnchorsVerified == true,
@@ -9182,7 +9183,7 @@ extension HadamardQuantizedLinear {
                 ExactVerifyHead.log("XHEAD compact parallel rows \(rows): \(parallelMatch ? "on; blocks16" : "MISMATCH, compact single-group path kept")")
             }
             exactHeadBounds.compactVerified = match
-            ExactVerifyHead.log("XHEAD compact rows \(rows): \(match ? "on; top4/32, omitted >= tau uses full float, info count -1" : "MISMATCH, original exact path kept")")
+            ExactVerifyHead.log("XHEAD compact rows \(rows): \(match ? "on; top2/32, omitted >= tau uses full float, info count -1" : "MISMATCH, original exact path kept")")
         }
         return original
     }
