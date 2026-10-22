@@ -86,6 +86,7 @@ public enum HostConstants {
 /// Forward evaluation computes `(x * signs) H`; inverse evaluation computes
 /// `(x H) * signs`. Signs cover the entire final dimension, not just one block.
 public struct SignedBlockHadamard {
+    nonisolated(unsafe) public static var rn16: ((MLXFast.MLXFastKernel,(String,String,String,Int)?,[MLXArray],[[Int]])->[MLXArray]?)?
     public let blockSize: Int
     public let width: Int
     public let signs: MLXArray
@@ -1477,26 +1478,16 @@ extension SignedBlockHadamard {
     }
 
     private static func wideRowInputNames(_ kind: WideRowKind) -> [String] {
-        switch kind {
-        case .residualNorm, .residualNormNormed, .residualNormRot:
-            return ["x", "residual", "norm_weight", "epsilon", "signs"]
-        case .normNormed: return ["x", "norm_weight", "epsilon", "signs"]
-        case .gatedNorm: return ["x", "gate", "norm_weight", "epsilon", "signs"]
-        case .plain, .plainRot: return ["x", "signs"]
-        case .swiglu: return ["x", "up", "signs"]
-        case .attentionGate: return ["x", "gate", "signs"]
-        }
+        let f = kind.form
+        return ["x"] + (f.residualNorm ? ["residual"] : [])
+            + (f.gatedNorm || f.attentionGate ? ["gate"] : []) + (f.swiglu ? ["up"] : [])
+            + (f.residualNorm || f.normOnly || f.gatedNorm ? ["norm_weight", "epsilon"] : []) + ["signs"]
     }
 
     private static func wideRowOutputNames(_ kind: WideRowKind) -> [String] {
-        switch kind {
-        case .residualNorm: return ["codes", "ascale", "rsb", "residual_out"]
-        case .residualNormNormed: return ["codes", "ascale", "rsb", "residual_out", "normed_out"]
-        case .residualNormRot: return ["codes", "ascale", "rsb", "residual_out", "rotated_out"]
-        case .normNormed: return ["codes", "ascale", "rsb", "normed_out"]
-        case .gatedNorm, .plain, .swiglu, .attentionGate: return ["codes", "ascale", "rsb"]
-        case .plainRot: return ["codes", "ascale", "rsb", "rotated_out"]
-        }
+        let f = kind.form
+        return ["codes", "ascale", "rsb"] + (f.residualNorm ? ["residual_out"] : [])
+            + (f.normalizedOutput ? ["normed_out"] : []) + (f.rotatedOutput ? ["rotated_out"] : [])
     }
 
     /// `DARKBLOOM_BONSAI_LOAD_HOIST=0` keeps the parent text of the norm forms
@@ -1530,12 +1521,15 @@ extension SignedBlockHadamard {
                 else { continue }
                 source = text
             }
+            let n = "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")"
+            let h = WideRowSource.header(threads: threads) + (headError2 ? ExactVerifyHead.l2Header : "")
             kernels[kind] = MLXFast.metalKernel(
-                name: "signed_block_hadamard_wide_\(kind.rawValue)_w\(threads)\(hoisted ? "_h" : "")\(headError2 ? "_head_error2_v1" : "")\(lean ? (wideRowLeanNegative ? "_lean_negctl" : "_lean") : "")",
+                name: n,
                 inputNames: wideRowInputNames(kind) + ["verify_rows"],
                 outputNames: wideRowOutputNames(kind) + (headError2 ? ["qerror2"] : []),
                 source: source,
-                header: WideRowSource.header(threads: threads) + (headError2 ? ExactVerifyHead.l2Header : ""), ensureRowContiguous: true)
+                header: h, ensureRowContiguous: true)
+            if kind == .residualNorm || kind == .residualNormNormed { _ = rn16?(kernels[kind]!, (n, source, h, threads), [], []) }
         }
         return kernels
     }
@@ -1678,6 +1672,7 @@ extension SignedBlockHadamard {
             ? (headError2 ? wideRowResolvedHeadKernels[kind.index] : wideRowResolvedKernels[kind.index])
             : (headError2 ? wideRowHeadKernels : wideRowWideKernels)[lanes]?[kind]
         if lanes > 0, let kernel = kernel ?? resolvedKernel {
+            if wideRowReady, kind == .residualNorm || kind == .residualNormNormed, let a = rn16?(kernel, nil, inputs, shapes) { return a }
             return kernel(
                 inputs + [HostConstants.int32([Int32(rows)])], template: [("BLOCKS_PER_ROW", blocks)],
                 grid: (lanes, tile * blocks, 1), threadGroup: (lanes, 1, 1),
