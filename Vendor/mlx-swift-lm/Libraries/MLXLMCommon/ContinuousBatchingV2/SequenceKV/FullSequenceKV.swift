@@ -95,6 +95,10 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+    /// True while no view of the stored buffers is out except the ones a graph in flight reads:
+    /// the buffers were produced by a slice update (donated or copied, so held by no snapshot)
+    /// and `snapshot()` has not been called since.
+    private var ownsStorage = false
 
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial
@@ -160,6 +164,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         }
         absoluteOffset += n
+        ownsStorage = true
 
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
@@ -167,7 +172,30 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// The stored rows `[..., ..<absoluteOffset, :]` for an attention whose launch stores the
+    /// `newKeys` rows behind them itself (`commitStoredRows` then books them). Makes the room an
+    /// `update` would. nil, with nothing changed, when this storage is not ours alone to write:
+    /// no 4-D storage, or a snapshot of it was handed out since the last slice update, which
+    /// replaces the buffer (a view of the old one keeps it from being donated).
+    func prefixViews(appending newKeys: MLXArray, _ newValues: MLXArray) -> (MLXArray, MLXArray)? {
+        guard ownsStorage, let k = keys, let v = values, k.ndim == 4, v.ndim == 4,
+            newKeys.ndim == 4, newValues.ndim == 4, absoluteOffset > 0, newKeys.dim(0) == 1,
+            newKeys.dim(1) == kvHeads, newValues.dim(2) == newKeys.dim(2),
+            absoluteOffset + newKeys.dim(2) <= maxLength
+        else { return nil }
+        ensureCapacity(absoluteOffset + newKeys.dim(2), keyTemplate: newKeys, valueTemplate: newValues)
+        return (
+            keys![.ellipsis, ..<absoluteOffset, 0...],
+            values![.ellipsis, ..<absoluteOffset, 0...]
+        )
+    }
+
+    func commitStoredRows(_ n: Int) {
+        absoluteOffset += n
+    }
+
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        ownsStorage = false
         guard let keys, let values else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
@@ -209,6 +237,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         let range = base ..< (base + rows.count)
         keys = Self.sliceUpdate(k, k.take(index, axis: 2), range)
         values = Self.sliceUpdate(v, v.take(index, axis: 2), range)
+        ownsStorage = true
     }
 
     func cbv2InnerState() -> [MLXArray] {
