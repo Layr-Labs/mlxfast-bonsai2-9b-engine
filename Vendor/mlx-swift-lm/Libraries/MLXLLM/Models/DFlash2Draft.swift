@@ -5808,14 +5808,16 @@ enum DF2Fast {
                   for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
                   if (TREE_SPLIT && e == 0) {
                     float z1 = 0.0f;
-                    for (int c = 0; c < 16; c++) { z1 += metal::precise::exp(tev[c] - mx); }
+                    const float x1 = metal::precise::exp(tev[int(tid)] - mx);
+                    for (int c = 0; c < 16; c++) { z1 += simd_shuffle(x1, ushort(c)); }
                     if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }
                   }
-                  float z = 0.0f, mine = 0.0f;
+                  // Lanes 0...15 share each exponential; keep the record's
+                  // sequential 0...15 addition order in every denominator.
+                  float z = 0.0f;
+                  const float mine = metal::precise::exp((tev[int(tid)] - mx) * tsc);
                   for (int c = 0; c < 16; c++) {
-                    const float x = metal::precise::exp((tev[c] - mx) * tsc);
-                    z += x;
-                    if (c == int(tid)) { mine = x; }
+                    z += simd_shuffle(mine, ushort(c));
                   }
                   fprob[16 * e + int(tid)] = pp * (mine / z);
                 }
