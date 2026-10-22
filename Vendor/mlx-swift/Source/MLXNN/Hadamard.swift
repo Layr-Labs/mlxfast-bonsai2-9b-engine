@@ -1348,7 +1348,7 @@ enum WideRowLean {
                 "threadgroup float4 buf_v[\(size / 4)];\nthreadgroup float* buf = (threadgroup float*)buf_v;"),
             swap("\n  v[r] = buf[(base0 + r) + ((base0 + r) >> \(b)u)];", ""),
             swap("float v[\(e)];\nfloat amax = 0.0f;\n", "float v[\(e)];\nfloat amax = 0.0f;\n" + load("base0", "v")),
-            swap("const size_t qidx = size_t(row) * size_t(kg) + size_t(g);", "const uint qidx = row * kg + g;")
+            (f.promptLayout || swap("const size_t qidx = size_t(row) * size_t(kg) + size_t(g);", "const uint qidx = row * kg + g;"))
         else { return nil }
         if f.gatedNorm && e == 4 {
             guard swap("threadgroup float head_part[32 * 32];", "float head_acc = 0.0f;"),
@@ -3219,8 +3219,7 @@ private enum DraftScreenQMV {
 
 // PROMPT-WIDE BEGIN
 extension SignedBlockHadamard {
-    /// Prompt-width (pw) boundaries on the hoisted 512-lane `WideRowSource`
-    /// text, served once `pwCheck` matched the record kernel bit for bit.
+    /// Prompt boundaries on the 512-lane lean WHT after `pwCheck` matches the record bits.
     static let pwKinds: [WideRowKind] = [.residualNorm, .residualNormNormed, .normNormed]
     static let pwEnabled = flagOn("DARKBLOOM_BONSAI_WHT_LEAN_PROMPT")
     static let pwNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_PROMPT_NEGCTL"] == "1"
@@ -3243,6 +3242,7 @@ extension SignedBlockHadamard {
             form.hoist = true
             form.promptLayout = true
             var source = WideRowSource.source(threads: 512, form: form)
+            source = WideRowLean.source(source, threads: 512, form: form) ?? source
             var header = WideRowSource.header(threads: 512)
             if pwNegative {
                 source.replaceSubrange(source.range(of: "widerow_radix8(x_reg);")!, with: "widerow_radix8_negctl(x_reg);")
