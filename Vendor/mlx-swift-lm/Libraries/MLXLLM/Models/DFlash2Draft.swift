@@ -2056,9 +2056,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
-        guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
+        let rows = targetHidden.dim(1)
+        let writeNorm = layers.contains { $0.selfAttn.slidingWindow.map { rows >= $0 } ?? false }
+        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group, writeNorm: writeNorm) else { return nil }
+        // Every precomputed K/V stays live when no layer drops context rows.
+        let context = writeNorm ? normed.0 : fcOut
+        guard let kv = contextKeysValues(normed.1, rows: rows) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
@@ -2724,28 +2727,314 @@ enum DF2Fast {
         }
         let s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
         let b = lo.asType(.float16).asType(.float32)
-        let u = clip(
-            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15
-        ).asType(.uint32).reshaped([N, K / 8, 2, 4])
-        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
-        let packed = (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
+        let packed = w4Pack(w4FitCodes(w, s: s, b: b))
         let sT = contiguous(s.asType(.float16).transposed())
         let bT = contiguous(b.asType(.float16).transposed())
         eval(packed, sT, bT)
-        let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
-        if group == 64 && ((N == 4096 && K == 32768)
+        let pairEligible = group == 64 && ((N == 4096 && K == 32768)
             || (N == 12288 && K == 4096) || (N == 4096 && K == 12288))
-        {
-            o.pair24 = W4Pair24(sT, bT)
+        var o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
+        if group == 64 && w4ALSChecked {
+            if let refined = try? withError({
+                try w4ALSOperands(w, original: o, error: best!, pairEligible: pairEligible)
+            }) {
+                o = refined
+            } else {
+                FileHandle.standardError.write(Data("DF2 w4 ALS2 fallback N\(N) K\(K)\n".utf8))
+            }
         }
+        if pairEligible && o.pair24 == nil { o.pair24 = W4Pair24(o.sT, o.bT) }
         if w4TilesOn {
             // A linear first used after adoption: same layout function as the checked ones.
-            o.tiles = w4Tile(packed, sT: sT, bT: bT, n: N, k: K, group: group)
+            o.tiles = w4Tile(o.w, sT: o.sT, bT: o.bT, n: N, k: K, group: group)
             eval(o.tiles!)
             w4Release(o)
         }
         w4Cache[ObjectIdentifier(layer)] = o
         return o
+    }
+
+    struct W4Fit {
+        let s: MLXArray, b: MLXArray, error: MLXArray
+    }
+
+    struct W4HalfBounds {
+        let sMin: UInt16, sMax: UInt16, bMin: UInt16, bMax: UInt16
+        var admitsPair24: Bool {
+            UInt32(sMax) - UInt32(sMin) <= 4095 && UInt32(bMax) - UInt32(bMin) <= 4095
+        }
+
+        init(_ s: MLXArray, _ b: MLXArray) {
+            let sb = contiguous(s.asType(.float16)).view(dtype: .uint16)
+            let bb = contiguous(b.asType(.float16)).view(dtype: .uint16)
+            let sl = sb.min(), sh = sb.max(), bl = bb.min(), bh = bb.max()
+            eval(sl, sh, bl, bh)
+            sMin = sl.item(UInt16.self); sMax = sh.item(UInt16.self)
+            bMin = bl.item(UInt16.self); bMax = bh.item(UInt16.self)
+        }
+
+        func contains(_ s: MLXArray, _ b: MLXArray) -> MLXArray {
+            let sb = contiguous(s.asType(.float16)).view(dtype: .uint16)
+            let bb = contiguous(b.asType(.float16)).view(dtype: .uint16)
+            return (sb .>= MLXArray(sMin)) .&& (sb .<= MLXArray(sMax))
+                .&& (bb .>= MLXArray(bMin)) .&& (bb .<= MLXArray(bMax))
+        }
+    }
+
+    static func w4FitCodes(_ w: MLXArray, s: MLXArray, b: MLXArray) -> MLXArray {
+        clip(round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)),
+            min: 0, max: 15)
+    }
+
+    static func w4FitError(_ w: MLXArray, u: MLXArray, s: MLXArray, b: MLXArray) -> MLXArray {
+        square(u * s.expandedDimensions(axis: -1) + b.expandedDimensions(axis: -1) - w)
+            .sum(axis: -1)
+    }
+
+    static func w4Pack(_ codes: MLXArray) -> MLXArray {
+        let N = codes.dim(0), K = codes.dim(1) * codes.dim(2)
+        let u = codes.asType(.uint32).reshaped([N, K / 8, 2, 4])
+        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
+        return (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
+    }
+
+    static func w4ALSTrial(
+        _ w: MLXArray, incumbent: W4Fit, scale: MLXArray, offset: MLXArray,
+        eligible: MLXArray, bounds: W4HalfBounds?
+    ) -> (fit: W4Fit, accepted: MLXArray) {
+        let s = scale.asType(.float16).asType(.float32)
+        let b = offset.asType(.float16).asType(.float32)
+        var valid = eligible .&& isFinite(s) .&& (s .> 0) .&& isFinite(b)
+            .&& isFinite(incumbent.error) .&& isFinite(w).all(axis: -1)
+        if let bounds { valid = valid .&& bounds.contains(s, b) }
+        // Invalid metadata never reaches the code-assignment division.
+        let safeS = which(valid, s, Float(1)), safeB = which(valid, b, Float(0))
+        let u = w4FitCodes(w, s: safeS, b: safeB)
+        let e = w4FitError(w, u: u, s: safeS, b: safeB)
+        let better = valid .&& isFinite(u).all(axis: -1) .&& isFinite(e) .&& (e .< incumbent.error)
+        let result = W4Fit(s: which(better, s, incumbent.s), b: which(better, b, incumbent.b),
+            error: which(better, e, incumbent.error))
+        eval(result.s, result.b, result.error, better)
+        return (result, better)
+    }
+
+    static func w4ALSRefine(_ w: MLXArray, original: W4Fit, bounds: W4HalfBounds?) -> W4Fit {
+        var fit = original
+        var active = isFinite(original.error)
+        let wm = w.mean(axis: -1, keepDims: true)
+        let wc = w - wm
+        eval(wm, wc)
+        for _ in 0..<2 {
+            let u = w4FitCodes(w, s: fit.s, b: fit.b)
+            let um = u.mean(axis: -1, keepDims: true)
+            let uc = u - um
+            let variance = square(uc).sum(axis: -1)
+            let covariance = (uc * wc).sum(axis: -1)
+            let eligible = active .&& isFinite(u).all(axis: -1) .&& isFinite(variance)
+                .&& (variance .> 0) .&& isFinite(covariance)
+            let scale = covariance / which(eligible, variance, Float(1))
+            let offset = wm.squeezed(axis: -1) - scale * um.squeezed(axis: -1)
+            let trial = w4ALSTrial(w, incumbent: fit, scale: scale, offset: offset,
+                eligible: eligible, bounds: bounds)
+            fit = trial.fit
+            active = trial.accepted
+        }
+        return fit
+    }
+
+    enum W4ALSError: Error { case invalid }
+
+    static func w4ALSOperands(
+        _ w: MLXArray, original: W4Operands, error: MLXArray, pairEligible: Bool
+    ) throws -> W4Operands {
+        let bounds = W4HalfBounds(original.sT, original.bT)
+        let protected = pairEligible && bounds.admitsPair24
+        var words: [MLXArray] = [], scales: [MLXArray] = [], offsets: [MLXArray] = []
+        var improved = 0
+        for row in stride(from: 0, to: original.n, by: 32) {
+            let end = Swift.min(row + 32, original.n)
+            let slab = contiguous(w[row..<end])
+            let s = contiguous(original.sT[0..., row..<end].transposed()).asType(.float32)
+            let b = contiguous(original.bT[0..., row..<end].transposed()).asType(.float32)
+            let incumbent = W4Fit(s: s, b: b, error: error[row..<end])
+            let check = w4FitError(slab, u: w4FitCodes(slab, s: s, b: b), s: s, b: b)
+            let identical = (check.view(dtype: .uint32) .== incumbent.error.view(dtype: .uint32)).all()
+            eval(identical)
+            // A backend reduction change caused by slabbing must retain the full baseline.
+            guard identical.item(Bool.self) else { throw W4ALSError.invalid }
+            let fit = w4ALSRefine(slab, original: incumbent, bounds: protected ? bounds : nil)
+            let packed = w4Pack(w4FitCodes(slab, s: fit.s, b: fit.b))
+            let halfS = contiguous(fit.s.asType(.float16))
+            let halfB = contiguous(fit.b.asType(.float16))
+            let count = (fit.error .< incumbent.error).asType(.int32).sum()
+            eval(packed, halfS, halfB, count)
+            improved += count.item(Int.self)
+            words.append(packed); scales.append(halfS); offsets.append(halfB)
+        }
+        let packed = concatenated(words, axis: 0)
+        let sT = contiguous(concatenated(scales, axis: 0).transposed())
+        let bT = contiguous(concatenated(offsets, axis: 0).transposed())
+        eval(packed, sT, bT)
+        if protected {
+            let inside = bounds.contains(sT, bT).all()
+            eval(inside)
+            guard inside.item(Bool.self) else { throw W4ALSError.invalid }
+        }
+        let result = W4Operands(w: packed, sT: sT, bT: bT, n: original.n, k: original.k)
+        if pairEligible {
+            result.pair24 = W4Pair24(sT, bT)
+            guard !protected || result.pair24 != nil else { throw W4ALSError.invalid }
+            if let pair = result.pair24 { eval(pair.words, pair.bases) }
+        }
+        withExtendedLifetime(original) {}
+        FileHandle.standardError.write(Data(
+            "DF2 w4 ALS2 N\(original.n) K\(original.k) improved=\(improved) pair24Protected=\(protected)\n".utf8))
+        return result
+    }
+
+    static let w4ALSChecked: Bool = {
+        guard ProcessInfo.processInfo.environment["DF2_W4_ALS"] != "0" else {
+            FileHandle.standardError.write(Data("DF2 w4 ALS2 disabled\n".utf8))
+            return false
+        }
+        let passed = (try? withError { try w4ALSSelfCheck() }) ?? false
+        FileHandle.standardError.write(Data("DF2 w4 ALS2 self-check \(passed ? "pass" : "fallback")\n".utf8))
+        return passed
+    }()
+
+    static func w4ALSSelfCheck() throws -> Bool {
+        let values: [Float] = (0..<256).map { (index: Int) -> Float in
+            let code = Float(index % 16)
+            return code * 0.75 - 6
+        }
+        let w = MLXArray(values, [4, 1, 64])
+        let s = MLXArray.ones([4, 1], dtype: .float32)
+        let b = MLXArray.full([4, 1], values: MLXArray(Float(-8)))
+        let error = w4FitError(w, u: w4FitCodes(w, s: s, b: b), s: s, b: b)
+        let original = W4Fit(s: s, b: b, error: error)
+        let refined = w4ALSRefine(w, original: original, bounds: nil)
+        let lower = (refined.error .< error).all()
+        eval(lower)
+        guard lower.item(Bool.self) else { return false }
+
+        func retained(_ fit: W4Fit, _ expected: W4Fit) -> Bool {
+            let same = (fit.s.view(dtype: .uint32) .== expected.s.view(dtype: .uint32)).all()
+                .&& (fit.b.view(dtype: .uint32) .== expected.b.view(dtype: .uint32)).all()
+                .&& (fit.error.view(dtype: .uint32) .== expected.error.view(dtype: .uint32)).all()
+            eval(same)
+            return same.item(Bool.self)
+        }
+        let yes = MLXArray.ones([4, 1], dtype: .bool)
+        let tie = w4ALSTrial(w, incumbent: original, scale: s, offset: b, eligible: yes, bounds: nil)
+        guard retained(tie.fit, original) else { return false }
+        let constant = MLXArray.full([4, 1, 64], values: MLXArray(Float(-3)))
+        let constantB = MLXArray.full([4, 1], values: MLXArray(Float(-3)))
+        let exact = W4Fit(s: s, b: constantB, error: MLXArray.zeros([4, 1]))
+        guard retained(w4ALSRefine(constant, original: exact, bounds: nil), exact) else { return false }
+        for bad: Float in [0, -1, .nan, .infinity, 1.0e10, 1.0e-10] {
+            let trial = w4ALSTrial(w, incumbent: original, scale: MLXArray(bad), offset: b,
+                eligible: yes, bounds: nil)
+            guard retained(trial.fit, original) else { return false }
+        }
+        for bad: Float in [Float.nan, .infinity, 1.0e10] {
+            let trial = w4ALSTrial(w, incumbent: original, scale: s, offset: MLXArray(bad),
+                eligible: yes, bounds: nil)
+            guard retained(trial.fit, original) else { return false }
+        }
+        for edge: Float in [Float(Float16.leastNonzeroMagnitude), Float(Float16.greatestFiniteMagnitude)] {
+            let edgeValues: [Float] = (0..<256).map { (index: Int) -> Float in
+                Float(index % 2) * edge
+            }
+            let edgeW = MLXArray(edgeValues, [4, 1, 64])
+            let zero = MLXArray.zeros([4, 1], dtype: .float32)
+            let edgeError = w4FitError(edgeW, u: w4FitCodes(edgeW, s: s, b: zero), s: s, b: zero)
+            let edgeFit = W4Fit(s: s, b: zero, error: edgeError)
+            let trial = w4ALSTrial(edgeW, incumbent: edgeFit, scale: MLXArray(edge), offset: zero,
+                eligible: yes, bounds: nil)
+            let accepted = trial.accepted.all()
+            let exactEdge = (trial.fit.error .== Float(0)).all()
+            eval(accepted, exactEdge)
+            guard accepted.item(Bool.self), exactEdge.item(Bool.self) else { return false }
+        }
+        let bounds = W4HalfBounds(s, b)
+        let locked = w4ALSRefine(w, original: original, bounds: bounds)
+        guard bounds.admitsPair24, retained(locked, original) else { return false }
+        let negative = MLXArray([Float(-8), Float(-4)], [2, 1])
+        let negativeBounds = W4HalfBounds(MLXArray([Float(1), Float(1)], [2, 1]), negative)
+        let inside = negativeBounds.contains(MLXArray(Float(1)), MLXArray(Float(-6))).all()
+        let outside = negativeBounds.contains(MLXArray(Float(1)), MLXArray(Float(6))).all()
+        eval(inside, outside)
+        guard negativeBounds.bMin == Float16(-4).bitPattern,
+            negativeBounds.bMax == Float16(-8).bitPattern,
+            inside.item(Bool.self), !outside.item(Bool.self) else { return false }
+
+        let codes: [UInt32] = (0..<256).map { (index: Int) -> UInt32 in UInt32(index % 16) }
+        let packed = w4Pack(MLXArray(codes, [4, 1, 64]))
+        eval(packed)
+        let words = packed.asArray(UInt32.self)
+        func decoded(_ words: [UInt32]) -> [UInt32] {
+            var result: [UInt32] = []
+            for word in words {
+                for nibble in 0..<8 {
+                    let byte = nibble % 4
+                    let divisor = UInt32(1) << UInt32(byte * 8)
+                    let octet = (word / divisor) % 256
+                    result.append(nibble < 4 ? octet % 16 : octet / 16)
+                }
+            }
+            return result
+        }
+        guard words.first == UInt32(0x73625140), decoded(words) == codes else { return false }
+        let pairS = MLXArray([Float(1), Float(1), Float(1), Float(1)], [1, 4]).asType(.float16)
+        let pairB = MLXArray([Float(-4), Float(-8), Float(-6), Float(-5)], [1, 4]).asType(.float16)
+        guard let pair = W4Pair24(pairS, pairB) else { return false }
+        eval(pair.words, pair.bases)
+        var corrupt = words
+        corrupt[0] ^= 1
+        guard decoded(corrupt) != codes else { return false }
+        let ss = refined.s.asArray(Float.self), bb = refined.b.asArray(Float.self)
+        let fitted = w4Pack(w4FitCodes(w, s: refined.s, b: refined.b)).asArray(UInt32.self)
+        let fittedCodes = decoded(fitted)
+        func reconstructionValid(_ scales: [Float], _ offsets: [Float], _ packed: [UInt32]) -> Bool {
+            let recovered = decoded(packed)
+            var oldSSE: Float = 0, newSSE: Float = 0
+            for i in values.indices {
+                let row = i / 64
+                let code = recovered[i]
+                let quotient = ((values[i] - offsets[row]) / scales[row]).rounded(.toNearestOrEven)
+                let expected = UInt32(Swift.max(Float(0), Swift.min(Float(15), quotient)))
+                if code != expected || !scales[row].isFinite || scales[row] <= 0
+                    || !offsets[row].isFinite { return false }
+                let difference = Float(code) * scales[row] + offsets[row] - values[i]
+                newSSE += difference * difference
+                let oldCode = ((values[i] + 8).rounded(.toNearestOrEven))
+                let oldDifference = Swift.max(Float(0), Swift.min(Float(15), oldCode)) - 8 - values[i]
+                oldSSE += oldDifference * oldDifference
+            }
+            return newSSE.isFinite && newSSE < oldSSE
+        }
+        guard fittedCodes.count == values.count, reconstructionValid(ss, bb, fitted) else { return false }
+        var damaged = fitted
+        damaged[0] ^= 1
+        guard !reconstructionValid(ss, bb, damaged) else { return false }
+        let baseline = W4Operands(w: w4Pack(w4FitCodes(w, s: s, b: b)),
+            sT: contiguous(s.asType(.float16).transposed()),
+            bT: contiguous(b.asType(.float16).transposed()), n: 4, k: 64)
+        eval(baseline.w, baseline.sT, baseline.bT)
+        let assembled = try w4ALSOperands(w, original: baseline, error: error, pairEligible: false)
+        let assembledS = assembled.sT.transposed().asType(.float32).asArray(Float.self)
+        let assembledB = assembled.bT.transposed().asType(.float32).asArray(Float.self)
+        guard reconstructionValid(assembledS, assembledB, assembled.w.asArray(UInt32.self)) else { return false }
+        let protected = try w4ALSOperands(w, original: baseline, error: error, pairEligible: true)
+        let unchanged = (protected.w .== baseline.w).all()
+            .&& (protected.sT.view(dtype: .uint16) .== baseline.sT.view(dtype: .uint16)).all()
+            .&& (protected.bT.view(dtype: .uint16) .== baseline.bT.view(dtype: .uint16)).all()
+        eval(unchanged)
+        guard unchanged.item(Bool.self), protected.pair24 != nil else { return false }
+        guard !reconstructionValid(ss.map { (value: Float) -> Float in value * 2 }, bb, fitted),
+            !reconstructionValid(ss, bb.map { (value: Float) -> Float in value + 16 }, fitted)
+        else { return false }
+        return true
     }
 
     // MARK: 4-bit codes in load-time tiles
@@ -3046,7 +3335,8 @@ enum DF2Fast {
         init?(_ scales: MLXArray, _ offsets: MLXArray) {
             guard scales.dtype == .float16, offsets.dtype == .float16,
                 scales.ndim == 2, scales.shape == offsets.shape, scales.dim(1) % 4 == 0,
-                scales.strides == [scales.dim(1), 1], offsets.strides == scales.strides,
+                scales.strides[1] == 1, scales.dim(0) == 1 || scales.strides[0] == scales.dim(1),
+                offsets.strides == scales.strides,
                 scales.size > 0, scales.size % 4 == 0, scales.size / 4 <= Int.max / 3
             else { return nil }
             let s = scales.view(dtype: .uint16).asArray(UInt16.self)
