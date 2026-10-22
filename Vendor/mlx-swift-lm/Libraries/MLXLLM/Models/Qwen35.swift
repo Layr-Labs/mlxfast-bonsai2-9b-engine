@@ -1445,9 +1445,10 @@ private enum Qwen35Fresh8PromptGDN {
     /// Simdgroups per threadgroup for the two chunk scans. `r0` is
     /// `thread_position_in_grid.y * 8`, so the block a simdgroup owns does not depend on
     /// this count; only how many threadgroups share one staged chunk does. The check
-    /// below compares both launch shapes bit for bit and times them at the served shape,
-    /// and 8 serves only if it is at least 1% faster.
-    /// `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4; `=1` forces 8 after the bit check.
+    /// below compares both launch shapes bit for bit at the served shape; 8 serves
+    /// whenever the check passes, deterministically, so the choice cannot flip on a
+    /// boot-time sample. The chain is still run once to compile and warm both pipelines.
+    /// `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4.
     private static let scanNS: Int = resolveScanNS()
 
     private static func resolveScanNS() -> Int {
@@ -1458,11 +1459,10 @@ private enum Qwen35Fresh8PromptGDN {
                 Data("qwen35 prompt scan simdgroups: 4 (DARKBLOOM_BONSAI_PSCAN8=0)\n".utf8))
             return 4
         }
-        let forced = ["1", "true", "yes", "on"].contains(raw ?? "")
         let verdict = scanShapeVerdict()
-        let ns = verdict.gain >= 0.01 || forced ? verdict.passed ? 8 : 4 : 4
+        let ns = verdict.passed ? 8 : 4
         let reason = verdict.passed
-            ? String(format: "%.1f%% faster than 4 at the served shape", verdict.gain * 100)
+            ? String(format: "bits equal at the served shape; 8 serves (%.1f%% faster here)", verdict.gain * 100)
             : "bit mismatch or error, 4 kept"
         FileHandle.standardError.write(
             Data("qwen35 prompt scan simdgroups: \(ns) (\(reason))\n".utf8))
@@ -2767,94 +2767,6 @@ enum Qwen35FusedGDNVerify {
             && swap("acc = fma(xin[p + tap], w[tap], acc);", tap)
             && swap("const uint r = p + tap;", "const uint r = tb_tab[p * 4u + tap];")
             && swap("for (int t = 0; t < int(T); ++t) {", restart)
-        guard ok else { return nil }
-        return preloadedTreeValues(s)
-    }
-
-    /// In SG16 the scan state is loaded after the frontend. Keep V row work
-    /// parallel, but read raw path values once per column-owner parity into
-    /// a scoped private array instead of reloading four taps for every row.
-    static func preloadedTreeValues(_ fast: String) -> String? {
-        guard fast.contains("const uint vtid = tid - 256u;") else { return fast }
-        var s = fast
-        let before = "const float vw[4] = {vw4.x, vw4.y, vw4.z, vw4.w};"
-        let after = before + """
-
-          float vx[3 + MAX_T];
-          #pragma clang loop unroll(full)
-          for (uint vr = 0u; vr < 3u + uint(MAX_T); ++vr) {
-            if (vr < 3u + T) {
-              vx[vr] = vr < 3u ? conv_state[vr * C + c] : qkv[(vr - 3u) * C + c];
-            }
-          }
-        """
-        let load = "const float v = r < 3u ? conv_state[r * C + c] : qkv[(r - 3u) * C + c];"
-        let raw = "const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];"
-        guard s.components(separatedBy: before).count == 2,
-            s.components(separatedBy: load).count == 2,
-            s.components(separatedBy: raw).count == 2 else { return nil }
-        s = s.replacingOccurrences(of: before, with: after)
-        s = s.replacingOccurrences(of: load, with: "const float v = vx[r];")
-        s = s.replacingOccurrences(of: raw, with: "const float xv = vx[t];")
-        return s
-    }
-
-    /// Reuse the strict-commit delta output instead of keeping a second cache.
-    /// Only the lane that already wrote this word reads it; SIMD shuffle then
-    /// broadcasts its own-thread device load, so no cross-lane memory fence is needed.
-    /// This transform is offered only after capturingDelta, not to non-delta scans.
-    static func cachedTreeDeltas(_ fast: String) -> String? {
-        var s = fast
-        func swap(_ from: String, _ to: String) -> Bool {
-            guard s.components(separatedBy: from).count == 2 else { return false }
-            s = s.replacingOccurrences(of: from, with: to)
-            return true
-        }
-        let old = """
-              const float2 vu = *((threadgroup const float2*)(v_tile + dvlocal + u * DVPT));
-              const float vq[DVPL] = {vu.x, vu.y};
-              float kvq[DVPL];
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < R / 4; ++j) {
-                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
-                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
-                  a0 = fma(state[d][4 * j], kq[4 * j], a0);
-                  a1 = fma(state[d][4 * j + 1], kq[4 * j + 1], a1);
-                  a2 = fma(state[d][4 * j + 2], kq[4 * j + 2], a2);
-                  a3 = fma(state[d][4 * j + 3], kq[4 * j + 3], a3);
-                }
-                kvq[d] = (a0 + a1) + (a2 + a3);
-              }
-              kvq[0] += simd_shuffle_xor(kvq[0], 4);
-              kvq[1] += simd_shuffle_xor(kvq[1], 4);
-              kvq[0] += simd_shuffle_xor(kvq[0], 2);
-              kvq[1] += simd_shuffle_xor(kvq[1], 2);
-              kvq[0] += simd_shuffle_xor(kvq[0], 1);
-              kvq[1] += simd_shuffle_xor(kvq[1], 1);
-          """
-        let update = """
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < R / 4; ++j) {
-                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
-                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
-                }
-              }
-          """
-        let registerDeltaLoad = """
-            float delta = 0.0f;
-            if (lane % LPD == 0u) {
-              delta = delta_out[(u * Hv + hv_idx) * (Dv + 1) + dvbase + d];
-            }
-            delta = simd_shuffle(delta, lane - lane % LPD);
-            """
-        let ok = swap(old, update)
-            && swap("const float bu = gate_beta[u];", "")
-            && swap("const float delta = (vq[d] - kvq[d]) * bu;", registerDeltaLoad)
         return ok ? s : nil
     }
 
@@ -3004,10 +2916,6 @@ enum Qwen35FusedGDNVerify {
         if chain {
             guard let guarded = chainStores(text) else { return nil }
             text = guarded
-        }
-        if delta && plainFast != nil {
-            guard let cached = cachedTreeDeltas(text) else { return nil }
-            text = cached
         }
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
         return MLXFast.metalKernel(
@@ -3201,6 +3109,99 @@ enum Qwen35FusedGDNVerify {
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
             + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed) dead2=\(chainStoresPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
+        guard Qwen35SnapshotCommit.offered else { return }
+        var snapOK = false
+        if snapshotOffered && fastTreeOffered && deltaPassed && chainStoresPassed {
+            do {
+                snapOK = try withError { checkSnapshotCommit() }
+            } catch {
+                FileHandle.standardError.write(Data("snap commit check error: \(error)\n".utf8))
+            }
+        }
+        Qwen35SnapshotCommit.mode = !snapOK ? .off : Qwen35SnapshotCommit.audit ? .auditing : .on
+        FileHandle.standardError.write(Data("snap commit checked: \(snapOK)\n".utf8))
+    }
+
+    /// The tree kernel the checked flags select, on fixed and pseudo-random descriptors: for every
+    /// path `CBv2BranchVerify.snapshotPrefix` accepts, a path ending at the snapshot row has the
+    /// kernel's `state_out` and `Qwen35SnapshotCommit.convTail` as its replay's bits, and a longer
+    /// path replayed from `state_out` past that row has the full replay's bits. Each skip width
+    /// compiles and matches on a chain. The parent row's replay must differ from `state_out`.
+    private static func checkSnapshotCommit() -> Bool {
+        let flags = (tunePassed, deltaPassed, deadPassed, chainStoresPassed)
+        defer { (tunePassed, deltaPassed, deadPassed, chainStoresPassed) = flags }
+        var trees: [[Int32]] = [
+            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
+            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 12],
+        ]
+        var seed: UInt32 = 12345
+        for _ in 0 ..< 8 {
+            var parents: [Int32] = [-1]
+            for t in 1 ..< 16 {
+                seed = seed &* 1_664_525 &+ 1_013_904_223
+                parents.append(Int32(t - 1 - Int(seed >> 16) % min(t, 4)))
+            }
+            trees.append(parents)
+        }
+        var ok = true
+        var distinct = false
+        var (ends, passes) = (0, 0)
+        for kind in 0 ..< 2 {
+            let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
+            let qkv = probeRows([1, 16, 8192], seed: 0.02, scale: 0.5)
+            let weight = probeRows([8192, 4, 1], seed: 0.03, scale: 0.1)
+            let a = probeRows([1, 16, 32], seed: 0.04, scale: 30)
+            let b = probeRows([1, 16, 32], seed: 0.05, scale: 8)
+            let aLog = probeRows([32], seed: 0.06, scale: 2)
+            let bias = probeRows([32], seed: 0.07, scale: 3)
+            let state = kind == 1 ? probeWords([1, 32, 128, 128])
+                : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)
+            let inputs = [convState, qkv, weight, a, b, aLog, bias, state]
+            for parents in trees {
+                let paths = probeTree(parents.map(Int.init)).1.map { $0.map(Int32.init) }
+                guard let out = probeForward(inputs, tuned: flags.0, delta: true, tree: probeTree(parents.map(Int.init)).0,
+                        dead: flags.2, chain: true),
+                    let tape = out.7
+                else { return false }
+                let split = out.0.dim(1) == 16
+                func replay(_ path: [Int32], from: MLXArray, skip: Int) -> (MLXArray, MLXArray)? {
+                    Qwen35DeltaReplay.run(committedRows: path.count, k: out.3, delta: tape, state: from,
+                        convInput: out.0, treeRows: MLXArray(path), stateIsRowContiguous: true,
+                        convState: split ? convState : nil, skip: skip)
+                }
+                for path in paths {
+                    guard let prefix = CBv2BranchVerify.snapshotPrefix(parents: parents, path: path) else { continue }
+                    let (row, rows) = prefix
+                    guard let full = replay(path, from: state, skip: 0) else { return false }
+                    if rows == path.count {
+                        let tail = Qwen35SnapshotCommit.convTail(
+                            path: path, convInput: out.0, convState: split ? convState : nil)
+                        ok = sameBits([full.0, full.1], [out.5, tail]) && ok
+                        ends += 1
+                        if kind == 0, row > 0, let other = replay(paths[Int(parents[row])], from: state, skip: 0) {
+                            distinct = distinct || !sameBits([other.0], [out.5])
+                        }
+                    } else {
+                        guard let resumed = replay(path, from: out.5, skip: rows) else { return false }
+                        ok = sameBits([full.0, full.1], [resumed.0, resumed.1]) && ok
+                        passes += 1
+                    }
+                }
+                if kind == 0, parents == trees[0] {
+                    for n in 2 ... 16 {
+                        let chain = (0 ..< Int32(n)).map { $0 }
+                        guard let first = replay([0], from: state, skip: 0),
+                            let full = replay(chain, from: state, skip: 0),
+                            let resumed = replay(chain, from: first.0, skip: 1)
+                        else { return false }
+                        ok = sameBits([full.0, full.1], [resumed.0, resumed.1]) && ok
+                    }
+                }
+            }
+        }
+        return ok && distinct && ends > 0 && passes > 0
     }
 
     private static func probeRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
@@ -3453,6 +3454,72 @@ enum Qwen35FusedGDNVerify {
 
 }
 
+/// B and B': on a tree commit whose accepted path passes the verify's snapshot row
+/// (`snapshotTreeSource`; with `chainStores` a branching descriptor leaves that snapshot in
+/// `state_out`), a path ending at the row commits `state_out` and its conv rows, and a longer path
+/// replays only the rows after it. The load check (`checkSnapshotCommit`) must pass first; a
+/// failure keeps the record replay, and so does `DARKBLOOM_BONSAI_SNAP_COMMIT=0`. Nothing checks
+/// on the round path: the boot warm runs no engine round, so a check there would sit in a timed window.
+enum Qwen35SnapshotCommit {
+    static let offered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SNAP_COMMIT"] != "0"
+    /// Diagnostic only: every snapshot commit keeps the record replay's result and checks the
+    /// snapshot path against it, reading the checks back one commit later.
+    static let audit = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SNAP_COMMIT_AUDIT"] == "1"
+
+    enum Mode { case off, auditing, on }
+    nonisolated(unsafe) static var mode = Mode.off
+    nonisolated(unsafe) private static var pending: [(same: MLXArray, ends: Bool)] = []
+    nonisolated(unsafe) private static var audited = (ends: 0, endsSame: 0, passes: 0, passesSame: 0)
+
+    /// The mode; while auditing, first reads the queued checks of earlier commits.
+    static func current() -> Mode {
+        guard mode == .auditing, pending.count >= 24 else { return mode }
+        let same = stacked(pending.map { $0.same }).asArray(Bool.self)
+        for (entry, equal) in zip(pending, same) {
+            if entry.ends {
+                audited.ends += 1
+                audited.endsSame += equal ? 1 : 0
+            } else {
+                audited.passes += 1
+                audited.passesSame += equal ? 1 : 0
+            }
+        }
+        FileHandle.standardError.write(Data(("snap commit audit: ends \(audited.endsSame)/\(audited.ends)"
+            + " passes \(audited.passesSame)/\(audited.passes) layer commits equal\n").utf8))
+        pending.removeAll()
+        return mode
+    }
+
+    static func note(record: CBv2RecurrentLayerState, snapshot: CBv2RecurrentLayerState, ends: Bool) {
+        func same(_ a: MLXArray?, _ b: MLXArray?) -> MLXArray {
+            guard let a, let b, a.shape == b.shape, a.dtype == .float32, b.dtype == .float32 else {
+                return MLXArray(false)
+            }
+            return (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+        }
+        pending.append((same(record.ssm, snapshot.ssm) .&& same(record.conv, snapshot.conv), ends))
+    }
+
+    /// The conv rows after `path`: the replay's `conv_tail` bits. `convState` set: `convInput` is
+    /// the window alone.
+    static func convTail(path: [Int32], convInput: MLXArray, convState: MLXArray?) -> MLXArray {
+        let rows = (0 ..< 3).map { path.count + $0 }
+        let index: [Int32]
+        let source: MLXArray
+        if let convState, rows[0] < 3 {
+            index = rows.map { $0 < 3 ? Int32($0) : 3 + path[$0 - 3] }
+            source = concatenated([convState, convInput], axis: 1)
+        } else if convState != nil {
+            index = rows.map { path[$0 - 3] }
+            source = convInput
+        } else {
+            index = rows.map { $0 < 3 ? Int32($0) : 3 + path[$0 - 3] }
+            source = convInput
+        }
+        return source.view(dtype: .uint32).take(HostConstants.recentInt32(index), axis: 1).view(dtype: .float32)
+    }
+}
+
 /// Accepted-prefix state reconstruction from the exact delta captured by verify.
 /// The multiply and FMA remain separate, in the original recurrence order.
 private enum Qwen35DeltaReplay {
@@ -3513,16 +3580,18 @@ private enum Qwen35DeltaReplay {
         inputNames: ["t_in", "k", "delta", "state_in", "conv_in"],
         outputNames: ["state_out", "conv_tail"], source: source, ensureRowContiguous: true)
 
+    private static let treeSource = source
+        .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
+        .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+        .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
+        .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
+        .replacingOccurrences(of: "(T + r) * cdim", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * cdim")
+
     private static let treeKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_delta_tree_replay",
         inputNames: ["k", "delta", "state_in", "conv_in", "tree_rows"],
         outputNames: ["state_out", "conv_tail"],
-        source: source
-            .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
-            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
-            .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
-            .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
-            .replacingOccurrences(of: "(T + r) * cdim", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * cdim"),
+        source: treeSource,
         ensureRowContiguous: true)
 
     /// The same recurrence with the step count as a template constant: the loop unrolls, the
@@ -3644,16 +3713,18 @@ private enum Qwen35DeltaReplay {
         inputNames: ["t_in", "k", "delta", "state_in", "conv_state", "conv_in"],
         outputNames: ["state_out", "conv_tail"], source: splitSource, ensureRowContiguous: true)
 
+    private static let splitTreeSource = splitSource
+        .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
+        .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+        .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
+        .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
+        .replacingOccurrences(of: "const uint row = T + r;", with: "const uint row = (T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u]);")
+
     private static let splitTreeKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_delta_tree_replay_split",
         inputNames: ["k", "delta", "state_in", "conv_state", "conv_in", "tree_rows"],
         outputNames: ["state_out", "conv_tail"],
-        source: splitSource
-            .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
-            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
-            .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
-            .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
-            .replacingOccurrences(of: "const uint row = T + r;", with: "const uint row = (T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u]);"),
+        source: splitTreeSource,
         ensureRowContiguous: true)
 
     private static func splitUnrolled(_ text: String) -> String {
@@ -3677,14 +3748,49 @@ private enum Qwen35DeltaReplay {
         outputNames: ["state_out", "conv_tail"], source: splitUnrolled(unrolledTreeSource),
         ensureRowContiguous: true)
 
+    /// The tree replays with the state scan starting at path row `t_skip[0]`: `state_in` is
+    /// then the state after the path's first `t_skip[0]` rows (the verify's snapshot), and the
+    /// conv tail still follows the whole path. The steps that run are the record's.
+    private static func skipping(_ text: String, unrolled: Bool) -> String? {
+        let (from, to) = unrolled
+            ? ("const float g = gs[t];", "if (t < uint(t_skip[0])) continue;\nconst float g = gs[t];")
+            : ("for (uint t = 0; t < T; ++t) {", "for (uint t = uint(t_skip[0]); t < T; ++t) {")
+        guard text.components(separatedBy: from).count == 2 else { return nil }
+        return text.replacingOccurrences(of: from, with: to)
+    }
+
+    private static func skipKernel(_ name: String, _ text: String, unrolled: Bool, split: Bool)
+        -> MLXFast.MLXFastKernel?
+    {
+        skipping(text, unrolled: unrolled).map {
+            MLXFast.metalKernel(
+                name: name + "_skip",
+                inputNames: ["t_skip", "k", "delta", "state_in"] + (split ? ["conv_state"] : [])
+                    + ["conv_in", "tree_rows"],
+                outputNames: ["state_out", "conv_tail"], source: $0, ensureRowContiguous: true)
+        }
+    }
+
+    private static let skipTreeKernel = skipKernel(
+        "qwen35_gdn_delta_tree_replay", treeSource, unrolled: false, split: false)
+    private static let skipUnrolledTreeKernel = skipKernel(
+        "qwen35_gdn_delta_tree_replay_unrolled", unrolledTreeSource, unrolled: true, split: false)
+    private static let skipSplitTreeKernel = skipKernel(
+        "qwen35_gdn_delta_tree_replay_split", splitTreeSource, unrolled: false, split: true)
+    private static let skipUnrolledSplitTreeKernel = skipKernel(
+        "qwen35_gdn_delta_tree_replay_unrolled_split", splitUnrolled(unrolledTreeSource),
+        unrolled: true, split: true)
+
     /// `convState` set: `convInput` is the verify window alone (`Qwen35FusedGDNVerify` without
-    /// its conv copy) and `convState` the three rows before it.
+    /// its conv copy) and `convState` the three rows before it. `skip` > 0 (tree rows only):
+    /// `state` holds the state after the first `skip` path rows, and the scan runs the rest.
     static func run(
         committedRows: Int, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
         treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false, unrolled: Bool? = nil,
-        convState: MLXArray? = nil
+        convState: MLXArray? = nil, skip: Int = 0
     ) -> (MLXArray, MLXArray)? {
-        guard (1...16).contains(committedRows),
+        guard (1...16).contains(committedRows), (0 ..< committedRows).contains(skip),
+            skip == 0 || treeRows != nil,
             k.ndim == 4, k.dim(0) == 1, (1...16).contains(k.dim(1)), k.dim(3) == 128,
             state.ndim == 4, state.dim(0) == 1, state.dim(2) == 128,
             delta.shape == [1, k.dim(1), state.dim(1), 129],
@@ -3707,11 +3813,21 @@ private enum Qwen35DeltaReplay {
         if let treeRows {
             guard treeRows.dtype == .int32, treeRows.ndim == 1,
                 treeRows.size == committedRows else { return nil }
-            inputs = convState.map { [k, delta, state, $0, convInput, treeRows] }
+            let rest = convState.map { [k, delta, state, $0, convInput, treeRows] }
                 ?? [k, delta, state, convInput, treeRows]
-            selected = convState == nil
-                ? (unroll ? unrolledTreeKernel : treeKernel)
-                : (unroll ? unrolledSplitTreeKernel : splitTreeKernel)
+            if skip > 0 {
+                guard let skipped = convState == nil
+                    ? (unroll ? skipUnrolledTreeKernel : skipTreeKernel)
+                    : (unroll ? skipUnrolledSplitTreeKernel : skipSplitTreeKernel)
+                else { return nil }
+                inputs = [HostConstants.int32([Int32(skip)])] + rest
+                selected = skipped
+            } else {
+                inputs = rest
+                selected = convState == nil
+                    ? (unroll ? unrolledTreeKernel : treeKernel)
+                    : (unroll ? unrolledSplitTreeKernel : splitTreeKernel)
+            }
         } else {
             let rows = HostConstants.int32([Int32(committedRows)])
             let lead = unroll ? [k, delta, state] : [rows, k, delta, state]
@@ -4380,12 +4496,49 @@ final class Qwen35GatedDeltaNet: Module {
         return canReplayPrefix(tape: tape, committedRows: committedRows)
     }
 
+    /// `treeStateOut`: the tree verify's `state_out`, which holds its snapshot on a branching
+    /// descriptor (`Qwen35SnapshotCommit`).
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int, treeStateOut: MLXArray? = nil
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
+        guard let treeStateOut, Qwen35SnapshotCommit.current() != .off,
+            let snapshot = snapshotCommitState(tape: tape, committedRows: committedRows, snapshot: treeStateOut)
+        else { return recordReplayedPrefixState(tape: tape, committedRows: committedRows) }
+        if Qwen35SnapshotCommit.mode == .on { return snapshot.state }
+        let record = recordReplayedPrefixState(tape: tape, committedRows: committedRows)
+        Qwen35SnapshotCommit.note(record: record, snapshot: snapshot.state, ends: snapshot.ends)
+        return record
+    }
+
+    private func snapshotCommitState(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int, snapshot: MLXArray
+    ) -> (state: CBv2RecurrentLayerState, ends: Bool)? {
+        guard let parents = CBv2BranchVerify.committedParents, let delta = tape.delta,
+            tape.ssmPreIsRowContiguous, tape.mask == nil, tape.rowCount == 16, tape.convStateRows == 3,
+            headKDim == 128, headVDim == 128, tape.convInput.dtype == .float32, tape.k.dtype == .float32,
+            snapshot.shape == [1, numVHeads, headVDim, headKDim], snapshot.dtype == .float32
+        else { return nil }
+        let path = CBv2BranchVerify.committedRows ?? (0 ..< Int32(committedRows)).map { $0 }
+        guard path.count == committedRows,
+            let rows = CBv2BranchVerify.snapshotPrefix(parents: parents, path: path)?.rows
+        else { return nil }
+        if rows == committedRows {
+            let conv = Qwen35SnapshotCommit.convTail(path: path, convInput: tape.convInput, convState: tape.convState)
+            return (CBv2RecurrentLayerState(conv: conv, ssm: snapshot, ssmIsRowContiguous: true), true)
+        }
+        guard let replay = Qwen35DeltaReplay.run(committedRows: committedRows, k: tape.k, delta: delta,
+            state: snapshot, convInput: tape.convInput, treeRows: HostConstants.recentInt32(path),
+            stateIsRowContiguous: true, convState: tape.convState, skip: rows)
+        else { return nil }
+        return (CBv2RecurrentLayerState(conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true), false)
+    }
+
+    private func recordReplayedPrefixState(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    ) -> CBv2RecurrentLayerState {
         if CBv2BranchVerify.committedRowsIsBranch,
             let path = CBv2BranchVerify.committedRows, path.count == committedRows,
             let pathArray = CBv2BranchVerify.committedRowsArray
@@ -4900,7 +5053,8 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions)
+                                tape: tape, committedRows: keepPositions,
+                                treeStateOut: tree != nil && B == 1 ? finalSSM : nil)
                         })
                 } catch {
                     preconditionFailure(
@@ -5929,10 +6083,10 @@ final class Qwen35DecoderLayer: Module {
         if let dense = mlp as? Qwen3NextMLP,
             let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
                 xPost, residual: rPost, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
-                projections: [dense.gateProj, dense.upProj],
-                swigluDown: xPost.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+                projections: [dense.gateProj, dense.upProj])
         {
-            return boundary.residual + dense.qwen35ProjectedGateUp(boundary.projections)
+            return boundary.residual + dense.qwen35ProjectedGateUp(
+                boundary.projections[0], boundary.projections[1])
         }
         let h = xPost + rPost
         let normalized = postAttentionLayerNorm(h)
@@ -5996,10 +6150,9 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             x, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
-            swigluDown: x.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         {
-            return (post.residual, dense.qwen35ProjectedGateUp(post.projections))
+            return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
         }
         let h = x + r
         return (h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
@@ -6047,12 +6200,11 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             boundary.residual, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
-            swigluDown: x.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         {
             return (
                 boundary.residual, post.residual,
-                dense.qwen35ProjectedGateUp(post.projections))
+                dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
         }
         let h = boundary.residual + r
         return (boundary.residual, h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
@@ -6380,6 +6532,20 @@ enum Qwen35VerifyStartFusion {
         return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
     }
 
+    /// `DARKBLOOM_BONSAI_PSTART_FUSE=0` keeps the record chain at prompt width.
+    static let promptOffered =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSTART_FUSE"] != "0"
+
+    /// The same rows at the prompt widths whose F16 embedding the forward casts to FP32
+    /// (`fusePromptBoundaries` with `promptPassed`); the check covers every id.
+    static func promptEmbed(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
+        guard promptOffered, verified, Qwen35Layer0FP32.promptPassed, inputs.ndim == 2,
+            inputs.dim(0) == 1, inputs.dim(1) >= 128, inputs.dim(1) % 64 == 0,
+            inputs.dtype == .int32, let e = packed(model)
+        else { return nil }
+        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
+    }
+
     static func prepare(_ model: Qwen35TextModelInner) {
         let note: String
         if !offered {
@@ -6400,6 +6566,10 @@ enum Qwen35VerifyStartFusion {
             note = "off (embedding not 2-bit g128 WHT-4096 F16)"
         }
         FileHandle.standardError.write(Data("qwen35 verify start fusion: \(note)\n".utf8))
+        let promptNote = !promptOffered ? "off"
+            : !Qwen35Layer0FP32.promptPassed ? "off (layer0 fp32 prompt off)"
+            : verified ? "on (same kernel and check)" : "off (verify start fusion off)"
+        FileHandle.standardError.write(Data("qwen35 prompt start fusion: \(promptNote)\n".utf8))
     }
 
     private static func check(_ e: HadamardQuantizedEmbedding) -> (Int, Int) {
@@ -6629,6 +6799,8 @@ public class Qwen35TextModelInner: Module {
         var hiddenStates = inputEmbeddings
             ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
                 && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
+            ?? (!captureRecurrentWindow && !exactTargetVerify
+                ? Qwen35VerifyStartFusion.promptEmbed(self, inputs) : nil)
             ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
