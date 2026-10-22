@@ -4867,9 +4867,10 @@ enum DF2Fast {
             const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
             float c0, s0, c1, s1;
             if (PHASES) {
-              const size_t phaseBase = ((size_t)posRow * 32 + lane) * 4;
-              c0 = freqs[phaseBase]; s0 = freqs[phaseBase + 1];
-              c1 = freqs[phaseBase + 2]; s1 = freqs[phaseBase + 3];
+              const size_t phaseIndex = (size_t)posRow * 32 + lane;
+              const float4 cs = ((const device float4*)freqs)[phaseIndex];
+              c0 = cs.x; s0 = cs.y;
+              c1 = cs.z; s1 = cs.w;
             } else {
               const float th0 = pos * (1.0f / freqs[d0]);
               c0 = metal::fast::cos(th0); s0 = metal::fast::sin(th0);
@@ -5012,11 +5013,10 @@ enum DF2Fast {
                 const float pos = float(phase_params[1] + phaseRow);
                 const float th0 = pos * (1.0f / freqs[lane]);
                 const float th1 = pos * (1.0f / freqs[lane + 32u]);
-                const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
-                phases[phaseBase] = metal::fast::cos(th0);
-                phases[phaseBase + 1] = metal::fast::sin(th0);
-                phases[phaseBase + 2] = metal::fast::cos(th1);
-                phases[phaseBase + 3] = metal::fast::sin(th1);
+                const size_t phaseIndex = (size_t)phaseRow * 32 + lane;
+                ((device float4*)phases)[phaseIndex] = float4(
+                    metal::fast::cos(th0), metal::fast::sin(th0),
+                    metal::fast::cos(th1), metal::fast::sin(th1));
               }
             }
             const int c0 = int(tid) * 16;
@@ -5109,11 +5109,10 @@ enum DF2Fast {
                     const float pos = float(phase_params[1] + phaseRow);
                     const float th0 = pos * (1.0f / freqs[lane]);
                     const float th1 = pos * (1.0f / freqs[lane + 32u]);
-                    const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
-                    phases[phaseBase] = metal::fast::cos(th0);
-                    phases[phaseBase + 1] = metal::fast::sin(th0);
-                    phases[phaseBase + 2] = metal::fast::cos(th1);
-                    phases[phaseBase + 3] = metal::fast::sin(th1);
+                    const size_t phaseIndex = (size_t)phaseRow * 32 + lane;
+                    ((device float4*)phases)[phaseIndex] = float4(
+                        metal::fast::cos(th0), metal::fast::sin(th0),
+                        metal::fast::cos(th1), metal::fast::sin(th1));
                   }
                 }
                 """))
@@ -5811,14 +5810,16 @@ enum DF2Fast {
                   for (int c = 1; c < 16; c++) { mx = max(mx, tev[c]); }
                   if (TREE_SPLIT && e == 0) {
                     float z1 = 0.0f;
-                    for (int c = 0; c < 16; c++) { z1 += metal::precise::exp(tev[c] - mx); }
+                    const float x1 = metal::precise::exp(tev[int(tid)] - mx);
+                    for (int c = 0; c < 16; c++) { z1 += simd_shuffle(x1, ushort(c)); }
                     if (z1 * 0.8f > 1.0f) { tsc = 1.0f; }
                   }
-                  float z = 0.0f, mine = 0.0f;
+                  // Lanes 0...15 share each exponential; keep the record's
+                  // sequential 0...15 addition order in every denominator.
+                  float z = 0.0f;
+                  const float mine = metal::precise::exp((tev[int(tid)] - mx) * tsc);
                   for (int c = 0; c < 16; c++) {
-                    const float x = metal::precise::exp((tev[c] - mx) * tsc);
-                    z += x;
-                    if (c == int(tid)) { mine = x; }
+                    z += simd_shuffle(mine, ushort(c));
                   }
                   fprob[16 * e + int(tid)] = pp * (mine / z);
                 }
@@ -6547,6 +6548,26 @@ public final class DFlash2ContextProjection {
 
     /// The projection of the verify columns `rows` (a draft tree's accepted path), in order.
     func gathered(_ rows: [Int32]) -> DFlash2ContextProjection {
+        let count = rows.count
+        func supportsPrefix(_ array: MLXArray) -> Bool {
+            array.ndim == 3 && array.dim(0) == 1 && count <= array.dim(1)
+        }
+        if count > 0,
+            rows.enumerated().allSatisfy({ Int($0.element) == $0.offset }),
+            supportsPrefix(anchorEmbeddings), supportsPrefix(context),
+            contextKV.allSatisfy({ supportsPrefix($0.0) && supportsPrefix($0.1) }),
+            lookupFCOutput.map(supportsPrefix) ?? true
+        {
+            // Construct a new projection to clear front, including for a full prefix.
+            // A leading accepted path needs only views of the existing row buffers.
+            func prefix(_ array: MLXArray) -> MLXArray {
+                array[0..., 0 ..< count, 0...]
+            }
+            return DFlash2ContextProjection(
+                anchorEmbeddings: prefix(anchorEmbeddings), context: prefix(context),
+                contextKV: contextKV.map { (prefix($0.0), prefix($0.1)) },
+                lookupFCOutput: lookupFCOutput.map(prefix))
+        }
         let index = MLXArray(rows)
         return DFlash2ContextProjection(
             anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),

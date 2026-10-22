@@ -1,8 +1,102 @@
 // Copyright © 2026 Eigen Labs.
 // Prism artifact contract: HF prism-ml/Ternary-Bonsai-2-27B-mlx-2bit@3f926b415992eaa2ae9dd7b573706494d6bbf787.
+import Cmlx
 import Foundation
 import MLX
 import MLXNN
+
+// Fixed launch values for the qualified 16-row residual norm.
+private enum PrismResidualNorm16 {
+    static let shapes = [[16, 4096], [512], [512], [1, 16, 4096]]
+    static let dtypes: [DType] = [.int8, .float32, .float32, .float32]
+
+    private final class Launch {
+        let original: MLXFast.MLXFastKernel
+        let kernel: mlx_fast_metal_kernel
+        let config: mlx_fast_metal_kernel_config
+
+        init(_ original: MLXFast.MLXFastKernel, _ metadata: (String, String, String, Int)) {
+            self.original = original
+            let (name, source, header, threads) = metadata
+            let inputNames = mlx_vector_string_new()
+            let outputNames = mlx_vector_string_new()
+            defer {
+                mlx_vector_string_free(inputNames)
+                mlx_vector_string_free(outputNames)
+            }
+            for name in ["x", "residual", "norm_weight", "epsilon", "signs", "verify_rows"] {
+                mlx_vector_string_append_value(inputNames, name)
+            }
+            for name in ["codes", "ascale", "rsb", "residual_out"] {
+                mlx_vector_string_append_value(outputNames, name)
+            }
+            kernel = name.withCString { name in
+                source.withCString { source in
+                    header.withCString { header in
+                        mlx_fast_metal_kernel_new(
+                            name, inputNames, outputNames, source, header, true, false)
+                    }
+                }
+            }
+            config = mlx_fast_metal_kernel_config_new()
+            mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLOCKS_PER_ROW", 1)
+            mlx_fast_metal_kernel_config_set_grid(config, Int32(threads), 16, 1)
+            mlx_fast_metal_kernel_config_set_thread_group(config, Int32(threads), 1, 1)
+            for (shape, dtype) in zip(PrismResidualNorm16.shapes, PrismResidualNorm16.dtypes) {
+                mlx_fast_metal_kernel_config_add_output_arg(
+                    config, shape.map(Int32.init), shape.count, dtype.cmlxDtype)
+            }
+            mlx_fast_metal_kernel_config_set_verbose(config, false)
+        }
+
+        deinit {
+            mlx_fast_metal_kernel_config_free(config)
+            mlx_fast_metal_kernel_free(kernel)
+        }
+
+        func apply(_ inputs: [MLXArray]) -> [MLXArray] {
+            let arrays = inputs + [HostConstants.int32([16])]
+            let input = withExtendedLifetime(arrays) {
+                mlx_vector_array_new_data(arrays.map { $0.ctx }, arrays.count)
+            }
+            defer { mlx_vector_array_free(input) }
+            var output = mlx_vector_array_new()
+            defer { mlx_vector_array_free(output) }
+            mlx_fast_metal_kernel_apply(&output, kernel, input, config, StreamOrDevice.default.ctx)
+            return (0 ..< mlx_vector_array_size(output)).map { index in
+                var ctx = mlx_array_new()
+                mlx_vector_array_get(&ctx, output, index)
+                return MLXArray(ctx)
+            }
+        }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var definitions:
+        [ObjectIdentifier: (MLXFast.MLXFastKernel, (String, String, String, Int))] = [:]
+    nonisolated(unsafe) private static var launch: Launch?
+    private static let installed: Void = {
+        SignedBlockHadamard.rn16 = { original, metadata, inputs, outputShapes in
+            let key = ObjectIdentifier(original)
+            if let metadata {
+                lock.lock()
+                defer { lock.unlock() }
+                definitions[key] = (original, metadata)
+                return nil
+            }
+            guard outputShapes == shapes else { return nil }
+            lock.lock()
+            if launch == nil, let definition = definitions[key] {
+                launch = Launch(definition.0, definition.1)
+            }
+            let current = launch?.original === original ? launch : nil
+            lock.unlock()
+            return current?.apply(inputs)
+        }
+    }()
+
+    static func install() { _ = installed }
+}
 
 public enum PrismCheckpointError: Error, LocalizedError {
     case invalid(String)
@@ -111,6 +205,7 @@ struct PrismHadamardCheckpoint {
     }
 
     func install(model: Module, weights: [String: MLXArray]) throws {
+        PrismResidualNorm16.install()
         let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         var replacements: [(String, Module)] = []
         for record in configuration.modules {
