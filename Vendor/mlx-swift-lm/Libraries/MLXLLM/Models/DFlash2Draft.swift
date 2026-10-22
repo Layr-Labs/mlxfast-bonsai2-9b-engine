@@ -7207,7 +7207,8 @@ private enum DraftSDPA {
     }()
 
     static let columns: Int = {
-        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_COLUMNS"] ?? "32") ?? 32
+        let defaultColumns = enabled ? "64" : "32"
+        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_COLUMNS"] ?? defaultColumns) ?? 32
         return [32, 64, 128].contains(requested) ? requested : 32
     }()
 
