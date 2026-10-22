@@ -1033,6 +1033,47 @@ enum CBv2VerifyVectorAttention {
         return gen >= (variant == "p" ? 18 : 17) ? 2 : 1
     }()
 
+    private static let treeMatrix64Enabled: Bool = {
+        guard #available(macOS 26.2, *) else { return false }
+        let architecture = GPU.deviceInfo().architecture
+        guard let range = architecture.range(of: "applegpu_g17"),
+            let part = architecture[range.upperBound...].first
+        else { return false }
+        return "gscd".contains(part)
+    }()
+
+    private static let treeMatrix64Mask = MLXFast.metalKernel(
+        name: "cbv2_verify_tree_matrix64_mask",
+        inputNames: ["tree", "n_keys"], outputNames: ["keep"],
+        source: """
+            const uint key = thread_position_in_grid.x;
+            const uint row = thread_position_in_grid.y;
+            const int N = n_keys[0];
+            const int base = N - 16;
+            bool visible = int(key) < base;
+            if (!visible) {
+              const int local = int(key) - base;
+              const int depth = tree[16 + row];
+              for (int d = 0; d <= depth; ++d) {
+                visible = visible || tree[32 + 16 * row + d] == local;
+              }
+            }
+            keep[row * uint(N) + key] = visible;
+            """)
+
+    private static let treeMatrix64Warm: Void = {
+        guard treeMatrix64Enabled, StreamOrDevice.default == StreamOrDevice.gpu else { return }
+        let queries = probe([1, 16, 16, 256], seed: 0.01, scale: 1.5)
+        let keys = probe([1, 4, 768, 256], seed: 0.02, scale: 1.5)
+        let values = probe([1, 4, 768, 256], seed: 0.03, scale: 1.0)
+        let tree = probeTree([-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        for nKeys in [512, 529] {
+            eval(attendTree(
+                queries: queries, keys: keys[0..., 0..., 0 ..< nKeys, 0...],
+                values: values[0..., 0..., 0 ..< nKeys, 0...], scale: 0.0625, tree: tree)!)
+        }
+    }()
+
     private static let partial = MLXFast.metalKernel(
         name: "cbv2_verify_sdpa_partial",
         inputNames: ["queries", "keys", "values", "n_keys"],
@@ -1526,7 +1567,7 @@ enum CBv2VerifyVectorAttention {
         return passed
     }()
 
-    static func prepareLean() { _ = leanVerdict; _ = combineDirectPassed }
+    static func prepareLean() { _ = leanVerdict; _ = combineDirectPassed; _ = treeMatrix64Warm }
 
     private static func probe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
@@ -1632,6 +1673,20 @@ enum CBv2VerifyVectorAttention {
         else { return nil }
         let L = qShape.2
         let params = HostConstants.recentInt32([Int32(kShape.2), Int32(bitPattern: scale.bitPattern)])
+        if L == 16 && treeMatrix64Enabled {
+            let nKeys = kShape.2
+            let folded = (queries * scale).reshaped([1, 4, 64, 256])
+            let scores = CBv2VerifyAttentionPartial.noted([
+                matmul(folded, keys.swappedAxes(-1, -2))
+            ])[0].reshaped([1, 4, 4, 16, nKeys])
+            let keep = treeMatrix64Mask(
+                [tree, params], grid: (nKeys, 16, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[16, nKeys]], outputDTypes: [.bool])[0]
+            let probabilities = softmax(
+                MLX.where(keep, scores, -Float.greatestFiniteMagnitude), axis: -1, precise: true)
+            return matmul(probabilities.reshaped([1, 4, 64, nKeys]), values)
+                .reshaped([1, 16, 16, 256])
+        }
         guard let states = launchStates(
             queries: queries, keys: keys, values: values, params: params, tree: tree, L: L,
             lean: leanApplies(keys: keys, values: values, nKeys: kShape.2))
