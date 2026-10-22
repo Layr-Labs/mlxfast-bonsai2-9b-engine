@@ -5529,28 +5529,55 @@ extension Qwen35VerifyQKNormRoPE {
     static let qFoldOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_QFOLD"] != "0"
     /// Written once by `prepare` before the resident serves; read-only afterwards.
     nonisolated(unsafe) static var qFoldVerified = false
+    /// `DARKBLOOM_BONSAI_KFILL=0` keeps the plain fold kernel's own keys and the cache's key fill (`CBv2FullSequenceKV`);
+    /// `..._KFILL_NEGCTL=1` makes the boot check's lean run one word off, which the check must report. Written once by `Qwen35AttentionCore.prepare` before the resident serves; read-only afterwards.
+    nonisolated(unsafe) static var kFillVerified = false
+    static let kFillOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_KFILL"] != "0"
+    static let kFillNegativeControl = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_KFILL_NEGCTL"] == "1"
     nonisolated(unsafe) private static var scaleArrays: [UInt32: MLXArray] = [:]
+
+    private static let foldSource = replacingOnce(
+        replacingOnce(
+            hoisted ? replacingOnce(source, normRopeParent, normRopeHoisted) : source,
+            "device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;",
+            """
+            const uint blk = t >> 7u;
+            const uint nb = min(128u, L - (blk << 7u));
+            const float qs = qscale[0];
+            device float* dst = is_q
+                ? q_out + (blk * uint(Q_HEADS) * 128u + h * nb + (t & 127u)) * D
+                : k_out + (h * L + t) * D;
+            """),
+        "float4(y[part][0], y[part][1], y[part][2], y[part][3]);",
+        """
+        is_q ? float4(y[part][0] * qs, y[part][1] * qs, y[part][2] * qs, y[part][3] * qs)
+            : float4(y[part][0], y[part][1], y[part][2], y[part][3]);
+        """)
 
     private static let foldKernel = MLXFast.metalKernel(
         name: "qwen35_prompt_qk_norm_rope_qfold",
-        inputNames: inputNames + ["qscale"], outputNames: outputNames,
+        inputNames: inputNames + ["qscale"], outputNames: outputNames, source: foldSource)
+
+    /// A `foldKernel` sibling with k written at the stride of the cache's first-fill buffer, `[kv heads, kcap, 256]`: row t of
+    /// head h at row `h * kcap + t`, then the zero rows `L ..< kcap` that the fill leaves after the keys, each written by the
+    /// head's threadgroups in turn (`kcap` is an input, so a single compile serves every capacity).
+    private static let keyFillKernel = MLXFast.metalKernel(
+        name: "qwen35_prompt_qk_norm_rope_qfold_kfill",
+        inputNames: inputNames + ["qscale", "kcap"], outputNames: outputNames,
         source: replacingOnce(
-            replacingOnce(
-                hoisted ? replacingOnce(source, normRopeParent, normRopeHoisted) : source,
-                "device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;",
-                """
-                const uint blk = t >> 7u;
-                const uint nb = min(128u, L - (blk << 7u));
-                const float qs = qscale[0];
-                device float* dst = is_q
-                    ? q_out + (blk * uint(Q_HEADS) * 128u + h * nb + (t & 127u)) * D
-                    : k_out + (h * L + t) * D;
-                """),
-            "float4(y[part][0], y[part][1], y[part][2], y[part][3]);",
-            """
-            is_q ? float4(y[part][0] * qs, y[part][1] * qs, y[part][2] * qs, y[part][3] * qs)
-                : float4(y[part][0], y[part][1], y[part][2], y[part][3]);
-            """))
+            foldSource, ": k_out + (h * L + t) * D;", ": k_out + (h * uint(kcap[0]) + t) * D;") + """
+            if (!is_q) {
+              const uint kc = uint(kcap[0]);
+              for (uint s = t; s < kc - L; s += L) {
+                device float* z = k_out + (h * kc + L + s) * D;
+                #pragma clang loop unroll(full)
+                for (uint part = 0; part < 2u; ++part) {
+                  *((device float4*)(z + part * 128u + lane * 4u)) = float4(0.0f);
+                }
+              }
+            }
+            """)
+    nonisolated(unsafe) private static var capacityArrays: [Int: MLXArray] = [:]
 
     /// `(queryBlocks, keys, queries)`: the 128-row query blocks `[1, queryHeads, n, 256]` already multiplied by
     /// `scale`, the keys `[1, keyHeads, L, 256]`, and the record kernel's unscaled queries, a graph node nothing
@@ -5558,7 +5585,7 @@ extension Qwen35VerifyQKNormRoPE {
     static func applyPrompt(
         queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
         keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
-        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, scale: Float
+        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, scale: Float, capacity: Int? = nil
     ) -> (blocks: [MLXArray], keys: MLXArray, queries: MLXArray)? {
         let L = keyProjection.shape3.1
         guard CBv2PromptAttentionCore.serves(rows: L), L <= 4096,
@@ -5576,19 +5603,39 @@ extension Qwen35VerifyQKNormRoPE {
             scaleArrays[bits] = scaleArray
         }
         let epsArray = epsRopeBaseArray(queryEps: queryEps, keyEps: keyEps, ropeBase: ropeBase)
-        let outputs = foldKernel(
-            [queryProjection, keyProjection, queryWeight, keyWeight, epsArray, offsets, scaleArray],
-            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
-                ("LAST_QUERY", false)],
-            grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
-            outputShapes: [[queryHeads * L * 256], [1, keyHeads, L, 256]],
-            outputDTypes: [.float32, .float32])
+        let template: [(String, any KernelTemplateArg)] = [
+            ("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims), ("LAST_QUERY", false)]
+        let outputs: [MLXArray]
+        var keys: MLXArray
+        if let capacity, capacity >= L {
+            let capacityArray: MLXArray
+            if let cached = capacityArrays[capacity] {
+                capacityArray = cached
+            } else {
+                capacityArray = MLXArray([Int32(capacity)])
+                capacityArrays[capacity] = capacityArray
+            }
+            outputs = keyFillKernel(
+                [queryProjection, keyProjection, queryWeight, keyWeight, epsArray, offsets, scaleArray, capacityArray],
+                template: template, grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
+                outputShapes: [[queryHeads * L * 256], [1, keyHeads, capacity, 256]],
+                outputDTypes: [.float32, .float32])
+            keys = outputs[1][0..., 0..., 0 ..< L, 0...]
+            CBv2FullSequenceKV.handKeys(view: keys, buffer: outputs[1])
+        } else {
+            outputs = foldKernel(
+                [queryProjection, keyProjection, queryWeight, keyWeight, epsArray, offsets, scaleArray],
+                template: template, grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
+                outputShapes: [[queryHeads * L * 256], [1, keyHeads, L, 256]],
+                outputDTypes: [.float32, .float32])
+            keys = outputs[1]
+        }
         let blocks = (0 ..< (L + 127) / 128).map { (index: Int) -> MLXArray in
             let n = min(128, L - 128 * index)
             let start = index * queryHeads * 128 * 256
             return outputs[0][start ..< (start + queryHeads * n * 256)].reshaped(1, queryHeads, n, 256)
         }
-        return (blocks, outputs[1], record.0)
+        return (blocks, keys, record.0)
     }
 }
 
@@ -5702,6 +5749,14 @@ final class Qwen35Attention: Module {
         return packedQuery.canCallPromptLastRow(x) && packedOutput.canCallPromptLastRow(x)
     }
 
+    /// The first-fill capacity of `rows` rows when `cache` is one fresh full-attention row, otherwise nil.
+    private static func firstFillCapacity(_ cache: any CBv2AttendingLayerCache, rows: Int) -> Int? {
+        guard let layer = cache as? CBv2LayerCache, layer.rows.count == 1,
+            let row = layer.rows[0] as? CBv2FullSequenceKV
+        else { return nil }
+        return row.firstFillCapacity(rows: rows)
+    }
+
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
@@ -5792,7 +5847,8 @@ final class Qwen35Attention: Module {
                 queryWeight: qNorm.weight, keyWeight: kNorm.weight,
                 queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets,
                 queryHeads: attentionHeads, keyHeads: kvHeads,
-                ropeDims: plainRope.dims, ropeBase: plainRope.base, scale: scale)
+                ropeDims: plainRope.dims, ropeBase: plainRope.base, scale: scale,
+                capacity: Qwen35VerifyQKNormRoPE.kFillVerified ? Self.firstFillCapacity(cache, rows: L) : nil)
         {
             // Prompt: the query blocks leave the kernel already scaled; `queries` is the record's
             // unscaled node, evaluated only if the blocks go unused.
@@ -5860,6 +5916,7 @@ final class Qwen35Attention: Module {
             attended = cache.updateAndAttend(
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
         }
+        CBv2FullSequenceKV.withdrawHandedKeys()
         if narrowsToLastQuery, !exactTargetVerify, B == 1, let packed = oProj as? HadamardQuantizedLinear,
             let gated = packed.callAfterAttentionGateLastRow(attended, queryProjection: gateProjection)
         {
@@ -6964,15 +7021,94 @@ enum Qwen35AttentionCore {
                 note = "off (error: \(error))"
             }
         }
+        var kfill = "off"
+        if Qwen35VerifyQKNormRoPE.kFillOffered, foldOK, CBv2FullSequenceKV.firstFillVerified {
+            do {
+                let (bad, cases) = try withError { checkKeyHandoff(model) }
+                Qwen35VerifyQKNormRoPE.kFillVerified = bad == 0
+                kfill = bad == 0 ? "on (\(cases) cases)" : "off (\(bad) of \(cases) cases differ)"
+            } catch {
+                kfill = "off (error: \(error))"
+            }
+        }
         Qwen35VerifyQKNormRoPE.qFoldVerified = foldOK
         CBv2PromptAttentionCore.softmaxVerified = smaxOK
         CBv2PromptAttentionCore.engaged = foldOK || smaxOK
-        FileHandle.standardError.write(Data("qwen35 attention core: \(note); first KV fill \(fill)\n".utf8))
+        FileHandle.standardError.write(
+            Data("qwen35 attention core: \(note); first KV fill \(fill); keys in cache layout \(kfill)\n".utf8))
     }
 
     private static func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         return MLX.all(contiguous(a).view(dtype: .uint32) .== contiguous(b).view(dtype: .uint32)).item(Bool.self)
+    }
+
+    /// Boot check of the keys written in the cache's layout (`Qwen35VerifyQKNormRoPE.keyFillKernel`): at 512, 448,
+    /// 256, 192 and 137 rows with the cache's 256 slack rows and at 512 with none, on the first full attention
+    /// layer's real norm weights and RoPE, a fresh `CBv2FullSequenceKV` fed the kernel's keys must hold keys and
+    /// values word for word equal to `zeros` with the record kernel's keys and the values slice-updated in, and must
+    /// have taken the handed buffer; a run on a projection one word off must come out different.
+    private static func checkKeyHandoff(_ model: Qwen35TextModelInner) -> (bad: Int, cases: Int) {
+        guard let attention = model.layers.lazy.compactMap({ (layer: Qwen35DecoderLayer) -> Qwen35Attention? in
+            layer.selfAttn
+        }).first, let rope = attention.plainRope, attention.attentionHeads == 16, attention.kvHeads == 4
+        else { return (1, 1) }
+        var bad = 0
+        var cases = 0
+        for (rows, extra) in [(512, 512), (448, 512), (256, 512), (192, 512), (137, 512), (512, 0)] {
+            cases += 1
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x4B46_0000 + rows + extra)), into: 3)
+            let queryProjection = MLXRandom.normal([1, rows, 16 * 512], key: keys[0])
+            let keyProjection = MLXRandom.normal([1, rows, 4 * 256], key: keys[1])
+            let values = MLXRandom.normal([1, rows, 4, 256], key: keys[2]).transposed(0, 2, 1, 3)
+            let offsets = MLXArray([Int32(rows == 256 ? 1000 : 0)])
+            let off = MLXArray((0 ..< keyProjection.size).map { (i: Int) -> Float in
+                i == (rows / 2) * 1024 + 3 * 256 + 5 ? 1 : 0
+            }).reshaped(keyProjection.shape)
+            func store() -> CBv2FullSequenceKV {
+                CBv2FullSequenceKV(promptLength: rows, maxLength: rows + extra, kvHeads: 4, headDim: 256)
+            }
+            guard
+                let record = Qwen35VerifyQKNormRoPE.apply(
+                    queryProjection: queryProjection, keyProjection: keyProjection,
+                    queryWeight: attention.qNorm.weight, keyWeight: attention.kNorm.weight,
+                    queryEps: attention.qNorm.eps, keyEps: attention.kNorm.eps, offsets: offsets,
+                    queryHeads: 16, keyHeads: 4, ropeDims: rope.dims, ropeBase: rope.base),
+                let capacity = store().firstFillCapacity(rows: rows)
+            else {
+                bad += 1
+                continue
+            }
+            var expectedKeys = MLXArray.zeros([1, 4, capacity, 256], dtype: .float32)
+            expectedKeys[.ellipsis, 0 ..< rows, 0...] = record.1
+            var expectedValues = MLXArray.zeros([1, 4, capacity, 256], dtype: .float32)
+            expectedValues[.ellipsis, 0 ..< rows, 0...] = values
+            func lean(_ projection: MLXArray) -> (buffers: (keys: MLXArray, values: MLXArray), taken: Bool)? {
+                let target = store()
+                guard
+                    let folded = Qwen35VerifyQKNormRoPE.applyPrompt(
+                        queryProjection: queryProjection, keyProjection: projection,
+                        queryWeight: attention.qNorm.weight, keyWeight: attention.kNorm.weight,
+                        queryEps: attention.qNorm.eps, keyEps: attention.kNorm.eps, offsets: offsets,
+                        queryHeads: 16, keyHeads: 4, ropeDims: rope.dims, ropeBase: rope.base,
+                        scale: attention.scale, capacity: capacity)
+                else { return nil }
+                let before = CBv2FullSequenceKV.keyHandoffAdopted
+                _ = target.update(keys: folded.keys, values: values)
+                CBv2FullSequenceKV.withdrawHandedKeys()
+                guard let buffers = target.storedBuffers else { return nil }
+                return (buffers, CBv2FullSequenceKV.keyHandoffAdopted == before + 1)
+            }
+            guard let run = lean(Qwen35VerifyQKNormRoPE.kFillNegativeControl ? keyProjection + off : keyProjection),
+                let control = lean(keyProjection + off)
+            else {
+                bad += 1
+                continue
+            }
+            let equal = run.taken && same(run.buffers.keys, expectedKeys) && same(run.buffers.values, expectedValues)
+            if !equal || !control.taken || same(control.buffers.keys, expectedKeys) { bad += 1 }
+        }
+        return (bad, cases)
     }
 
     private static func check(_ model: Qwen35TextModelInner, fold: Bool, smax: Bool) -> (bad: Int, cases: Int) {
