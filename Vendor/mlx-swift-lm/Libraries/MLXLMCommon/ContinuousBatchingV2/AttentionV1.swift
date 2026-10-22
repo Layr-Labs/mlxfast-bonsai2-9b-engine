@@ -21,6 +21,11 @@ import Foundation
 import MLX
 import MLXNN
 
+#if canImport(Metal)
+@_silgen_name("mlxfast_prompt_gqa_nax_source")
+private func cbv2PromptGQANAXSource() -> UnsafePointer<CChar>?
+#endif
+
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
@@ -1487,8 +1492,8 @@ enum CBv2VerifyVectorAttention {
             let twin = lean ? (isTree ? pairedTreeLean : pairedLean) : nil
             guard let kernel = twin ?? (isTree ? pairedTree : pairedPartial) else { return nil }
             return kernel(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 4)],
+                grid: (32 * 32 * L, 1, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: outputShapes, outputDTypes: outputDTypes)
         }
         let twin = lean ? (isTree ? partialTreeLean : partialLean) : nil
@@ -1602,6 +1607,17 @@ enum CBv2VerifyVectorAttention {
         else { return nil }
         let L = qShape.2
         let nKeys = kShape.2
+        if L == 16 && classesPerGroup == 2 {
+            let folded = (queries * scale).reshaped([1, 4, 64, 256])
+            let scores = CBv2VerifyAttentionPartial.noted([
+                matmul(folded, keys.swappedAxes(-1, -2))
+            ])[0].reshaped([1, 4, 4, 16, nKeys])
+            let keep = CBv2AttentionV1.boolMask(L: 16, kL: nKeys, window: nil)!
+            let probabilities = softmax(
+                MLX.where(keep, scores, -Float.greatestFiniteMagnitude), axis: -1, precise: true)
+            return matmul(probabilities.reshaped([1, 4, 64, nKeys]), values)
+                .reshaped([1, 16, 16, 256])
+        }
         let params = HostConstants.recentInt32([Int32(nKeys), Int32(bitPattern: scale.bitPattern)])
         guard let states = launchStates(
             queries: queries, keys: keys, values: values, params: params, tree: nil, L: L,
@@ -1723,6 +1739,84 @@ public enum CBv2PromptAttentionBlocks {
 /// is one kernel with `softmax_single_row`'s thread layout and reduction order. Graph build only; the
 /// per-call state is set by `capturing` and cleared on exit.
 public enum CBv2PromptAttentionCore {
+    /// Two 128-row query heads per tile share the same KV head. The NAX
+    /// K loop and TF32 mode are the stock matmul's; only its M tile is wider.
+    private static let groupedNAX: (kernel: MLXFast.MLXFastKernel, bk: Int)? = {
+        #if canImport(Metal)
+            guard #available(macOS 26.2, *),
+                StreamOrDevice.default == StreamOrDevice.gpu
+            else { return nil }
+            let architecture = GPU.deviceInfo().architecture
+            guard let range = architecture.range(of: "applegpu_g17"),
+                let part = architecture[range.upperBound...].first,
+                "gscd".contains(part), let source = cbv2PromptGQANAXSource()
+            else { return nil }
+            let header = String(cString: source)
+            guard !header.isEmpty else { return nil }
+            let kernel = MLXFast.metalKernel(
+                name: "cbv2_prompt_grouped_gqa_nax",
+                inputNames: ["a", "b"], outputNames: ["out"],
+                source: """
+                    constexpr int K = QK ? 256 : KEYS;
+                    constexpr int N = QK ? KEYS : 256;
+                    const uint3 group = threadgroup_position_in_grid;
+                    const uint sg = simdgroup_index_in_threadgroup;
+                    const uint row = group.y * 256u + (sg / 4u) * 64u;
+                    const uint col = group.x * 128u + (sg % 4u) * 32u;
+                    const device float* ap;
+                    const device float* bp;
+                    int lda;
+                    const int ldb = int(b_strides[2]);
+                    if constexpr (QK) {
+                      const uint head = group.z * 4u + row / 128u;
+                      ap = a + head * a_strides[1] + (row % 128u) * a_strides[2];
+                      bp = b + group.z * b_strides[1] + col * b_strides[2];
+                      lda = int(a_strides[2]);
+                    } else {
+                      ap = a + (group.z * 512u + row) * KEYS;
+                      bp = b + group.z * b_strides[1] + col;
+                      lda = KEYS;
+                    }
+                    auto tile = mlx::steel::gemm_loop<
+                        float, 64, 32, 32, BK, false, QK, true, true, (K % BK == 0), float>(
+                        ap, bp, lda, ldb, K, K / BK, 64, 32);
+                    tile.store(out + (group.z * 512u + row) * N + col, N);
+                    """,
+                header: header, ensureRowContiguous: false)
+            return (kernel, "scd".contains(part) ? 256 : 512)
+        #else
+            return nil
+        #endif
+    }()
+
+    private static func groupedKernel(
+        query: MLXArray, keys: MLXArray, values: MLXArray
+    ) -> (kernel: MLXFast.MLXFastKernel, bk: Int)? {
+        guard StreamOrDevice.default == StreamOrDevice.gpu,
+            query.shape == [1, 16, 128, 256],
+            keys.ndim == 4, (128 ... 512).contains(keys.dim(2)), keys.dim(2) % 128 == 0,
+            keys.shape == [1, 4, keys.dim(2), 256], values.shape == keys.shape,
+            query.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            query.strides[3] == 1, keys.strides[3] == 1, values.strides[3] == 1,
+            [query, keys, values].allSatisfy({
+                $0.strides[1] > 0 && $0.strides[2] >= 256 && $0.strides[2] <= Int(Int32.max)
+            })
+        else { return nil }
+        return groupedNAX
+    }
+
+    private static func groupedProduct(
+        _ a: MLXArray, _ b: MLXArray, keys: Int, qk: Bool,
+        using grouped: (kernel: MLXFast.MLXFastKernel, bk: Int)
+    ) -> MLXArray {
+        let columns = qk ? keys : 256
+        return grouped.kernel(
+            [a, b], template: [("QK", qk), ("KEYS", keys), ("BK", grouped.bk)],
+            grid: (columns / 128 * 32, 8, 16), threadGroup: (32, 4, 4),
+            outputShapes: [qk ? [1, 4, 4, 128, keys] : [1, 16, 128, 256]],
+            outputDTypes: [.float32])[0]
+    }
+
     /// `DARKBLOOM_BONSAI_ATTN_SMAX=0` keeps `where` + `softmax`.
     public static let softmaxOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_SMAX"] != "0"
     public static let negativeControl =
@@ -1906,13 +2000,16 @@ public enum CBv2PromptAttentionCore {
         var q = scaled ? query : multiply(MLXArray(scale), query)
         var k = keys
         var v = values
+        let grouped = groupedKernel(query: q, keys: keys, values: values)
         let repeats = query.dim(1) / keys.dim(1)
-        if repeats > 1 {
+        if repeats > 1, grouped == nil {
             q = unflatten(q, axis: 1, shape: [keys.dim(1), repeats])
             k = expandedDimensions(k, axis: 2)
             v = expandedDimensions(v, axis: 2)
         }
-        var scores = matmul(q, swappedAxes(k, -1, -2))
+        var scores = grouped.map {
+            groupedProduct(q, k, keys: kL, qk: true, using: $0)
+        } ?? matmul(q, swappedAxes(k, -1, -2))
         let probs: MLXArray
         if fusedSoftmax && kL <= 4096 {
             probs = causalSoftmax(scores, rows: n, keyCount: kL, shift: softmaxShift)
@@ -1923,6 +2020,9 @@ public enum CBv2PromptAttentionCore {
             scores = MLX.where(
                 greaterEqual(queryIndex, keyIndex), scores, MLXArray(-Float.greatestFiniteMagnitude))
             probs = softmax(scores, axes: [-1], precise: true)
+        }
+        if let grouped {
+            return groupedProduct(probs, v, keys: kL, qk: false, using: grouped)
         }
         let out = matmul(probs, v)
         return repeats > 1 ? flattened(out, start: 1, end: 2) : out

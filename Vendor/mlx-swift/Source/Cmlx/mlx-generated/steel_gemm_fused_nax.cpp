@@ -1,4 +1,8 @@
+#include "mlx/utils.h"
+
 namespace mlx::core::metal {
+
+const char* gemm_nax();
 
 const char* steel_gemm_fused_nax() {
   return R"preamble(
@@ -235,3 +239,8 @@ template <
 }
 
 } // namespace mlx::core::metal
+
+// Swift's local prompt wrapper uses the same source and TF32 mode as matmul.
+extern "C" __attribute__((swiftcall)) const char* mlxfast_prompt_gqa_nax_source() {
+  return mlx::core::env::enable_tf32() ? mlx::core::metal::gemm_nax() : nullptr;
+}
