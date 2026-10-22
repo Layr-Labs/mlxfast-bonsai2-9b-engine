@@ -2863,10 +2863,6 @@ enum ExactVerifyHead {
             .replacingOccurrences(of: originalTau, with: anchoredTau)
     }()
 
-    static let compactParallelPartitionRescoreSource = compactParallelAnchorRescoreSource
-        .replacingOccurrences(of: "if (USE_L2) e = head_l2_error(e, ascale, bounds, error2, row, in_g);", with: "float local_e = e; if (USE_L2) e = head_l2_partition_error(e, ascale, bounds, error2, row, in_g, block, local_e);")
-        .replacingOccurrences(of: "const float anchor_t = anchor_floor - e;", with: "const float anchor_t = anchor_floor - local_e;")
-
     static let compactParallelScan = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_parallel_scan16", inputNames: ["logits", "compact_ids", "compact_bad"],
         outputNames: ["part_ids", "part_values", "part_meta"],
@@ -2881,11 +2877,8 @@ enum ExactVerifyHead {
         inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
         outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         source: compactParallelAnchorRescoreSource, header: Float16ConstantQMV.topTwoHeader + l2Header)
-    static let compactParallelPartitionRescore = MLXFast.metalKernel(
-        name: "hadamard_xhead_compact_parallel_rescore16_partition_l2_anchors_v1",
-        inputNames: ["logits", "ascale", "bounds", "x", "w", "scales", "biases", "part_ids", "part_values", "part_meta", "compact_ids", "omitted", "error2"],
-        outputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
-        source: compactParallelPartitionRescoreSource, header: Float16ConstantQMV.topTwoHeader + partitionL2Header)
+    static let compactParallelPartitionRescore = HadamardQuantizedLinear.verifyHeadRescore?(
+        compactParallelAnchorRescoreSource, Float16ConstantQMV.topTwoHeader + partitionL2Header)
     static let compactParallelMerge = MLXFast.metalKernel(
         name: "hadamard_xhead_compact_parallel_merge16", inputNames: ["blk_ids", "blk_values", "blk_meta", "row_e"],
         outputNames: ["sel_ids", "sel_values", "flag", "info"],
@@ -2907,13 +2900,13 @@ enum ExactVerifyHead {
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b]], outputDTypes: [.int32, .float32, .int32])
         let local = partitionL2 && anchors && error2 != nil && rows == 16 && b == 16
             && x.dim(1) == 4096 && scales.dim(1) == 32 && weight.dim(0) % 512 == 0
-            && n == weight.dim(0) / 8 && bounds.size == 19 * 32
-        let kernel = local ? compactParallelPartitionRescore
+            && n == weight.dim(0) / 8 && bounds.size == 19 * 32 && compactParallelPartitionRescore != nil
+        let kernel = local ? compactParallelPartitionRescore!.0
             : (anchors ? compactParallelAnchorRescore : compactParallelRescore)
         let blk = kernel(
             [values, ascale, bounds, x, weight, scales, biases, parts[0], parts[1], parts[2], ids, summary.omitted, error2 ?? ascale],
             template: [("CAP", cap), ("THREADS", blockThreads), ("BLOCKS", b), ("NV", n), ("NEG", negative ? 1 : 0), ("USE_L2", error2 != nil)],
-            grid: (b * blockThreads, rows, 1), threadGroup: (blockThreads, 1, 1),
+            grid: (b * blockThreads, rows, 1), threadGroup: (local ? compactParallelPartitionRescore!.1 : blockThreads, 1, 1),
             outputShapes: [[rows, b, 2], [rows, b, 2], [rows, b, 4], [rows]], outputDTypes: [.int32, .float32, .int32, .float32])
         return compactParallelMerge(
             blk, template: [("CAP", cap), ("BLOCKS", b)],
@@ -8204,6 +8197,7 @@ final class DraftHeadScreenState {
 /// Pass weights already folded and packed in MLX format. The initializer does
 /// not requantize them and does not accept raw GGUF quantization blocks.
 public final class HadamardQuantizedLinear: QuantizedLinear {
+    nonisolated(unsafe) public static var verifyHeadRescore: ((String, String) -> (MLXFast.MLXFastKernel, Int))?
     nonisolated(unsafe) public static var verifyK64Prepare: (() -> Void)?
     nonisolated(unsafe) public static var verifyK64Run: (([MLXArray], Bool, Bool, Bool) -> [MLXArray]?)?
     public static func verifyK64Source(_ s: Bool) -> (String, MLXFast.MLXFastKernel)? {
