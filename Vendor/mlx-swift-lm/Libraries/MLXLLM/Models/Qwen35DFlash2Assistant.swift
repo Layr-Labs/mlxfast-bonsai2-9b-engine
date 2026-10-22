@@ -300,6 +300,9 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         {
             return
         }
+        if CBv2LongLookup.width != nil, CBv2LongLookup.probe == nil {
+            CBv2LongLookup.probe = { DFlash2PromptLookup.continuation(history: $0, depth: $1) != nil }
+        }
         state.promptDraft = DFlash2PromptLookup.continuation(history: history, depth: depth)
         state.preparedLookup = (history, depth)
     }
@@ -392,7 +395,8 @@ public final class Qwen35DFlash2Assistant: CBv2MTPBlockDrafter, @unchecked Senda
         anchor: Int, depth: Int, requestState: any CBv2MTPRequestState
     ) {
         let state = self.state(requestState)
-        guard state.prestaged == nil else { return }
+        // A wide lookup round (`CBv2LongLookup`) is planned per round; never prestage a block past its own.
+        guard state.prestaged == nil, depth < drafter.config.dflash.blockSize else { return }
         let preparedLookup = state.preparedLookup
         guard let tokens = try? proposeBlock(anchor: anchor, depth: depth, requestState: requestState)
         else { return }

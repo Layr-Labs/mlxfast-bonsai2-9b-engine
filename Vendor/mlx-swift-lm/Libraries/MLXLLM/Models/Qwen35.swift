@@ -2767,94 +2767,6 @@ enum Qwen35FusedGDNVerify {
             && swap("acc = fma(xin[p + tap], w[tap], acc);", tap)
             && swap("const uint r = p + tap;", "const uint r = tb_tab[p * 4u + tap];")
             && swap("for (int t = 0; t < int(T); ++t) {", restart)
-        guard ok else { return nil }
-        return preloadedTreeValues(s)
-    }
-
-    /// In SG16 the scan state is loaded after the frontend. Keep V row work
-    /// parallel, but read raw path values once per column-owner parity into
-    /// a scoped private array instead of reloading four taps for every row.
-    static func preloadedTreeValues(_ fast: String) -> String? {
-        guard fast.contains("const uint vtid = tid - 256u;") else { return fast }
-        var s = fast
-        let before = "const float vw[4] = {vw4.x, vw4.y, vw4.z, vw4.w};"
-        let after = before + """
-
-          float vx[3 + MAX_T];
-          #pragma clang loop unroll(full)
-          for (uint vr = 0u; vr < 3u + uint(MAX_T); ++vr) {
-            if (vr < 3u + T) {
-              vx[vr] = vr < 3u ? conv_state[vr * C + c] : qkv[(vr - 3u) * C + c];
-            }
-          }
-        """
-        let load = "const float v = r < 3u ? conv_state[r * C + c] : qkv[(r - 3u) * C + c];"
-        let raw = "const float xv = t < 3u ? conv_state[t * C + c] : qkv[(t - 3u) * C + c];"
-        guard s.components(separatedBy: before).count == 2,
-            s.components(separatedBy: load).count == 2,
-            s.components(separatedBy: raw).count == 2 else { return nil }
-        s = s.replacingOccurrences(of: before, with: after)
-        s = s.replacingOccurrences(of: load, with: "const float v = vx[r];")
-        s = s.replacingOccurrences(of: raw, with: "const float xv = vx[t];")
-        return s
-    }
-
-    /// Reuse the strict-commit delta output instead of keeping a second cache.
-    /// Only the lane that already wrote this word reads it; SIMD shuffle then
-    /// broadcasts its own-thread device load, so no cross-lane memory fence is needed.
-    /// This transform is offered only after capturingDelta, not to non-delta scans.
-    static func cachedTreeDeltas(_ fast: String) -> String? {
-        var s = fast
-        func swap(_ from: String, _ to: String) -> Bool {
-            guard s.components(separatedBy: from).count == 2 else { return false }
-            s = s.replacingOccurrences(of: from, with: to)
-            return true
-        }
-        let old = """
-              const float2 vu = *((threadgroup const float2*)(v_tile + dvlocal + u * DVPT));
-              const float vq[DVPL] = {vu.x, vu.y};
-              float kvq[DVPL];
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < R / 4; ++j) {
-                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
-                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
-                  a0 = fma(state[d][4 * j], kq[4 * j], a0);
-                  a1 = fma(state[d][4 * j + 1], kq[4 * j + 1], a1);
-                  a2 = fma(state[d][4 * j + 2], kq[4 * j + 2], a2);
-                  a3 = fma(state[d][4 * j + 3], kq[4 * j + 3], a3);
-                }
-                kvq[d] = (a0 + a1) + (a2 + a3);
-              }
-              kvq[0] += simd_shuffle_xor(kvq[0], 4);
-              kvq[1] += simd_shuffle_xor(kvq[1], 4);
-              kvq[0] += simd_shuffle_xor(kvq[0], 2);
-              kvq[1] += simd_shuffle_xor(kvq[1], 2);
-              kvq[0] += simd_shuffle_xor(kvq[0], 1);
-              kvq[1] += simd_shuffle_xor(kvq[1], 1);
-          """
-        let update = """
-              #pragma clang loop unroll(full)
-              for (int d = 0; d < DVPL; ++d) {
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < R / 4; ++j) {
-                  state[d][4 * j] *= gu; state[d][4 * j + 1] *= gu;
-                  state[d][4 * j + 2] *= gu; state[d][4 * j + 3] *= gu;
-                }
-              }
-          """
-        let registerDeltaLoad = """
-            float delta = 0.0f;
-            if (lane % LPD == 0u) {
-              delta = delta_out[(u * Hv + hv_idx) * (Dv + 1) + dvbase + d];
-            }
-            delta = simd_shuffle(delta, lane - lane % LPD);
-            """
-        let ok = swap(old, update)
-            && swap("const float bu = gate_beta[u];", "")
-            && swap("const float delta = (vq[d] - kvq[d]) * bu;", registerDeltaLoad)
         return ok ? s : nil
     }
 
@@ -3004,10 +2916,6 @@ enum Qwen35FusedGDNVerify {
         if chain {
             guard let guarded = chainStores(text) else { return nil }
             text = guarded
-        }
-        if delta && plainFast != nil {
-            guard let cached = cachedTreeDeltas(text) else { return nil }
-            text = cached
         }
         let route = snapshot != nil ? "snapshot" : plainFast != nil ? "fast" : "record"
         return MLXFast.metalKernel(
@@ -5929,10 +5837,10 @@ final class Qwen35DecoderLayer: Module {
         if let dense = mlp as? Qwen3NextMLP,
             let boundary = HadamardQuantizedLinear.sharedResidualNormProjections(
                 xPost, residual: rPost, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps,
-                projections: [dense.gateProj, dense.upProj],
-                swigluDown: xPost.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+                projections: [dense.gateProj, dense.upProj])
         {
-            return boundary.residual + dense.qwen35ProjectedGateUp(boundary.projections)
+            return boundary.residual + dense.qwen35ProjectedGateUp(
+                boundary.projections[0], boundary.projections[1])
         }
         let h = xPost + rPost
         let normalized = postAttentionLayerNorm(h)
@@ -5996,10 +5904,9 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             x, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
-            swigluDown: x.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         {
-            return (post.residual, dense.qwen35ProjectedGateUp(post.projections))
+            return (post.residual, dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
         }
         let h = x + r
         return (h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))
@@ -6047,12 +5954,11 @@ extension Qwen35DecoderLayer {
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             boundary.residual, residual: r, weight: postAttentionLayerNorm.weight,
-            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj],
-            swigluDown: x.size == 16 * 4096 ? dense.downProj as? HadamardQuantizedLinear : nil)
+            eps: postAttentionLayerNorm.eps, projections: [dense.gateProj, dense.upProj])
         {
             return (
                 boundary.residual, post.residual,
-                dense.qwen35ProjectedGateUp(post.projections))
+                dense.qwen35ProjectedGateUp(post.projections[0], post.projections[1]))
         }
         let h = boundary.residual + r
         return (boundary.residual, h, dense.qwen35TargetVerify(postAttentionLayerNorm(h), exact: false))

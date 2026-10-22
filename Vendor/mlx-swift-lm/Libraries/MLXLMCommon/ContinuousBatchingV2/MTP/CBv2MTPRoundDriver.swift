@@ -560,6 +560,15 @@ final class CBv2MTPRoundDriver {
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
 
+    /// Widen this plan past the declared depth: a long, unambiguous prompt-lookup copy
+    /// (`CBv2LongLookup`) verified in one round. Never applied to a drafted round.
+    func raisePlanDepth(to depth: Int, reason: String) {
+        guard depth > planDecision.depth else { return }
+        planDecision = CBv2MTPDepthDecision(
+            depth: depth, decodeRowBucket: planDecision.decodeRowBucket,
+            reason: reason, isExploration: false)
+    }
+
     /// A plan boundary can discover that one otherwise eligible row cannot
     /// complete the selected full round (typically a max-token tail). Mixing
     /// that row's L=1 target decode with neighbors' L=1+k verify changes the
@@ -1246,4 +1255,21 @@ enum CBv2MTPBlockContextIndex {
             "CBv2 block MTP: \(confirmed) confirmed columns of a \(verifyWidth)-wide verify")
         return 0 ..< confirmed
     }
+}
+
+/// Long prompt-lookup rounds. A lookup copy is not limited by a drafter's block: when the
+/// committed history's suffix recurs with one unambiguous continuation of `width` tokens, the
+/// round verifies that whole copy (`width + 1` rows) instead of the declared depth. The target
+/// still decides every emitted token. `DARKBLOOM_BONSAI_LOOKUP_WIDE=0` keeps the declared depth;
+/// a positive value sets the width (default 31, a 32-row verify).
+public enum CBv2LongLookup {
+    public static let width: Int? = {
+        let v = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_LOOKUP_WIDE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["0", "false", "no", "off"].contains(v ?? "") { return nil }
+        return v.flatMap(Int.init).map { $0 > 0 ? $0 : 31 } ?? 31
+    }()
+    /// Whether `history` has an unambiguous lookup continuation of `width` tokens; set by the
+    /// drafter that owns the lookup rule, so the planner and the proposal apply the same rule.
+    nonisolated(unsafe) public static var probe: (([Int], Int) -> Bool)?
 }

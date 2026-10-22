@@ -229,6 +229,16 @@ extension EngineLoopV2 {
                 to: mtp.lookupMissRoundDepth(for: eligibleRows, missDepth: missDepth),
                 reason: "lookup_miss")
         }
+        // A long unambiguous prompt-lookup copy is verified whole, past the declared depth
+        // (`CBv2LongLookup`); single stream, full-depth plans only, inside the output budget.
+        if let wide = CBv2LongLookup.width, let probe = CBv2LongLookup.probe,
+            eligibleRows.count == 1, let rec = eligibleRows.first,
+            mtp.planDepth == mtp.config.fixedDraftTokens,
+            rec.request.maxTokens - rec.generatedTokenCount > wide,
+            probe(rec.tokens, wide)
+        {
+            mtp.raisePlanDepth(to: wide, reason: "wide_lookup")
+        }
         if mtp.planDepth > 0 {
             let eligibleIDs = Set(eligibleRows.map(\.id))
             let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
