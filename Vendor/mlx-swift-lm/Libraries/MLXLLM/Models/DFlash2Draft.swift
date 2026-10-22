@@ -4864,9 +4864,10 @@ enum DF2Fast {
             const float ny1 = (w[d1 + 64] * (y1 * inv_mean)) * mscale;
             float c0, s0, c1, s1;
             if (PHASES) {
-              const size_t phaseBase = ((size_t)posRow * 32 + lane) * 4;
-              c0 = freqs[phaseBase]; s0 = freqs[phaseBase + 1];
-              c1 = freqs[phaseBase + 2]; s1 = freqs[phaseBase + 3];
+              const size_t phaseIndex = (size_t)posRow * 32 + lane;
+              const float4 cs = ((const device float4*)freqs)[phaseIndex];
+              c0 = cs.x; s0 = cs.y;
+              c1 = cs.z; s1 = cs.w;
             } else {
               const float th0 = pos * (1.0f / freqs[d0]);
               c0 = metal::fast::cos(th0); s0 = metal::fast::sin(th0);
@@ -5009,11 +5010,10 @@ enum DF2Fast {
                 const float pos = float(phase_params[1] + phaseRow);
                 const float th0 = pos * (1.0f / freqs[lane]);
                 const float th1 = pos * (1.0f / freqs[lane + 32u]);
-                const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
-                phases[phaseBase] = metal::fast::cos(th0);
-                phases[phaseBase + 1] = metal::fast::sin(th0);
-                phases[phaseBase + 2] = metal::fast::cos(th1);
-                phases[phaseBase + 3] = metal::fast::sin(th1);
+                const size_t phaseIndex = (size_t)phaseRow * 32 + lane;
+                ((device float4*)phases)[phaseIndex] = float4(
+                    metal::fast::cos(th0), metal::fast::sin(th0),
+                    metal::fast::cos(th1), metal::fast::sin(th1));
               }
             }
             const int c0 = int(tid) * 16;
@@ -5106,11 +5106,10 @@ enum DF2Fast {
                     const float pos = float(phase_params[1] + phaseRow);
                     const float th0 = pos * (1.0f / freqs[lane]);
                     const float th1 = pos * (1.0f / freqs[lane + 32u]);
-                    const size_t phaseBase = ((size_t)phaseRow * 32 + lane) * 4;
-                    phases[phaseBase] = metal::fast::cos(th0);
-                    phases[phaseBase + 1] = metal::fast::sin(th0);
-                    phases[phaseBase + 2] = metal::fast::cos(th1);
-                    phases[phaseBase + 3] = metal::fast::sin(th1);
+                    const size_t phaseIndex = (size_t)phaseRow * 32 + lane;
+                    ((device float4*)phases)[phaseIndex] = float4(
+                        metal::fast::cos(th0), metal::fast::sin(th0),
+                        metal::fast::cos(th1), metal::fast::sin(th1));
                   }
                 }
                 """))
