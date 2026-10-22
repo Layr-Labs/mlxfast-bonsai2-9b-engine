@@ -1458,9 +1458,11 @@ private enum Qwen35Fresh8PromptGDN {
                 Data("qwen35 prompt scan simdgroups: 4 (DARKBLOOM_BONSAI_PSCAN8=0)\n".utf8))
             return 4
         }
-        let passed = scanShapesAgree()
-        let ns = passed ? 8 : 4
-        let reason = passed ? "bits equal at the served shape" : "bit mismatch or error, 4 kept"
+        let verdict = scanShapeVerdict()
+        let ns = verdict.passed ? 8 : 4
+        let reason = verdict.passed
+            ? String(format: "bits equal at 256, 512 and 1024 rows; 8 serves (%.1f%% faster at 512 here)", verdict.gain * 100)
+            : "bit mismatch or error, 4 kept"
         FileHandle.standardError.write(
             Data("qwen35 prompt scan simdgroups: \(ns) (\(reason))\n".utf8))
         return ns
@@ -1473,58 +1475,88 @@ private enum Qwen35Fresh8PromptGDN {
         return (MLX.sin(i * 0.017 + seed) * amplitude * scale).reshaped(shape)
     }
 
-    /// Runs both launch shapes of both chunk scans at the served shape (T = 512, 16 key
-    /// heads, 32 value heads) and compares every output word.
-    private static func scanShapesAgree() -> Bool {
-        let T = 512
-        let rows = MLXArray(Int32(T))
-        let q = scanProbe([1, T, 16, 128], seed: 0.01, scale: 0.5)
-        let k = scanProbe([1, T, 16, 128], seed: 0.02, scale: 0.5)
-        let v = scanProbe([1, T, 32, 128], seed: 0.03, scale: 0.5)
-        let ba = scanProbe([1, T, 64], seed: 0.04, scale: 0.2)
-        let aLog = scanProbe([32], seed: 0.05, scale: 0.1) - 0.5
-        let dtBias = scanProbe([32], seed: 0.06, scale: 0.5)
-        let convState = scanProbe([1, 3, 8192], seed: 0.07, scale: 0.5)
-        let qkv = scanProbe([1, T, 8192], seed: 0.08, scale: 0.5)
-        let weight = scanProbe([8192, 4, 1], seed: 0.09, scale: 0.1)
-        let prepared = prepKernel(
-            [q, k, ba, aLog, dtBias, rows],
-            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
-            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
-            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
-            outputDTypes: [.float32, .float32, .float32])
-        func folded(_ ns: Int) -> [MLXArray] {
+    /// Compares both launch shapes bit for bit on the two prompt widths the engine uses:
+    /// the timed prefill's 512 rows and the resident boot warm's 1024. Every output word and
+    /// the final state must match. The 512-row chain is then timed for the log line; the
+    /// choice itself is the bit check, not the stopwatch.
+    private static func scanShapeVerdict() -> (passed: Bool, gain: Double) {
+        func probes(_ T: Int) -> (rows: MLXArray, inputs: [MLXArray], prepared: [MLXArray]) {
+            let rows = MLXArray(Int32(T))
+            let q = scanProbe([1, T, 16, 128], seed: 0.01, scale: 0.5)
+            let k = scanProbe([1, T, 16, 128], seed: 0.02, scale: 0.5)
+            let ba = scanProbe([1, T, 64], seed: 0.04, scale: 0.2)
+            let aLog = scanProbe([32], seed: 0.05, scale: 0.1) - 0.5
+            let dtBias = scanProbe([32], seed: 0.06, scale: 0.5)
+            let convState = scanProbe([1, 3, 8192], seed: 0.07, scale: 0.5)
+            let qkv = scanProbe([1, T, 8192], seed: 0.08, scale: 0.5)
+            let weight = scanProbe([8192, 4, 1], seed: 0.09, scale: 0.1)
+            let prepared = prepKernel(
+                [q, k, ba, aLog, dtBias, rows],
+                template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
+                grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
+                outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+                outputDTypes: [.float32, .float32, .float32])
+            return (rows, [q, k, convState, qkv, weight], prepared)
+        }
+        func outputs(_ T: Int, _ probe: (rows: MLXArray, inputs: [MLXArray], prepared: [MLXArray]), _ ns: Int)
+            -> [MLXArray]
+        {
             convolvedValueScanKernel(
-                [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
+                probe.inputs + probe.prepared + [probe.rows],
                 template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
                 grid: (32, 16, 32), threadGroup: (32, ns, 1),
                 outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
                 outputDTypes: [.float32, .float32])
         }
-        func plain(_ ns: Int) -> [MLXArray] {
-            scanKernel(
-                [q, k, v, prepared[0], prepared[1], prepared[2], rows],
-                template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
-                grid: (32, 16, 32), threadGroup: (32, ns, 1),
-                outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
-                outputDTypes: [.float32, .float32])
-        }
-        do {
-            return try withError {
-                let four = folded(4) + plain(4)
-                let eight = folded(8) + plain(8)
-                eval(four + eight)
-                for (a, b) in zip(four, eight) {
-                    let same = (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
-                        .item(Bool.self)
-                    if !same { return false }
-                }
-                return true
+        var prep512: (rows: MLXArray, inputs: [MLXArray], prepared: [MLXArray])? = nil
+        for T in [256, 512, 1024] {
+            let probe = probes(T)
+            if T == 512 {
+                // The 1024 probe copies these arrays; the 512 one is reused for the timing.
+                prep512 = probe
             }
-        } catch {
-            FileHandle.standardError.write(Data("qwen35 prompt scan check error: \(error)\n".utf8))
-            return false
+            let v = scanProbe([1, T, 32, 128], seed: 0.03, scale: 0.5)
+            func plain(_ ns: Int) -> [MLXArray] {
+                scanKernel(
+                    [probe.inputs[0], probe.inputs[1], v] + probe.prepared + [probe.rows],
+                    template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
+                    grid: (32, 16, 32), threadGroup: (32, ns, 1),
+                    outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
+                    outputDTypes: [.float32, .float32])
+            }
+            var passed = false
+            do {
+                passed = try withError {
+                    let four = outputs(T, probe, 4) + plain(4)
+                    let eight = outputs(T, probe, 8) + plain(8)
+                    eval(four + eight)
+                    for (a, b) in zip(four, eight) {
+                        let same = (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                            .item(Bool.self)
+                        if !same { return false }
+                    }
+                    return true
+                }
+            } catch {
+                FileHandle.standardError.write(Data("qwen35 prompt scan check error: \(error)\n".utf8))
+                return (false, 0)
+            }
+            guard passed else { return (false, 0) }
         }
+        guard let probe = prep512 else { return (false, 0) }
+        func chain(_ ns: Int) -> Double {
+            var best = Double.infinity
+            for _ in 0 ..< 3 {
+                let start = DispatchTime.now().uptimeNanoseconds
+                eval(outputs(512, probe, ns))
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+                best = min(best, elapsed)
+            }
+            return best
+        }
+        let four = chain(4)
+        let eight = chain(8)
+        return (true, four > 0 ? 1 - eight / four : 0)
     }
 
 }
