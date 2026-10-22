@@ -4547,12 +4547,21 @@ final class Qwen35GatedDeltaNet: Module {
 
         let batch = tape.k.dim(0)
         let windowRows = tape.convState == nil ? tape.convStateRows + tape.rowCount : tape.rowCount
+        // Delta tapes may omit q/v when a boundary state lacks a producer layout
+        // certificate. Check the backing, as Qwen35DeltaReplay.run already does.
+        var deltaStateIsRowContiguous = tape.ssmPreIsRowContiguous
+        if tape.delta != nil && !deltaStateIsRowContiguous, let state = tape.ssmPre {
+            deltaStateIsRowContiguous = (try? state.evaluatedBufferInfo())?.isRowContiguous == true
+            if ProcessInfo.processInfo.environment["GDN_REPLAY_LAYOUT_DIAGNOSTIC"] == "1" {
+                FileHandle.standardError.write(Data("replay layout observed: contiguous=\(deltaStateIsRowContiguous) q=\(tape.q.shape) v=\(tape.v.shape) state=\(state.shape) rows=\(committedRows)/\(tape.rowCount)\n".utf8))
+            }
+        }
         guard tape.convInput.shape3 == (batch, windowRows, convDim),
               tape.convState.map({ $0.shape3 == (batch, tape.convStateRows, convDim) }) ?? true,
               tape.k.shape4 == (batch, tape.rowCount, numKHeads, headKDim),
               tape.a.shape3 == (batch, tape.rowCount, numVHeads),
               tape.b.shape3 == (batch, tape.rowCount, numVHeads),
-              (tape.delta != nil && tape.ssmPreIsRowContiguous) || (
+              (tape.delta != nil && deltaStateIsRowContiguous) || (
                   tape.q.shape4 == (batch, tape.rowCount, numKHeads, headKDim) &&
                   tape.v.shape4 == (batch, tape.rowCount, numVHeads, headVDim))
         else { return false }

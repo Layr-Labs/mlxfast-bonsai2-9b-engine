@@ -2376,11 +2376,25 @@ enum DF2Fast {
             auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[16], accb[16];
             for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
@@ -2407,7 +2421,7 @@ enum DF2Fast {
                 const float s = (i >> 3) ? s1v[j] : s0v[j];
                 const float b = (i >> 3) ? b1v[j] : b0v[j];
                 const bool hi = (i >> 2) & 1;
-                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 accb[i] = fma(b, hi ? x1 : x0, accb[i]);
               }
               simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -3511,6 +3525,10 @@ enum DF2Fast {
         let K = ops[0].k, G = K / 64
         return metadata[0].selection.resolve(ops, K: K, ns: ns, group: 64,
             form: form, narrow: narrow, split: split) {
+            if ProcessInfo.processInfo.environment["DF2_PAIR24_DIAGNOSTIC_RAW"] == "1" {
+                FileHandle.standardError.write(Data("DF2 pair24 diagnostic pin K\(K) N\(ns) form\(form) ordinary=raw full16=raw\n".utf8))
+                return W4Pair24Choice(ordinary: .raw, full16: .raw)
+            }
             let coldStart = DispatchTime.now().uptimeNanoseconds
             let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
             let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
@@ -3778,7 +3796,7 @@ enum DF2Fast {
                   const float s = \(pickS);
                   const float b = \(pickB);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                   accb[i] = fma(b, hi ? x1 : x0, accb[i]);
                 }
 
@@ -3797,7 +3815,7 @@ enum DF2Fast {
                   const int j = (i & 3);
                   const float s = \(pickS);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 }
 
             """
@@ -3990,11 +4008,25 @@ enum DF2Fast {
             """ + operandB + """
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[\(ne)], accb[\(ne)];
             for (int i = 0; i < \(ne); i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
@@ -5780,10 +5812,50 @@ enum DF2Fast {
         let merge = String(s[...cut.lowerBound])
         let loop = "for (int p = int(sg); p < P; p += 16) {"
         guard merge.components(separatedBy: loop).count == 2 else { return nil }
+        let root = """
+            threadgroup bool rootDiffuse;
+            threadgroup float rootScore[128];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+              float mx = tu[0][0];
+              for (int j = 1; j < 16; j++) { mx = max(mx, tu[0][j]); }
+              float z = 0.0f;
+              for (int j = 0; j < 16; j++) { z += metal::precise::exp(tu[0][j] - mx); }
+              rootDiffuse = ROOT_ADMISSION && z > 5.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (rootDiffuse) {
+              const int p = 0, pr = anchor[0];
+              for (int i = int(sg); i < 128; i += int(NSG)) {
+                const int c = cand[i];
+            \(edge)\
+                if (lane == 0) { rootScore[i] = float(unary[i]) + acc; }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (sg == 0) {
+                float cv[4]; int ci[4];
+                const uint base = lane * 4u;
+                for (int k = 0; k < 4; k++) { cv[k] = rootScore[base + k]; ci[k] = cand[base + k]; }
+                for (int r = 0; r < 16; r++) {
+                  float bv = NEG; int bi = 0x7fffffff, bk = 0;
+                  for (int k = 0; k < 4; k++) {
+                    if (cv[k] > bv || (cv[k] == bv && ci[k] < bi)) { bv = cv[k]; bi = ci[k]; bk = k; }
+                  }
+                  const float m = simd_max(bv);
+                  const int best = simd_min(bv == m ? bi : 0x7fffffff);
+                  if (bv == m && bi == best) {
+                    tc[0][r] = best; tu[0][r] = float(unary[base + bk]); cv[bk] = NEG;
+                  }
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """
         return merge.replacingOccurrences(of: loop, with: "for (int p = int(sg); p < P; p += int(NSG)) {")
             .replacingOccurrences(
                 of: "const int P = int(cand_shape[0]);",
                 with: "const int P = int(cand_shape[0]);\nconst uint NSG = simdgroups_per_threadgroup;\nconst uint NT = threads_per_threadgroup.x;")
+            + root
             + """
             threadgroup float fprob[256];
             threadgroup float tev[16];
@@ -5910,6 +5982,7 @@ enum DF2Fast {
     static func treeConfigured(_ source: String) -> String {
         source.replacingOccurrences(of: "TREE_SCALE", with: treeSharp ? "1.25f" : "1.0f")
             .replacingOccurrences(of: "TREE_SPLIT", with: treeSplit ? "true" : "false")
+            .replacingOccurrences(of: "ROOT_ADMISSION", with: rootAdmission ? "true" : "false")
     }
 
     /// Verify a draft tree instead of the greedy chain; `DARKBLOOM_BONSAI_TREE=0` keeps the chain.
@@ -5926,12 +5999,87 @@ enum DF2Fast {
             predLookup: predLookup, succLookup: succLookup)
     }
 
+    /// Proposal-only admission: evaluate all screened root tokens against the known anchor.
+    /// Preserve unary values; the existing tree adds the edge exactly once at expansion.
+    static let rootAdmission = ProcessInfo.processInfo.environment["DF2_ROOT_ADMISSION"] != "0"
+    static let rootAdmissionDiagnostic = ProcessInfo.processInfo.environment["DF2_ROOT_ADMISSION_DIAGNOSTIC"] == "1"
+    static let rootAdmissionKernel: MLXFast.MLXFastKernel? = selectorEdgeText.map { edge in
+        MLXFast.metalKernel(
+            name: "df2_root128_admission",
+            inputNames: ["cand", "unary", "proj", "pred", "succ", "anchor", "predLookup", "succLookup"],
+            outputNames: ["ids", "values", "joint"],
+            source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+            threadgroup float score[128];
+            const int p = 0, pr = anchor[0];
+            for (int i = int(sg); i < 128; i += 16) {
+              const int c = cand[i];
+            \(edge)\
+              if (lane == 0) { score[i] = float(unary[i]) + acc; joint[i] = score[i]; }
+            }
+            for (uint i = tid; i < 15u * 128u; i += 512u) {
+              ids[i] = cand[i]; values[i] = i < 128u ? -INFINITY : float(unary[i]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+              float cv[4]; int ci[4];
+              for (int k = 0; k < 4; k++) { cv[k] = score[lane * 4u + k]; ci[k] = cand[lane * 4u + k]; }
+              for (int r = 0; r < 16; r++) {
+                float bv = -INFINITY; int bi = 0x7fffffff, bk = 0;
+                for (int k = 0; k < 4; k++) {
+                  if (cv[k] > bv || (cv[k] == bv && ci[k] < bi)) { bv = cv[k]; bi = ci[k]; bk = k; }
+                }
+                const float m = simd_max(bv);
+                const int best = simd_min(bv == m ? bi : 0x7fffffff);
+                if (bv == m && bi == best) {
+                  ids[r] = best; values[r] = float(unary[lane * 4u + uint(bk)]); cv[bk] = -INFINITY;
+                }
+              }
+            }
+            """)
+    }
+
+    static func admitRoot(
+        top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
+        predLookup: MLXArray?, succLookup: MLXArray?
+    ) -> [MLXArray] {
+        guard let kernel = rootAdmissionKernel else { return top }
+        let out = kernel(
+            [top[0], top[1], projected.reshaped([15, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
+             predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
+            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
+            grid: (512, 1, 1), threadGroup: (512, 1, 1),
+            outputShapes: [[15, 128], [15, 128], [128]], outputDTypes: [.int32, .float32, .float32])
+        guard out.count == 3 else { return top }
+        if rootAdmissionDiagnostic {
+            let ids = top[0].asArray(Int32.self), unary = top[1].asArray(Float.self)
+            let joint = out[2].asArray(Float.self), selected = Array(out[0].asArray(Int32.self).prefix(16))
+            let selectedUnary = Array(out[1].asArray(Float.self).prefix(16))
+            let order = (0 ..< 128).sorted { joint[$0] == joint[$1] ? ids[$0] < ids[$1] : joint[$0] > joint[$1] }
+            precondition(joint.allSatisfy { $0.isFinite } && selected == order.prefix(16).map { ids[$0] }, "root128 admission ranking")
+            precondition(zip(selectedUnary, order.prefix(16)).allSatisfy { $0.0.bitPattern == unary[$0.1].bitPattern }, "root128 unary must not double count edge")
+            let object: [String: Any] = ["ids": Array(ids.prefix(128)), "unary": Array(unary.prefix(128)), "joint": joint, "selected": selected,
+                "anchor": anchor.asType(.int32).asArray(Int32.self)[0],
+                "projected": Array(projected.asType(.float32).asArray(Float.self).prefix(256))]
+            if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
+                FileHandle.standardError.write(Data("ROOT_ADMISSION ".utf8) + data + Data([10]))
+            }
+        }
+        return Array(out.prefix(2))
+    }
+
     /// `selectTree` on precomputed `top` pairs: the split kernels once `TreeWide.prepare` qualified them.
     static func selectTree(
         top: [MLXArray], projected: MLXArray, anchor: MLXArray, pred: MLXArray, succ: MLXArray,
         predLookup: MLXArray? = nil, succLookup: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
-        if TreeWide.passed, let wide = TreeWide.kernels {
+        if rootAdmissionDiagnostic && rootAdmission {
+            _ = admitRoot(top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
+                          predLookup: predLookup, succLookup: succLookup)
+        }
+        // The split route's merge has its own source; keep root admission on the fused record/lean path.
+        if !rootAdmission, TreeWide.passed, let wide = TreeWide.kernels {
             return wide.select(
                 top: top, projected: projected, anchor: anchor, pred: pred, succ: succ,
                 predLookup: predLookup, succLookup: succLookup)
@@ -7523,11 +7671,17 @@ private enum DF2LeanIndex {
         let tail = "if (tid == 0) {\n  int order[16];"
         guard record.components(separatedBy: tail).count == 2, let cut = record.range(of: tail) else { return nil }
         var s = String(record[..<cut.lowerBound]) + treeTail
-        let ok = swap(
-            &s, "for (int r = int(lane); r < 256; r += 64) {",
+        // Root admission and expansion each contain the same exact edge reduction.
+        func swapBoth(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 3 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let ok = swapBoth(
+            "for (int r = int(lane); r < 256; r += 64) {",
             "#pragma clang loop unroll(full)\nfor (int lx_i = 0; lx_i < \(negativeControl ? 3 : 4); lx_i++) {\n"
                 + "const int r = int(lane) + 64 * lx_i;")
-            && swap(&s, "const uint pair = uint(r >> 6) * 32u + lane;", "const uint pair = uint(lx_i) * 32u + lane;")
+            && swapBoth("const uint pair = uint(r >> 6) * 32u + lane;", "const uint pair = uint(lx_i) * 32u + lane;")
         return ok ? s : nil
     }
 
