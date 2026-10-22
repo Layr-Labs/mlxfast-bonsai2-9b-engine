@@ -5,6 +5,41 @@ import MLX
 import os
 
 
+
+// The scalar prefix stays contiguous; the M16 tail is consumed only after both checks.
+private enum VerifyActivationMetadata {
+    static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_AR"] != "0"
+    nonisolated(unsafe) static var producerMask: UInt32 = 0
+    static var ready: Bool { enabled && producerMask == 0x1ff }
+
+    static func scaleCount(rows: Int, groups: Int) -> Int {
+        (enabled && rows == 16 ? 48 : rows) * groups
+    }
+
+    static func matches(_ a: MLXArray, _ rb: MLXArray, groups: Int) -> Bool {
+        guard a.size == 48 * groups, rb.size == 16 * groups else { return false }
+        let av = a.asArray(Float.self)
+        let rv = rb.asArray(Float.self)
+        for row in 0 ..< 16 {
+            for g in 0 ..< groups {
+                let scalar = row * groups + g
+                let packed = 16 * groups + g * 32 + (row & 7) * 4 + (row >> 3) * 2
+                if av[scalar].bitPattern != av[packed].bitPattern { return false }
+                if rv[scalar].bitPattern != av[packed + 1].bitPattern { return false }
+            }
+        }
+        return true
+    }
+
+    static func mark(_ index: Int) {
+        let before = ready
+        producerMask |= UInt32(1) << UInt32(index)
+        if !before && ready {
+            FileHandle.standardError.write(Data("int8 verify packed metadata producers: passed nine forms\n".utf8))
+        }
+    }
+}
+
 /// Invalid transform metadata or incompatible packed weights.
 public enum HadamardError: Error {
     case invalidBlockSize
@@ -470,8 +505,14 @@ public struct SignedBlockHadamard {
               const size_t qidx = VERIFY_ROWS > 0 ? size_t(row) * size_t(kg) + size_t(g)
                   : size_t(row >> 6) * size_t(kg) * 64 + size_t(g) * 64
                   + size_t(((ml >> 4) & 1u) * 32u + (ml & 7u) * 4u + ((ml >> 5) & 1u) * 2u + ((ml >> 3) & 1u));
+              const float packed_rsb = qs * part;
               ascale[qidx] = qs;
-              rsb[qidx] = qs * part;
+              rsb[qidx] = packed_rsb;
+              if (VERIFY_ROWS == 16 && \(VerifyActivationMetadata.enabled ? "true" : "false")) {
+                const uint ar_idx = 16u * kg + g * 32u + (row & 7u) * 4u + (row >> 3u) * 2u;
+                ascale[ar_idx] = qs;
+                ascale[ar_idx + 1u] = packed_rsb;
+              }
               \(headError2 ? "qerror2[qidx] = head_error2;" : "")
             }
             """
@@ -1288,8 +1329,14 @@ enum WideRowSource {
               const uint kg = uint(BLOCKS_PER_ROW) * 32u;
               const uint g = (block_idx % uint(BLOCKS_PER_ROW)) * 32u + (base0 >> 7);
               \(qidx)
+              const float packed_rsb = qs * part;
               ascale[qidx] = qs;
-              rsb[qidx] = qs * part;
+              rsb[qidx] = packed_rsb;
+              if (VERIFY_ROWS == 16 && \(VerifyActivationMetadata.enabled && !f.promptLayout ? "true" : "false")) {
+                const uint ar_idx = 16u * kg + g * 32u + (row & 7u) * 4u + (row >> 3u) * 2u;
+                ascale[ar_idx] = qs;
+                ascale[ar_idx + 1u] = packed_rsb;
+              }
               \(f.headError2 ? "qerror2[qidx] = head_error2;" : "")
             }
             """
@@ -1644,6 +1691,12 @@ extension SignedBlockHadamard {
                 kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: lean == nil ? 0 : threads)
             let wide = wideRowDispatch(
                 kind, inputs, rows: rows, blocks: kind.checkBlocks, lanes: threads, kernel: lean)
+            if rows == 16 && VerifyActivationMetadata.enabled {
+                let groups = 32 * kind.checkBlocks
+                guard VerifyActivationMetadata.matches(record[1], record[2], groups: groups),
+                    VerifyActivationMetadata.matches(wide[1], wide[2], groups: groups) else { return false }
+                VerifyActivationMetadata.mark(kind.index)
+            }
             same.append(MLX.all(record[0] .== wide[0]))
             for (r, w) in zip(record.dropFirst(), wide.dropFirst()) {
                 same.append(MLX.all(r.view(dtype: .uint32) .== w.view(dtype: .uint32)))
@@ -1660,7 +1713,8 @@ extension SignedBlockHadamard {
         sideShape: [Int]? = nil, lanes: Int, headError2: Bool = false, kernel: MLXFast.MLXFastKernel? = nil
     ) -> [MLXArray] {
         let tile = VerifyInt8Matmul.tileRows
-        var shapes = [[tile, 4096 * blocks], [rows * 32 * blocks], [rows * 32 * blocks]]
+        let scaleCount = VerifyActivationMetadata.scaleCount(rows: rows, groups: 32 * blocks)
+        var shapes = [[tile, 4096 * blocks], [scaleCount], [rows * 32 * blocks]]
             + Array(
                 repeating: sideShape ?? inputs[0].shape, count: kind.sideOutputCount)
         if headError2 { shapes.append([rows * 32 * blocks]) }
@@ -3328,6 +3382,22 @@ public struct PromptInt8Activation {
     public let rsb: MLXArray
     let rows: Int
     let k: Int
+    let arStorage: MLXArray?
+
+    init(codes: MLXArray, ascale: MLXArray, rsb: MLXArray, rows: Int, k: Int) {
+        self.codes = codes
+        self.rsb = rsb
+        self.rows = rows
+        self.k = k
+        let groups = k / 128
+        if rows == 16 && ascale.size == 48 * groups {
+            self.ascale = ascale[0 ..< 16 * groups]
+            self.arStorage = VerifyActivationMetadata.ready ? ascale : nil
+        } else {
+            self.ascale = ascale
+            self.arStorage = nil
+        }
+    }
 }
 
 /// Prompt-width packed matmul on int8 activation codes (27b 5fbfa003, with
@@ -4312,8 +4382,11 @@ enum PromptInt8Matmul {
                 n > 0 && n % 64 == 0 && n <= limit / (k / 16) && m <= limit / n
             }
             dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
-            inputs = [codes] + layers.map { $0.weight } + layers.map { $0.scalesT } + layers.map { $0.biasesT }
-                + [ascale, rsb, dims]
+            let weights = layers.map { $0.weight }
+            let scales = layers.map { $0.scalesT }
+            let biases = layers.map { $0.biasesT }
+            let operands = [codes] + weights + scales
+            inputs = operands + biases + [ascale, rsb, dims]
             outputShapes = ns.map { [m, $0] }
             outputDTypes = ns.map { _ in .float32 }
         }
@@ -6661,6 +6734,126 @@ enum VerifyInt8Matmul {
         narrowShift(k: k).map { (narrowMask & (1 << ($0 + (compact ? 3 : 1)))) != 0 } ?? false
     }
 
+
+    private static func packedBody(_ source: String) -> String? {
+        let a = "fa = ascale[mr * Kg + gl];"
+        let rb = "frb = rsb[mr * Kg + gl];"
+        let upper = "if (ROWS > 8) { fa1 = ascale[mr1 * Kg + gl]; frb1 = rsb[mr1 * Kg + gl]; }"
+        guard source.components(separatedBy: a).count == 3,
+            source.components(separatedBy: rb).count == 3,
+            source.components(separatedBy: upper).count == 3 else { return nil }
+        let load = "const float4 ar4 = *(const device float4*)(ascale + 16 * Kg + gl * 32 + mrow * 4); fa = ar4.x;"
+        var result = source.replacingOccurrences(of: a, with: load)
+        result = result.replacingOccurrences(of: rb, with: "frb = ar4.y;")
+        result = result.replacingOccurrences(of: upper, with: "if (ROWS > 8) { fa1 = ar4.z; frb1 = ar4.w; }")
+        return result
+    }
+
+    private static func makePackedFastKernel(_ layers: Int) -> MLXFast.MLXFastKernel? {
+        guard let source = packedBody(streamedFormsSource(layers: layers)) else { return nil }
+        let weights = (0 ..< layers).map { "w\($0)" }
+        let scales = (0 ..< layers).map { "s\($0)" }
+        let biases = (0 ..< layers).map { "b\($0)" }
+        let operands = ["xq"] + weights + scales + biases
+        let inputs = operands + ["ascale", "rsb", "ksz"]
+        return MLXFast.metalKernel(
+            name: "bonsai_verify_packed_ar_c16_\(layers)", inputNames: inputs,
+            outputNames: (0 ..< layers).map { "out\($0)" }, source: source,
+            header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+    }
+
+    private static let packedFastKernels = (1 ... 3).compactMap { makePackedFastKernel($0) }
+    private static let packedNarrowKernel: MLXFast.MLXFastKernel? = {
+        let prefix = naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
+        let body = streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)")
+        guard let source = packedBody(prefix + body) else { return nil }
+        return MLXFast.metalKernel(
+            name: "bonsai_verify_packed_ar_c16_n16",
+            inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"], outputNames: ["out"],
+            source: source, header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
+    }()
+    nonisolated(unsafe) private static var packedK = Set<Int>()
+    nonisolated(unsafe) private static var packedFailed = false
+    nonisolated(unsafe) private static var packedUsed: UInt32 = 0
+
+    private static func notePackedUse(k: Int, narrow: Bool, forced: Bool) {
+        guard !forced else { return }
+        let shift = (k == 4096 ? 0 : 2) + (narrow ? 1 : 0)
+        let bit = UInt32(1) << UInt32(shift)
+        if packedUsed & bit == 0 {
+            packedUsed |= bit
+            FileHandle.standardError.write(Data("int8 verify packed metadata use: K\(k) \(narrow ? "narrow" : "fast")\n".utf8))
+        }
+    }
+
+    private static func checkPackedMetadata() -> Set<Int> {
+        guard packedFastKernels.count == 3, packedNarrowKernel != nil, streamedSourcesReady else { return [] }
+        var passed = Set<Int>()
+        for k in formsK {
+            let groups = k / 128, n = 64
+            var q = [Int8](repeating: 0, count: 16 * k)
+            for i in q.indices { q[i] = Int8(truncatingIfNeeded: (i * 37 + 11) % 255 - 127) }
+            var words = [UInt32](repeating: 0, count: n * k / 16)
+            for i in words.indices { words[i] = UInt32(truncatingIfNeeded: UInt64(i + 1) &* 2_654_435_761) }
+            var sv = [Float16](repeating: 0, count: groups * n)
+            var bv = sv
+            for i in sv.indices {
+                sv[i] = Float16(Float(i % 13 + 1) / 1024)
+                bv[i] = Float16(-Float(i % 7) / 512)
+            }
+            var av = [Float](repeating: 0, count: 16 * groups)
+            var rv = av
+            for i in av.indices { av[i] = Float(i % 11 + 1) / 256; rv[i] = Float(i % 17 - 8) / 64 }
+            var full = av + [Float](repeating: 0, count: 32 * groups)
+            for row in 0 ..< 16 {
+                for g in 0 ..< groups {
+                    let at = 16 * groups + g * 32 + (row & 7) * 4 + (row >> 3) * 2
+                    full[at] = av[row * groups + g]
+                    full[at + 1] = rv[row * groups + g]
+                }
+            }
+            let codes = MLXArray(q, [16, k]), weight = MLXArray(words, [n, k / 16])
+            let scales = MLXArray(sv, [groups, n]), biases = MLXArray(bv, [groups, n])
+            let a = MLXArray(av), rb = MLXArray(rv), ar = MLXArray(full)
+            let negated = (scales.view(dtype: .uint16) ^ MLXArray(UInt16(0x8000))).view(dtype: .float16)
+            let ranges: [[Range<Int>]] = [[0 ..< 64], [0 ..< 32, 32 ..< 64], [0 ..< 32, 32 ..< 64, 0 ..< 32]]
+            var matched = true
+            packedFailed = false
+            withErrorHandler({ _ in VerifyInt8Matmul.packedFailed = true }) {
+                for negative in [false, true] where matched {
+                    let offsets = negative ? negated : biases
+                    for columns in ranges where matched {
+                        let layers = columns.map { (weight: weight[$0], scalesT: scales[0..., $0], biasesT: offsets[0..., $0]) }
+                        let copies = layers.map { streamPack($0.weight, k: k, columns: 16) }
+                        let old = runFast(codes: codes, ascale: a, rsb: rb, layers: layers,
+                            m: 16, k: k, negative: negative, forms: true, streamedWeights: copies)
+                        let new = runFast(codes: codes, ascale: a, rsb: rb, layers: layers,
+                            m: 16, k: k, negative: negative, forms: true, streamedWeights: copies, arStorage: ar, forceAR: true)
+                        let oldBits = concatenated(old, axis: 1).view(dtype: .uint32)
+                        let newBits = concatenated(new, axis: 1).view(dtype: .uint32)
+                        let equal = MLX.all(oldBits .== newBits)
+                        eval(equal)
+                        matched = !packedFailed && equal.item(Bool.self)
+                    }
+                    if matched {
+                        let copy = streamPack(weight, k: k, columns: 16)
+                        let old = runNarrow(codes: codes, ascale: a, rsb: rb, weight: weight,
+                            scalesT: scales, biasesT: offsets, m: 16, k: k, negative: negative,
+                            forms: true, compact: true, streamedWeight: copy)
+                        let new = runNarrow(codes: codes, ascale: a, rsb: rb, weight: weight,
+                            scalesT: scales, biasesT: offsets, m: 16, k: k, negative: negative,
+                            forms: true, compact: true, streamedWeight: copy, arStorage: ar, forceAR: true)
+                        let equal = MLX.all(old.view(dtype: .uint32) .== new.view(dtype: .uint32))
+                        eval(equal)
+                        matched = !packedFailed && equal.item(Bool.self)
+                    }
+                }
+            }
+            if matched && !packedFailed { passed.insert(k) }
+        }
+        return passed
+    }
+
     /// As `PromptInt8Matmul`: the vector tensor kernel when it matches the plain kernel at load, and the `NEG = 1`
     /// forms when they match theirs.
     nonisolated(unsafe) private static var naxVector = false
@@ -6688,9 +6881,15 @@ enum VerifyInt8Matmul {
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
         layers: [(weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray)],
-        m: Int, k: Int, negative: Bool, forms: Bool? = nil, streamedWeights: [MLXArray]? = nil, product: Bool = false
+        m: Int, k: Int, negative: Bool, forms: Bool? = nil, streamedWeights: [MLXArray]? = nil, product: Bool = false, arStorage: MLXArray? = nil, forceAR: Bool = false
     ) -> [MLXArray] {
         let useForms = forms ?? usesForms(k: k, layers: layers)
+        let k64Shape = m == 16 && k == 4096 && layers.count == 2
+            && layers[0].weight.dim(0) == 12288 && layers[1].weight.dim(0) == 12288
+        let useAR = m == 16 && useForms && streamedWeights != nil && arStorage != nil
+            && !k64Shape && packedFastKernels.count == 3 && (forceAR || packedK.contains(k))
+        if useAR { notePackedUse(k: k, narrow: false, forced: forceAR) }
+        let stats = useAR ? arStorage! : ascale
         let dims: MLXArray
         let inputs: [MLXArray]
         let outputShapes: [[Int]]
@@ -6703,7 +6902,7 @@ enum VerifyInt8Matmul {
             totalN = n0
             dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0)])
             let w0 = (useForms ? streamedWeights?[0] : nil) ?? l0.weight
-            inputs = [codes, w0, l0.scalesT, l0.biasesT, ascale, rsb, dims]
+            inputs = [codes, w0, l0.scalesT, l0.biasesT, stats, rsb, dims]
             outputShapes = [[m, n0]]
             outputDTypes = [.float32]
         case 2:
@@ -6713,7 +6912,7 @@ enum VerifyInt8Matmul {
             dims = HostConstants.int32([Int32(k), Int32(m), Int32(n0), Int32(n1)])
             let w0 = (useForms ? streamedWeights?[0] : nil) ?? l0.weight
             let w1 = (useForms ? streamedWeights?[1] : nil) ?? l1.weight
-            inputs = [codes, w0, w1, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, ascale, rsb, dims]
+            inputs = [codes, w0, w1, l0.scalesT, l1.scalesT, l0.biasesT, l1.biasesT, stats, rsb, dims]
             outputShapes = [[m, n0], [m, n1]]
             outputDTypes = [.float32, .float32]
         case 3:
@@ -6728,7 +6927,7 @@ enum VerifyInt8Matmul {
                 codes, w0, w1, w2,
                 l0.scalesT, l1.scalesT, l2.scalesT,
                 l0.biasesT, l1.biasesT, l2.biasesT,
-                ascale, rsb, dims,
+                stats, rsb, dims,
             ]
             outputShapes = [[m, n0], [m, n1], [m, n2]]
             outputDTypes = [.float32, .float32, .float32]
@@ -6737,12 +6936,13 @@ enum VerifyInt8Matmul {
             totalN = ns.reduce(0, +)
             dims = HostConstants.int32([Int32(k), Int32(m)] + ns.map { Int32($0) })
             let ws = (useForms ? streamedWeights : nil) ?? layers.map { $0.weight }
-            inputs = [codes] + ws + layers.map { $0.scalesT } + layers.map { $0.biasesT } + [ascale, rsb, dims]
+            inputs = [codes] + ws + layers.map { $0.scalesT } + layers.map { $0.biasesT } + [stats, rsb, dims]
             outputShapes = ns.map { [m, $0] }
             outputDTypes = ns.map { _ in .float32 }
         }
         if useForms {
-            let kernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
+            let standardKernels = streamedWeights == nil ? naxFormsKernels : streamedKernels
+            let kernels = useAR ? packedFastKernels : standardKernels
             if m == 16, k == 4096, outputShapes == [[16, 12288], [16, 12288]],
                 let a = HadamardQuantizedLinear.verifyK64Run?(inputs, negative, streamedWeights != nil, product) { return a }
             let template = [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)]
@@ -6760,16 +6960,21 @@ enum VerifyInt8Matmul {
 
     private static func runNarrow(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
-        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, negative: Bool, forms: Bool? = nil, compact: Bool = false, streamedWeight: MLXArray? = nil, arStorage: MLXArray? = nil, forceAR: Bool = false
     ) -> MLXArray {
         let n = weight.dim(0)
         let dims = HostConstants.int32([Int32(k), Int32(m), Int32(n)])
         if forms ?? (formsAllowed && hasNarrowForms(k: k, compact: compact) && formsFit(k: k, n: n)) {
             let stream = compact && streamedWeight != nil
-            let kernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            let useAR = m == 16 && stream && arStorage != nil && packedNarrowKernel != nil
+                && (forceAR || packedK.contains(k))
+            if useAR { notePackedUse(k: k, narrow: true, forced: forceAR) }
+            let standardKernel = stream ? streamedNarrowKernel : compact ? naxNarrow16FormsKernel : naxNarrowFormsKernel
+            let kernel = useAR ? packedNarrowKernel! : standardKernel
+            let stats = useAR ? arStorage! : ascale
             let kernelWeight = stream ? streamedWeight! : weight
             return kernel(
-                [codes, kernelWeight, scalesT, biasesT, ascale, rsb, dims],
+                [codes, kernelWeight, scalesT, biasesT, stats, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
                 grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
@@ -7095,6 +7300,10 @@ enum VerifyInt8Matmul {
         streamReady = chosen == .nax && naxFast && checkStreamed()
         FileHandle.standardError.write(
             "int8 verify streamed: \(streamReady ? "on (M16 guard, fast/shared/N16/dense-b/a bit-identical)" : "off")\n".data(using: .utf8)!)
+        if chosen == .nax && streamReady && VerifyActivationMetadata.enabled {
+            packedK = checkPackedMetadata()
+            FileHandle.standardError.write(Data("int8 verify packed metadata consumers: K \(packedK.sorted()) (M16 fast/shared/N16, both bias modes)\n".utf8))
+        }
         return chosen
     }()
 
@@ -7107,13 +7316,13 @@ enum VerifyInt8Matmul {
             return runNarrow(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb, weight: weight,
                 scalesT: scalesT, biasesT: biasesT, m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, compact: hasNarrow16(k: activation.k), streamedWeight: streamedWeight)
+                negative: negative && negativeForms, compact: hasNarrow16(k: activation.k), streamedWeight: streamedWeight, arStorage: activation.arStorage)
         }
         if route == .nax && naxFast {
             return runFast(
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: [(weight, scalesT, biasesT)], m: activation.rows, k: activation.k,
-                negative: negative && negativeForms, streamedWeights: streamedWeight.map { [$0] })[0]
+                negative: negative && negativeForms, streamedWeights: streamedWeight.map { [$0] }, arStorage: activation.arStorage)[0]
         }
         return run(
             route, codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
@@ -7135,7 +7344,7 @@ enum VerifyInt8Matmul {
                 codes: activation.codes, ascale: activation.ascale, rsb: activation.rsb,
                 layers: layers.map { ($0.weight, $0.scalesT, $0.biasesT) },
                 m: activation.rows, k: activation.k,
-                negative: negativeForms && layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights, product: product)
+                negative: negativeForms && layers.allSatisfy { $0.negative }, streamedWeights: streamedWeights, product: product, arStorage: activation.arStorage)
         }
         let outputs = layers.compactMap {
             matmul(activation, weight: $0.weight, scalesT: $0.scalesT, biasesT: $0.biasesT, negative: $0.negative)
