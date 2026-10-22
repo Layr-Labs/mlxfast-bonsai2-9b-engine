@@ -689,6 +689,10 @@ enum CBv2AttentionV1 {
         precondition(historyCount >= 0)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
+        let core = CBv2PromptAttentionCore.plan(
+            queries: queries, keys: keys, values: values, newTokenCount: newTokenCount,
+            window: window, sinks: sinks, softcap: softcap, blockSize: blockSize,
+            spanContext: spanContext, keepMask: keepMask)
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
@@ -740,15 +744,19 @@ enum CBv2AttentionV1 {
                     $0[0..., 0..., offset ..< (offset + count), visibleStart ..< visibleEnd]
                 }
                 outputs.append(
-                    attend(
-                        queries: querySlice, keys: keySlice, values: valueSlice,
-                        scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap,
-                        keepMask: blockKeepMask))
+                    core?.attend(
+                        blockIndex: offset / blockSize, queries: querySlice, keys: keySlice,
+                        values: valueSlice, scale: scale)
+                        ?? attend(
+                            queries: querySlice, keys: keySlice, values: valueSlice,
+                            scale: scale, L: count, kL: visibleEnd - visibleStart,
+                            window: window, sinks: sinks, softcap: softcap,
+                            keepMask: blockKeepMask))
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return outputs.count == 1
+            ? outputs[0] : CBv2PromptAttentionBlocks.noted(outputs, concatenated(outputs, axis: 2))
     }
 
     /// `attendSerialQueries` for a draft tree window: query `t` attends to the history and its
@@ -1154,126 +1162,6 @@ enum CBv2VerifyVectorAttention {
             }
             """
 
-    /// The combine without the threadgroup transpose: each lane reads its own
-    /// partial straight from `part_o` (lane l holds partial l) instead of
-    /// copying every partial through `staged` and waiting on a barrier. The
-    /// staged path copies values without arithmetic, so the two forms compute
-    /// `simd_sum(part_o[base + simd_lid][...] * factor)` on the same words.
-    /// Kept only when a load-time bit check and a chain timing both accept it.
-    private static let combineDirect = MLXFast.metalKernel(
-        name: "cbv2_verify_sdpa_combine_direct",
-        inputNames: ["part_o", "part_m", "part_s"],
-        outputNames: ["out"],
-        source: """
-            #pragma clang fp reassociate(off)
-            #pragma clang fp contract(off)
-            constexpr int v_per_thread = 16;
-            const uint head = threadgroup_position_in_grid.x / 2u;
-            const uint half_ = threadgroup_position_in_grid.x % 2u;
-            const uint t = threadgroup_position_in_grid.y;
-            const uint L = threadgroups_per_grid.y;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-            const uint base = (head * L + t) * 32u;
-            float max_score = part_m[base + simd_lid];
-            float new_max = simd_max(max_score);
-            float factor = fast::exp(max_score - new_max);
-            float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
-            const device float* po = part_o + (base + simd_lid) * 256u + half_ * 128u
-                + simd_gid * uint(v_per_thread);
-            float o[v_per_thread];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < v_per_thread; i++) {
-              o[i] = simd_sum(po[i] * factor);
-              o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
-            }
-            if (simd_lid == 0) {
-              device float* op = out + (head * L + t) * 256u + half_ * 128u
-                  + simd_gid * v_per_thread;
-              *((device packed_float4*)(op + 0)) = packed_float4(o[0], o[1], o[2], o[3]);
-              *((device packed_float4*)(op + 4)) = packed_float4(o[4], o[5], o[6], o[7]);
-              *((device packed_float4*)(op + 8)) = packed_float4(o[8], o[9], o[10], o[11]);
-              *((device packed_float4*)(op + 12)) = packed_float4(o[12], o[13], o[14], o[15]);
-            }
-            """)
-
-    /// `DARKBLOOM_BONSAI_VATTN_COMBINE_DIRECT=0` keeps the record combine.
-    private static let combineDirectSwitch = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_VATTN_COMBINE_DIRECT"] != "0"
-
-    /// Whether the direct combine gave the record combine's bits on fixed probes and timed at
-    /// least 2% faster on a chain, checked once at load. A slower or mismatching device keeps
-    /// the record combine.
-    private static let combineDirectVerdict: Bool = {
-        guard combineDirectSwitch else {
-            FileHandle.standardError.write(Data("vattn combine direct: off (switch)\n".utf8))
-            return false
-        }
-        var passed = false
-        do {
-            passed = try withError { checkCombineDirect() }
-        } catch {
-            FileHandle.standardError.write(Data("vattn combine direct check error: \(error)\n".utf8))
-        }
-        return passed
-    }()
-
-    private static var combineChosen: MLXFast.MLXFastKernel {
-        combineDirectVerdict ? combineDirect : combine
-    }
-
-    static func prepareCombine() { _ = combineDirectVerdict }
-
-    private static func checkCombineDirect() -> Bool {
-        var note = "record (no timing gain)"
-        for L in [16, 7] {
-            let slots = 16 * L * 32
-            let o = probe([slots, 256], seed: 0.11, scale: 1.0)
-            let m = probe([slots], seed: 0.12, scale: 2.0)
-            let s = probe([slots], seed: 0.13, scale: 3.0)
-            let record = combine(
-                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-            let direct = combineDirect(
-                [o, m, s], grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
-            let same = (record.view(dtype: .uint32) .== direct.view(dtype: .uint32)).all()
-                .item(Bool.self)
-            guard same else {
-                FileHandle.standardError.write(
-                    Data("vattn combine direct: off (bits differ at L \(L))\n".utf8))
-                return false
-            }
-            if L == 16 {
-                note = timingNote(o: o, m: m, s: s)
-            }
-        }
-        FileHandle.standardError.write(Data("vattn combine direct: \(note)\n".utf8))
-        return note.hasPrefix("on")
-    }
-
-    private static func timingNote(o: MLXArray, m: MLXArray, s: MLXArray) -> String {
-        func chain(_ kernel: MLXFast.MLXFastKernel) -> Double {
-            var best = Double.infinity
-            for _ in 0 ..< 4 {
-                let start = DispatchTime.now().uptimeNanoseconds
-                let out = kernel(
-                    [o, m, s], grid: (32 * 256, 16, 1), threadGroup: (256, 1, 1),
-                    outputShapes: [[1, 16, 16, 256]], outputDTypes: [.float32])[0]
-                eval(out)
-                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
-                best = min(best, elapsed)
-            }
-            return best
-        }
-        let recordTime = chain(combine)
-        let directTime = chain(combineDirect)
-        let gain = recordTime > 0 ? 1 - directTime / recordTime : 0
-        return gain >= 0.02
-            ? "on (\(Int((gain * 100).rounded()))% faster than the record)"
-            : "record (\(Int((gain * 100).rounded()))% direct)"
-    }
-
     /// One threadgroup per (head, query, half of the output dims); the 32
     /// partials pass through threadgroup memory so lane l holds partial l.
     private static let combine = MLXFast.metalKernel(
@@ -1320,6 +1208,87 @@ enum CBv2VerifyVectorAttention {
             }
             """)
 
+
+    /// Same lane/reduction order as combine, but read partials directly.
+    /// Removes the threadgroup transpose and barrier, never changes key scanning.
+    private static let combineDirect = MLXFast.metalKernel(
+        name: "cbv2_verify_sdpa_combine_direct",
+        inputNames: ["part_o", "part_m", "part_s"], outputNames: ["out"],
+        source: """
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(off)
+        constexpr int v_per_thread = 16;
+
+        const uint head = threadgroup_position_in_grid.x / 2u;
+        const uint half_ = threadgroup_position_in_grid.x % 2u;
+        const uint t = threadgroup_position_in_grid.y;
+        const uint L = threadgroups_per_grid.y;
+        const uint tid = thread_index_in_threadgroup;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const uint base = (head * L + t) * 32u;
+        float max_score = part_m[base + simd_lid];
+        float new_max = simd_max(max_score);
+        float factor = fast::exp(max_score - new_max);
+        float sum_exp_score = simd_sum(part_s[base + simd_lid] * factor);
+
+        float o[v_per_thread];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < v_per_thread; i++) {
+          o[i] = simd_sum(part_o[(base + simd_lid) * 256u + half_ * 128u + simd_gid * v_per_thread + i] * factor);
+          o[i] = sum_exp_score == 0 ? o[i] : metal::precise::divide(o[i], sum_exp_score);
+        }
+        if (simd_lid == 0) {
+          device float* op = out + (head * L + t) * 256u + half_ * 128u
+              + simd_gid * v_per_thread;
+          *((device packed_float4*)(op + 0)) = packed_float4(o[0], o[1], o[2], o[3]);
+          *((device packed_float4*)(op + 4)) = packed_float4(o[4], o[5], o[6], o[7]);
+          *((device packed_float4*)(op + 8)) = packed_float4(o[8], o[9], o[10], o[11]);
+          *((device packed_float4*)(op + 12)) = packed_float4(o[12], o[13], o[14], o[15]);
+        }
+        """)
+
+    private static let combineDirectOffered: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VATTN_DIRECT_COMBINE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    private static let combineDirectPassed: Bool = {
+        guard combineDirectOffered else { return false }
+        var passed = false
+        do { passed = try withError { checkDirectCombine() } }
+        catch { FileHandle.standardError.write(Data("vattn direct combine check error: \(error)\n".utf8)) }
+        FileHandle.standardError.write(Data("vattn direct combine checked: \(passed) (18 finite bitwise cases and negative control)\n".utf8))
+        return passed
+    }()
+
+    private static func checkDirectCombine() -> Bool {
+        var negativeControl = false
+        for L in [2, 7, 16] {
+            for seed: Float in [1, 17, 33] {
+                let o = probe([16 * L * 32, 256], seed: seed, scale: 0.2)
+                let m = probe([16 * L * 32], seed: seed + 1, scale: 3)
+                let sums = abs(probe([16 * L * 32], seed: seed + 2, scale: 20)) + 0.1
+                for empty in [false, true] {
+                    let inputs = [o, m, empty ? MLXArray.zeros(like: sums) : sums]
+                    let reference = combine(inputs, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+                    let direct = combineDirect(inputs, grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+                    let finite = isFinite(reference).all() .&& isFinite(direct).all()
+                    let same = (reference.view(dtype: .uint32) .== direct.view(dtype: .uint32)).all()
+                    eval(finite, same)
+                    guard finite.item(Bool.self), same.item(Bool.self) else { return false }
+                    if !negativeControl {
+                        let changed = direct + 1
+                        negativeControl = !(reference.view(dtype: .uint32) .== changed.view(dtype: .uint32)).all().item(Bool.self)
+                    }
+                }
+            }
+        }
+        return negativeControl
+    }
 
     private static let pairedPartial = MLXFast.metalKernel(
         name: "cbv2_verify_sdpa_paired",
@@ -1557,10 +1526,7 @@ enum CBv2VerifyVectorAttention {
         return passed
     }()
 
-    static func prepareLean() {
-        _ = leanVerdict
-        prepareCombine()
-    }
+    static func prepareLean() { _ = leanVerdict; _ = combineDirectPassed }
 
     private static func probe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
@@ -1641,7 +1607,8 @@ enum CBv2VerifyVectorAttention {
             queries: queries, keys: keys, values: values, params: params, tree: nil, L: L,
             lean: leanApplies(keys: keys, values: values, nKeys: nKeys))
         else { return nil }
-        return combineChosen(
+        let combineKernel = combineDirectPassed ? combineDirect : combine
+        return combineKernel(
             CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
@@ -1669,7 +1636,8 @@ enum CBv2VerifyVectorAttention {
             queries: queries, keys: keys, values: values, params: params, tree: tree, L: L,
             lean: leanApplies(keys: keys, values: values, nKeys: kShape.2))
         else { return nil }
-        return combineChosen(
+        let combineKernel = combineDirectPassed ? combineDirect : combine
+        return combineKernel(
             CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
     }
@@ -1718,6 +1686,249 @@ public enum CBv2VerifyAttentionPartial {
     public static func prepareLean() { CBv2VerifyVectorAttention.prepareLean() }
 }
 
+/// The query-block outputs (`attendQueryBlocks`) of a prompt attention, handed to a caller that
+/// reads them in place of their concatenation: the concatenation is then never evaluated. Graph
+/// build only; nothing is held outside `capturing`.
+public enum CBv2PromptAttentionBlocks {
+    nonisolated(unsafe) private static var active = false
+    nonisolated(unsafe) private static var captured: (whole: MLXArray, blocks: [MLXArray])?
+
+    /// The query-block width the blocks were cut at.
+    public static var blockSize: Int { CBv2AttentionV1.queryBlockSize }
+
+    /// `body()` and, when it returned an `attendQueryBlocks` concatenation itself, the blocks.
+    public static func capturing(_ body: () -> MLXArray) -> (MLXArray, [MLXArray]?) {
+        active = true
+        captured = nil
+        defer {
+            active = false
+            captured = nil
+        }
+        let result = body()
+        guard let blocks = captured, blocks.whole === result else { return (result, nil) }
+        return (result, blocks.blocks)
+    }
+
+    static func noted(_ blocks: [MLXArray], _ whole: MLXArray) -> MLXArray {
+        if active { captured = (whole, blocks) }
+        return whole
+    }
+}
+
+/// The prompt attention of a full-attention layer, composed in Swift from MLX's own fallback graph
+/// (`fast.cpp`'s composed attention branch, the one the 128-row blocks take on every
+/// GPU) with two optional substitutions, each served only after a boot check finds the block outputs equal
+/// to the record's bit for bit: the queries arrive already multiplied by the scale (`Qwen35VerifyQKNormRoPE.applyPrompt`
+/// folds the power-of-two multiply into the q/k norm and RoPE kernel), and `where(causal mask)` + `softmax`
+/// is one kernel with `softmax_single_row`'s thread layout and reduction order. Graph build only; the
+/// per-call state is set by `capturing` and cleared on exit.
+public enum CBv2PromptAttentionCore {
+    /// `DARKBLOOM_BONSAI_ATTN_SMAX=0` keeps `where` + `softmax`.
+    public static let softmaxOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_SMAX"] != "0"
+    public static let negativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_SMAX_NEGCTL"] == "1"
+    /// Written once by the boot check before the resident serves; read-only afterwards.
+    nonisolated(unsafe) public static var softmaxVerified = false
+    /// Whether the composed path serves at all (the q fold or the softmax is verified), set with the flags.
+    nonisolated(unsafe) public static var engaged = false
+
+    nonisolated(unsafe) private static var capturingNow = false
+    nonisolated(unsafe) private static var prescaled: [MLXArray]?
+    nonisolated(unsafe) private static var consumed = false
+    nonisolated(unsafe) private static var dimsCache: [Int: MLXArray] = [:]
+
+    /// `body()` with the composed path armed, and whether `attendQueryBlocks` took it. `prescaled`: the query
+    /// blocks already multiplied by the scale, or nil to multiply here.
+    public static func capturing(prescaled blocks: [MLXArray]?, _ body: () -> MLXArray) -> (MLXArray, Bool) {
+        capturingNow = true
+        prescaled = blocks
+        consumed = false
+        defer {
+            capturingNow = false
+            prescaled = nil
+            consumed = false
+        }
+        let result = body()
+        return (result, consumed)
+    }
+
+    struct Plan {
+        let prescaled: [MLXArray]?
+        let fusedSoftmax: Bool
+
+        func attend(
+            blockIndex: Int, queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
+        ) -> MLXArray {
+            let query = prescaled.map { (blocks: [MLXArray]) -> MLXArray in blocks[blockIndex] } ?? queries
+            return CBv2PromptAttentionCore.composed(
+                query: query, keys: keys, values: values, scale: scale,
+                scaled: prescaled != nil, fusedSoftmax: fusedSoftmax)
+        }
+    }
+
+    /// Whether a prompt of `rows` rows is cut into 128-row blocks that all take MLX's composed attention branch:
+    /// a block of 8 rows or fewer takes the fused vector kernel, so such a prompt keeps the
+    /// record's call.
+    public static func serves(rows: Int) -> Bool {
+        rows > 128 && (rows % 128 == 0 || rows % 128 > 8)
+    }
+
+    /// The plan for one `attendQueryBlocks` call, or nil to keep the record's attention call. Only the plain
+    /// causal float32 full-attention prompt qualifies.
+    static func plan(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, newTokenCount: Int, window: Int?,
+        sinks: MLXArray?, softcap: Float?, blockSize: Int, spanContext: CBv2SpanChunkContext?,
+        keepMask: MLXArray?
+    ) -> Plan? {
+        guard capturingNow, engaged, serves(rows: newTokenCount), blockSize == 128, window == nil,
+            sinks == nil, softcap == nil, spanContext == nil, keepMask == nil,
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4, queries.dim(0) == 1,
+            queries.dtype == .float32, keys.dtype == .float32, values.dtype == .float32,
+            queries.dim(2) == newTokenCount, keys.dim(1) == values.dim(1),
+            keys.dim(1) > 0, queries.dim(1) % keys.dim(1) == 0
+        else { return nil }
+        if let blocks = prescaled {
+            let count = (newTokenCount + blockSize - 1) / blockSize
+            guard blocks.count == count else { return nil }
+            for (index, block) in blocks.enumerated() {
+                let rows = min(blockSize, newTokenCount - index * blockSize)
+                guard block.dtype == .float32, block.shape == [1, queries.dim(1), rows, queries.dim(3)]
+                else { return nil }
+            }
+        }
+        guard prescaled != nil || softmaxVerified else { return nil }
+        consumed = true
+        return Plan(prescaled: prescaled, fusedSoftmax: softmaxVerified)
+    }
+
+    /// Row `r` of a `[.., n, kL]` score block reads keys `0 ... r + kL - n + shift` (the causal mask of
+    /// `fast.cpp`: `q_idx = r + kL - n >= k_idx`), then `softmax_single_row` (`softmax.h`) unchanged:
+    /// N_READS 4, one thread per 4 keys, a threadgroup of ceil(kL / 4) rounded up to 32, the same simd and
+    /// threadgroup reductions, `fast::exp`, `1 / sum`. A masked value is the `where` fill, -FLT_MAX.
+    /// `dims` = [n, kL, shift]; `shift` is 0 outside the boot check's negative control.
+    private static let softmaxKernel = MLXFast.metalKernel(
+        name: "cbv2_prompt_causal_softmax",
+        inputNames: ["scores", "dims"], outputNames: ["probs"],
+        source: """
+            constexpr int N_READS = 4;
+            const int axis_size = dims[1];
+            const uint gid = threadgroup_position_in_grid.x;
+            const int lid = int(thread_position_in_threadgroup.x);
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const int last_visible = int(gid % uint(dims[0])) + (axis_size - dims[0]) + dims[2];
+            threadgroup float local_max[32];
+            threadgroup float local_normalizer[32];
+            const device float* in = scores + size_t(gid) * size_t(axis_size);
+            float ld[N_READS];
+            for (int i = 0; i < N_READS; i++) {
+              const int key = lid * N_READS + i;
+              ld[i] = key < axis_size
+                  ? (key <= last_visible ? in[key] : -metal::numeric_limits<float>::max())
+                  : -metal::numeric_limits<float>::infinity();
+            }
+            if (simd_group_id == 0) {
+              local_max[simd_lane_id] = -metal::numeric_limits<float>::infinity();
+              local_normalizer[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float maxval = -metal::numeric_limits<float>::max();
+            for (int i = 0; i < N_READS; i++) {
+              maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (simd_lane_id == 0) {
+              local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              maxval = simd_max(local_max[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_max[0] = maxval;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+              const float exp_x = metal::fast::exp(ld[i] - maxval);
+              ld[i] = exp_x;
+              normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (simd_lane_id == 0) {
+              local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+              normalizer = simd_sum(local_normalizer[simd_lane_id]);
+              if (simd_lane_id == 0) {
+                local_normalizer[0] = normalizer;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
+            device float* out_row = probs + size_t(gid) * size_t(axis_size);
+            for (int i = 0; i < N_READS; i++) {
+              const int key = lid * N_READS + i;
+              if (key < axis_size) {
+                out_row[key] = ld[i] * normalizer;
+              }
+            }
+            """)
+
+    /// `where(causal mask, scores, min)` then `softmax` over the last axis, of a `[.., n, kL]` float32 block
+    /// with kL <= 4096 (above that MLX's softmax is the looped kernel).
+    public static func causalSoftmax(_ scores: MLXArray, rows n: Int, keyCount kL: Int, shift: Int32 = 0) -> MLXArray {
+        let key = n << 32 | kL << 8 | Int(shift + 128)
+        let dims: MLXArray
+        if let cached = dimsCache[key] {
+            dims = cached
+        } else {
+            dims = MLXArray([Int32(n), Int32(kL), shift])
+            dimsCache[key] = dims
+        }
+        let threads = 32 * (((kL + 3) / 4 + 31) / 32)
+        return softmaxKernel(
+            [scores, dims], grid: (scores.size / kL * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [scores.shape], outputDTypes: [.float32])[0]
+    }
+
+    /// MLX's composed attention graph for a causal float32 block: `query` `[1, qHeads, n, d]`
+    /// against `keys`, `values` `[1, kvHeads, kL, d]` (strided views are fine), every op the fallback's.
+    /// `scaled`: `query` already carries the scale.
+    public static func composed(
+        query: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, scaled: Bool,
+        fusedSoftmax: Bool, softmaxShift: Int32 = 0
+    ) -> MLXArray {
+        let n = query.dim(2)
+        let kL = keys.dim(2)
+        var q = scaled ? query : multiply(MLXArray(scale), query)
+        var k = keys
+        var v = values
+        let repeats = query.dim(1) / keys.dim(1)
+        if repeats > 1 {
+            q = unflatten(q, axis: 1, shape: [keys.dim(1), repeats])
+            k = expandedDimensions(k, axis: 2)
+            v = expandedDimensions(v, axis: 2)
+        }
+        var scores = matmul(q, swappedAxes(k, -1, -2))
+        let probs: MLXArray
+        if fusedSoftmax && kL <= 4096 {
+            probs = causalSoftmax(scores, rows: n, keyCount: kL, shift: softmaxShift)
+        } else {
+            let offset = kL - n
+            let queryIndex = expandedDimensions(MLXArray.arange(offset, n + offset), axis: 1)
+            let keyIndex = expandedDimensions(MLXArray.arange(0, kL), axis: 0)
+            scores = MLX.where(
+                greaterEqual(queryIndex, keyIndex), scores, MLXArray(-Float.greatestFiniteMagnitude))
+            probs = softmax(scores, axes: [-1], precise: true)
+        }
+        let out = matmul(probs, v)
+        return repeats > 1 ? flattened(out, start: 1, end: 2) : out
+    }
+}
+
 /// Draft tree verify: the round's tree descriptor (int32 [333], `DF2Fast.treeSource`) for
 /// the target verify, set by the engine around the verify forward and read by the attention,
 /// RoPE and GDN layers; nil keeps every record kernel.
@@ -1737,6 +1948,53 @@ public enum CBv2BranchVerify {
                 committedRowsArray = nil
             }
         }
+    }
+
+    /// The parent rows (`treeDesc[0 ..< 16]`) of the tree round that commits, set with
+    /// `committedRows` on every tree round, a chain-prefix path included.
+    nonisolated(unsafe) public static var committedParents: [Int32]?
+
+    static let snapshotNegativeControl =
+        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SNAP_COMMIT_NEGCTL"] == "1"
+
+    /// Host mirror of the GDN tree verify's snapshot pick (`Qwen35FusedGDNVerify.snapshotTreeSource`):
+    /// row s scores depth(s) + 1 for each restart row t > s (parent not t - 1) that has s as an
+    /// ancestor; the highest score wins, then the higher row. nil when no row scores or `parents`
+    /// is not a 16-row tree with every parent above its child.
+    public static func snapshotRow(parents: [Int32]) -> Int? {
+        guard parents.count == 16, parents[0] < 0 else { return nil }
+        var depth = [Int](repeating: 0, count: 16)
+        for t in 1 ..< 16 {
+            let p = Int(parents[t])
+            guard (0 ..< t).contains(p) else { return nil }
+            depth[t] = depth[p] + 1
+        }
+        var best = 0
+        for s in 0 ..< 15 {
+            var score = 0
+            for t in (s + 1) ..< 16 where Int(parents[t]) != t - 1 {
+                var a = Int(parents[t])
+                while a > s { a = Int(parents[a]) }
+                if a == s { score += depth[s] + 1 }
+            }
+            if score != 0 { best = max(best, (score << 4) | s) }
+        }
+        guard best != 0 else { return nil }
+        let row = best & 15
+        return snapshotNegativeControl && row > 0 ? Int(parents[row]) : row
+    }
+
+    /// `(row, rows)` when the committed `path` (anchor first) passes through the snapshot row:
+    /// the snapshot holds the state after the path's first `rows` rows.
+    public static func snapshotPrefix(parents: [Int32], path: [Int32]) -> (row: Int, rows: Int)? {
+        guard !path.isEmpty, path[0] == 0, parents.count == 16 else { return nil }
+        for i in 1 ..< path.count {
+            guard (1 ..< 16).contains(Int(path[i])), parents[Int(path[i])] == path[i - 1] else { return nil }
+        }
+        guard let row = snapshotRow(parents: parents),
+            let index = path.firstIndex(of: Int32(row))
+        else { return nil }
+        return (row, index + 1)
     }
 
     /// Recent tree proposals: the drafter registers each tree's tokens with its descriptor,
