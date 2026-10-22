@@ -3047,11 +3047,13 @@ enum DF2Fast {
         let selection = W4Pair24SelectionCache()
 
         init?(_ scales: MLXArray, _ offsets: MLXArray) {
-            guard scales.dtype == .float16, offsets.dtype == .float16,
-                scales.ndim == 2, scales.shape == offsets.shape, scales.dim(1) % 4 == 0,
-                scales.strides == [scales.dim(1), 1], offsets.strides == scales.strides,
-                scales.size > 0, scales.size % 4 == 0, scales.size / 4 <= Int.max / 3
-            else { return nil }
+            guard scales.dtype == .float16, offsets.dtype == .float16 else { return nil }
+            guard scales.ndim == 2, scales.shape == offsets.shape else { return nil }
+            guard scales.dim(1) % 4 == 0 else { return nil }
+            let rowStrides = [scales.dim(1), 1]
+            guard scales.strides == rowStrides, offsets.strides == scales.strides else { return nil }
+            guard scales.size > 0, scales.size % 4 == 0 else { return nil }
+            guard scales.size / 4 <= Int.max / 3 else { return nil }
             let s = scales.view(dtype: .uint16).asArray(UInt16.self)
             let b = offsets.view(dtype: .uint16).asArray(UInt16.self)
             let sb = UInt32(s.min()!), bb = UInt32(b.min()!)
@@ -3367,8 +3369,9 @@ enum DF2Fast {
     static func w4Pair24DownWideEligible(
         _ ops: [W4Operands], rows: Int, ns: [Int], group: Int, form: Int, narrow: Bool, split: Int
     ) -> Bool {
-        rows == 16 && group == 64 && split == 8 && form == 2 && narrow && ops.count == 1
-            && ops[0].k == 12288 && ops[0].n == 4096 && ns == [4096]
+        guard rows == 16, group == 64, split == 8, form == 2 else { return false }
+        guard narrow, ops.count == 1 else { return false }
+        return ops[0].k == 12288 && ops[0].n == 4096 && ns == [4096]
     }
 
     static func w4Pair24ChooseWithWide(
@@ -3504,84 +3507,19 @@ enum DF2Fast {
         }
     }
 
-    /// The existing bind preparation reaches this R16 key; runtime row changes do not retune it.
+    /// Keep the reference kernel for every row count. Selection is independent of load-time
+    /// scheduling noise and remains the same when record operands become tiled operands.
+    /// Alternative metadata forms retain the same weights but are not selected by a noisy
+    /// record-layout microbenchmark to serve the subsequent tiled-layout decode.
     static func w4Pair24Selected(
         _ ops: [W4Operands], ns: [Int], metadata: [W4Pair24], form: Int, narrow: Bool
     ) -> W4Pair24Choice {
-        let K = ops[0].k, G = K / 64
+        let K = ops[0].k
         return metadata[0].selection.resolve(ops, K: K, ns: ns, group: 64,
             form: form, narrow: narrow, split: split) {
-            let coldStart = DispatchTime.now().uptimeNanoseconds
-            let xq = MLXArray((0 ..< 16 * K).map { Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) }, [16 * K])
-            let a = MLXArray((0 ..< 16 * G).map { Float(1 + $0 % 11) / 256 }, [16 * G])
-            let x = MLXArray((0 ..< 16 * G).map { Float($0 % 17 - 8) / 64 }, [16 * G])
-            let sizes = MLXArray([Int32(K), Int32(16)] + ns.map { Int32($0) })
-            func build(_ index: Int) -> [MLXArray] {
-                w4Pair24Output(W4Pair24Method(rawValue: index)!, form: form, narrow: narrow,
-                    xq: xq, ascale: a, xs: x, rows: 16, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizes)
-            }
-            let quartet = ops.count == 1 && K == 12288 && ns == [4096] && form == 2 && narrow
-            let wideQuartet = ops.count == 2 && K == 4096 && ns == [12288, 12288] && form == 2 && !narrow
-            let rawWide = w4Pair24DownWideEligible(ops, rows: 16, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split)
-            let fcStatic = w4FCStaticEligible(ops, rows: 16, ns: ns, group: 64,
-                form: form, narrow: narrow, split: split)
-            let methods = fcStatic ? [0, 1, 4] : (rawWide ? [0, 1, 2, 3] : (quartet || wideQuartet ? [0, 1, 2] : [0, 1]))
-            let candidateCount = fcStatic ? 5 : (rawWide ? 4 : 3)
-            var valid = [Bool](repeating: false, count: candidateCount)
-            var reference: MLXArray?
-            valid[0] = (try? withError {
-                let output = concatenated(build(0), axis: 1)
-                let finite = isFinite(output).all()
-                eval(finite)
-                reference = output
-                return finite.item(Bool.self)
-            }) ?? false
-            if valid[0], let reference {
-                for index in methods.dropFirst() {
-                    valid[index] = w4Pair24Exact({ build(index) }, reference: reference)
-                }
-            }
-            reference = nil
-            var warm = [UInt64](repeating: 0, count: candidateCount)
-            var samples = [[UInt64]](repeating: [], count: candidateCount)
-            var legs = [[[UInt64]]](repeating: [], count: candidateCount)
-            if valid[0] {
-                for index in methods where valid[index] {
-                    if let elapsed = w4Pair24Time({ build(index) }) { warm[index] = elapsed }
-                    else { valid[index] = false }
-                }
-                if valid[0] {
-                    let orders = fcStatic
-                        ? [[0, 1, 4], [1, 4, 0], [4, 0, 1]]
-                        : (rawWide
-                            ? [[0, 1, 2, 3], [1, 2, 3, 0], [2, 3, 0, 1]]
-                            : [[0, 1, 2], [1, 2, 0], [2, 0, 1]])
-                    for order in orders {
-                        if !valid[0] { break }
-                        var round = [[UInt64]](repeating: [], count: candidateCount)
-                        for mirrored in [order, Array(order.reversed())] {
-                            if !valid[0] { break }
-                            for index in mirrored where methods.contains(index) && valid[index] {
-                                if let elapsed = w4Pair24Time({ build(index) }) { round[index].append(elapsed) }
-                                else { valid[index] = false; samples[index] = [] }
-                            }
-                        }
-                        for index in methods {
-                            legs[index].append(round[index])
-                            if valid[index] && round[index].count == 2 {
-                                samples[index].append(round[index][0] + round[index][1])
-                            }
-                        }
-                    }
-                }
-            }
-            let choice = w4Pair24ChooseWithFCStatic(valid: valid, samples: samples, wideEligible: rawWide, eligible: fcStatic)
-            withExtendedLifetime((xq, a, x, sizes)) {}
-            let cold = DispatchTime.now().uptimeNanoseconds - coldStart
             FileHandle.standardError.write(Data(
-                "DF2 pair24 select K\(K) N\(ns) form\(form) narrow=\(narrow) R16 policy=all3>=1.03 valid=\(valid) warm_ns=\(warm) legs_ns=\(legs) round_sums_ns=\(samples) ordinary=\(choice.ordinary) full16=\(choice.full16) calibration_ns=\(cold)\n".utf8))
-            return choice
+                "DF2 pair24 select K\(K) N\(ns) form\(form) narrow=\(narrow) R16 policy=reference ordinary=raw full16=raw\n".utf8))
+            return W4Pair24Choice(ordinary: .raw, full16: .raw)
         }
     }
 
