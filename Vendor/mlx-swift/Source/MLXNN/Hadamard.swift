@@ -315,7 +315,7 @@ public struct SignedBlockHadamard {
             }
             """
 
-    public static func quantized4096Source(
+    private static func quantized4096Source(
         swiglu: Bool, residualNorm: Bool = false, gatedNorm: Bool = false,
         attentionGate: Bool = false, normalizedOutput: Bool = false,
         rotatedOutput: Bool = false, normOnly: Bool = false, headError2: Bool = false
@@ -584,9 +584,12 @@ public struct SignedBlockHadamard {
             of: "* uint(VERIFY_ROWS) + ag_row", with: "* uint(ATTENTION_ROWS) + ag_row"),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `quantizedForVerifyAttentionGate` at prompt width: rows `ATTENTION_ROWS`, codes `[rows, width]`,
-    /// constants in the row-tiled order `PromptInt8Matmul` reads. Nil when the shapes do not qualify.
-    public func quantizedForPromptAttentionGate(
+    /// `quantizedForVerifyAttentionGate` at prompt width: the same kernel
+    /// arithmetic, with the head-major attention rows given by
+    /// `ATTENTION_ROWS`, the codes `[rows, width]` and the constants in the
+    /// row-tiled order `PromptInt8Matmul` reads. Nil when the shapes do not
+    /// qualify.
+    func quantizedForPromptAttentionGate(
         _ attention: MLXArray, queryProjection: MLXArray
     ) -> PromptInt8Activation? {
         guard blockSize == 4096, width == 4096, attention.dtype == .float32,
@@ -682,7 +685,11 @@ public struct SignedBlockHadamard {
         source: quantized4096Source(swiglu: false, residualNorm: true, normalizedOutput: true),
         header: quantized4096Header, ensureRowContiguous: true)
 
-    /// `[codes, ascale, rsb, x + residual, rmsNorm(x + residual, weight)]` at verify width, in MLX's add and norm bits.
+    /// `residualNorm` at verify width that also returns the normalized
+    /// (unrotated) rows: `[codes, ascale, rsb, x + residual, rmsNorm(x +
+    /// residual, weight)]`. The sum and the normalized values are the bits of
+    /// MLX's add and `rmsNorm`; the codes are those of `quantizedForVerify`
+    /// on the normalized rows.
     func residualNormVerifyNormalized(
         _ x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
     ) -> [MLXArray]? {
@@ -1502,8 +1509,7 @@ extension SignedBlockHadamard {
     static let wideRowLean = flagOn("DARKBLOOM_BONSAI_WHT_LEAN")
     static let wideRowLeanNegative = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_WHT_LEAN_NEGCTL"] == "1"
     static let wideRowLeanThreads: [WideRowKind: Int] = [
-        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512,
-        .attentionGate: 512, .normNormed: flagOn("DARKBLOOM_BONSAI_WHT_LEAN_NN") ? 1024 : 0,
+        .residualNormNormed: 1024, .residualNorm: 1024, .gatedNorm: 1024, .swiglu: 512, .attentionGate: 512,
     ]
 
     private static func wideRowMakeKernels(hoist: Bool, threads: Int, headError2: Bool = false, lean: Bool = false)
@@ -1567,7 +1573,10 @@ extension SignedBlockHadamard {
         for kind in WideRowKind.allCases where wideRowKindEnabled(kind) {
             let candidates = wideRowLaneCandidates(kind)
             for threads in candidates {
-                // An MLX error falls to the next lane count, then to the record kernel.
+                // An MLX error in the check (a pipeline that cannot run this
+                // many threads per threadgroup on this GPU, a compile error)
+                // falls to the next lane count, then to the record kernel,
+                // instead of stopping the process.
                 var note = "mismatch"
                 do {
                     if try withError({ wideRowCheck(kind, threads: threads) }) {
@@ -8562,7 +8571,6 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         public let residual: MLXArray
         /// `rmsNorm(x + delta, weight)`.
         public let normalized: MLXArray
-        public var outputs: [MLXArray] { [activation.codes, activation.ascale, activation.rsb, residual] }
     }
 
     /// `x`, its RMSNorm and the verify codes of the rotated norm in one kernel.
@@ -8590,10 +8598,10 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     /// `x + delta`, its RMSNorm and the verify codes of the rotated norm in one kernel, with the rotation of
-    /// `projections` (all must share it). Without `normalized` the norm is not stored and `normalized` is the sum.
+    /// `projections` (all must share it).
     public static func verifyBoundary(
         _ x: MLXArray, delta: MLXArray, weight: MLXArray, eps: Float,
-        projections: [Linear], normalized: Bool = true
+        projections: [Linear]
     ) -> VerifyBoundary? {
         guard x.ndim >= 2, x.dim(-1) == 4096, x.dtype == .float32, VerifyInt8Matmul.route != .off,
             VerifyInt8Matmul.rowRange.contains(x.size / 4096)
@@ -8605,15 +8613,14 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
                     && $0.transform.blockSize == 4096 && $0.weight.dim(0) % 32 == 0
                     && $0.transform.isIdentical(to: first.transform)
             }),
-            let outputs = normalized ? first.transform.residualNormVerifyNormalized(
-                x, residual: delta, weight: weight, eps: eps) : first.transform.residualNorm(
-                x, residual: delta, weight: weight, eps: eps, quantized: true, verifyRows: x.size / 4096)
+            let outputs = first.transform.residualNormVerifyNormalized(
+                x, residual: delta, weight: weight, eps: eps)
         else { return nil }
         let rows = x.size / 4096
         return VerifyBoundary(
             activation: PromptInt8Activation(
                 codes: outputs[0], ascale: outputs[1], rsb: outputs[2], rows: rows, k: 4096),
-            transform: first.transform, residual: outputs[3], normalized: outputs[outputs.count - 1])
+            transform: first.transform, residual: outputs[3], normalized: outputs[4])
     }
 
     /// `projections` applied to `boundary.normalized` from the boundary's
@@ -8969,18 +8976,18 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
         return bias.map { shaped + $0 } ?? shaped
     }
 
-    /// `callAfterAttentionGate` at prompt width (`PromptInt8Matmul` rows), as `[1, rows, N]`;
-    /// `quantized`: its codes, ascale and rsb. Nil when the route, packing or shapes do not qualify.
+    /// `callAfterAttentionGate` at prompt width (`PromptInt8Matmul` rows):
+    /// `self(attention * sigmoid(gate))` with the gate formed in the
+    /// quantizing rotation, as `[1, rows, N]`. Nil when the route, the
+    /// packing or the shapes do not qualify.
     public func callAfterAttentionGatePrompt(
-        _ attention: MLXArray, queryProjection: MLXArray, fold: PromptResidualFold? = nil,
-        quantized q: [MLXArray]? = nil
+        _ attention: MLXArray, queryProjection: MLXArray, fold: PromptResidualFold? = nil
     ) -> MLXArray? {
         guard gdnLayout == nil, readsFloat16ConstantsInPlace, transform.blockSize == 4096,
             attention.ndim == 4, PromptInt8Matmul.applies(rows: attention.dim(2)),
             weight.dim(0) % 64 == 0, transform.width % 512 == 0, PromptInt8Matmul.route != .off,
-            let activation = q.map({ PromptInt8Activation(
-                codes: $0[0], ascale: $0[1], rsb: $0[2], rows: attention.dim(2), k: 4096) })
-                ?? transform.quantizedForPromptAttentionGate(attention, queryProjection: queryProjection),
+            let activation = transform.quantizedForPromptAttentionGate(
+                attention, queryProjection: queryProjection),
             let output = promptMatmul(activation, fold: fold)
         else { return nil }
         let shaped = output.reshaped([1, activation.rows, weight.dim(0)])
@@ -9515,7 +9522,8 @@ private enum DraftStepRowKernels {
 
 extension HadamardQuantizedEmbedding {
     /// Draft-only front row of an MTP head step: `[rmsNorm(self(token)) · embedNorm | rmsNorm(hidden) · hiddenNorm]`
-    /// as one FP32 `[2 * 4096]` row, computed in FP32.
+    /// as one FP32 `[2 * 4096]` row, computed in FP32 (the module path rounds the looked-up row to the FP16
+    /// constants' dtype first).
     public func draftFrontRow(
         token: MLXArray, embedNorm: MLXArray, hidden: MLXArray, hiddenNorm: MLXArray, eps: MLXArray
     ) -> MLXArray? {

@@ -150,23 +150,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
 
-        if keys == nil, absoluteOffset == 0, Self.firstFillVerified,
-            let (filledKeys, filledValues) = Self.firstFill(
-                newKeys, newValues, capacity: min(maxLength, max(capacity, n)))
-        {
-            capacity = min(maxLength, max(capacity, n))
-            keys = filledKeys
-            values = filledValues
-        } else {
-            ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
+        ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-            if keys!.ndim == 4, newKeys.ndim == 4, values!.ndim == 4, newValues.ndim == 4 {
-                keys = Self.sliceUpdate(keys!, newKeys, absoluteOffset ..< (absoluteOffset + n))
-                values = Self.sliceUpdate(values!, newValues, absoluteOffset ..< (absoluteOffset + n))
-            } else {
-                keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
-                values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
-            }
+        if keys!.ndim == 4, newKeys.ndim == 4, values!.ndim == 4, newValues.ndim == 4 {
+            keys = Self.sliceUpdate(keys!, newKeys, absoluteOffset ..< (absoluteOffset + n))
+            values = Self.sliceUpdate(values!, newValues, absoluteOffset ..< (absoluteOffset + n))
+        } else {
+            keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
+            values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         }
         absoluteOffset += n
 
@@ -222,102 +213,6 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     func cbv2InnerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
-    }
-
-    // MARK: - First fill
-
-    /// `DARKBLOOM_BONSAI_ATTN_KVFILL=0` keeps the zero fill and the slice update of a sequence's first append.
-    public static let firstFillOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_KVFILL"] != "0"
-    static let firstFillNegativeControl =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_KVFILL_NEGCTL"] == "1"
-    /// Written once by `prepareFirstFill` before the resident serves; read-only afterwards.
-    nonisolated(unsafe) public private(set) static var firstFillVerified = false
-
-    /// The first append as one kernel: the whole `[1, heads, capacity, headDim]` buffer, the source's rows
-    /// first (read through its strides, so a transposed value view needs no copy) and zeros after, where the
-    /// record allocates `zeros` and slice-updates the rows in. The same stored values, one pass less.
-    private static let firstFillKernel = MLXFast.metalKernel(
-        name: "cbv2_first_kv_fill",
-        inputNames: ["src"], outputNames: ["dst"],
-        source: """
-            const uint x = thread_position_in_grid.x;
-            const uint row = thread_position_in_grid.y;
-            const uint head = thread_position_in_grid.z;
-            float4 value = float4(0.0f);
-            if (row < uint(src_shape[2])) {
-              const device float* p = src + head * src_strides[1] + row * src_strides[2] + x * 4 * src_strides[3];
-              value = src_strides[3] == 1
-                  ? float4(*((const device packed_float4*)p))
-                  : float4(p[0], p[src_strides[3]], p[2 * src_strides[3]], p[3 * src_strides[3]]);
-            }
-            *((device float4*)(dst + (head * uint(CAPACITY) + row) * uint(HEAD_DIM) + x * 4)) = value;
-            """,
-        ensureRowContiguous: false)
-
-    private static func firstFill(
-        _ newKeys: MLXArray, _ newValues: MLXArray, capacity: Int
-    ) -> (MLXArray, MLXArray)? {
-        guard StreamOrDevice.default == StreamOrDevice.gpu else { return nil }
-        guard let filledKeys = fill(newKeys, capacity: capacity),
-            let filledValues = fill(newValues, capacity: capacity)
-        else { return nil }
-        return (filledKeys, filledValues)
-    }
-
-    private static func fill(_ source: MLXArray, capacity: Int) -> MLXArray? {
-        guard source.ndim == 4, source.dtype == .float32, source.dim(0) == 1, source.dim(3) % 4 == 0,
-            source.dim(3) <= 1024, source.dim(2) <= capacity
-        else { return nil }
-        let heads = source.dim(1)
-        let headDim = source.dim(3)
-        return firstFillKernel(
-            [source],
-            template: [("CAPACITY", capacity), ("HEAD_DIM", headDim)],
-            grid: (headDim / 4, capacity, heads), threadGroup: (headDim / 4, 1, 1),
-            outputShapes: [[1, heads, capacity, headDim]], outputDTypes: [.float32])[0]
-    }
-
-    /// Boot check: 512, 137 and 64 rows of a contiguous key block and a transposed (strided) value view, 4 heads
-    /// of 256, capacity rows + 256 as the cache allocates: the first fill against `zeros` + slice update, word for
-    /// word; the same fill of a source one word off must differ. Returns the failed and the total case count.
-    public static func prepareFirstFill() -> (bad: Int, cases: Int) {
-        var bad = 0
-        var cases = 0
-        guard firstFillOffered else { return (0, 0) }
-        for rows in [512, 137, 64] {
-            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x4B56_0000 + rows)), into: 2)
-            let keySource = MLXRandom.normal([1, 4, rows, 256], key: keys[0])
-            let valueSource = MLXRandom.normal([1, rows, 4, 256], key: keys[1]).transposed(0, 2, 1, 3)
-            let capacity = rows + initialSlack
-            func record(_ source: MLXArray) -> MLXArray {
-                sliceUpdate(MLXArray.zeros([1, 4, capacity, 256], dtype: .float32), source, 0 ..< rows)
-            }
-            func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
-                a.shape == b.shape
-                    && MLX.all(
-                        contiguous(a).view(dtype: .uint32) .== contiguous(b).view(dtype: .uint32)
-                    ).item(Bool.self)
-            }
-            let off = MLXArray((0 ..< keySource.size).map { (i: Int) -> Float in
-                i == (3 * rows + rows / 2) * 256 + 5 ? 1 : 0
-            }).reshaped(keySource.shape)
-            guard let leanKeys = fill(firstFillNegativeControl ? keySource + off : keySource, capacity: capacity),
-                let leanValues = fill(valueSource, capacity: capacity),
-                let control = fill(keySource + off, capacity: capacity)
-            else {
-                bad += 1
-                cases += 1
-                continue
-            }
-            cases += 1
-            if !same(leanKeys, record(keySource)) || !same(leanValues, record(valueSource))
-                || same(control, record(keySource))
-            {
-                bad += 1
-            }
-        }
-        firstFillVerified = bad == 0 && cases > 0
-        return (bad, cases)
     }
 
     // MARK: - Private

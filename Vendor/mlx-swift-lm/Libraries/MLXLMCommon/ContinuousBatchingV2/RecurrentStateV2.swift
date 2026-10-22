@@ -545,12 +545,10 @@ public final class CBv2RecurrentRequestState {
                 // A draft tree commit replays its accepted path: the rows are read now, the
                 // lazy replay may run after the round.
                 let treePath = CBv2BranchVerify.committedRows
-                let treeParents = CBv2BranchVerify.committedParents
                 deferredCommitted = {
-                    let outer = (CBv2BranchVerify.committedRows, CBv2BranchVerify.committedParents)
+                    let outer = CBv2BranchVerify.committedRows
                     CBv2BranchVerify.committedRows = treePath
-                    CBv2BranchVerify.committedParents = treeParents
-                    defer { (CBv2BranchVerify.committedRows, CBv2BranchVerify.committedParents) = outer }
+                    defer { CBv2BranchVerify.committedRows = outer }
                     return replay.mapValues { $0.replay(keep) }
                 }
             }

@@ -314,11 +314,7 @@ extension EngineLoopV2 {
             let committedRows = outcome.path.prefix(max(confirmed, 1)).map { Int32($0) }
             let treeBranch = CBv2BranchVerify.isBranch(committedRows)
             CBv2BranchVerify.committedRows = treeBranch ? committedRows : nil
-            CBv2BranchVerify.committedParents = verify.treeDesc != nil ? Array(host.suffix(16)) : nil
-            defer {
-                CBv2BranchVerify.committedRows = nil
-                CBv2BranchVerify.committedParents = nil
-            }
+            defer { CBv2BranchVerify.committedRows = nil }
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {

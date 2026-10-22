@@ -1445,9 +1445,9 @@ private enum Qwen35Fresh8PromptGDN {
     /// Simdgroups per threadgroup for the two chunk scans. `r0` is
     /// `thread_position_in_grid.y * 8`, so the block a simdgroup owns does not depend on
     /// this count; only how many threadgroups share one staged chunk does. The check
-    /// below compares both launch shapes bit for bit on both scans at the served shape,
-    /// and 8 serves whenever it passes, so no boot-time sample picks the route.
-    /// `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4.
+    /// below compares both launch shapes bit for bit and times them at the served shape,
+    /// and 8 serves only if it is at least 1% faster.
+    /// `DARKBLOOM_BONSAI_PSCAN8=0` keeps 4; `=1` forces 8 after the bit check.
     private static let scanNS: Int = resolveScanNS()
 
     private static func resolveScanNS() -> Int {
@@ -1458,9 +1458,12 @@ private enum Qwen35Fresh8PromptGDN {
                 Data("qwen35 prompt scan simdgroups: 4 (DARKBLOOM_BONSAI_PSCAN8=0)\n".utf8))
             return 4
         }
-        let passed = scanShapesAgree()
-        let ns = passed ? 8 : 4
-        let reason = passed ? "bits equal at the served shape" : "bit mismatch or error, 4 kept"
+        let forced = ["1", "true", "yes", "on"].contains(raw ?? "")
+        let verdict = scanShapeVerdict()
+        let ns = verdict.gain >= 0.01 || forced ? verdict.passed ? 8 : 4 : 4
+        let reason = verdict.passed
+            ? String(format: "%.1f%% faster than 4 at the served shape", verdict.gain * 100)
+            : "bit mismatch or error, 4 kept"
         FileHandle.standardError.write(
             Data("qwen35 prompt scan simdgroups: \(ns) (\(reason))\n".utf8))
         return ns
@@ -1473,9 +1476,10 @@ private enum Qwen35Fresh8PromptGDN {
         return (MLX.sin(i * 0.017 + seed) * amplitude * scale).reshaped(shape)
     }
 
-    /// Runs both launch shapes of both chunk scans at the served shape (T = 512, 16 key
-    /// heads, 32 value heads) and compares every output word.
-    private static func scanShapesAgree() -> Bool {
+    /// Runs both scans at the served shape (T = 512, 16 key heads, 32 value heads), compares
+    /// every output word, and times the value-folded scan, which is the prompt path used by the
+    /// timed prefill.
+    private static func scanShapeVerdict() -> (passed: Bool, gain: Double) {
         let T = 512
         let rows = MLXArray(Int32(T))
         let q = scanProbe([1, T, 16, 128], seed: 0.01, scale: 0.5)
@@ -1493,7 +1497,7 @@ private enum Qwen35Fresh8PromptGDN {
             grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
             outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
             outputDTypes: [.float32, .float32, .float32])
-        func folded(_ ns: Int) -> [MLXArray] {
+        func outputs(_ ns: Int) -> [MLXArray] {
             convolvedValueScanKernel(
                 [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
                 template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
@@ -1501,18 +1505,11 @@ private enum Qwen35Fresh8PromptGDN {
                 outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
                 outputDTypes: [.float32, .float32])
         }
-        func plain(_ ns: Int) -> [MLXArray] {
-            scanKernel(
-                [q, k, v, prepared[0], prepared[1], prepared[2], rows],
-                template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
-                grid: (32, 16, 32), threadGroup: (32, ns, 1),
-                outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
-                outputDTypes: [.float32, .float32])
-        }
+        var passed = false
         do {
-            return try withError {
-                let four = folded(4) + plain(4)
-                let eight = folded(8) + plain(8)
+            passed = try withError {
+                let four = outputs(4)
+                let eight = outputs(8)
                 eval(four + eight)
                 for (a, b) in zip(four, eight) {
                     let same = (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
@@ -1523,8 +1520,22 @@ private enum Qwen35Fresh8PromptGDN {
             }
         } catch {
             FileHandle.standardError.write(Data("qwen35 prompt scan check error: \(error)\n".utf8))
-            return false
+            return (false, 0)
         }
+        guard passed else { return (false, 0) }
+        func chain(_ ns: Int) -> Double {
+            var best = Double.infinity
+            for _ in 0 ..< 3 {
+                let start = DispatchTime.now().uptimeNanoseconds
+                eval(outputs(ns))
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start)
+                best = min(best, elapsed)
+            }
+            return best
+        }
+        let four = chain(4)
+        let eight = chain(8)
+        return (true, four > 0 ? 1 - eight / four : 0)
     }
 
 }
@@ -3190,99 +3201,6 @@ enum Qwen35FusedGDNVerify {
         let message = "gdn16 checked: tune=\(tunePassed) delta=\(deltaPassed)"
             + " unroll=\(Qwen35DeltaReplay.unrolledPassed) dead=\(deadPassed) dead2=\(chainStoresPassed)\n"
         FileHandle.standardError.write(Data(message.utf8))
-        guard Qwen35SnapshotCommit.offered else { return }
-        var snapOK = false
-        if snapshotOffered && fastTreeOffered && deltaPassed && chainStoresPassed {
-            do {
-                snapOK = try withError { checkSnapshotCommit() }
-            } catch {
-                FileHandle.standardError.write(Data("snap commit check error: \(error)\n".utf8))
-            }
-        }
-        Qwen35SnapshotCommit.mode = !snapOK ? .off : Qwen35SnapshotCommit.audit ? .auditing : .on
-        FileHandle.standardError.write(Data("snap commit checked: \(snapOK)\n".utf8))
-    }
-
-    /// The tree kernel the checked flags select, on fixed and pseudo-random descriptors: for every
-    /// path `CBv2BranchVerify.snapshotPrefix` accepts, a path ending at the snapshot row has the
-    /// kernel's `state_out` and `Qwen35SnapshotCommit.convTail` as its replay's bits, and a longer
-    /// path replayed from `state_out` past that row has the full replay's bits. Each skip width
-    /// compiles and matches on a chain. The parent row's replay must differ from `state_out`.
-    private static func checkSnapshotCommit() -> Bool {
-        let flags = (tunePassed, deltaPassed, deadPassed, chainStoresPassed)
-        defer { (tunePassed, deltaPassed, deadPassed, chainStoresPassed) = flags }
-        var trees: [[Int32]] = [
-            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
-            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 12],
-        ]
-        var seed: UInt32 = 12345
-        for _ in 0 ..< 8 {
-            var parents: [Int32] = [-1]
-            for t in 1 ..< 16 {
-                seed = seed &* 1_664_525 &+ 1_013_904_223
-                parents.append(Int32(t - 1 - Int(seed >> 16) % min(t, 4)))
-            }
-            trees.append(parents)
-        }
-        var ok = true
-        var distinct = false
-        var (ends, passes) = (0, 0)
-        for kind in 0 ..< 2 {
-            let convState = probeRows([1, 3, 8192], seed: 0.01, scale: 0.5)
-            let qkv = probeRows([1, 16, 8192], seed: 0.02, scale: 0.5)
-            let weight = probeRows([8192, 4, 1], seed: 0.03, scale: 0.1)
-            let a = probeRows([1, 16, 32], seed: 0.04, scale: 30)
-            let b = probeRows([1, 16, 32], seed: 0.05, scale: 8)
-            let aLog = probeRows([32], seed: 0.06, scale: 2)
-            let bias = probeRows([32], seed: 0.07, scale: 3)
-            let state = kind == 1 ? probeWords([1, 32, 128, 128])
-                : probeRows([1, 32, 128, 128], seed: 0.08, scale: 0.5)
-            let inputs = [convState, qkv, weight, a, b, aLog, bias, state]
-            for parents in trees {
-                let paths = probeTree(parents.map(Int.init)).1.map { $0.map(Int32.init) }
-                guard let out = probeForward(inputs, tuned: flags.0, delta: true, tree: probeTree(parents.map(Int.init)).0,
-                        dead: flags.2, chain: true),
-                    let tape = out.7
-                else { return false }
-                let split = out.0.dim(1) == 16
-                func replay(_ path: [Int32], from: MLXArray, skip: Int) -> (MLXArray, MLXArray)? {
-                    Qwen35DeltaReplay.run(committedRows: path.count, k: out.3, delta: tape, state: from,
-                        convInput: out.0, treeRows: MLXArray(path), stateIsRowContiguous: true,
-                        convState: split ? convState : nil, skip: skip)
-                }
-                for path in paths {
-                    guard let prefix = CBv2BranchVerify.snapshotPrefix(parents: parents, path: path) else { continue }
-                    let (row, rows) = prefix
-                    guard let full = replay(path, from: state, skip: 0) else { return false }
-                    if rows == path.count {
-                        let tail = Qwen35SnapshotCommit.convTail(
-                            path: path, convInput: out.0, convState: split ? convState : nil)
-                        ok = sameBits([full.0, full.1], [out.5, tail]) && ok
-                        ends += 1
-                        if kind == 0, row > 0, let other = replay(paths[Int(parents[row])], from: state, skip: 0) {
-                            distinct = distinct || !sameBits([other.0], [out.5])
-                        }
-                    } else {
-                        guard let resumed = replay(path, from: out.5, skip: rows) else { return false }
-                        ok = sameBits([full.0, full.1], [resumed.0, resumed.1]) && ok
-                        passes += 1
-                    }
-                }
-                if kind == 0, parents == trees[0] {
-                    for n in 2 ... 16 {
-                        let chain = (0 ..< Int32(n)).map { $0 }
-                        guard let first = replay([0], from: state, skip: 0),
-                            let full = replay(chain, from: state, skip: 0),
-                            let resumed = replay(chain, from: first.0, skip: 1)
-                        else { return false }
-                        ok = sameBits([full.0, full.1], [resumed.0, resumed.1]) && ok
-                    }
-                }
-            }
-        }
-        return ok && distinct && ends > 0 && passes > 0
     }
 
     private static func probeRows(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
@@ -3535,72 +3453,6 @@ enum Qwen35FusedGDNVerify {
 
 }
 
-/// B and B': on a tree commit whose accepted path passes the verify's snapshot row
-/// (`snapshotTreeSource`; with `chainStores` a branching descriptor leaves that snapshot in
-/// `state_out`), a path ending at the row commits `state_out` and its conv rows, and a longer path
-/// replays only the rows after it. The load check (`checkSnapshotCommit`) must pass first; a
-/// failure keeps the record replay, and so does `DARKBLOOM_BONSAI_SNAP_COMMIT=0`. Nothing checks
-/// on the round path: the boot warm runs no engine round, so a check there would sit in a timed window.
-enum Qwen35SnapshotCommit {
-    static let offered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SNAP_COMMIT"] != "0"
-    /// Diagnostic only: every snapshot commit keeps the record replay's result and checks the
-    /// snapshot path against it, reading the checks back one commit later.
-    static let audit = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_SNAP_COMMIT_AUDIT"] == "1"
-
-    enum Mode { case off, auditing, on }
-    nonisolated(unsafe) static var mode = Mode.off
-    nonisolated(unsafe) private static var pending: [(same: MLXArray, ends: Bool)] = []
-    nonisolated(unsafe) private static var audited = (ends: 0, endsSame: 0, passes: 0, passesSame: 0)
-
-    /// The mode; while auditing, first reads the queued checks of earlier commits.
-    static func current() -> Mode {
-        guard mode == .auditing, pending.count >= 24 else { return mode }
-        let same = stacked(pending.map { $0.same }).asArray(Bool.self)
-        for (entry, equal) in zip(pending, same) {
-            if entry.ends {
-                audited.ends += 1
-                audited.endsSame += equal ? 1 : 0
-            } else {
-                audited.passes += 1
-                audited.passesSame += equal ? 1 : 0
-            }
-        }
-        FileHandle.standardError.write(Data(("snap commit audit: ends \(audited.endsSame)/\(audited.ends)"
-            + " passes \(audited.passesSame)/\(audited.passes) layer commits equal\n").utf8))
-        pending.removeAll()
-        return mode
-    }
-
-    static func note(record: CBv2RecurrentLayerState, snapshot: CBv2RecurrentLayerState, ends: Bool) {
-        func same(_ a: MLXArray?, _ b: MLXArray?) -> MLXArray {
-            guard let a, let b, a.shape == b.shape, a.dtype == .float32, b.dtype == .float32 else {
-                return MLXArray(false)
-            }
-            return (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
-        }
-        pending.append((same(record.ssm, snapshot.ssm) .&& same(record.conv, snapshot.conv), ends))
-    }
-
-    /// The conv rows after `path`: the replay's `conv_tail` bits. `convState` set: `convInput` is
-    /// the window alone.
-    static func convTail(path: [Int32], convInput: MLXArray, convState: MLXArray?) -> MLXArray {
-        let rows = (0 ..< 3).map { path.count + $0 }
-        let index: [Int32]
-        let source: MLXArray
-        if let convState, rows[0] < 3 {
-            index = rows.map { $0 < 3 ? Int32($0) : 3 + path[$0 - 3] }
-            source = concatenated([convState, convInput], axis: 1)
-        } else if convState != nil {
-            index = rows.map { path[$0 - 3] }
-            source = convInput
-        } else {
-            index = rows.map { $0 < 3 ? Int32($0) : 3 + path[$0 - 3] }
-            source = convInput
-        }
-        return source.view(dtype: .uint32).take(HostConstants.recentInt32(index), axis: 1).view(dtype: .float32)
-    }
-}
-
 /// Accepted-prefix state reconstruction from the exact delta captured by verify.
 /// The multiply and FMA remain separate, in the original recurrence order.
 private enum Qwen35DeltaReplay {
@@ -3661,18 +3513,16 @@ private enum Qwen35DeltaReplay {
         inputNames: ["t_in", "k", "delta", "state_in", "conv_in"],
         outputNames: ["state_out", "conv_tail"], source: source, ensureRowContiguous: true)
 
-    private static let treeSource = source
-        .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
-        .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
-        .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
-        .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
-        .replacingOccurrences(of: "(T + r) * cdim", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * cdim")
-
     private static let treeKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_delta_tree_replay",
         inputNames: ["k", "delta", "state_in", "conv_in", "tree_rows"],
         outputNames: ["state_out", "conv_tail"],
-        source: treeSource,
+        source: source
+            .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
+            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+            .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
+            .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
+            .replacingOccurrences(of: "(T + r) * cdim", with: "((T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u])) * cdim"),
         ensureRowContiguous: true)
 
     /// The same recurrence with the step count as a template constant: the loop unrolls, the
@@ -3794,18 +3644,16 @@ private enum Qwen35DeltaReplay {
         inputNames: ["t_in", "k", "delta", "state_in", "conv_state", "conv_in"],
         outputNames: ["state_out", "conv_tail"], source: splitSource, ensureRowContiguous: true)
 
-    private static let splitTreeSource = splitSource
-        .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
-        .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
-        .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
-        .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
-        .replacingOccurrences(of: "const uint row = T + r;", with: "const uint row = (T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u]);")
-
     private static let splitTreeKernel = MLXFast.metalKernel(
         name: "qwen35_gdn_delta_tree_replay_split",
         inputNames: ["k", "delta", "state_in", "conv_state", "conv_in", "tree_rows"],
         outputNames: ["state_out", "conv_tail"],
-        source: splitTreeSource,
+        source: splitSource
+            .replacingOccurrences(of: "const uint T = uint(t_in[0]);", with: "const uint T = uint(tree_rows_shape[0]);")
+            .replacingOccurrences(of: "for (uint t = 0; t < T; ++t) {", with: "for (uint t = 0; t < T; ++t) {\nconst uint step = uint(tree_rows[t]);")
+            .replacingOccurrences(of: "(t * uint(Hv)", with: "(step * uint(Hv)")
+            .replacingOccurrences(of: "t * uint(Hk * Dk)", with: "step * uint(Hk * Dk)")
+            .replacingOccurrences(of: "const uint row = T + r;", with: "const uint row = (T + r) < 3u ? (T + r) : 3u + uint(tree_rows[T + r - 3u]);"),
         ensureRowContiguous: true)
 
     private static func splitUnrolled(_ text: String) -> String {
@@ -3829,49 +3677,14 @@ private enum Qwen35DeltaReplay {
         outputNames: ["state_out", "conv_tail"], source: splitUnrolled(unrolledTreeSource),
         ensureRowContiguous: true)
 
-    /// The tree replays with the state scan starting at path row `t_skip[0]`: `state_in` is
-    /// then the state after the path's first `t_skip[0]` rows (the verify's snapshot), and the
-    /// conv tail still follows the whole path. The steps that run are the record's.
-    private static func skipping(_ text: String, unrolled: Bool) -> String? {
-        let (from, to) = unrolled
-            ? ("const float g = gs[t];", "if (t < uint(t_skip[0])) continue;\nconst float g = gs[t];")
-            : ("for (uint t = 0; t < T; ++t) {", "for (uint t = uint(t_skip[0]); t < T; ++t) {")
-        guard text.components(separatedBy: from).count == 2 else { return nil }
-        return text.replacingOccurrences(of: from, with: to)
-    }
-
-    private static func skipKernel(_ name: String, _ text: String, unrolled: Bool, split: Bool)
-        -> MLXFast.MLXFastKernel?
-    {
-        skipping(text, unrolled: unrolled).map {
-            MLXFast.metalKernel(
-                name: name + "_skip",
-                inputNames: ["t_skip", "k", "delta", "state_in"] + (split ? ["conv_state"] : [])
-                    + ["conv_in", "tree_rows"],
-                outputNames: ["state_out", "conv_tail"], source: $0, ensureRowContiguous: true)
-        }
-    }
-
-    private static let skipTreeKernel = skipKernel(
-        "qwen35_gdn_delta_tree_replay", treeSource, unrolled: false, split: false)
-    private static let skipUnrolledTreeKernel = skipKernel(
-        "qwen35_gdn_delta_tree_replay_unrolled", unrolledTreeSource, unrolled: true, split: false)
-    private static let skipSplitTreeKernel = skipKernel(
-        "qwen35_gdn_delta_tree_replay_split", splitTreeSource, unrolled: false, split: true)
-    private static let skipUnrolledSplitTreeKernel = skipKernel(
-        "qwen35_gdn_delta_tree_replay_unrolled_split", splitUnrolled(unrolledTreeSource),
-        unrolled: true, split: true)
-
     /// `convState` set: `convInput` is the verify window alone (`Qwen35FusedGDNVerify` without
-    /// its conv copy) and `convState` the three rows before it. `skip` > 0 (tree rows only):
-    /// `state` holds the state after the first `skip` path rows, and the scan runs the rest.
+    /// its conv copy) and `convState` the three rows before it.
     static func run(
         committedRows: Int, k: MLXArray, delta: MLXArray, state: MLXArray, convInput: MLXArray,
         treeRows: MLXArray? = nil, stateIsRowContiguous: Bool = false, unrolled: Bool? = nil,
-        convState: MLXArray? = nil, skip: Int = 0
+        convState: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
-        guard (1...16).contains(committedRows), (0 ..< committedRows).contains(skip),
-            skip == 0 || treeRows != nil,
+        guard (1...16).contains(committedRows),
             k.ndim == 4, k.dim(0) == 1, (1...16).contains(k.dim(1)), k.dim(3) == 128,
             state.ndim == 4, state.dim(0) == 1, state.dim(2) == 128,
             delta.shape == [1, k.dim(1), state.dim(1), 129],
@@ -3894,21 +3707,11 @@ private enum Qwen35DeltaReplay {
         if let treeRows {
             guard treeRows.dtype == .int32, treeRows.ndim == 1,
                 treeRows.size == committedRows else { return nil }
-            let rest = convState.map { [k, delta, state, $0, convInput, treeRows] }
+            inputs = convState.map { [k, delta, state, $0, convInput, treeRows] }
                 ?? [k, delta, state, convInput, treeRows]
-            if skip > 0 {
-                guard let skipped = convState == nil
-                    ? (unroll ? skipUnrolledTreeKernel : skipTreeKernel)
-                    : (unroll ? skipUnrolledSplitTreeKernel : skipSplitTreeKernel)
-                else { return nil }
-                inputs = [HostConstants.int32([Int32(skip)])] + rest
-                selected = skipped
-            } else {
-                inputs = rest
-                selected = convState == nil
-                    ? (unroll ? unrolledTreeKernel : treeKernel)
-                    : (unroll ? unrolledSplitTreeKernel : splitTreeKernel)
-            }
+            selected = convState == nil
+                ? (unroll ? unrolledTreeKernel : treeKernel)
+                : (unroll ? unrolledSplitTreeKernel : splitTreeKernel)
         } else {
             let rows = HostConstants.int32([Int32(committedRows)])
             let lead = unroll ? [k, delta, state] : [rows, k, delta, state]
@@ -4577,49 +4380,12 @@ final class Qwen35GatedDeltaNet: Module {
         return canReplayPrefix(tape: tape, committedRows: committedRows)
     }
 
-    /// `treeStateOut`: the tree verify's `state_out`, which holds its snapshot on a branching
-    /// descriptor (`Qwen35SnapshotCommit`).
     private func replayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int, treeStateOut: MLXArray? = nil
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> CBv2RecurrentLayerState {
         precondition(
             canReplayPrefix(tape: tape, committedRows: committedRows),
             "Qwen35 invalid compact recurrent prefix replay")
-        guard let treeStateOut, Qwen35SnapshotCommit.current() != .off,
-            let snapshot = snapshotCommitState(tape: tape, committedRows: committedRows, snapshot: treeStateOut)
-        else { return recordReplayedPrefixState(tape: tape, committedRows: committedRows) }
-        if Qwen35SnapshotCommit.mode == .on { return snapshot.state }
-        let record = recordReplayedPrefixState(tape: tape, committedRows: committedRows)
-        Qwen35SnapshotCommit.note(record: record, snapshot: snapshot.state, ends: snapshot.ends)
-        return record
-    }
-
-    private func snapshotCommitState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int, snapshot: MLXArray
-    ) -> (state: CBv2RecurrentLayerState, ends: Bool)? {
-        guard let parents = CBv2BranchVerify.committedParents, let delta = tape.delta,
-            tape.ssmPreIsRowContiguous, tape.mask == nil, tape.rowCount == 16, tape.convStateRows == 3,
-            headKDim == 128, headVDim == 128, tape.convInput.dtype == .float32, tape.k.dtype == .float32,
-            snapshot.shape == [1, numVHeads, headVDim, headKDim], snapshot.dtype == .float32
-        else { return nil }
-        let path = CBv2BranchVerify.committedRows ?? (0 ..< Int32(committedRows)).map { $0 }
-        guard path.count == committedRows,
-            let rows = CBv2BranchVerify.snapshotPrefix(parents: parents, path: path)?.rows
-        else { return nil }
-        if rows == committedRows {
-            let conv = Qwen35SnapshotCommit.convTail(path: path, convInput: tape.convInput, convState: tape.convState)
-            return (CBv2RecurrentLayerState(conv: conv, ssm: snapshot, ssmIsRowContiguous: true), true)
-        }
-        guard let replay = Qwen35DeltaReplay.run(committedRows: committedRows, k: tape.k, delta: delta,
-            state: snapshot, convInput: tape.convInput, treeRows: HostConstants.recentInt32(path),
-            stateIsRowContiguous: true, convState: tape.convState, skip: rows)
-        else { return nil }
-        return (CBv2RecurrentLayerState(conv: replay.1, ssm: replay.0, ssmIsRowContiguous: true), false)
-    }
-
-    private func recordReplayedPrefixState(
-        tape: ArraysCache.PrefixReplayTape, committedRows: Int
-    ) -> CBv2RecurrentLayerState {
         if CBv2BranchVerify.committedRowsIsBranch,
             let path = CBv2BranchVerify.committedRows, path.count == committedRows,
             let pathArray = CBv2BranchVerify.committedRowsArray
@@ -5134,8 +4900,7 @@ final class Qwen35GatedDeltaNet: Module {
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
-                                tape: tape, committedRows: keepPositions,
-                                treeStateOut: tree != nil && B == 1 ? finalSSM : nil)
+                                tape: tape, committedRows: keepPositions)
                         })
                 } catch {
                     preconditionFailure(
@@ -5519,79 +5284,6 @@ enum Qwen35VerifyQKNormRoPE {
     }
 }
 
-/// The prompt q/k norm and RoPE kernel with `q * scale` folded in. The scale is 2^-4, so the multiply that MLX's
-/// composed attention graph makes on the whole query is exact and happens here on the register that is stored: the same
-/// IEEE multiply of the same stored float. q leaves block-major (block b = rows 128b ..< 128b + n, laid out as
-/// [heads, n, 256]) so each `[1, heads, n, 256]` block is one contiguous view, the layout that multiply's output
-/// had. k is the record kernel's. Served only after `Qwen35AttentionCore.prepare` finds the block outputs
-/// equal to the record's; `DARKBLOOM_BONSAI_ATTN_QFOLD=0` keeps the record kernel and the graph's multiply.
-extension Qwen35VerifyQKNormRoPE {
-    static let qFoldOffered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_QFOLD"] != "0"
-    /// Written once by `prepare` before the resident serves; read-only afterwards.
-    nonisolated(unsafe) static var qFoldVerified = false
-    nonisolated(unsafe) private static var scaleArrays: [UInt32: MLXArray] = [:]
-
-    private static let foldKernel = MLXFast.metalKernel(
-        name: "qwen35_prompt_qk_norm_rope_qfold",
-        inputNames: inputNames + ["qscale"], outputNames: outputNames,
-        source: replacingOnce(
-            replacingOnce(
-                hoisted ? replacingOnce(source, normRopeParent, normRopeHoisted) : source,
-                "device float* dst = (is_q ? q_out : k_out) + (h * outL + outT) * D;",
-                """
-                const uint blk = t >> 7u;
-                const uint nb = min(128u, L - (blk << 7u));
-                const float qs = qscale[0];
-                device float* dst = is_q
-                    ? q_out + (blk * uint(Q_HEADS) * 128u + h * nb + (t & 127u)) * D
-                    : k_out + (h * L + t) * D;
-                """),
-            "float4(y[part][0], y[part][1], y[part][2], y[part][3]);",
-            """
-            is_q ? float4(y[part][0] * qs, y[part][1] * qs, y[part][2] * qs, y[part][3] * qs)
-                : float4(y[part][0], y[part][1], y[part][2], y[part][3]);
-            """))
-
-    /// `(queryBlocks, keys, queries)`: the 128-row query blocks `[1, queryHeads, n, 256]` already multiplied by
-    /// `scale`, the keys `[1, keyHeads, L, 256]`, and the record kernel's unscaled queries, a graph node nothing
-    /// evaluates unless the blocks go unused. Nil when the prompt does not qualify.
-    static func applyPrompt(
-        queryProjection: MLXArray, keyProjection: MLXArray, queryWeight: MLXArray,
-        keyWeight: MLXArray, queryEps: Float, keyEps: Float, offsets: MLXArray,
-        queryHeads: Int, keyHeads: Int, ropeDims: Int, ropeBase: Float, scale: Float
-    ) -> (blocks: [MLXArray], keys: MLXArray, queries: MLXArray)? {
-        let L = keyProjection.shape3.1
-        guard CBv2PromptAttentionCore.serves(rows: L), L <= 4096,
-            let record = apply(
-                queryProjection: queryProjection, keyProjection: keyProjection, queryWeight: queryWeight,
-                keyWeight: keyWeight, queryEps: queryEps, keyEps: keyEps, offsets: offsets,
-                queryHeads: queryHeads, keyHeads: keyHeads, ropeDims: ropeDims, ropeBase: ropeBase)
-        else { return nil }
-        let bits = scale.bitPattern
-        let scaleArray: MLXArray
-        if let cached = scaleArrays[bits] {
-            scaleArray = cached
-        } else {
-            scaleArray = MLXArray([scale])
-            scaleArrays[bits] = scaleArray
-        }
-        let epsArray = epsRopeBaseArray(queryEps: queryEps, keyEps: keyEps, ropeBase: ropeBase)
-        let outputs = foldKernel(
-            [queryProjection, keyProjection, queryWeight, keyWeight, epsArray, offsets, scaleArray],
-            template: [("Q_HEADS", queryHeads), ("KV_HEADS", keyHeads), ("ROPE_DIMS", ropeDims),
-                ("LAST_QUERY", false)],
-            grid: (32, queryHeads + keyHeads, L), threadGroup: (32, 1, 1),
-            outputShapes: [[queryHeads * L * 256], [1, keyHeads, L, 256]],
-            outputDTypes: [.float32, .float32])
-        let blocks = (0 ..< (L + 127) / 128).map { (index: Int) -> MLXArray in
-            let n = min(128, L - 128 * index)
-            let start = index * queryHeads * 128 * 256
-            return outputs[0][start ..< (start + queryHeads * n * 256)].reshaped(1, queryHeads, n, 256)
-        }
-        return (blocks, outputs[1], record.0)
-    }
-}
-
 final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
@@ -5708,20 +5400,10 @@ final class Qwen35Attention: Module {
         exactTargetVerify: Bool = false,
         boundary: HadamardQuantizedLinear.VerifyBoundary? = nil,
         promptProjections: [MLXArray]? = nil, lastQueryOnly: Bool = false,
-        fold: PromptResidualFold? = nil, normalizedRows: (() -> MLXArray)? = nil
+        fold: PromptResidualFold? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
-        // With `normalizedRows` (`Qwen35DeadOutputs3`), `x` carries only the shape; a path that reads the rows
-        // rebuilds them with the record boundary kernel.
-        var rebuilt: MLXArray? = nil
-        func rows() -> MLXArray {
-            guard let normalizedRows else { return x }
-            if let rebuilt { return rebuilt }
-            let value = normalizedRows()
-            rebuilt = value
-            return value
-        }
         let narrowsToLastQuery = lastQueryOnly && canUseLastQueryPrefill(
             x, cache: cache, positionIds: positionIds, exactTargetVerify: exactTargetVerify)
         let queryRows = narrowsToLastQuery ? 1 : L
@@ -5742,23 +5424,23 @@ final class Qwen35Attention: Module {
                 ? boundary.flatMap {
                     HadamardQuantizedLinear.boundaryProjections($0, projectionLayers)
                 } ?? (L >= 128
-                    ? HadamardQuantizedLinear.sharedPromptProjections(rows(), projectionLayers)
-                    : HadamardQuantizedLinear.sharedShortProjections(rows(), projectionLayers))
+                    ? HadamardQuantizedLinear.sharedPromptProjections(x, projectionLayers)
+                    : HadamardQuantizedLinear.sharedShortProjections(x, projectionLayers))
                 : nil)
         }
         let qProjOutput: MLXArray
         if narrowsToLastQuery {
-            qProjOutput = promptProjections?[0] ?? (qProj as! HadamardQuantizedLinear).callPromptLastRow(rows())!
+            qProjOutput = promptProjections?[0] ?? (qProj as! HadamardQuantizedLinear).callPromptLastRow(x)!
         } else {
             qProjOutput = exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(qProj, rows()) : (shared?[0] ?? qProj(rows()))
+                ? qwen35A3BExactW4G64Projection(qProj, x) : (shared?[0] ?? qProj(x))
         }
         let keyIndex = narrowsToLastQuery && promptProjections == nil ? 0 : 1
         let valueIndex = narrowsToLastQuery && promptProjections == nil ? 1 : 2
         let kProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, rows()) : (shared?[keyIndex] ?? kProj(rows()))
+            ? qwen35A3BExactW4G64Projection(kProj, x) : (shared?[keyIndex] ?? kProj(x))
         let vProjection = exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, rows()) : (shared?[valueIndex] ?? vProj(rows()))
+            ? qwen35A3BExactW4G64Projection(vProj, x) : (shared?[valueIndex] ?? vProj(x))
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -5772,9 +5454,6 @@ final class Qwen35Attention: Module {
 
         var queries: MLXArray
         var keys: MLXArray
-        let promptCore = Qwen35VerifyQKNormRoPE.qFoldVerified && !exactTargetVerify && !narrowsToLastQuery
-            && gateSplit == nil && B == 1 && L > 128
-        var foldedBlocks: [MLXArray]? = nil
         let tree = L == 16 && !narrowsToLastQuery ? CBv2BranchVerify.tree : nil
         if let tree {
             guard !exactTargetVerify, positionIds == nil, let plainRope,
@@ -5786,18 +5465,6 @@ final class Qwen35Attention: Module {
                     ropeDims: plainRope.dims, ropeBase: plainRope.base, tree: tree)
             else { preconditionFailure("Qwen35 tree verify: tree q/k RoPE unavailable") }
             (queries, keys) = fused
-        } else if promptCore, positionIds == nil, let plainRope,
-            let folded = Qwen35VerifyQKNormRoPE.applyPrompt(
-                queryProjection: qProjOutput, keyProjection: kProjection,
-                queryWeight: qNorm.weight, keyWeight: kNorm.weight,
-                queryEps: qNorm.eps, keyEps: kNorm.eps, offsets: cache.positionOffsets,
-                queryHeads: attentionHeads, keyHeads: kvHeads,
-                ropeDims: plainRope.dims, ropeBase: plainRope.base, scale: scale)
-        {
-            // Prompt: the query blocks leave the kernel already scaled; `queries` is the record's
-            // unscaled node, evaluated only if the blocks go unused.
-            (queries, keys) = (folded.queries, folded.keys)
-            foldedBlocks = folded.blocks
         } else if !exactTargetVerify, positionIds == nil, let plainRope,
             let fused = Qwen35VerifyQKNormRoPE.apply(
                 queryProjection: qProjOutput, keyProjection: kProjection,
@@ -5827,7 +5494,6 @@ final class Qwen35Attention: Module {
         }
 
         let attended: MLXArray
-        var attentionBlocks: [MLXArray]?
         var gateProjection = qProjOutput
         if narrowsToLastQuery {
             attended = (cache as! any CBv2LastQueryPrefillLayerCache).updateAndAttendLastQuery(
@@ -5838,24 +5504,7 @@ final class Qwen35Attention: Module {
                 cache.updateAndAttend(queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
             }
             gateProjection = gateSplit.gate(partial ?? attended)
-                ?? HadamardQuantizedLinear.boundaryProjections(boundary, [qProj])?[0] ?? qProj(rows())
-        } else if (Qwen35AttentionBlocks.verified || CBv2PromptAttentionCore.engaged), !exactTargetVerify, B == 1,
-            L > 128
-        {
-            let attend = { [scale] in
-                cache.updateAndAttend(queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
-            }
-            var blocks: [MLXArray]?
-            if CBv2PromptAttentionCore.engaged {
-                (attended, _) = CBv2PromptAttentionCore.capturing(prescaled: foldedBlocks) {
-                    let (result, captured) = CBv2PromptAttentionBlocks.capturing(attend)
-                    blocks = captured
-                    return result
-                }
-            } else {
-                (attended, blocks) = CBv2PromptAttentionBlocks.capturing(attend)
-            }
-            attentionBlocks = Qwen35AttentionBlocks.verified ? blocks : nil
+                ?? HadamardQuantizedLinear.boundaryProjections(boundary, [qProj])?[0] ?? qProj(x)
         } else {
             attended = cache.updateAndAttend(
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
@@ -5871,11 +5520,7 @@ final class Qwen35Attention: Module {
             return gated
         }
         if !narrowsToLastQuery, !exactTargetVerify, B == 1, L >= 64, let packed = oProj as? HadamardQuantizedLinear,
-            let gated = packed.callAfterAttentionGatePrompt(
-                attended, queryProjection: gateProjection, fold: fold,
-                quantized: attentionBlocks.flatMap { (blocks: [MLXArray]) -> [MLXArray]? in
-                    Qwen35AttentionBlocks.quantize(blocks, gate: gateProjection, transform: packed.transform)
-                })
+            let gated = packed.callAfterAttentionGatePrompt(attended, queryProjection: gateProjection, fold: fold)
         {
             return gated
         }
@@ -6384,11 +6029,10 @@ extension Qwen35DecoderLayer {
             guard let selfAttn, attentionCache != nil else { return nil }
             firstProjections = [selfAttn.qProj, selfAttn.kProj, selfAttn.vProj]
         }
-        let lean = !isLinear && Qwen35DeadOutputs3.verified
         guard
             let boundary = HadamardQuantizedLinear.verifyBoundary(
                 x, delta: delta, weight: inputLayerNorm.weight, eps: inputLayerNorm.eps,
-                projections: firstProjections, normalized: !lean)
+                projections: firstProjections)
         else { return nil }
         let r: MLXArray
         if isLinear {
@@ -6397,15 +6041,9 @@ extension Qwen35DecoderLayer {
                 recurrentState: recurrentState, exactTargetVerify: false,
                 boundary: boundary)
         } else {
-            let norm = inputLayerNorm
             r = selfAttn!.cbv2Forward(
                 boundary.normalized, cache: attentionCache!, positionIds: positionIds,
-                exactTargetVerify: false, boundary: boundary,
-                normalizedRows: lean ? {
-                    HadamardQuantizedLinear.verifyBoundary(
-                        x, delta: delta, weight: norm.weight, eps: norm.eps, projections: firstProjections
-                    )?.normalized ?? norm(boundary.residual)
-                } : nil)
+                exactTargetVerify: false, boundary: boundary)
         }
         if let post = HadamardQuantizedLinear.sharedResidualNormProjections(
             boundary.residual, residual: r, weight: postAttentionLayerNorm.weight,
@@ -6561,9 +6199,6 @@ enum Qwen35Layer0FP32 {
     static func prepareIfBoot(_ model: Qwen35TextModelInner, promptRows: Int) {
         guard promptRows >= 1024, !prepared else { return }
         prepared = true
-        Qwen35DeadOutputs3.prepare(model)
-        Qwen35AttentionBlocks.prepare(model)
-        Qwen35AttentionCore.prepare(model)
         guard offered else {
             FileHandle.standardError.write(Data("qwen35 layer0 fp32: off\n".utf8))
             return
@@ -6682,413 +6317,6 @@ enum Qwen35Layer0FP32 {
     }
 }
 
-/// The attention layers' verify boundary without its normalized rows (`verifyBoundary(normalized: false)`): on the
-/// split-gate route those layers read the rows only for their shape, and any other path rebuilds them with the record
-/// kernel (`cbv2Forward(normalizedRows:)`). Served only after a check at the boot warm, on every attention layer's
-/// norm weight and q/k/v at verify rows 2 to 16, finds the codes, scales, offsets, sum and the split-gate route's
-/// query, key, value and gate outputs bitwise equal to the record boundary's. `DARKBLOOM_BONSAI_DEAD_OUTPUTS3=0`
-/// keeps the record boundary; `DARKBLOOM_BONSAI_DEAD_OUTPUTS3_NEGCTL=1` scales one norm weight of the lean side by
-/// 1 + 2^-8, which the check must report.
-enum Qwen35DeadOutputs3 {
-    static let offered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS3"] != "0"
-    static let negativeControl = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_DEAD_OUTPUTS3_NEGCTL"] == "1"
-    /// Set once by `prepare` before the resident serves; only read after that.
-    nonisolated(unsafe) static var verified = false
-
-    static func prepare(_ model: Qwen35TextModelInner) {
-        let note: String
-        if !offered {
-            note = "off"
-        } else {
-            do {
-                let (bad, cases) = try withError { check(model) }
-                verified = bad == 0 && cases > 0
-                note = verified ? "on (\(cases) cases bitwise equal)" : "off (\(bad) of \(cases) cases differ)"
-            } catch {
-                note = "off (error: \(error))"
-            }
-        }
-        FileHandle.standardError.write(Data("qwen35 dead outputs3: \(note)\n".utf8))
-    }
-
-    private static func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
-        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
-        let bits: DType = a.dtype == .float32 ? .uint32 : a.dtype
-        return MLX.all(contiguous(a).view(dtype: bits) .== contiguous(b).view(dtype: bits))
-    }
-
-    /// Query (`index` 0) or gate (1) halves of each 512-wide head; the launch leaves the other half unwritten.
-    private static func half(_ a: MLXArray, _ index: Int) -> MLXArray {
-        let n = a.dim(-1)
-        return a.reshaped([-1, n / 512, 2, 256])[0..., 0..., index, 0...]
-    }
-
-    private static func check(_ model: Qwen35TextModelInner) -> (bad: Int, cases: Int) {
-        var bad = 0
-        var cases = 0
-        let bump = MLXArray((0 ..< 4096).map { (i: Int) -> Float in i == 7 ? Float(1) / 256 : 0 })
-        for layer in model.layers where !layer.isLinear {
-            guard let attention = layer.selfAttn else { return (bad + 1, cases + 1) }
-            let projections: [Linear] = [attention.qProj, attention.kProj, attention.vProj]
-            let norm = layer.inputLayerNorm
-            let leanWeight = negativeControl ? norm.weight * (bump + 1) : norm.weight
-            var results: [MLXArray] = []
-            for rows in 2 ... 16 {
-                let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x4430_0000 + rows)), into: 2)
-                let scale = MLXArray((0 ..< rows).map { (r: Int) -> Float in r == 0 ? 0 : (r == 1 ? 30 : 1) })
-                    .reshaped([1, rows, 1])
-                let x = MLXRandom.uniform(low: -3, high: 3, [1, rows, 4096], key: keys[0]) * scale
-                let delta = MLXRandom.uniform(low: -4, high: 4, [1, rows, 4096], key: keys[1]) * scale
-                guard let full = HadamardQuantizedLinear.verifyBoundary(
-                    x, delta: delta, weight: norm.weight, eps: norm.eps, projections: projections)
-                else { continue }
-                cases += 1
-                guard let lean = HadamardQuantizedLinear.verifyBoundary(
-                        x, delta: delta, weight: leanWeight, eps: norm.eps, projections: projections,
-                        normalized: false),
-                    lean.normalized.shape == full.normalized.shape,
-                    let a = HadamardQuantizedLinear.boundarySplitQueryGate(
-                        full, query: attention.qProj, key: attention.kProj, value: attention.vProj),
-                    let b = HadamardQuantizedLinear.boundarySplitQueryGate(
-                        lean, query: attention.qProj, key: attention.kProj, value: attention.vProj),
-                    let gateA = a.gate(a.value), let gateB = b.gate(b.value)
-                else {
-                    bad += 1
-                    continue
-                }
-                var eqs = zip(full.outputs, lean.outputs).map { (pair: (MLXArray, MLXArray)) -> MLXArray in
-                    same(pair.0, pair.1)
-                }
-                eqs.append(same(half(a.query, 0), half(b.query, 0)))
-                eqs.append(same(a.key, b.key))
-                eqs.append(same(a.value, b.value))
-                eqs.append(same(half(gateA, 1), half(gateB, 1)))
-                results.append(MLX.all(MLX.stacked(eqs)))
-            }
-            guard !results.isEmpty else { continue }
-            let passed = MLX.stacked(results).asType(.int32).sum().item(Int.self)
-            bad += results.count - passed
-        }
-        return (bad, cases)
-    }
-}
-
-/// The prompt attention's gate quantizer reading the query-block outputs (`CBv2PromptAttentionBlocks`) in place,
-/// so their concatenation (a copy of the whole attention output) is never formed: the record kernel with
-/// only its attention load moved from the concatenation to the block holding the row. Served only after a check at
-/// the boot warm, on the real `o_proj` signs at 512, 448, 256 and 192 rows, finds the codes, ascale and rsb words
-/// equal to the record kernel's on the concatenation, a lean input one word off unequal, and 128 rows (one block)
-/// declined. `DARKBLOOM_BONSAI_ATTNBLK=0` keeps the concatenation; `DARKBLOOM_BONSAI_ATTNBLK_NEGCTL=1` adds 1 to
-/// one attention value of every lean case, which the check must report.
-enum Qwen35AttentionBlocks {
-    static let offered = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTNBLK"] != "0"
-    static let negativeControl = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTNBLK_NEGCTL"] == "1"
-    /// Set once by `prepare` before the resident serves; only read after that.
-    nonisolated(unsafe) static var verified = false
-
-    private static func replacingOnce(_ text: String, _ old: String, _ new: String) -> String {
-        guard text.components(separatedBy: old).count == 2 else {
-            preconditionFailure("qwen35 attention blocks: anchor not unique")
-        }
-        return text.replacingOccurrences(of: old, with: new)
-    }
-
-    /// Prompt row r reads block r / 128 (inputs `x`, `x1`, `x2`, `x3`) at its row r % 128; a block holds
-    /// min(128, rows - its first row) prompt rows.
-    private static let kernel = MLXFast.metalKernel(
-        name: "qwen35_attention_gate_prompt_blocks_q8",
-        inputNames: ["x", "x1", "x2", "x3", "gate", "signs"],
-        outputNames: ["codes", "ascale", "rsb"],
-        source: replacingOnce(
-            replacingOnce(
-                SignedBlockHadamard.quantized4096Source(swiglu: false, attentionGate: true),
-                "const float4 attn = *((const device float4*)(x",
-                """
-                const uint ag_block = ag_row >> 7;
-                const device float* ag_x = ag_block == 0u ? x : ag_block == 1u ? x1 : ag_block == 2u ? x2 : x3;
-                const float4 attn = *((const device float4*)(ag_x
-                """),
-            "* uint(VERIFY_ROWS) + ag_row", "* min(128u, uint(ATTENTION_ROWS) - (ag_row & ~127u)) + (ag_row & 127u)"),
-        header: SignedBlockHadamard.fused4096Header.replacingOccurrences(
-            of: "hadamard_radix16(", with: "hadamard_radix16_q8("),
-        ensureRowContiguous: true)
-
-    /// Codes, ascale and rsb of `transform.quantizedForPromptAttentionGate` on the blocks' concatenation, read from
-    /// the 2 to 4 blocks of 128 rows (the last 64 to 128). Nil when the blocks or shapes do not qualify.
-    static func quantize(_ blocks: [MLXArray], gate: MLXArray, transform: SignedBlockHadamard) -> [MLXArray]? {
-        guard CBv2PromptAttentionBlocks.blockSize == 128, (2 ... 4).contains(blocks.count),
-            transform.blockSize == 4096, transform.width == 4096, gate.dtype == .float32,
-            StreamOrDevice.default == StreamOrDevice.gpu
-        else { return nil }
-        let last = blocks[blocks.count - 1].dim(2)
-        let rows = 128 * (blocks.count - 1) + last
-        guard last > 0, last <= 128, rows % 64 == 0, gate.size == rows * 8192 else { return nil }
-        for (index, block) in blocks.enumerated() {
-            let n = index == blocks.count - 1 ? last : 128
-            guard block.dtype == .float32, block.shape == [1, 16, n, 256] else { return nil }
-        }
-        let filled = blocks + Array(repeating: blocks[blocks.count - 1], count: 4 - blocks.count)
-        return kernel(
-            filled + [gate.reshaped([rows, 8192]), transform.signs],
-            template: [("BLOCKS_PER_ROW", 1), ("VERIFY_ROWS", 0), ("ATTENTION_ROWS", rows)],
-            grid: (256, rows, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[rows, 4096], [rows * 32], [rows * 32]],
-            outputDTypes: [.int8, .float32, .float32])
-    }
-
-    static func prepare(_ model: Qwen35TextModelInner) {
-        let note: String
-        if !offered {
-            note = "off"
-        } else {
-            do {
-                let (bad, cases) = try withError { check(model) }
-                verified = bad == 0 && cases > 0
-                note = verified ? "on (\(cases) cases bitwise equal)" : "off (\(bad) of \(cases) cases differ)"
-            } catch {
-                note = "off (error: \(error))"
-            }
-        }
-        FileHandle.standardError.write(Data("qwen35 attention blocks: \(note)\n".utf8))
-    }
-
-    private static func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
-        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
-        let bits: DType = a.dtype == .float32 ? .uint32 : a.dtype
-        return MLX.all(contiguous(a).view(dtype: bits) .== contiguous(b).view(dtype: bits))
-    }
-
-    /// Each case: blocks of uniform attention values (a zero row and a x30 row in each), the
-    /// `[1, rows, 8192]` query projection, record kernel on the concatenation against `quantize` on the
-    /// blocks. Returns the failed and the total case count; a case also fails when a lean input one word
-    /// off still matches.
-    private static func check(_ model: Qwen35TextModelInner) -> (bad: Int, cases: Int) {
-        guard let packed = model.layers.lazy.compactMap({ (layer: Qwen35DecoderLayer) -> HadamardQuantizedLinear? in
-            layer.selfAttn?.oProj as? HadamardQuantizedLinear
-        }).first else { return (1, 1) }
-        let transform = packed.transform
-        var bad = 0
-        var cases = 0
-        for rows in [512, 448, 256, 192, 128] {
-            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x4154_0000 + rows)), into: 5)
-            var blocks: [MLXArray] = []
-            var start = 0
-            while start < rows {
-                let n = min(128, rows - start)
-                let scale = MLXArray((0 ..< n).map { (r: Int) -> Float in r == 0 ? 0 : (r == 1 ? 30 : 1) })
-                    .reshaped([1, 1, n, 1])
-                blocks.append(
-                    MLXRandom.uniform(low: -3, high: 3, [1, 16, n, 256], key: keys[blocks.count]) * scale)
-                start += n
-            }
-            let gate = MLXRandom.uniform(low: -6, high: 6, [1, rows, 8192], key: keys[4])
-            let whole = concatenated(blocks, axis: 2)
-            cases += 1
-            guard rows > 128 else {
-                if quantize(blocks, gate: gate, transform: transform) != nil { bad += 1 }
-                continue
-            }
-            // One attention value of the last block (head 3, its row 16, dim 5) one up.
-            let tail = blocks[blocks.count - 1]
-            let offset = MLXArray((0 ..< tail.size).map { (i: Int) -> Float in
-                i == (3 * tail.dim(2) + 16) * 256 + 5 ? 1 : 0
-            }).reshaped(tail.shape)
-            let off = Array(blocks.dropLast()) + [tail + offset]
-            guard let record = transform.quantizedForPromptAttentionGate(whole, queryProjection: gate),
-                let lean = quantize(negativeControl ? off : blocks, gate: gate, transform: transform),
-                let control = quantize(off, gate: gate, transform: transform)
-            else {
-                bad += 1
-                continue
-            }
-            let expected = [record.codes, record.ascale, record.rsb]
-            let equal = MLX.all(MLX.stacked(zip(expected, lean).map { (pair: (MLXArray, MLXArray)) -> MLXArray in
-                same(pair.0, pair.1)
-            }))
-            let controlEqual = MLX.all(MLX.stacked(zip(expected, control).map { (pair: (MLXArray, MLXArray)) -> MLXArray in
-                same(pair.0, pair.1)
-            }))
-            if !equal.item(Bool.self) || controlEqual.item(Bool.self) { bad += 1 }
-        }
-        return (bad, cases)
-    }
-}
-
-/// Boot check of the prompt attention core (`CBv2PromptAttentionCore`, `Qwen35VerifyQKNormRoPE.applyPrompt`): at 512,
-/// 448, 256, 192 and 137 rows (every query block the scored shapes cut, the last of 9 to 128 rows) on the first full
-/// attention layer's real norm weights, rope and scale, the record's per-block `scaledDotProductAttention` on the
-/// cache's strided K/V against the core's blocks, bit for bit, for each enabled part alone and, when both are,
-/// together; k from the folded kernel must equal the record's; a lean run with its scale (fold) or its causal limit
-/// (softmax) one step off must differ; 129 rows must decline. The softmax is also compared on score blocks of every
-/// kL with a spread of magnitudes. `DARKBLOOM_BONSAI_ATTN_QFOLD=0` and `DARKBLOOM_BONSAI_ATTN_SMAX=0` switch a part
-/// off; `..._NEGCTL=1` on either makes its lean run one step off, which the check must report.
-enum Qwen35AttentionCore {
-    private static let foldNegativeControl =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_ATTN_QFOLD_NEGCTL"] == "1"
-
-    static func prepare(_ model: Qwen35TextModelInner) {
-        let fold = Qwen35VerifyQKNormRoPE.qFoldOffered
-        let smax = CBv2PromptAttentionCore.softmaxOffered
-        var foldOK = false
-        var smaxOK = false
-        var note = "off"
-        var fill = "off"
-        if CBv2FullSequenceKV.firstFillOffered {
-            do {
-                let (bad, cases) = try withError { CBv2FullSequenceKV.prepareFirstFill() }
-                fill = CBv2FullSequenceKV.firstFillVerified ? "on (\(cases) cases)" : "off (\(bad) of \(cases) cases differ)"
-            } catch {
-                fill = "off (error: \(error))"
-            }
-        }
-        if fold || smax {
-            do {
-                var cases = 0
-                if fold {
-                    let (bad, n) = try withError { check(model, fold: true, smax: false) }
-                    foldOK = bad == 0
-                    cases += n
-                }
-                if smax {
-                    let (bad, n) = try withError { check(model, fold: false, smax: true) }
-                    smaxOK = bad == 0
-                    cases += n
-                }
-                if foldOK && smaxOK {
-                    let (bad, n) = try withError { check(model, fold: true, smax: true) }
-                    smaxOK = bad == 0
-                    cases += n
-                }
-                note = "q fold \(foldOK ? "on" : "off"), softmax \(smaxOK ? "on" : "off") (\(cases) cases)"
-            } catch {
-                note = "off (error: \(error))"
-            }
-        }
-        Qwen35VerifyQKNormRoPE.qFoldVerified = foldOK
-        CBv2PromptAttentionCore.softmaxVerified = smaxOK
-        CBv2PromptAttentionCore.engaged = foldOK || smaxOK
-        FileHandle.standardError.write(Data("qwen35 attention core: \(note); first KV fill \(fill)\n".utf8))
-    }
-
-    private static func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
-        guard a.shape == b.shape, a.dtype == b.dtype else { return false }
-        return MLX.all(contiguous(a).view(dtype: .uint32) .== contiguous(b).view(dtype: .uint32)).item(Bool.self)
-    }
-
-    private static func check(_ model: Qwen35TextModelInner, fold: Bool, smax: Bool) -> (bad: Int, cases: Int) {
-        guard let attention = model.layers.lazy.compactMap({ (layer: Qwen35DecoderLayer) -> Qwen35Attention? in
-            layer.selfAttn
-        }).first, let rope = attention.plainRope, attention.attentionHeads == 16, attention.kvHeads == 4
-        else { return (1, 1) }
-        let scale = attention.scale
-        var bad = 0
-        var cases = 0
-        cases += 1
-        if !CBv2PromptAttentionCore.serves(rows: 512) || !CBv2PromptAttentionCore.serves(rows: 137)
-            || CBv2PromptAttentionCore.serves(rows: 129) || CBv2PromptAttentionCore.serves(rows: 136)
-            || CBv2PromptAttentionCore.serves(rows: 128)
-        {
-            bad += 1
-        }
-        for rows in [512, 448, 256, 192, 137] {
-            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x4143_0000 + rows)), into: 6)
-            let queryProjection = MLXRandom.normal([1, rows, 16 * 512], key: keys[0])
-            let keyProjection = MLXRandom.normal([1, rows, 4 * 256], key: keys[1])
-            let values = MLXRandom.normal([1, 4, rows, 256], key: keys[2])
-            let offsets = MLXArray([Int32(rows == 256 ? 1000 : 0)])
-            guard
-                let record = Qwen35VerifyQKNormRoPE.apply(
-                    queryProjection: queryProjection, keyProjection: keyProjection,
-                    queryWeight: attention.qNorm.weight, keyWeight: attention.kNorm.weight,
-                    queryEps: attention.qNorm.eps, keyEps: attention.kNorm.eps, offsets: offsets,
-                    queryHeads: 16, keyHeads: 4, ropeDims: rope.dims, ropeBase: rope.base)
-            else {
-                bad += 1
-                cases += 1
-                continue
-            }
-            let store = CBv2FullSequenceKV(promptLength: rows, maxLength: rows + 512, kvHeads: 4, headDim: 256)
-            let (cachedKeys, cachedValues) = store.update(keys: record.1, values: values)
-            let ranges = (0 ..< (rows + 127) / 128).map { (index: Int) -> (start: Int, count: Int) in
-                (128 * index, min(128, rows - 128 * index))
-            }
-            let expected = ranges.map { (range: (start: Int, count: Int)) -> MLXArray in
-                MLXFast.scaledDotProductAttention(
-                    queries: record.0[0..., 0..., range.start ..< (range.start + range.count), 0...],
-                    keys: cachedKeys[0..., 0..., 0 ..< (range.start + range.count), 0...],
-                    values: cachedValues[0..., 0..., 0 ..< (range.start + range.count), 0...],
-                    scale: scale, mask: .causal, sinks: nil)
-            }
-            func lean(foldScale: Float, shift: Int32) -> (outputs: [MLXArray], keys: MLXArray)? {
-                var prescaled: [MLXArray]? = nil
-                var leanKeys = record.1
-                if fold {
-                    guard let folded = Qwen35VerifyQKNormRoPE.applyPrompt(
-                        queryProjection: queryProjection, keyProjection: keyProjection,
-                        queryWeight: attention.qNorm.weight, keyWeight: attention.kNorm.weight,
-                        queryEps: attention.qNorm.eps, keyEps: attention.kNorm.eps, offsets: offsets,
-                        queryHeads: 16, keyHeads: 4, ropeDims: rope.dims, ropeBase: rope.base, scale: foldScale)
-                    else { return nil }
-                    prescaled = folded.blocks
-                    leanKeys = folded.keys
-                }
-                let outputs = ranges.enumerated().map { (index: Int, range: (start: Int, count: Int)) -> MLXArray in
-                    CBv2PromptAttentionCore.composed(
-                        query: prescaled?[index]
-                            ?? record.0[0..., 0..., range.start ..< (range.start + range.count), 0...],
-                        keys: cachedKeys[0..., 0..., 0 ..< (range.start + range.count), 0...],
-                        values: cachedValues[0..., 0..., 0 ..< (range.start + range.count), 0...],
-                        scale: scale, scaled: fold, fusedSoftmax: smax, softmaxShift: shift)
-                }
-                return (outputs, leanKeys)
-            }
-            cases += 1
-            let stepped = scale * (1 + 1.0 / 4_194_304)
-            guard let run = lean(
-                foldScale: foldNegativeControl ? stepped : scale,
-                shift: CBv2PromptAttentionCore.negativeControl ? 1 : 0)
-            else {
-                bad += 1
-                continue
-            }
-            var equal = same(run.keys, record.1)
-            for (a, b) in zip(expected, run.outputs) where !same(a, b) { equal = false }
-            var controlDiffers = true
-            if fold, let control = lean(foldScale: stepped, shift: 0) {
-                controlDiffers = zip(expected, control.outputs).contains { (pair: (MLXArray, MLXArray)) -> Bool in
-                    !same(pair.0, pair.1)
-                }
-            }
-            if smax, let control = lean(foldScale: scale, shift: 1) {
-                controlDiffers = controlDiffers && zip(expected, control.outputs).contains {
-                    (pair: (MLXArray, MLXArray)) -> Bool in !same(pair.0, pair.1)
-                }
-            }
-            if !equal || !controlDiffers { bad += 1 }
-            guard smax, !fold else { continue }
-            for range in ranges {
-                let kL = range.start + range.count
-                cases += 1
-                let draw = MLXRandom.normal([1, 4, 4, range.count, kL], key: keys[3])
-                let spread = MLXRandom.uniform(low: -1, high: 5, [1, 4, 4, range.count, 1], key: keys[4])
-                let scores = draw * (MLXArray(1) + spread * 12) + MLXRandom.uniform(
-                    low: -30, high: 30, [1, 4, 4, range.count, 1], key: keys[5])
-                let reference = softmax(
-                    MLX.where(
-                        greaterEqual(
-                            expandedDimensions(MLXArray.arange(kL - range.count, kL), axis: 1),
-                            expandedDimensions(MLXArray.arange(0, kL), axis: 0)),
-                        scores, MLXArray(-Float.greatestFiniteMagnitude)),
-                    axes: [-1], precise: true)
-                let fused = CBv2PromptAttentionCore.causalSoftmax(scores, rows: range.count, keyCount: kL)
-                let off = CBv2PromptAttentionCore.causalSoftmax(scores, rows: range.count, keyCount: kL, shift: 1)
-                if !same(reference, fused) || same(reference, off) { bad += 1 }
-            }
-        }
-        return (bad, cases)
-    }
-}
-
 enum Qwen35VerifyStartFusion {
     static let offered =
         ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VSTART_FUSE"] != "0"
@@ -7152,20 +6380,6 @@ enum Qwen35VerifyStartFusion {
         return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
     }
 
-    /// `DARKBLOOM_BONSAI_PSTART_FUSE=0` keeps the record chain at prompt width.
-    static let promptOffered =
-        ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PSTART_FUSE"] != "0"
-
-    /// The same rows at the prompt widths whose F16 embedding the forward casts to FP32
-    /// (`fusePromptBoundaries` with `promptPassed`); the check covers every id.
-    static func promptEmbed(_ model: Qwen35TextModelInner, _ inputs: MLXArray) -> MLXArray? {
-        guard promptOffered, verified, Qwen35Layer0FP32.promptPassed, inputs.ndim == 2,
-            inputs.dim(0) == 1, inputs.dim(1) >= 128, inputs.dim(1) % 64 == 0,
-            inputs.dtype == .int32, let e = packed(model)
-        else { return nil }
-        return rows(e, inputs.reshaped([-1])).reshaped([1, inputs.dim(1), 4096])
-    }
-
     static func prepare(_ model: Qwen35TextModelInner) {
         let note: String
         if !offered {
@@ -7186,10 +6400,6 @@ enum Qwen35VerifyStartFusion {
             note = "off (embedding not 2-bit g128 WHT-4096 F16)"
         }
         FileHandle.standardError.write(Data("qwen35 verify start fusion: \(note)\n".utf8))
-        let promptNote = !promptOffered ? "off"
-            : !Qwen35Layer0FP32.promptPassed ? "off (layer0 fp32 prompt off)"
-            : verified ? "on (same kernel and check)" : "off (verify start fusion off)"
-        FileHandle.standardError.write(Data("qwen35 prompt start fusion: \(promptNote)\n".utf8))
     }
 
     private static func check(_ e: HadamardQuantizedEmbedding) -> (Int, Int) {
@@ -7419,8 +6629,6 @@ public class Qwen35TextModelInner: Module {
         var hiddenStates = inputEmbeddings
             ?? (captureRecurrentWindow && !exactTargetVerify && !lastPositionOnly
                 && Qwen35Layer0FP32.verifyPassed ? Qwen35VerifyStartFusion.embed(self, inputs) : nil)
-            ?? (!captureRecurrentWindow && !exactTargetVerify
-                ? Qwen35VerifyStartFusion.promptEmbed(self, inputs) : nil)
             ?? embedTokens(inputs)
         // Read the tap ONCE. A nil list costs one comparison per layer and
         // allocates nothing; the drafter is not attached on a serial leg.
