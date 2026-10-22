@@ -1487,8 +1487,8 @@ enum CBv2VerifyVectorAttention {
             let twin = lean ? (isTree ? pairedTreeLean : pairedLean) : nil
             guard let kernel = twin ?? (isTree ? pairedTree : pairedPartial) else { return nil }
             return kernel(
-                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
-                grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
+                inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 4)],
+                grid: (32 * 32 * L, 1, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: outputShapes, outputDTypes: outputDTypes)
         }
         let twin = lean ? (isTree ? partialTreeLean : partialLean) : nil
@@ -1602,6 +1602,17 @@ enum CBv2VerifyVectorAttention {
         else { return nil }
         let L = qShape.2
         let nKeys = kShape.2
+        if L == 16 && classesPerGroup == 2 {
+            let folded = (queries * scale).reshaped([1, 4, 64, 256])
+            let scores = CBv2VerifyAttentionPartial.noted([
+                matmul(folded, keys.swappedAxes(-1, -2))
+            ])[0].reshaped([1, 4, 4, 16, nKeys])
+            let keep = CBv2AttentionV1.boolMask(L: 16, kL: nKeys, window: nil)!
+            let probabilities = softmax(
+                MLX.where(keep, scores, -Float.greatestFiniteMagnitude), axis: -1, precise: true)
+            return matmul(probabilities.reshaped([1, 4, 64, nKeys]), values)
+                .reshaped([1, 16, 16, 256])
+        }
         let params = HostConstants.recentInt32([Int32(nKeys), Int32(bitPattern: scale.bitPattern)])
         guard let states = launchStates(
             queries: queries, keys: keys, values: values, params: params, tree: nil, L: L,

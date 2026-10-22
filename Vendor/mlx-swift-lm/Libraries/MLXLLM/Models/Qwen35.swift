@@ -7,6 +7,7 @@
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 //
 
+import Cmlx
 import Dispatch
 import Foundation
 import MLX
@@ -972,24 +973,8 @@ private enum Qwen35PromptConvQKNorm {
         inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out", "v_out"],
         source: source, ensureRowContiguous: true)
 
-    private static let qkOnlyKernel = MLXFast.metalKernel(
-        name: "qwen35_gdn_prompt_conv_qk_only",
-        inputNames: ["state", "qkv", "conv_weight"], outputNames: ["q_out", "k_out"],
-        source: source.replacingOccurrences(
-            of: "const uint groups = uint(2 * HK + HV);", with: "const uint groups = uint(2 * HK);")
-            .replacingOccurrences(of: """
-            if (gi >= uint(2 * HK)) {
-              const uint o = (t * uint(HV) + (gi - uint(2 * HK))) * 128u + lane * 4u;
-              ((device float4*)(v_out + o))[0] = float4(val[0], val[1], val[2], val[3]);
-              continue;
-            }
-
-            """, with: ""),
-        ensureRowContiguous: true)
-
     static func apply(
-        state: MLXArray, qkv: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int,
-        materializeValue: Bool = true
+        state: MLXArray, qkv: MLXArray, weight: MLXArray, keyHeads: Int, valueHeads: Int
     ) -> [MLXArray]? {
         let C = qkv.dim(-1)
         guard state.ndim == 3, state.dim(0) == 1, state.dim(1) == 3, qkv.ndim == 3, qkv.dim(0) == 1,
@@ -1000,16 +985,15 @@ private enum Qwen35PromptConvQKNorm {
         else { return nil }
         let S = qkv.dim(1)
         let invScale = pow(Float(128), -0.5)
-        return (materializeValue ? kernel : qkOnlyKernel)(
+        return kernel(
             [state, qkv, weight],
             template: [("HK", keyHeads), ("HV", valueHeads), ("CONV_DIM", C),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
                 ("K_SCALE_BITS", Int(invScale.bitPattern))],
-            grid: (32, ((S + 1) / 2) * (2 * keyHeads + (materializeValue ? valueHeads : 0)), 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128]]
-                + (materializeValue ? [[1, S, valueHeads, 128]] : []),
-            outputDTypes: Array(repeating: .float32, count: materializeValue ? 3 : 2))
+            grid: (32, ((S + 1) / 2) * (2 * keyHeads + valueHeads), 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, S, keyHeads, 128], [1, S, keyHeads, 128], [1, S, valueHeads, 128]],
+            outputDTypes: [.float32, .float32, .float32])
     }
 }
 
@@ -1048,44 +1032,44 @@ private enum Qwen35Fresh8PromptGDN {
         return (result[0], result[1])
     }
 
-    /// The QK-only producer and this scan share contiguous convolution inputs.
-    /// Each V element is computed once at its sole 8x8 scan-tile load.
-    static func runConvolvedValue(
-        q: MLXArray, k: MLXArray, convState: MLXArray, qkv: MLXArray, weight: MLXArray,
-        ba: MLXArray, aLog: MLXArray, dtBias: MLXArray
+    /// Q/K convolution and normalization feed prep through threadgroup memory.
+    /// Each simdgroup keeps the producer's two-row, five-input convolution reuse.
+    static func runConvolvedInputs(
+        convState: MLXArray, qkv: MLXArray, weight: MLXArray,
+        ba: MLXArray, aLog: MLXArray, dtBias: MLXArray, freshState: Bool = false
     ) -> (MLXArray, MLXArray)? {
-        guard q.ndim == 4, q.shape == k.shape, q.dim(0) == 1,
-            (64 ... 1365).contains(q.dim(1)), q.dim(1) % 8 == 0,
-            q.dim(2) == 16, q.dim(3) == 128,
-            convState.shape == [1, 3, 8192], qkv.shape == [1, q.dim(1), 8192],
-            weight.shape == [8192, 4, 1], ba.shape == [1, q.dim(1), 64],
-            aLog.size == 32, dtBias.size == 32,
-            q.dtype == .float32, k.dtype == .float32, convState.dtype == .float32,
-            qkv.dtype == .float32, weight.dtype == .float32, ba.dtype == .float32,
-            aLog.dtype == .float32, dtBias.dtype == .float32,
-            StreamOrDevice.default == StreamOrDevice.gpu
+        guard qkv.ndim == 3, qkv.dim(0) == 1, qkv.dim(2) == 8192,
+            (64 ... 1365).contains(qkv.dim(1)), qkv.dim(1) % 8 == 0,
+            convState.shape == [1, 3, 8192], weight.shape == [8192, 4, 1],
+            ba.shape == [1, qkv.dim(1), 64], aLog.size == 32, dtBias.size == 32,
+            convState.dtype == .float32, qkv.dtype == .float32, weight.dtype == .float32,
+            ba.dtype == .float32, aLog.dtype == .float32, dtBias.dtype == .float32,
+            qkv.size <= Int(Int32.max), StreamOrDevice.default == StreamOrDevice.gpu
         else { return nil }
-        let T = q.dim(1)
-        let q = q.contiguous(), k = k.contiguous(), ba = ba.contiguous()
-        let rows = MLXArray(Int32(T))
-        let prepared = prepKernel(
-            [q, k, ba, aLog, dtBias, rows],
-            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32)],
-            grid: (32, T / 8, 16), threadGroup: (32, 1, 1),
-            outputShapes: [[1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
-            outputDTypes: [.float32, .float32, .float32])
+        let T = qkv.dim(1)
+        let ba = ba.contiguous(), rows = MLXArray(Int32(T))
+        let invScale = pow(Float(128), -0.5)
+        let prepared = convolvedInputPrepKernel(
+            [freshState ? MLXArray([Float(0)]) : convState, qkv, weight, ba, aLog, dtBias, rows],
+            template: [("C", 8), ("Dk", 128), ("Hk", 16), ("Hv", 32),
+                ("FRESH_CONV", freshState ? 1 : 0),
+                ("EPS_BITS", Int(Float(1e-6).bitPattern)),
+                ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
+                ("K_SCALE_BITS", Int(invScale.bitPattern))],
+            grid: (128, T / 8, 16), threadGroup: (128, 1, 1),
+            outputShapes: [[1, T, 16, 128], [1, T, 16, 128],
+                [1, 32, T / 8, 8, 8], [1, 32, T / 8, 8, 8], [1, 32, T / 8, 2, 8]],
+            outputDTypes: [.float32, .float32, .float32, .float32, .float32])
         let result = convolvedValueScanKernel(
-            [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
-            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", scanNS)],
+            [prepared[0], prepared[1], freshState ? MLXArray([Float(0)]) : convState,
+                qkv, weight, prepared[2], prepared[3], prepared[4], rows],
+            template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", scanNS), ("FRESH_CONV", freshState ? 1 : 0)],
             grid: (32, 16, 32), threadGroup: (32, scanNS, 1),
             outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]], outputDTypes: [.float32, .float32])
         return (result[0], result[1])
     }
 
-    private static let prepKernel = MLXFast.metalKernel(
-        name: "qwen35_fresh8_prompt_prep",
-        inputNames: ["q", "k", "ba", "a_log", "dt_bias", "T"], outputNames: ["tp", "pm", "gf"],
-        source: """
+    private static let prepSource = """
         // grid: (32, NC, B * Hk). One simdgroup per (b, key head, chunk): K K^T and
         // Q K^T are formed once and serve the Hv / Hk value heads of this key
         // head, which run side by side in lane groups of C lanes (lane = head
@@ -1213,7 +1197,87 @@ private enum Qwen35Fresh8PromptGDN {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        """, header: Qwen35RegisterGatedSIMD.gateHeader)
+        """
+
+    private static let prepKernel = MLXFast.metalKernel(
+        name: "qwen35_fresh8_prompt_prep",
+        inputNames: ["q", "k", "ba", "a_log", "dt_bias", "T"], outputNames: ["tp", "pm", "gf"],
+        source: prepSource, header: Qwen35RegisterGatedSIMD.gateHeader)
+
+    private static let convolvedInputPrepKernel = MLXFast.metalKernel(
+        name: "qwen35_fresh8_prompt_prep_paired_qkfold",
+        inputNames: ["conv_state", "qkv", "conv_weight", "ba", "a_log", "dt_bias", "T"],
+        outputNames: ["q_out", "k_out", "tp", "pm", "gf"],
+        source: convolvedInputPrepSource, header: Qwen35RegisterGatedSIMD.gateHeader,
+        ensureRowContiguous: true)
+
+    private static let convolvedInputPrepSource = prepSource
+        .replacingOccurrences(of: "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            with: "simdgroup_barrier(mem_flags::mem_threadgroup);")
+        .replacingOccurrences(of: "const int ks = Hk * Dk;", with: "const int ks = Dk + 8;")
+        .replacingOccurrences(of: """
+        const device float* k_ = k + ((uint)b_idx * T_ + t0) * ks + hk * Dk;
+        const device float* q_ = q + ((uint)b_idx * T_ + t0) * ks + hk * Dk;
+        """, with: """
+        threadgroup float Ksh[C * (Dk + 8)];
+        threadgroup float Qsh[C * (Dk + 8)];
+        {
+          #pragma clang fp reassociate(off)
+          const uint CD = uint((2 * Hk + Hv) * Dk);
+          for (uint pair = simdgroup_index_in_threadgroup; pair < uint(C / 2); pair += 4u) {
+            const uint pair_t0 = uint(t0) + pair * 2u;
+            for (uint qk = 0; qk < 2u; ++qk) {
+              const uint c0 = (uint(hk) + qk * uint(Hk)) * uint(Dk) + lane * 4u;
+              float vals[2][4];
+              for (int i = 0; i < 4; ++i) {
+                const uint c = c0 + uint(i);
+                const float4 wt = ((const device float4*)conv_weight)[c];
+                float xv[5];
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 5u; ++j) {
+                  const uint rr = pair_t0 + j;
+                  xv[j] = rr < 3u ? conv_state[FRESH_CONV ? 0u : rr * CD + c] :
+                      (rr < uint(T_) + 3u ? qkv[(rr - 3u) * CD + c] : 0.0f);
+                }
+                float ac0 = 0.0f, ac1 = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint tap = 0; tap < 4u; ++tap) {
+                  ac0 = fma(xv[tap], wt[tap], ac0);
+                  ac1 = fma(xv[tap + 1u], wt[tap], ac1);
+                }
+                const float e0 = 1.0f / (1.0f + metal::exp(metal::abs(ac0)));
+                const float e1 = 1.0f / (1.0f + metal::exp(metal::abs(ac1)));
+                vals[0][i] = ac0 * (ac0 < 0.0f ? e0 : 1.0f - e0);
+                vals[1][i] = ac1 * (ac1 < 0.0f ? e1 : 1.0f - e1);
+              }
+              for (uint dt = 0; dt < 2u; ++dt) {
+                const uint row = pair * 2u + dt;
+                const float val[4] = {vals[dt][0], vals[dt][1], vals[dt][2], vals[dt][3]};
+                float sum = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                  sum += val[i] * val[i];
+                }
+                const float eps = as_type<float>(uint(EPS_BITS));
+                const float inv = metal::precise::rsqrt(simd_sum(sum) / 128.0f + eps);
+                const bool is_q = qk == 0u;
+                const float scale = as_type<float>(uint(is_q ? Q_SCALE_BITS : K_SCALE_BITS));
+                const float4 normed = float4(
+                  scale * (val[0] * inv),
+                  scale * (val[1] * inv),
+                  scale * (val[2] * inv),
+                  scale * (val[3] * inv));
+                *(threadgroup float4*)((is_q ? Qsh : Ksh) + row * ks + lane * 4u) = normed;
+                const uint o = ((uint(t0) + row) * uint(Hk) + uint(hk)) * uint(Dk) + lane * 4u;
+                *(device float4*)((is_q ? q_out : k_out) + o) = normed;
+              }
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup float* k_ = Ksh;
+        const threadgroup float* q_ = Qsh;
+        if (simdgroup_index_in_threadgroup == 0) {
+        """) + "\n}"
 
     private static let scanSource = """
         // grid: (32, Dv / 8, B * Hv), threadgroup (32, NS, 1). One simdgroup per
@@ -1429,7 +1493,7 @@ private enum Qwen35Fresh8PromptGDN {
               float acc = 0.0f;
               for (uint tap = 0; tap < 4u; ++tap) {
                 const uint r = uint(t) + tap;
-                const float xv = r < 3u ? conv_state[r * CD + col] : qkv[(r - 3u) * CD + col];
+                const float xv = r < 3u ? conv_state[FRESH_CONV ? 0u : r * CD + col] : qkv[(r - 3u) * CD + col];
                 acc = fma(xv, wt[tap], acc);
               }
               const float e = 1.0f / (1.0f + metal::exp(metal::abs(acc)));
@@ -1496,7 +1560,7 @@ private enum Qwen35Fresh8PromptGDN {
         func folded(_ ns: Int) -> [MLXArray] {
             convolvedValueScanKernel(
                 [q, k, convState, qkv, weight, prepared[0], prepared[1], prepared[2], rows],
-                template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns)],
+                template: [("C", 8), ("Dk", 128), ("Dv", 128), ("Hk", 16), ("Hv", 32), ("NS", ns), ("FRESH_CONV", 0)],
                 grid: (32, 16, 32), threadGroup: (32, ns, 1),
                 outputShapes: [[1, T, 32, 128], [1, 32, 128, 128]],
                 outputDTypes: [.float32, .float32])
@@ -1689,7 +1753,49 @@ private enum Qwen35PromptGatedGDN {
 final class Qwen35PromptGateWeights {
     private var sources: (MLXArray, MLXArray)?
     private var stacked: MLXArray?
+    private struct Decay {
+        let identity: UInt
+        let stream: StreamOrDevice
+        let source: MLXArray
+        let value: MLXArray
+    }
+    private var decay: Decay?
     nonisolated(unsafe) private static var checked: Bool?
+
+    private static let decayKernel = MLXFast.metalKernel(
+        name: "qwen35_gdn_negative_a",
+        inputNames: ["a_log"], outputNames: ["negative_a"],
+        source: "negative_a[thread_position_in_grid.x] = -metal::precise::exp(a_log[thread_position_in_grid.x]);")
+
+    func prepareDecay(_ aLog: MLXArray) {
+        guard aLog.dtype == .float32, aLog.shape == [32],
+            StreamOrDevice.default == StreamOrDevice.gpu else { return }
+        if preparedDecay(aLog) != nil { return }
+        var identity: UInt = 0
+        var canCache = false
+        guard _mlx_array_constant_cache_identity(&identity, &canCache, aLog.ctx) == 0,
+            canCache else { return }
+        var context = mlx_array_new()
+        guard mlx_array_set(&context, aLog.ctx) == 0 else {
+            mlx_array_free(context)
+            return
+        }
+        let source = MLXArray(context)
+        let value = Self.decayKernel(
+            [source], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[32]], outputDTypes: [.float32])[0]
+        eval(value)
+        decay = Decay(identity: identity, stream: .default, source: source, value: value)
+    }
+
+    func preparedDecay(_ aLog: MLXArray) -> MLXArray? {
+        guard let decay, decay.stream == StreamOrDevice.default else { return nil }
+        var identity: UInt = 0
+        var canCache = false
+        guard _mlx_array_constant_cache_identity(&identity, &canCache, aLog.ctx) == 0,
+            canCache, identity == decay.identity else { return nil }
+        return decay.value
+    }
 
     func prepared(b: MLXArray, a: MLXArray) -> MLXArray? {
         guard let (sb, sa) = sources, sb === b, sa === a else { return nil }
@@ -2222,7 +2328,7 @@ enum Qwen35FusedGDNVerify {
         threadgroup float gate_g[MAX_T];
         threadgroup float gate_beta[MAX_T];
         if (tid < T) {
-          const float negative_a = -metal::precise::exp(a_log[hv_idx]);
+          const float negative_a = PREPARED_A ? a_log[hv_idx] : -metal::precise::exp(a_log[hv_idx]);
           const float bias = dt_bias[hv_idx];
           const uint gate_idx = (b_idx * T + tid) * Hv + hv_idx;
           gate_g[tid] = qwen35_simd_gate_decay(a[gate_idx], bias, negative_a);
@@ -3027,7 +3133,7 @@ enum Qwen35FusedGDNVerify {
     static func applyTree(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
         aLog: MLXArray, dtBias: MLXArray, state: MLXArray, tree: MLXArray,
-        keyHeads: Int, valueHeads: Int
+        keyHeads: Int, valueHeads: Int, preparedA: MLXArray? = nil
     ) -> VerifyResult? {
         guard let treeKernel, tree.dtype == .int32, tree.size >= 288,
             convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
@@ -3074,8 +3180,9 @@ enum Qwen35FusedGDNVerify {
             ? [[1, S + 3, C], qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C], [1, S, valueHeads, 129]]
             : [[1, S + 3, C], vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], [1, 3, C]]
         let o = selected(
-            [convState, qkv, convWeight, a, b, aLog, dtBias, state, tree],
-            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+            [convState, qkv, convWeight, a, b, preparedA ?? aLog, dtBias, state, tree],
+            template: [("PREPARED_A", preparedA == nil ? 0 : 1),
+                ("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
                 ("CONV_DIM", C), ("MAX_T", maximumRows),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
@@ -3100,7 +3207,8 @@ enum Qwen35FusedGDNVerify {
     /// buffer.
     static func apply(
         convState: MLXArray, qkv: MLXArray, convWeight: MLXArray, a: MLXArray, b: MLXArray,
-        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int
+        aLog: MLXArray, dtBias: MLXArray, state: MLXArray, keyHeads: Int, valueHeads: Int,
+        preparedA: MLXArray? = nil
     ) -> VerifyResult? {
         guard convState.ndim == 3, qkv.ndim == 3, convWeight.ndim == 3,
             a.ndim == 3, b.ndim == 3, state.ndim == 4,
@@ -3143,8 +3251,9 @@ enum Qwen35FusedGDNVerify {
             ? [convShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape, [1, S, valueHeads, 129]]
             : [convShape, vShape, qShape, qShape, vShape, [1, valueHeads, 128, 128], tailShape]
         let outputs = selectedKernel(
-            [convState, qkv, convWeight, a, b, aLog, dtBias, state],
-            template: [("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
+            [convState, qkv, convWeight, a, b, preparedA ?? aLog, dtBias, state],
+            template: [("PREPARED_A", preparedA == nil ? 0 : 1),
+                ("Dk", 128), ("Dv", 128), ("Hk", keyHeads), ("Hv", valueHeads),
                 ("CONV_DIM", C), ("MAX_T", maximumRows),
                 ("EPS_BITS", Int(Float(1e-6).bitPattern)),
                 ("Q_SCALE_BITS", Int(pow(invScale, 2).bitPattern)),
@@ -4058,6 +4167,10 @@ final class Qwen35GatedDeltaNet: Module {
 
     var hasFusedInputProjection: Bool { fusedInProj != nil }
 
+    fileprivate func prepareGateDecay() {
+        promptGateWeights.prepareDecay(aLog)
+    }
+
     private func inputProjectionSourceSignature(
         _ projections: (
             qkv: QuantizedLinear, z: QuantizedLinear,
@@ -4399,12 +4512,9 @@ final class Qwen35GatedDeltaNet: Module {
         if freshState && S % 8 == 0 && numKHeads == 16 && numVHeads == 32 {
             let foldState = convState.contiguous(), foldQKV = qkv.contiguous()
             let foldWeight = conv1d.weight.contiguous()
-            if let qk = Qwen35PromptConvQKNorm.apply(
-                    state: foldState, qkv: foldQKV, weight: foldWeight,
-                    keyHeads: numKHeads, valueHeads: numVHeads, materializeValue: false),
-                let folded = Qwen35Fresh8PromptGDN.runConvolvedValue(
-                    q: qk[0], k: qk[1], convState: foldState, qkv: foldQKV, weight: foldWeight,
-                    ba: ba, aLog: aLog, dtBias: dtBias)
+            if let folded = Qwen35Fresh8PromptGDN.runConvolvedInputs(
+                    convState: foldState, qkv: foldQKV, weight: foldWeight,
+                    ba: ba, aLog: aLog, dtBias: dtBias, freshState: true)
             {
                 return (folded.0, contiguous(qkv[0..., (S - 3)...]), folded.1)
             }
@@ -4977,11 +5087,13 @@ final class Qwen35GatedDeltaNet: Module {
                 Qwen35FusedGDNVerify.applyTree(
                     convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                     aLog: aLog, dtBias: dtBias, state: ssmState, tree: $0,
-                    keyHeads: numKHeads, valueHeads: numVHeads)
+                    keyHeads: numKHeads, valueHeads: numVHeads,
+                    preparedA: promptGateWeights.preparedDecay(aLog))
             } ?? Qwen35FusedGDNVerify.apply(
                 convState: convState, qkv: qkv, convWeight: conv1d.weight, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState,
-                keyHeads: numKHeads, valueHeads: numVHeads))
+                keyHeads: numKHeads, valueHeads: numVHeads,
+                preparedA: promptGateWeights.preparedDecay(aLog)))
         precondition(tree == nil || fusedMiddle != nil, "Qwen35 tree verify: fused GDN tree kernel unavailable")
         let fusedConv = fusedMiddle != nil || exactTargetVerify || conv1d.bias != nil
             || convKernelSize != 4
@@ -8104,6 +8216,7 @@ extension Qwen35TextModel: DFlash2TapTarget {
     public func prepareDFlash2Verify(rows: Int) {
         Qwen35RegisterGatedSIMD.prepareHoistedReplay()
         if rows == 16 {
+            for layer in model.layers { layer.linearAttn?.prepareGateDecay() }
             Qwen35FusedGDNVerify.prepare()
             CBv2VerifyAttentionPartial.prepareLean()
         }
