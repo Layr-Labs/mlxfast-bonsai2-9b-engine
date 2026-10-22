@@ -1331,62 +1331,129 @@ private final class DFlash2PackedCodebook {
     let rows: Int
     let width: Int
 
-    init?(_ source: MLXArray) throws {
+    init?(_ source: MLXArray, allow11: Bool = true) throws {
         guard source.dtype == .bfloat16, source.ndim == 2,
             source.dim(1) % 64 == 0, source.size > 0 else { return nil }
         rows = source.dim(0)
         width = source.dim(1)
         let bits = source.view(dtype: .uint16).asArray(UInt16.self)
-        var rowBases = [UInt8](repeating: 0, count: rows)
-        var globalMin = 256, globalMax = 0
-        for row in 0 ..< rows {
-            var low = 256, high = 0
-            for i in row * width ..< (row + 1) * width {
-                let exponent = Int((bits[i] >> 7) & 255)
-                if exponent != 0 {
-                    low = Swift.min(low, exponent)
-                    high = Swift.max(high, exponent)
-                }
-            }
-            guard low == 256 || high - low < 14 else { return nil }
-            rowBases[row] = low == 256 ? 0 : UInt8(low)
-            globalMin = Swift.min(globalMin, low)
-            globalMax = Swift.max(globalMax, high)
-        }
-        // One base for a shared window; otherwise one exact window per row.
-        let bases = globalMin == 256 || globalMax - globalMin < 14
-            ? [globalMin == 256 ? UInt8(0) : UInt8(globalMin)] : rowBases
-        var words = [UInt32](repeating: 0, count: bits.count / 8 * 3)
-        for i in stride(from: 0, to: bits.count, by: 8) {
-            var block: UInt64 = 0
-            let out = i / 8 * 3
-            let base = Int(bases[bases.count == 1 ? 0 : i / width])
-            for j in 0 ..< 8 {
-                let column = i % width + j
-                let logical = column / 64 * 64 + (column % 64) / 2 + (column & 1) * 32
-                let value = bits[i / width * width + logical]
-                let exponent = Int((value >> 7) & 255)
-                let field = exponent == 0 ? 0 : exponent - base + 1
-                let code = ((value & 0x8000) >> 4) | UInt16(field << 7) | (value & 127)
-                block |= UInt64(code) << ((j % 2) * 12)
-                if j % 2 == 1 {
-                    let shift = (j / 2 * 24) % 32
-                    let word = j / 2 * 24 / 32
-                    words[out + word] |= UInt32(truncatingIfNeeded: block << shift)
-                    if shift > 8 {
-                        words[out + word + 1] |= UInt32(block >> (32 - shift))
+        if allow11, let encoded = Self.pack11(bits, rows: rows, width: width) {
+            packed = MLXArray(encoded.words)
+            lookup = MLXArray(encoded.lookup)
+        } else {
+            var rowBases = [UInt8](repeating: 0, count: rows)
+            var globalMin = 256, globalMax = 0
+            for row in 0 ..< rows {
+                var low = 256, high = 0
+                for i in row * width ..< (row + 1) * width {
+                    let exponent = Int((bits[i] >> 7) & 255)
+                    if exponent != 0 {
+                        low = Swift.min(low, exponent)
+                        high = Swift.max(high, exponent)
                     }
-                    block = 0
+                }
+                guard low == 256 || high - low < 14 else { return nil }
+                rowBases[row] = low == 256 ? 0 : UInt8(low)
+                globalMin = Swift.min(globalMin, low)
+                globalMax = Swift.max(globalMax, high)
+            }
+            // One base for a shared window; otherwise one exact window per row.
+            let bases = globalMin == 256 || globalMax - globalMin < 14
+                ? [globalMin == 256 ? UInt8(0) : UInt8(globalMin)] : rowBases
+            var words = [UInt32](repeating: 0, count: bits.count / 8 * 3)
+            for i in stride(from: 0, to: bits.count, by: 8) {
+                var block: UInt64 = 0
+                let out = i / 8 * 3
+                let base = Int(bases[bases.count == 1 ? 0 : i / width])
+                for j in 0 ..< 8 {
+                    let column = i % width + j
+                    let logical = column / 64 * 64 + (column % 64) / 2 + (column & 1) * 32
+                    let value = bits[i / width * width + logical]
+                    let exponent = Int((value >> 7) & 255)
+                    let field = exponent == 0 ? 0 : exponent - base + 1
+                    let code = ((value & 0x8000) >> 4) | UInt16(field << 7) | (value & 127)
+                    block |= UInt64(code) << ((j % 2) * 12)
+                    if j % 2 == 1 {
+                        let shift = (j / 2 * 24) % 32
+                        let word = j / 2 * 24 / 32
+                        words[out + word] |= UInt32(truncatingIfNeeded: block << shift)
+                        if shift > 8 {
+                            words[out + word + 1] |= UInt32(block >> (32 - shift))
+                        }
+                        block = 0
+                    }
                 }
             }
+            packed = MLXArray(words)
+            // UInt8 exponent bases replace the dependent value lookup.
+            lookup = MLXArray(bases)
         }
-        packed = MLXArray(words)
-        // UInt8 exponent bases replace the dependent value lookup.
-        lookup = MLXArray(bases)
         let restored = try materialize().view(dtype: .uint16)
         let exact = MLX.all(restored .== source.view(dtype: .uint16))
         try withError { eval(exact) }
         guard exact.item(Bool.self) else { return nil }
+    }
+
+    /// Seven consecutive exponents, signed-zero codes and exact indexed escapes.
+    /// A row descriptor stores its exponent base and a 24-bit escape offset.
+    private static func pack11(_ bits: [UInt16], rows: Int, width: Int)
+        -> (words: [UInt32], lookup: [UInt32])?
+    {
+        guard width == 256 else { return nil }
+        var descriptors = [UInt32](repeating: 0, count: rows)
+        var totalEscapes = 0
+        for row in 0 ..< rows {
+            var counts = [Int](repeating: 0, count: 256)
+            var nonzero = 0
+            for i in row * width ..< (row + 1) * width where bits[i] & 0x7fff != 0 {
+                counts[Int((bits[i] >> 7) & 255)] += 1
+                nonzero += 1
+            }
+            var covered = counts[0 ..< 7].reduce(0, +)
+            var best = covered, base = 0
+            for candidate in 1 ... 249 {
+                covered += counts[candidate + 6] - counts[candidate - 1]
+                if covered > best { best = covered; base = candidate }
+            }
+            guard nonzero - best <= 254, totalEscapes < 1 << 24 else { return nil }
+            descriptors[row] = UInt32(base) | (UInt32(totalEscapes) << 8)
+            totalEscapes += nonzero - best
+        }
+        guard totalEscapes < 1 << 24 else { return nil }
+        let wordCount = bits.count / 32 * 11
+        let lookupCount = rows + (totalEscapes + 1) / 2
+        // Beat even a 12-bit copy with no base metadata.
+        guard (wordCount + lookupCount) * 4 < bits.count / 2 * 3 else { return nil }
+        var words = [UInt32](repeating: 0, count: wordCount)
+        var lookup = descriptors
+        lookup.append(contentsOf: repeatElement(UInt32(0), count: lookupCount - rows))
+        for row in 0 ..< rows {
+            let base = Int(descriptors[row] & 255)
+            let start = Int(descriptors[row] >> 8)
+            var escape = 0
+            for column in 0 ..< width {
+                let logical = column / 64 * 64 + (column % 64) / 2 + (column & 1) * 32
+                let value = bits[row * width + logical]
+                let exponent = Int((value >> 7) & 255)
+                let code: UInt32
+                if value & 0x7fff == 0 {
+                    code = value & 0x8000 == 0 ? 0x47e : 0x47f
+                } else if exponent >= base && exponent < base + 7 {
+                    code = UInt32(value & 127) | UInt32((value & 0x8000) >> 5)
+                        | UInt32((exponent - base + 1) << 7)
+                } else {
+                    code = UInt32(escape & 127) | UInt32((escape & 128) << 3)
+                    let index = start + escape
+                    lookup[rows + index / 2] |= UInt32(value) << ((index & 1) * 16)
+                    escape += 1
+                }
+                let bit = (row * width + column) * 11
+                let word = bit / 32, shift = bit & 31
+                words[word] |= code << shift
+                if shift > 21 { words[word + 1] |= code >> (32 - shift) }
+            }
+        }
+        return (words, lookup)
     }
 
     func gather(_ ids: MLXArray, floatOutput: Bool = false) -> MLXArray {
@@ -1397,7 +1464,7 @@ private final class DFlash2PackedCodebook {
     private func gatherOutputs(_ ids: MLXArray, floatOutput: Bool) -> [MLXArray] {
         Self.gatherKernel(
             [packed, lookup, ids.asType(.uint32).reshaped(-1)],
-            template: [("WIDTH", width), ("FLOAT_OUTPUT", floatOutput)],
+            template: [("WIDTH", width), ("FLOAT_OUTPUT", floatOutput), ("PACK11", lookup.dtype == .uint32)],
             grid: (ids.size * width / 2, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [ids.shape + [width]], outputDTypes: [floatOutput ? .float32 : .uint16])
     }
@@ -1418,19 +1485,38 @@ private final class DFlash2PackedCodebook {
             if (i >= uint(ids_shape[0]) * (WIDTH / 2)) return;
             const uint row = ids[i / (WIDTH / 2)];
             const uint pair = i % (WIDTH / 2);
-            const uint base = lookup[lookup_shape[0] == 1 ? 0u : row];
+            const uint base = lookup[PACK11 ? row : (lookup_shape[0] == 1 ? 0u : row)];
             const uint index = row * (WIDTH / 2) + pair;
             const uint outIndex = i / (WIDTH / 2) * WIDTH + (pair >> 5u) * 64u + (pair & 31u);
-            const uint bit = (index & 3u) * 24u;
-            const uint word = (index >> 2u) * 3u + (bit >> 5u);
+            const uint bit = PACK11 ? index * 22u : (index & 3u) * 24u;
+            const uint word = PACK11 ? bit >> 5u : (index >> 2u) * 3u + (bit >> 5u);
             const uint shift = bit & 31u;
             uint codes = packed[word] >> shift;
-            if (shift > 8u) codes |= packed[word + 1u] << (32u - shift);
-            const uint lo = codes & 4095u, hi = (codes >> 12u) & 4095u;
-            const uint le = (lo >> 7u) & 15u, he = (hi >> 7u) & 15u;
-            const ushort2 values(
-                ushort((lo & 127u) | ((lo & 2048u) << 4u) | ((le == 0u ? 0u : base + le - 1u) << 7u)),
-                ushort((hi & 127u) | ((hi & 2048u) << 4u) | ((he == 0u ? 0u : base + he - 1u) << 7u)));
+            if (shift > (PACK11 ? 10u : 8u)) codes |= packed[word + 1u] << (32u - shift);
+            ushort2 values;
+            for (uint part = 0u; part < 2u; part++) {
+                const uint code = (codes >> (part * (PACK11 ? 11u : 12u))) & (PACK11 ? 2047u : 4095u);
+                const uint exponent = (code >> 7u) & (PACK11 ? 7u : 15u);
+                ushort value;
+                if constexpr (PACK11) {
+                    if (exponent != 0u) {
+                        value = ushort((code & 127u) | ((code & 1024u) << 5u)
+                            | (((base & 255u) + exponent - 1u) << 7u));
+                    } else {
+                        const uint local = (code & 127u) | ((code >> 3u) & 128u);
+                        if (local >= 254u) { value = local == 254u ? 0u : 32768u; }
+                        else {
+                            const uint escape = (base >> 8u) + local;
+                            value = ushort(lookup[packed_shape[0] / (WIDTH * 11 / 32) + (escape >> 1u)]
+                                >> ((escape & 1u) * 16u));
+                        }
+                    }
+                } else {
+                    value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                        | ((exponent == 0u ? 0u : base + exponent - 1u) << 7u));
+                }
+                values[part] = value;
+            }
             if constexpr (FLOAT_OUTPUT) {
                 const float2 widened(cast_to<float>(uint16_to_bfloat16(values.x)),
                                      cast_to<float>(uint16_to_bfloat16(values.y)));
@@ -3344,9 +3430,7 @@ enum DF2Fast {
             let op = w4Cache[ObjectIdentifier(layer)], op.k == 32768, op.n == 4096,
             let metadata = op.pair24
         else { return false }
-        let wide = DF2WideLanes.serves(
-            .init(kind: .quantG, dtype: input.dtype, dtype2: input.dtype, k: 32768, group: 64, flag: 0))
-        return !wide && metadata.selection.fcLookupPrefixCompatible(op)
+        return metadata.selection.fcLookupPrefixCompatible(op)
     }
 
     /// Raw is the incumbent.3% in all3 rounds is a conservative initial policy.
@@ -3859,8 +3943,15 @@ enum DF2Fast {
                 const device half* oc = bT + n0 + nb;
                 half4 ps0 = *(const device half4*)(sc + (size_t)sg * N), ps1 = *(const device half4*)(sc + (size_t)sg * N + 16);
                 half4 po0 = *(const device half4*)(oc + (size_t)sg * N), po1 = *(const device half4*)(oc + (size_t)sg * N + 16);
-                float pa0 = ascale[m0 * G + int(sg)], pa1 = ascale[m1 * G + int(sg)];
-                float px0 = xs[m0 * G + int(sg)], px1 = xs[m1 * G + int(sg)];
+                // mrow excludes lane bits 0 and 3; these four lanes share both rows.
+                const ushort activationOwner = ushort(lane & ~9u);
+                float pa0 = 0.0f, pa1 = 0.0f, px0 = 0.0f, px1 = 0.0f;
+                if ((lane & 9u) == 0u) {
+                  pa0 = ascale[m0 * G + int(sg)]; pa1 = ascale[m1 * G + int(sg)];
+                  px0 = xs[m0 * G + int(sg)]; px1 = xs[m1 * G + int(sg)];
+                }
+                pa0 = simd_shuffle(pa0, activationOwner); pa1 = simd_shuffle(pa1, activationOwner);
+                px0 = simd_shuffle(px0, activationOwner); px1 = simd_shuffle(px1, activationOwner);
                 for (int g = int(sg); g < G; g += SPLIT) {
                 \(stage)  const half4 cs0 = ps0, cs1 = ps1;
                   const float a0 = pa0, a1 = pa1;
@@ -3876,8 +3967,12 @@ enum DF2Fast {
                     const size_t r = (size_t)(g + SPLIT) * N;
                     ps0 = *(const device half4*)(sc + r); ps1 = *(const device half4*)(sc + r + 16);
                     po0 = *(const device half4*)(oc + r); po1 = *(const device half4*)(oc + r + 16);
-                    pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
-                    px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
+                    if ((lane & 9u) == 0u) {
+                      pa0 = ascale[m0 * G + g + SPLIT]; pa1 = ascale[m1 * G + g + SPLIT];
+                      px0 = xs[m0 * G + g + SPLIT]; px1 = xs[m1 * G + g + SPLIT];
+                    }
+                    pa0 = simd_shuffle(pa0, activationOwner); pa1 = simd_shuffle(pa1, activationOwner);
+                    px0 = simd_shuffle(px0, activationOwner); px1 = simd_shuffle(px1, activationOwner);
                   }
                 \(barrier)  auto tA = A.template slice<\(group), 16>(g * \(group), 0);
                   op.run(tA, Bt, cT);
@@ -5664,30 +5759,64 @@ enum DF2Fast {
                 const uint shift = bit & 31u;
                 uint predCodes = 0u, succCodes = 0u;
                 if constexpr (PRED_PACKED) {
-                  const size_t word = (size_t)pr * 96u + offset;
-                  predCodes = uint(pred[word]) >> shift;
-                  if (shift > 8u) predCodes |= uint(pred[word + 1u]) << (32u - shift);
+                  const size_t word = (size_t)pr * (PRED11 ? 88u : 96u)
+                      + (PRED11 ? (pair * 22u) >> 5u : offset);
+                  const uint codeShift = PRED11 ? (pair * 22u) & 31u : shift;
+                  predCodes = uint(pred[word]) >> codeShift;
+                  if (codeShift > (PRED11 ? 10u : 8u)) predCodes |= uint(pred[word + 1u]) << (32u - codeShift);
                 }
                 if constexpr (SUCC_PACKED) {
-                  const size_t word = (size_t)c * 96u + offset;
-                  succCodes = uint(succ[word]) >> shift;
-                  if (shift > 8u) succCodes |= uint(succ[word + 1u]) << (32u - shift);
+                  const size_t word = (size_t)c * (SUCC11 ? 88u : 96u)
+                      + (SUCC11 ? (pair * 22u) >> 5u : offset);
+                  const uint codeShift = SUCC11 ? (pair * 22u) & 31u : shift;
+                  succCodes = uint(succ[word]) >> codeShift;
+                  if (codeShift > (SUCC11 ? 10u : 8u)) succCodes |= uint(succ[word + 1u]) << (32u - codeShift);
                 }
                 for (int part = 0; part < 2; part++) {
                   const int component = r + part * 32;
                   float pv, sv;
                   if constexpr (PRED_PACKED) {
-                    const uint code = (predCodes >> (part * 12)) & 4095u;
-                    const uint exponent = (code >> 7u) & 15u;
-                    const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
-                        | ((exponent == 0u ? 0u : predBase + exponent - 1u) << 7u));
+                    const uint code = (predCodes >> (part * (PRED11 ? 11 : 12))) & (PRED11 ? 2047u : 4095u);
+                    const uint exponent = (code >> 7u) & (PRED11 ? 7u : 15u);
+                    ushort value;
+                    if constexpr (PRED11) {
+                      if (exponent != 0u) {
+                        value = ushort((code & 127u) | ((code & 1024u) << 5u)
+                            | (((predBase & 255u) + exponent - 1u) << 7u));
+                      } else {
+                        const uint local = (code & 127u) | ((code >> 3u) & 128u);
+                        if (local >= 254u) { value = local == 254u ? 0u : 32768u; }
+                        else {
+                          const uint escape = (predBase >> 8u) + local;
+                          value = ushort(predLookup[pred_shape[0] / 88u + (escape >> 1u)] >> ((escape & 1u) * 16u));
+                        }
+                      }
+                    } else {
+                      value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                          | ((exponent == 0u ? 0u : predBase + exponent - 1u) << 7u));
+                    }
                     pv = cast_to<float>(uint16_to_bfloat16(value));
                   } else { pv = float(pred[(size_t)pr * 256 + component]); }
                   if constexpr (SUCC_PACKED) {
-                    const uint code = (succCodes >> (part * 12)) & 4095u;
-                    const uint exponent = (code >> 7u) & 15u;
-                    const ushort value = ushort((code & 127u) | ((code & 2048u) << 4u)
-                        | ((exponent == 0u ? 0u : succBase + exponent - 1u) << 7u));
+                    const uint code = (succCodes >> (part * (SUCC11 ? 11 : 12))) & (SUCC11 ? 2047u : 4095u);
+                    const uint exponent = (code >> 7u) & (SUCC11 ? 7u : 15u);
+                    ushort value;
+                    if constexpr (SUCC11) {
+                      if (exponent != 0u) {
+                        value = ushort((code & 127u) | ((code & 1024u) << 5u)
+                            | (((succBase & 255u) + exponent - 1u) << 7u));
+                      } else {
+                        const uint local = (code & 127u) | ((code >> 3u) & 128u);
+                        if (local >= 254u) { value = local == 254u ? 0u : 32768u; }
+                        else {
+                          const uint escape = (succBase >> 8u) + local;
+                          value = ushort(succLookup[succ_shape[0] / 88u + (escape >> 1u)] >> ((escape & 1u) * 16u));
+                        }
+                      }
+                    } else {
+                      value = ushort((code & 127u) | ((code & 2048u) << 4u)
+                          | ((exponent == 0u ? 0u : succBase + exponent - 1u) << 7u));
+                    }
                     sv = cast_to<float>(uint16_to_bfloat16(value));
                   } else { sv = float(succ[(size_t)c * 256 + component]); }
                   acc += pv * float(proj[p * 256 + component]) * sv;
@@ -5747,7 +5876,7 @@ enum DF2Fast {
         let path = selector(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
-            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
+            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil), ("PRED11", predLookup?.dtype == .uint32), ("SUCC11", succLookup?.dtype == .uint32)],
             grid: (512, 1, 1), threadGroup: (512, 1, 1),
             outputShapes: [[P]], outputDTypes: [.int32])[0]
         return path.reshaped([1, P])
@@ -5965,7 +6094,7 @@ enum DF2Fast {
         return (kernel ?? treeSelector!)(
             [top[0], top[1], projected.reshaped([P, -1]).asType(.float32), pred, succ, anchor.asType(.int32),
              predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
-            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil),
+            template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil), ("PRED11", predLookup?.dtype == .uint32), ("SUCC11", succLookup?.dtype == .uint32),
                 ("TREE_NODES", 15)],
             grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[P], [333]], outputDTypes: [.int32, .int32])
@@ -6030,8 +6159,8 @@ extension DF2Fast {
                 const int p = tg == 0u ? 0 : 1 + int(tg - 1u) / (16 / KS);
                 const int s0 = tg == 0u ? 16 : KS * int((tg - 1u) % uint(16 / KS));
                 const uint j = sg;
-                const int predRows = PRED_PACKED ? int(pred_shape[0]) / 96 : int(pred_shape[0]);
-                const int succRows = SUCC_PACKED ? int(succ_shape[0]) / 96 : int(succ_shape[0]);
+                const int predRows = PRED_PACKED ? int(pred_shape[0]) / (PRED11 ? 88 : 96) : int(pred_shape[0]);
+                const int succRows = SUCC_PACKED ? int(succ_shape[0]) / (SUCC11 ? 88 : 96) : int(succ_shape[0]);
                 const int cRaw = mtc[p * 16 + int(j)];
                 const int c = cRaw >= 0 && cRaw < succRows
                     && (!SUCC_PACKED || succLookup_shape[0] == 1 || cRaw < int(succLookup_shape[0])) ? cRaw : 0;
@@ -6234,7 +6363,7 @@ extension DF2Fast {
                 let edges: [MLXArray] = try checkedOutputs(scorer(
                     [merged[0], merged[1], projected.reshaped([P, -1]).asType(.float32), pred, succ,
                      anchor.asType(.int32), predLookup ?? selectorLookupSentinel, succLookup ?? selectorLookupSentinel],
-                    template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil)],
+                    template: [("PRED_PACKED", predLookup != nil), ("SUCC_PACKED", succLookup != nil), ("PRED11", predLookup?.dtype == .uint32), ("SUCC11", succLookup?.dtype == .uint32)],
                     grid: (groups * 512, 1, 1), threadGroup: (512, 1, 1),
                     outputShapes: [[P * 17 * 16]], outputDTypes: [.float32]), 1, "tree wide edges")
                 return (merged[0], merged[1], edges[0])
@@ -6368,8 +6497,10 @@ extension DF2Fast {
             let rows: Int = 4096
             let narrow: MLXArray = syntheticCodebook(rows: rows, seed: 84, spread: false)
             let spread: MLXArray = syntheticCodebook(rows: rows, seed: 85, spread: true)
-            guard let n = try DFlash2PackedCodebook(narrow), let s = try DFlash2PackedCodebook(spread),
-                n.lookup.size == 1, s.lookup.size == rows
+            guard let n = try DFlash2PackedCodebook(narrow, allow11: false),
+                let s = try DFlash2PackedCodebook(spread, allow11: false),
+                let n11 = try DFlash2PackedCodebook(narrow), let s11 = try DFlash2PackedCodebook(spread),
+                n.lookup.size == 1, s.lookup.size == rows, n11.lookup.dtype == .uint32, s11.lookup.dtype == .uint32
             else { return nil }
             return [
                 Codebooks(
@@ -6383,11 +6514,17 @@ extension DF2Fast {
                     predLookup: s.lookup, succLookup: n.lookup, rows: rows),
                 Codebooks(name: "unpacked", pred: narrow, succ: spread, predLookup: nil, succLookup: nil, rows: rows),
                 Codebooks(
-                    name: "packed pred, unpacked succ", pred: n.packed, succ: spread,
-                    predLookup: n.lookup, succLookup: nil, rows: rows),
+                    name: "packed 11/12", pred: n11.packed, succ: s.packed,
+                    predLookup: n11.lookup, succLookup: s.lookup, rows: rows),
                 Codebooks(
-                    name: "unpacked pred, packed succ", pred: narrow, succ: s.packed,
-                    predLookup: nil, succLookup: s.lookup, rows: rows),
+                    name: "packed 12/11", pred: n.packed, succ: s11.packed,
+                    predLookup: n.lookup, succLookup: s11.lookup, rows: rows),
+                Codebooks(
+                    name: "packed11 pred, unpacked succ", pred: n11.packed, succ: spread,
+                    predLookup: n11.lookup, succLookup: nil, rows: rows),
+                Codebooks(
+                    name: "unpacked pred, packed11 succ", pred: narrow, succ: s11.packed,
+                    predLookup: nil, succLookup: s11.lookup, rows: rows),
             ]
         }
 
@@ -6408,7 +6545,7 @@ extension DF2Fast {
             let ref: [MLXArray] = try checkedOutputs(k.reference(
                 [top[0], top[1], projected, books.pred, books.succ, anchor,
                  books.predLookup ?? selectorLookupSentinel, books.succLookup ?? selectorLookupSentinel],
-                template: [("PRED_PACKED", books.predLookup != nil), ("SUCC_PACKED", books.succLookup != nil),
+                template: [("PRED_PACKED", books.predLookup != nil), ("SUCC_PACKED", books.succLookup != nil), ("PRED11", books.predLookup?.dtype == .uint32), ("SUCC11", books.succLookup?.dtype == .uint32),
                     ("TREE_NODES", 15)],
                 grid: (512, 1, 1), threadGroup: (512, 1, 1),
                 outputShapes: [[15], [333], [240], [15], [1], [1], [240], [240]],
@@ -7518,6 +7655,41 @@ private enum DF2LeanIndex {
 
         """
 
+    /// Decode one predecessor row per expansion for all 16 candidate simdgroups.
+    private static func sharePredecessor(_ text: inout String) -> Bool {
+        guard let edge = DF2Fast.selectorEdgeText, let e = DF2Fast.TreeWide.pieces(edge, at: [
+            "  if constexpr (PRED_PACKED) { predBase",
+            "  if constexpr (SUCC_PACKED) { succBase",
+            "  float acc = 0.0f;\n",
+            "  for (int r = int(lane); r < 256; r += 64) {\n",
+            "    uint predCodes = 0u, succCodes = 0u;\n",
+            "    if constexpr (PRED_PACKED) {\n      const size_t word",
+            "    if constexpr (SUCC_PACKED) {\n      const size_t word",
+            "      float pv, sv;\n",
+            "      if constexpr (PRED_PACKED) {\n        const uint code",
+            "      if constexpr (SUCC_PACKED) {\n        const uint code",
+            "      acc += pv",
+            "    }\n  }\n  acc = simd_sum(acc);\n",
+        ]) else { return false }
+        let stage = "if (sg == 0u) {\nuint predBase = 0u;\n" + e[1] + e[4]
+            + "uint predCodes = 0u;\n" + e[6]
+            + "for (int part = 0; part < 2; part++) {\nconst int component = r + part * 32;\nfloat pv;\n"
+            + e[9] + "lx_pred[component] = pv;\n}\n}\n}\n"
+            + "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        return swap(&text, e[0] + e[1], "  uint succBase = 0u;\n")
+            && swap(&text, e[5], "    uint succCodes = 0u;\n")
+            && swap(&text, e[6], "")
+            && swap(&text, e[9], "      pv = lx_pred[component];\n")
+            // Match the packed/raw rounded product and fused accumulation.
+            && swap(&text, e[11], "      if constexpr (PRED_PACKED && !SUCC_PACKED) {\n"
+                + "        #pragma clang fp reassociate(off)\n"
+                + "        #pragma clang fp contract(off)\n"
+                + "        acc = fma(float(proj[p * 256 + component]) * sv, pv, acc);\n"
+                + "      } else {\n" + e[11] + "      }\n")
+            && swap(&text, "threadgroup float fprob[256];", "threadgroup float lx_pred[256];\nthreadgroup float fprob[256];")
+            && swap(&text, "    for (uint j = sg; j < 16u; j += NSG) {", stage + "    for (uint j = sg; j < 16u; j += NSG) {")
+    }
+
     /// The lean twin of `DF2Fast.treeSource` (before `treeConfigured`), or nil when a cut misses.
     static func treeSource(_ record: String) -> String? {
         let tail = "if (tid == 0) {\n  int order[16];"
@@ -7528,7 +7700,7 @@ private enum DF2LeanIndex {
             "#pragma clang loop unroll(full)\nfor (int lx_i = 0; lx_i < \(negativeControl ? 3 : 4); lx_i++) {\n"
                 + "const int r = int(lane) + 64 * lx_i;")
             && swap(&s, "const uint pair = uint(r >> 6) * 32u + lane;", "const uint pair = uint(lx_i) * 32u + lane;")
-        return ok ? s : nil
+        return ok && sharePredecessor(&s) ? s : nil
     }
 
     /// Launched only by `recordTreeOutputs`, with 512 threads (the tail needs 256).
