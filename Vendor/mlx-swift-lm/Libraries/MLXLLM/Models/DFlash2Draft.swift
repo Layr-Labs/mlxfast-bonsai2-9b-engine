@@ -1273,10 +1273,19 @@ private final class DFlash2DecoderLayer: Module {
             n2 = DF2Fast.rms(attended, postAttentionLayerNorm)
             n2Codes = nil
         }
-        let p2 =
-            (n2Codes.flatMap {
-                DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [mlpConv.kernelProjection])
-            }?[0]) ?? DF2Fast.linear(n2, mlpConv.kernelProjection)
+        let p2: MLXArray
+        if nextQStart == 1, DF2Fast.w4Group != nil,
+            let q = mlpConv.kernelProjection as? QuantizedLinear,
+            q.mode == .affine, q.bits == 8, q.groupSize == 32, q.bias == nil,
+            q.weight.shape == [1024, 1024]
+        {
+            p2 = q(n2)
+        } else {
+            p2 =
+                (n2Codes.flatMap {
+                    DF2Fast.w4LinearsFromCodes($0, leadShape: leadShape, [mlpConv.kernelProjection])
+                }?[0]) ?? DF2Fast.linear(n2, mlpConv.kernelProjection)
+        }
         let base2 = mlpConv.fastBase
         let mlpOut: MLXArray
         if DF2Fast.w4Group != nil {
