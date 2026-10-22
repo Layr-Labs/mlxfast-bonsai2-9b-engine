@@ -407,6 +407,31 @@ enum CBv2AttentionV1 {
             keepMask: keepMask, metadata: metadata, packet: packet)
     }
 
+    /// The native-vector verify attention over the stored prefix and the window's new rows, whose
+    /// launch also stores the new rows into the cache, so no slice update stands between the rows'
+    /// producers and the attention. Same attention bits and same cache bytes as `row.update`
+    /// then attention; nil (and no state changed) when the row or the inputs do not qualify.
+    private static func attendBeforeWrite(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?, keepMask: MLXArray?,
+        allowNativeVectorBatch: Bool
+    ) -> MLXArray? {
+        guard allowNativeVectorBatch, CBv2VerifyVectorAttention.kvwriteEnabled,
+            let stored = row as? CBv2FullSequenceKV,
+            canBatchSerialQueriesWithNativeVector(
+                kind: kind, queries: queries, keys: keys, values: values,
+                sinks: sinks, softcap: softcap, keepMask: keepMask),
+            let (prefixKeys, prefixValues) = stored.prefixViews(appending: keys, values),
+            let attended = CBv2VerifyVectorAttention.attendNewRows(
+                queries: queries, prefixKeys: prefixKeys, prefixValues: prefixValues,
+                newKeys: keys, newValues: values, scale: scale,
+                tree: queries.dim(2) == 16 ? CBv2BranchVerify.tree : nil)
+        else { return nil }
+        stored.commitStoredRows(keys.dim(2))
+        return attended
+    }
+
     private static func updateAndAttendRowSerialQueries(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -414,6 +439,13 @@ enum CBv2AttentionV1 {
         keepMask: MLXArray? = nil, allowNativeVectorBatch: Bool = false
     ) -> MLXArray {
         let L = queries.dim(2)
+        if let shared = attendBeforeWrite(
+            row: row, kind: kind, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: softcap, keepMask: keepMask,
+            allowNativeVectorBatch: allowNativeVectorBatch)
+        {
+            return shared
+        }
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if let tree = CBv2BranchVerify.tree, L == 16 {
             precondition(keepMask == nil && allowNativeVectorBatch, "CBv2 tree verify: unsupported attention form")
@@ -1473,26 +1505,129 @@ enum CBv2VerifyVectorAttention {
     private static let pairedTreeLean = leanKernel(
         "cbv2_verify_sdpa_paired_tree_lean", leanSource(pairedSource, tree: true), tree: true)
 
+    /// `DARKBLOOM_BONSAI_KVWRITE=0` keeps the record's write-then-attend order of the target K/V rows.
+    private static let kvwriteSwitch: Bool = {
+        let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_KVWRITE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["0", "false", "no", "off"].contains(value ?? "")
+    }()
+
+    /// Twin of a lean source whose window keys come from the round's new rows (`new_k`, `new_v`,
+    /// any strides) instead of cache rows `tv_base ..< N`, and which stores those rows into the
+    /// cache buffer behind `keys` and `values` itself (the cache is mutated through its input
+    /// pointer; the rows `tv_base ..< N` are read by no thread of this launch). `keys` and
+    /// `values` are read only before the window. The chain twin splits the key loop at the
+    /// window start: the same classes, the same key order, the same loads and floating-point
+    /// operations. The tree twin reads its peeled window key from the new row
+    /// `tree_pi - tv_base`. nil when an anchor is missing.
+    static func newRowsSource(_ lean: String, tree: Bool) -> String? {
+        func once(_ text: String, _ piece: String) -> Range<String.Index>? {
+            guard text.components(separatedBy: piece).count == 2 else { return nil }
+            return text.range(of: piece)
+        }
+        guard let anchor = once(lean, "const int vstep = 32 * vs;") else { return nil }
+        var s = lean
+        s.replaceSubrange(anchor, with: """
+            const int vstep = 32 * vs;
+            const device float* nkp = new_k + kvh * new_k_strides[1] + simd_lid * 8;
+            const device float* nvp = new_v + kvh * new_v_strides[1] + simd_lid * 8;
+            const int nks = int(new_k_strides[2]);
+            const int nvs = int(new_v_strides[2]);
+            if (c == 0 && threadgroup_position_in_grid.y == 0) {
+              const int64_t row = int64_t(N - int(L)) + int64_t(t);
+              device float* kw = const_cast<device float*>(keys)
+                  + int64_t(kvh) * keys_strides[1] + row * keys_strides[2] + simd_lid * 8;
+              device float* vw = const_cast<device float*>(values)
+                  + int64_t(kvh) * values_strides[1] + row * values_strides[2] + simd_lid * 8;
+              const device float* ksrc = new_k + int64_t(kvh) * new_k_strides[1]
+                  + int64_t(t) * new_k_strides[2] + simd_lid * 8;
+              const device float* vsrc = new_v + int64_t(kvh) * new_v_strides[1]
+                  + int64_t(t) * new_v_strides[2] + simd_lid * 8;
+              *((device packed_float4*)(kw + 0)) = *((const device packed_float4*)(ksrc + 0));
+              *((device packed_float4*)(kw + 4)) = *((const device packed_float4*)(ksrc + 4));
+              *((device packed_float4*)(vw + 0)) = *((const device packed_float4*)(vsrc + 0));
+              *((device packed_float4*)(vw + 4)) = *((const device packed_float4*)(vsrc + 4));
+            }
+            """)
+        if tree {
+            let from = "const device float* kr = kp + tree_pi * ks;\nconst device float* vr = vp + tree_pi * vs;"
+            guard let at = once(s, from) else { return nil }
+            s.replaceSubrange(at, with: """
+                const device float* kr = nkp + (tree_pi - tv_base) * nks;
+                const device float* vr = nvp + (tree_pi - tv_base) * nvs;
+                """)
+            return s
+        }
+        let header = "const device float* kr = kp + c * ks;\nconst device float* vr = vp + c * vs;\n"
+            + "for (int i = c; i <= limit; i += 32, kr += kstep, vr += vstep) {"
+        let footer = "\n}\n#pragma clang loop unroll(full)\nfor (int h = 0; h < G; h++) {\n  const uint slot"
+        guard let head = once(s, header), let foot = once(s, footer), head.upperBound <= foot.lowerBound
+        else { return nil }
+        let body = String(s[head.upperBound ..< foot.lowerBound])
+        return String(s[..<head.lowerBound]) + """
+            const int tv_base = N - int(L);
+            const device float* kr = kp + c * ks;
+            const device float* vr = vp + c * vs;
+            int i = c;
+            for (; i < tv_base; i += 32, kr += kstep, vr += vstep) {
+            """ + body + """
+
+            }
+            for (; i <= limit; i += 32) {
+            const device float* kr = nkp + (i - tv_base) * nks;
+            const device float* vr = nvp + (i - tv_base) * nvs;
+            """ + body + String(s[foot.lowerBound...])
+    }
+
+    private static func newRowsKernel(_ name: String, _ lean: String?, tree: Bool)
+        -> MLXFast.MLXFastKernel?
+    {
+        guard kvwriteSwitch, let lean, let source = newRowsSource(lean, tree: tree) else { return nil }
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: tree ? ["queries", "keys", "values", "n_keys", "tree", "new_k", "new_v"]
+                : ["queries", "keys", "values", "n_keys", "new_k", "new_v"],
+            outputNames: ["part_o", "part_m", "part_s"],
+            source: source,
+            ensureRowContiguous: false)
+    }
+
+    private static let partialNew = newRowsKernel(
+        "cbv2_verify_sdpa_partial_newrows", leanSource(partialSource, tree: false), tree: false)
+    private static let partialTreeNew = newRowsKernel(
+        "cbv2_verify_sdpa_partial_tree_newrows", leanSource(partialSource, tree: true), tree: true)
+    private static let pairedNew = newRowsKernel(
+        "cbv2_verify_sdpa_paired_newrows", leanSource(pairedSource, tree: false), tree: false)
+    private static let pairedTreeNew = newRowsKernel(
+        "cbv2_verify_sdpa_paired_tree_newrows", leanSource(pairedSource, tree: true), tree: true)
+
     /// The partial states `[part_o, part_m, part_s]` of the record kernel this device dispatches,
     /// or of its lean twin when `lean` and the twin exists. `tree` is nil for a chain verify.
+    /// With `newRows`, `keys` and `values` hold only the rows before the window and the window's
+    /// rows come from `newRows` (see `newRowsSource`).
     private static func launchStates(
         queries: MLXArray, keys: MLXArray, values: MLXArray, params: MLXArray,
-        tree: MLXArray?, L: Int, lean: Bool
+        tree: MLXArray?, L: Int, lean: Bool, newRows: (MLXArray, MLXArray)? = nil
     ) -> [MLXArray]? {
-        let inputs = tree.map { [queries, keys, values, params, $0] } ?? [queries, keys, values, params]
+        var inputs = tree.map { [queries, keys, values, params, $0] } ?? [queries, keys, values, params]
+        if let newRows { inputs += [newRows.0, newRows.1] }
         let outputShapes = [[16 * L * 32, 256], [16 * L * 32], [16 * L * 32]]
         let outputDTypes: [DType] = [.float32, .float32, .float32]
         let isTree = tree != nil
         if L > 8 && classesPerGroup == 2 {
-            let twin = lean ? (isTree ? pairedTreeLean : pairedLean) : nil
-            guard let kernel = twin ?? (isTree ? pairedTree : pairedPartial) else { return nil }
+            let twin = newRows != nil ? (isTree ? pairedTreeNew : pairedNew)
+                : lean ? (isTree ? pairedTreeLean : pairedLean) : nil
+            guard let kernel = twin ?? (newRows != nil ? nil : isTree ? pairedTree : pairedPartial)
+            else { return nil }
             return kernel(
                 inputs, template: [("N_QUERIES", L), ("CPT", 1), ("GH", 2)],
                 grid: (32 * 32 * L, 2, 4), threadGroup: (32 * 1 * L, 1, 1),
                 outputShapes: outputShapes, outputDTypes: outputDTypes)
         }
-        let twin = lean ? (isTree ? partialTreeLean : partialLean) : nil
-        guard let kernel = twin ?? (isTree ? partialTree : partial) else { return nil }
+        let twin = newRows != nil ? (isTree ? partialTreeNew : partialNew)
+            : lean ? (isTree ? partialTreeLean : partialLean) : nil
+        guard let kernel = twin ?? (newRows != nil ? nil : isTree ? partialTree : partial)
+        else { return nil }
         return kernel(
             inputs, template: [("N_QUERIES", L), ("CPT", classesPerGroup)],
             grid: (32 * 32 * L, 1, 4), threadGroup: (32 * classesPerGroup * L, 1, 1),
@@ -1526,7 +1661,7 @@ enum CBv2VerifyVectorAttention {
         return passed
     }()
 
-    static func prepareLean() { _ = leanVerdict; _ = combineDirectPassed }
+    static func prepareLean() { _ = leanVerdict; _ = combineDirectPassed; _ = kvwriteVerdict }
 
     private static func probe(_ shape: [Int], seed: Float, scale: Float) -> MLXArray {
         let n = shape.reduce(1, *)
@@ -1582,6 +1717,100 @@ enum CBv2VerifyVectorAttention {
             }
         }
         return true
+    }
+
+    /// Whether the new-row kernels gave the lean kernels' partial states, and left the cache
+    /// holding the bytes a slice update of the same rows leaves (the whole buffer, rows after the
+    /// window included), bit for bit, for every verify row count 2 ... 16 (chain) and for tree
+    /// windows at 16, over window-edge prefix lengths, with row-contiguous and transposed new
+    /// rows; and whether new rows shifted by one row differ in both (negative control). Checked
+    /// once; only a GPU the lean twins serve (two classes per group) uses them.
+    private static let kvwriteVerdict: Bool = {
+        guard kvwriteSwitch, classesPerGroup == 2, leanVerdict else { return false }
+        var passed = false
+        do {
+            passed = try withError { checkNewRows() }
+        } catch {
+            FileHandle.standardError.write(Data("kvwrite check error: \(error)\n".utf8))
+        }
+        FileHandle.standardError.write(Data("kvwrite checked: \(passed)\n".utf8))
+        return passed
+    }()
+
+    static var kvwriteEnabled: Bool { kvwriteVerdict }
+
+    private static func checkNewRows() -> Bool {
+        let trees: [[Int]] = [
+            Array(-1 ..< 15),
+            [-1, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 11, 4, 13, 14],
+        ]
+        func equal(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all().item(Bool.self)
+        }
+        func same(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+            zip(a, b).allSatisfy { (x: MLXArray, y: MLXArray) -> Bool in equal(x, y) }
+        }
+        var negativeControls = 0
+        var cases = 0
+        for L in 2 ... 16 {
+            let treeChoices: [MLXArray?] = L == 16
+                ? [nil] + trees.map { (parents: [Int]) -> MLXArray? in probeTree(parents) } : [nil]
+            let queries = probe([1, 16, L, 256], seed: 0.01, scale: 1.5)
+            for base in [1, 33, 512, 640] {
+                let params = MLXArray([Int32(base + L), Int32(bitPattern: Float(0.0625).bitPattern)])
+                for transposed in [false, true] {
+                    let newK = transposed
+                        ? probe([1, L, 4, 256], seed: 0.04, scale: 1.5).transposed(0, 2, 1, 3)
+                        : probe([1, 4, L, 256], seed: 0.04, scale: 1.5)
+                    let newV = transposed
+                        ? probe([1, L, 4, 256], seed: 0.05, scale: 1.0).transposed(0, 2, 1, 3)
+                        : probe([1, 4, L, 256], seed: 0.05, scale: 1.0)
+                    let shiftedK = concatenated([newK[.ellipsis, 1..., 0...], newK[.ellipsis, ..<1, 0...]], axis: 2)
+                    let shiftedV = concatenated([newV[.ellipsis, 1..., 0...], newV[.ellipsis, ..<1, 0...]], axis: 2)
+                    for tree in treeChoices {
+                        func fresh(_ seed: Float, _ scale: Float) -> MLXArray {
+                            let cache = probe([1, 4, base + L + 24, 256], seed: seed, scale: scale)
+                            eval(cache)
+                            return cache
+                        }
+                        let cacheK = fresh(0.02, 1.5)
+                        let cacheV = fresh(0.03, 1.0)
+                        let shiftedCacheK = fresh(0.02, 1.5)
+                        let shiftedCacheV = fresh(0.03, 1.0)
+                        let writtenK = concatenated(
+                            [cacheK[.ellipsis, ..<base, 0...], newK, cacheK[.ellipsis, (base + L)..., 0...]], axis: 2)
+                        let writtenV = concatenated(
+                            [cacheV[.ellipsis, ..<base, 0...], newV, cacheV[.ellipsis, (base + L)..., 0...]], axis: 2)
+                        eval(writtenK, writtenV)
+                        guard
+                            let reference = launchStates(
+                                queries: queries, keys: writtenK[.ellipsis, ..<(base + L), 0...],
+                                values: writtenV[.ellipsis, ..<(base + L), 0...], params: params,
+                                tree: tree, L: L, lean: true),
+                            let moved = launchStates(
+                                queries: queries, keys: cacheK[.ellipsis, ..<base, 0...],
+                                values: cacheV[.ellipsis, ..<base, 0...], params: params,
+                                tree: tree, L: L, lean: true, newRows: (newK, newV)),
+                            let shifted = launchStates(
+                                queries: queries, keys: shiftedCacheK[.ellipsis, ..<base, 0...],
+                                values: shiftedCacheV[.ellipsis, ..<base, 0...], params: params,
+                                tree: tree, L: L, lean: true, newRows: (shiftedK, shiftedV))
+                        else { return false }
+                        eval(reference + moved + shifted)
+                        guard same(reference, moved), equal(cacheK, writtenK), equal(cacheV, writtenV)
+                        else { return false }
+                        cases += 1
+                        if !same(reference, shifted) && !equal(shiftedCacheK, writtenK)
+                            && !equal(shiftedCacheV, writtenV)
+                        {
+                            negativeControls += 1
+                        }
+                    }
+                }
+            }
+        }
+        return cases > 0 && negativeControls == cases
     }
 
     /// `[1, 16, L, 256]`, or nil when the inputs do not qualify.
@@ -1640,6 +1869,50 @@ enum CBv2VerifyVectorAttention {
         return combineKernel(
             CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+    }
+
+    /// `attend` (chain) or `attendTree` (`tree`) over the cached rows before the window
+    /// (`prefixKeys`, `prefixValues`) and the window's rows `newKeys`, `newValues` in place, so
+    /// the attention does not wait for a cache write; the launch stores the rows into the cache
+    /// behind `prefixKeys` and `prefixValues` (which must be views of the cache's leading rows
+    /// at offset 0, owned by the caller alone). Returns the attention and its partial states.
+    /// nil when the inputs do not qualify or the load-time check failed.
+    static func attendNewRows(
+        queries: MLXArray, prefixKeys: MLXArray, prefixValues: MLXArray,
+        newKeys: MLXArray, newValues: MLXArray, scale: Float, tree: MLXArray?
+    ) -> MLXArray? {
+        guard kvwriteVerdict,
+            queries.ndim == 4, prefixKeys.ndim == 4, prefixValues.ndim == 4,
+            newKeys.ndim == 4, newValues.ndim == 4,
+            queries.dtype == .float32, prefixKeys.dtype == .float32, prefixValues.dtype == .float32,
+            newKeys.dtype == .float32, newValues.dtype == .float32
+        else { return nil }
+        if let tree { guard tree.dtype == .int32, tree.size >= 288 else { return nil } }
+        let qShape = queries.shape4
+        let pShape = prefixKeys.shape4
+        let nShape = newKeys.shape4
+        let L = qShape.2
+        guard qShape.0 == 1, qShape.1 == 16, qShape.3 == 256, (2 ... 16).contains(L),
+            tree == nil || L == 16,
+            pShape.0 == 1, pShape.1 == 4, pShape.2 > 0, pShape.3 == 256,
+            prefixValues.shape4 == pShape, nShape == (1, 4, L, 256), newValues.shape4 == nShape,
+            pShape.2 + L < 1024,
+            queries.hasUnitInnerStride4, prefixKeys.hasUnitInnerStride4, prefixValues.hasUnitInnerStride4,
+            newKeys.hasUnitInnerStride4, newValues.hasUnitInnerStride4,
+            StreamOrDevice.default == StreamOrDevice.gpu,
+            leanStrideFits(prefixKeys, keys: pShape.2 + L), leanStrideFits(prefixValues, keys: pShape.2 + L),
+            leanStrideFits(newKeys, keys: L), leanStrideFits(newValues, keys: L)
+        else { return nil }
+        let params = HostConstants.recentInt32([Int32(pShape.2 + L), Int32(bitPattern: scale.bitPattern)])
+        guard let states = launchStates(
+            queries: queries, keys: prefixKeys, values: prefixValues, params: params, tree: tree, L: L,
+            lean: true, newRows: (newKeys, newValues))
+        else { return nil }
+        let combineKernel = combineDirectPassed ? combineDirect : combine
+        let attended = combineKernel(
+            CBv2VerifyAttentionPartial.noted(states), grid: (32 * 256, L, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 16, L, 256]], outputDTypes: [.float32])[0]
+        return attended
     }
 }
 
