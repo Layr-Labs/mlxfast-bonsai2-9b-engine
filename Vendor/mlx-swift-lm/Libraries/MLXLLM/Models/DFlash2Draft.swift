@@ -2725,12 +2725,33 @@ enum DF2Fast {
             }
             eval(best!, lo, hi)
         }
-        let s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
-        let b = lo.asType(.float16).asType(.float32)
-        let u = clip(
-            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15
-        ).asType(.uint32).reshaped([N, K / 8, 2, 4])
-        let bytes = u[0..., 0..., 0, 0...] | (u[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
+        var s = which(hi .> lo, (hi - lo) / 15, Float(1)).asType(.float16).asType(.float32)
+        var b = lo.asType(.float16).asType(.float32)
+        var u = clip(
+            round((w - b.expandedDimensions(axis: -1)) / s.expandedDimensions(axis: -1)), min: 0, max: 15)
+        if group == 64, N == 256, K == 4096 {
+            // Refit the selector projection once; the stored affine W4/G64 layout is unchanged.
+            let um = u.mean(axis: -1), wm = w.mean(axis: -1)
+            let du = u - um.expandedDimensions(axis: -1)
+            let dw = w - wm.expandedDimensions(axis: -1)
+            let den = square(du).sum(axis: -1)
+            let sc = ((du * dw).sum(axis: -1) / which(den .> 0, den, Float(1)))
+                .asType(.float16).asType(.float32)
+            let bc = (wm - sc * um).asType(.float16).asType(.float32)
+            let valid = (den .> 0) .&& (sc .> 0) .&& isFinite(sc) .&& isFinite(bc)
+            let uc = clip(round((w - bc.expandedDimensions(axis: -1))
+                / which(valid, sc, s).expandedDimensions(axis: -1)), min: 0, max: 15)
+            let oldError = square(u * s.expandedDimensions(axis: -1)
+                + b.expandedDimensions(axis: -1) - w).sum(axis: -1)
+            let newError = square(uc * sc.expandedDimensions(axis: -1)
+                + bc.expandedDimensions(axis: -1) - w).sum(axis: -1)
+            let better = valid .&& (newError .< oldError)
+            s = which(better, sc, s)
+            b = which(better, bc, b)
+            u = which(better.expandedDimensions(axis: -1), uc, u)
+        }
+        let codes = u.asType(.uint32).reshaped([N, K / 8, 2, 4])
+        let bytes = codes[0..., 0..., 0, 0...] | (codes[0..., 0..., 1, 0...] << MLXArray(UInt32(4)))
         let packed = (bytes << MLXArray([0, 8, 16, 24] as [UInt32])).sum(axis: -1).asType(.uint32)
         let sT = contiguous(s.asType(.float16).transposed())
         let bT = contiguous(b.asType(.float16).transposed())
