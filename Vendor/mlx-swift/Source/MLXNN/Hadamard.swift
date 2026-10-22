@@ -5453,7 +5453,6 @@ enum PromptSplitZ {
 /// the same order: the same bits, which `checkKernels` checks on the device
 /// before `nax` is used.
 enum VerifyInt8Matmul {
-    /// The canonical 2-bit codes remain model parameters.
     static let streamAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_STREAM"]?.lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
@@ -5481,7 +5480,6 @@ enum VerifyInt8Matmul {
             outputShapes: [[n, k / 16]], outputDTypes: [.uint32])[0]
     }
 
-    /// `DARKBLOOM_BONSAI_VERIFY_WIDESTORE=0` keeps 16-B tile stores in the 32-column streamed body.
     static let wideStoreAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_VERIFY_WIDESTORE"]?.lowercased()
         return !["0", "false", "no", "off"].contains(value ?? "")
@@ -5500,9 +5498,6 @@ enum VerifyInt8Matmul {
         return "const uint col = (lane >> 1) + 16u * uint(t / 4); const uint word = (lane & 1u) * 4u + uint(t % 4); threadgroup uint4* target = (threadgroup uint4*)(bs[sg] + col * 32u + word * 4u); *target = uint4(v & 0x03030303u, (v >> 2) & 0x03030303u, (v >> 4) & 0x03030303u, (v >> 6) & 0x03030303u);"
     }
 
-    /// The streamed staging alone (no tensor op): one simdgroup per (tile,
-    /// group) loads the copy's words and writes the `columns x 32`-word B tile
-    /// to device memory with the body's own load and store statements.
     private static func stagingTwinSource(columns: Int, wide: Bool) -> String {
         let words = columns / 4
         let tileWords = columns * 32
@@ -5539,8 +5534,6 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
 
-    /// Every word of every tile and group at each streamed K, both forms over one real copy of hashed words; 255
-    /// marks an unwritten word (a staged word holds bytes 0...3 only).
     private static func checkWideStore(columns: Int) -> Bool {
         let n = 64
         let tileWords = columns * 32
@@ -5570,8 +5563,6 @@ enum VerifyInt8Matmul {
         return matched && !didFail
     }
 
-    /// Runs before any streamed kernel is built, so a failed twin keeps the
-    /// 16-B stores in every streamed source.
     static func prepareWideStore() {
         guard wideStoreAllowed else {
             FileHandle.standardError.write(Data("int8 verify streamed 32-B tile stores: off (DARKBLOOM_BONSAI_VERIFY_WIDESTORE=0)\n".utf8))
@@ -5582,7 +5573,6 @@ enum VerifyInt8Matmul {
         FileHandle.standardError.write(Data("int8 verify streamed 32-B tile stores: N32 \(wideStore ? "passed" : "FAILED"), N16 \(wideStore16 ? "passed" : "FAILED") staging twin K 4096/12288 all tiles/groups/lanes\n".utf8))
     }
 
-    /// Same staged B tile, int32 tensor result and FP32 epilogue.
     private static func makeStreamedBody(_ body: String, columns: Int) -> String? {
         let words = columns / 4
         let oldPointer = "const device uint32_t* wcol = w + (size_t)(n0 + c) * KW + j;"
@@ -5647,11 +5637,9 @@ enum VerifyInt8Matmul {
         name: "bonsai_q8_verify_streamed_col_n16", inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
         source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + streamedBody(naxNarrow16Body, columns: 16).replacingOccurrences(of: "(size_t)", with: "(uint)"),
+            + twoSimdNarrow(streamedBody(naxNarrow16Body, columns: 16)).replacingOccurrences(of: "(size_t)", with: "(uint)"),
         header: PromptInt8Matmul.naxHeader, ensureRowContiguous: true)
 
-    /// Input-independent guard at load, before any request. Compare new
-    /// pipelines with the unchanged canonical forms, including dense b/a.
     private static func checkStreamed() -> Bool {
         guard streamAllowed, naxShared, formsAllowed, streamedSourcesReady else { return false }
         var matched = true
@@ -6127,7 +6115,6 @@ enum VerifyInt8Matmul {
         }
         """
 
-    /// Same Q8 values as naxFastBody; five stable selections per 32-column tile.
     static let compactHeadEpilogue = """
         for (int e = int(tid); e < ROWS * 8; e += 128) {
           float4 v = r0[e] + r1[e];
@@ -6210,10 +6197,6 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }()
 
-    /// The compact head on the stream copy: the streamed one-layer body (`streamedFormsSource(layers: 1)`, which
-    /// `checkStreamed` matches against the canonical form: 16-B word loads and, once the staging twin passed, 32-B
-    /// tile stores) with the compact head's epilogue in place of the store, as `compactHeadKernel` does on the
-    /// canonical body.
     private static let compactHeadStreamedKernel: MLXFast.MLXFastKernel? = {
         guard let body = makeStreamedBody(naxFastBody, columns: 32),
             body.components(separatedBy: compactHeadStore).count == 2 else { return nil }
@@ -6228,8 +6211,6 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }()
 
-    /// `DARKBLOOM_BONSAI_HEAD_STREAM=0` keeps the 16-row compact head on the
-    /// canonical words (the record path).
     static let streamHeadAllowed: Bool = {
         let value = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_HEAD_STREAM"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -6237,8 +6218,6 @@ enum VerifyInt8Matmul {
     }()
     nonisolated(unsafe) private static var streamHeadFailed = false
 
-    /// Decided once at load, after `route`: the streamed compact head
-    /// matched the canonical one bit for bit on all four outputs.
     static let streamHeadReady: Bool = {
         guard streamHeadAllowed else {
             FileHandle.standardError.write(Data("int8 verify streamed head: off (DARKBLOOM_BONSAI_HEAD_STREAM=0)\n".utf8))
@@ -6251,11 +6230,6 @@ enum VerifyInt8Matmul {
         return ready
     }()
 
-    /// Input-independent: synthetic codes (rows of -128, 127 and both),
-    /// words (all-ones and zero columns) and constants at 16 rows (the only
-    /// row count this head takes), K 4096, N 512 (16 threadgroups), both
-    /// offset forms (NEG 0 and 1); any launch error fails it; canonical and
-    /// streamed compact heads compared on ids, values, omitted and flags.
     private static func checkStreamedHead() -> Bool {
         let k = 4096, n = 512, kg = k / 128, rows = tileRows
         guard compactHeadAvailable(rows: rows, k: k, n: n) else { return false }
@@ -6331,8 +6305,6 @@ enum VerifyInt8Matmul {
             && formsAllowed && hasMatchedForm(k: k, layers: 1) && formsFit(k: k, n: n)
     }
 
-    /// `streamedWeight` (the module's `streamPack` copy, 16 columns) is read
-    /// only once `streamHeadReady` holds, or by its own check (`checking`).
     static func compactHead(
         _ activation: PromptInt8Activation, weight: MLXArray, scalesT: MLXArray, biasesT: MLXArray,
         negative: Bool, streamedWeight: MLXArray? = nil, checking: Bool = false
@@ -6356,14 +6328,10 @@ enum VerifyInt8Matmul {
         return (result[1], result[0], result[2], result[3])
     }
 
-    /// `naxFastBody` for `layers` sibling projections of one activation in one dispatch: threadgroups x < N0 / 32
-    /// take layer 0, the next N1 / 32 layer 1, and so on, each running the one-layer body unchanged.
     static func naxFastSource(layers: Int) -> String {
         naxFastPick(layers: layers) + naxFastBody
     }
 
-    /// `naxFastSource` with K a compile-time constant (template `KC`, the loop bound and the word and group strides)
-    /// and every `size_t` index computed in 32 bits.
     static func naxFormsSource(layers: Int) -> String {
         naxFastPick(layers: layers).replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
             + naxFastBody.replacingOccurrences(of: "(size_t)", with: "(uint)")
@@ -6499,8 +6467,6 @@ enum VerifyInt8Matmul {
         }
         """
 
-    /// The narrow output uses only 16 columns. Keep the accepted N32
-    /// operation as fallback; use this N16 operation only after its check.
     static let naxNarrow16Body = naxNarrowBody
         .replacingOccurrences(of: "matmul2d_descriptor(16, 32, 128,", with: "matmul2d_descriptor(16, 16, 128,")
         .replacingOccurrences(of: "threadgroup uint32_t bs[4][32 * 32];", with: "threadgroup uint32_t bs[4][16 * 32];")
@@ -6508,6 +6474,32 @@ enum VerifyInt8Matmul {
         .replacingOccurrences(of: "bool ok = cap == 16;", with: "bool ok = cap == 8;")
         .replacingOccurrences(of: "for (int i = 0; i < 16; i++) {", with: "for (int i = 0; i < 8; i++) {")
         .replacingOccurrences(of: "  #pragma clang loop unroll(full)\n  for (int e = 0; e < 4; e++) {\n    const float t0 = float(cA[e]) * float(cT[e]);\n    acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n    if (ROWS > 8) {\n      const float t2 = float(cA[e]) * float(cT[4 + e]);\n      acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n    }\n  }\n", with: "  if (good) {\n    #pragma clang loop unroll(full)\n    for (int e = 0; e < 4; e++) {\n      const float t0 = float(cA[e]) * float(cT[e]);\n      acc[e] = fma(float(dA[e]), crb, fma(ca, t0, acc[e]));\n      if (ROWS > 8) {\n        const float t2 = float(cA[e]) * float(cT[4 + e]);\n        acc[4 + e] = fma(float(dA[e]), crb1, fma(ca1, t2, acc[4 + e]));\n      }\n    }\n  }\n")
+
+    private static func twoSimdNarrow(_ body: String) -> String {
+        var result = body.replacingOccurrences(of: "alignas(32) threadgroup", with: "threadgroup")
+        let replacements: [(String, String)] = [
+            ("const uint sg = simdgroup_index_in_threadgroup;", "const uint physical = simdgroup_index_in_threadgroup;"),
+            ("constexpr auto desc =", "float partials[2][8];\n  bool allGood = true;\n  alignas(32) threadgroup uint32_t bs[2][16 * 32];\n  for (uint pass = 0; pass < 2; ++pass) {\n  const uint sg = physical + pass * 2;\n  constexpr auto desc ="),
+            ("threadgroup uint32_t bs[4][16 * 32];", ""),
+            ("bs[sg]", "bs[physical]"),
+            ("const bool good = simd_all(ok);", "const bool good = simd_all(ok);\n  allGood = allGood && good;"),
+            ("threadgroup float* red = (threadgroup float*)bs[physical];", "#pragma clang loop unroll(full)\n  for (int e = 0; e < 8; ++e) { partials[pass][e] = acc[e]; }\n  }\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n  for (uint pass = 0; pass < 2; ++pass) {\n  const uint sg = physical + pass * 2;\n  const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);\n  const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);\n  threadgroup float* red = (threadgroup float*)bs + sg * 256;"),
+            ("red[mrow * 16 + nb + e] = acc[e];", "red[mrow * 16 + nb + e] = partials[pass][e];"),
+            ("red[(mrow + 8) * 16 + nb + e] = acc[4 + e];", "red[(mrow + 8) * 16 + nb + e] = partials[pass][4 + e];"),
+            ("threadgroup_barrier(mem_flags::mem_threadgroup);\nconst threadgroup float4* r0", "}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nconst threadgroup float4* r0"),
+            ("(const threadgroup float4*)bs[1]", "(const threadgroup float4*)((threadgroup float*)bs + 256)"),
+            ("(const threadgroup float4*)bs[2]", "(const threadgroup float4*)((threadgroup float*)bs + 512)"),
+            ("(const threadgroup float4*)bs[3]", "(const threadgroup float4*)((threadgroup float*)bs + 768)"),
+            ("e += 128", "e += 64"),
+            ("= good ? v :", "= allGood ? v :"),
+        ]
+        for (old, new) in replacements {
+            guard result.contains(old) else { return body }
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
+    }
+    static let naxNarrowTwoBody = twoSimdNarrow(naxNarrow16Body)
 
     static let naxNarrowPick = """
         #pragma clang fp contract(off)
@@ -6534,7 +6526,6 @@ enum VerifyInt8Matmul {
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
-    /// `naxFastSource` for one, two and three layers (index `layers - 1`).
     private static let naxFastKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_matmul_nax_fast\(layers)",
@@ -6546,7 +6537,6 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
 
-    /// `naxFormsSource` for one, two and three layers (index `layers - 1`).
     static let naxFormsKernels = (1 ... 3).map { layers in
         MLXFast.metalKernel(
             name: "bonsai_q8_verify_matmul_nax_forms\(layers)",
@@ -6558,11 +6548,7 @@ enum VerifyInt8Matmul {
             ensureRowContiguous: true)
     }
 
-    /// The model's verify K values (hidden 4096, MLP 12288); each gets its own compile-time form, used only after
-    /// `checkForms` matched it at that K.
     static let formsK = [4096, 12288]
-    /// Bitmask for fast hot-path lookup without string formatting:
-    /// bit `(layers - 1)` for `k == 4096`, bit `(layers + 3)` for `k == 12288`.
     nonisolated(unsafe) private static var formsMatchedMask: UInt32 = 0
     @inline(__always)
     private static func formBit(k: Int, layers: Int) -> UInt32 {
@@ -6621,7 +6607,7 @@ enum VerifyInt8Matmul {
         name: "bonsai_q8_verify_matmul_nax_narrow16",
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
-        source: naxNarrowPick + naxNarrow16Body,
+        source: naxNarrowPick + naxNarrowTwoBody,
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -6630,7 +6616,7 @@ enum VerifyInt8Matmul {
         inputNames: ["xq", "w", "scalesT", "biasesT", "ascale", "rsb", "ksz"],
         outputNames: ["out"],
         source: naxNarrowPick.replacingOccurrences(of: "const int K = ksz[0];", with: "const int K = KC;")
-            + naxNarrow16Body.replacingOccurrences(of: "(size_t)", with: "(uint)"),
+            + naxNarrowTwoBody.replacingOccurrences(of: "(size_t)", with: "(uint)"),
         header: PromptInt8Matmul.naxHeader,
         ensureRowContiguous: true)
 
@@ -6780,14 +6766,14 @@ enum VerifyInt8Matmul {
             return kernel(
                 [codes, kernelWeight, scalesT, biasesT, ascale, rsb, dims],
                 template: [("ROWS", m), ("NEG", negative ? 1 : 0), ("KC", k)] as [(String, any KernelTemplateArg)],
-                grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+                grid: (n / 16 * (compact ? 64 : 128), 1, 1), threadGroup: (compact ? 64 : 128, 1, 1),
                 outputShapes: [[m, n]], outputDTypes: [.float32])[0]
         }
         let kernel = compact ? naxNarrow16Kernel : naxNarrowKernel
         return kernel(
             [codes, weight, scalesT, biasesT, ascale, rsb, dims],
             template: [("ROWS", m), ("NEG", negative ? 1 : 0)] as [(String, any KernelTemplateArg)],
-            grid: (n / 16 * 128, 1, 1), threadGroup: (128, 1, 1),
+            grid: (n / 16 * (compact ? 64 : 128), 1, 1), threadGroup: (compact ? 64 : 128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
