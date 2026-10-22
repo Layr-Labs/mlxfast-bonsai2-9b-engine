@@ -4552,7 +4552,8 @@ final class Qwen35GatedDeltaNet: Module {
               tape.k.shape4 == (batch, tape.rowCount, numKHeads, headKDim),
               tape.a.shape3 == (batch, tape.rowCount, numVHeads),
               tape.b.shape3 == (batch, tape.rowCount, numVHeads),
-              (tape.delta != nil && tape.ssmPreIsRowContiguous) || (
+              (tape.delta != nil && (tape.ssmPreIsRowContiguous || (
+                  (try? tape.ssmPre?.evaluatedBufferInfo()?.isRowContiguous) == true))) || (
                   tape.q.shape4 == (batch, tape.rowCount, numKHeads, headKDim) &&
                   tape.v.shape4 == (batch, tape.rowCount, numVHeads, headVDim))
         else { return false }

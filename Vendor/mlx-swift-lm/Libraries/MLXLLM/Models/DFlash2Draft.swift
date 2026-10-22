@@ -625,6 +625,7 @@ private final class DFlash2Attention: Module {
         contextCodes: DF2Fast.W4Codes? = nil,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
         precomputedQKV: (MLXArray, MLXArray, MLXArray)? = nil,
+        contextRowIndex: MLXArray? = nil,
         submitProjections: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
@@ -633,6 +634,15 @@ private final class DFlash2Attention: Module {
         var contextLength = context.dim(1)
         var activeContextCodes = contextCodes
         var activePrecomputedKV = precomputedContextKV
+        var activeRowIndex = contextRowIndex
+        let indexedEligible = DF2Fast.on && ropeSpec != nil && B == 1 && heads == 32 && kvHeads == 8
+            && L > 0 && (1 ... 16).contains(contextLength) && cache is DFlash2LayerKVCache
+            && (slidingWindow.map { DFlash2SlidingMask.contextSkip(
+                contextLength: contextLength, slidingWindow: $0) == 0 } ?? true)
+        if let index = activeRowIndex, !indexedEligible, let kv = activePrecomputedKV {
+            activePrecomputedKV = (kv.0.take(index, axis: 1), kv.1.take(index, axis: 1))
+            activeRowIndex = nil
+        }
 
         if let slidingWindow {
             let skip = DFlash2SlidingMask.contextSkip(
@@ -698,7 +708,8 @@ private final class DFlash2Attention: Module {
                 q: queries, k: blockKeys, v: blockValues,
                 ck: contextKeys!, cv: contextValues!,
                 qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
-                L: L, C: contextLength, blockOffset: blockOffset, ctxOffset: fastCache.offset)
+                L: L, C: contextLength, blockOffset: blockOffset, ctxOffset: fastCache.offset,
+                contextRowIndex: activeRowIndex)
         {
             queries = allOut.0
             combinedKV = (allOut.1, allOut.2)
@@ -1227,6 +1238,7 @@ private final class DFlash2DecoderLayer: Module {
         context: MLXArray, rope: RoPELayer, cache: KVCache,
         ropeSpec: DF2Fast.RopeSpec?, contextCodes: DF2Fast.W4Codes?,
         precomputedContextKV: (MLXArray, MLXArray)? = nil,
+        contextRowIndex: MLXArray? = nil,
         submitAttention: Bool = false,
         front: DFlash2LayerZeroFront? = nil
     ) -> (h: MLXArray, nextNormed: MLXArray?, nextCodes: DF2Fast.W4Codes?) {
@@ -1251,13 +1263,14 @@ private final class DFlash2DecoderLayer: Module {
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
                 precomputedContextKV: precomputedContextKV,
                 precomputedQKV: frontQKV,
+                contextRowIndex: contextRowIndex,
                 submitProjections: submitAttention && DF2Fast.earlyFront)
         } else {
             let a = DF2Fast.dynConv(n1, dyn: p1, base: base1, part: 0, residual: nil)
             attnOut = selfAttn(
                 a, context: context, rope: rope, cache: cache,
                 ropeSpec: ropeSpec, contextCodes: contextCodes,
-                precomputedContextKV: precomputedContextKV)
+                precomputedContextKV: precomputedContextKV, contextRowIndex: contextRowIndex)
         }
         // Hand the attention half to the GPU while the rest is built.
         if submitAttention { asyncEval(attnOut) }
@@ -1850,7 +1863,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                     nextNorm: nextNorm, nextQStart: nextQStart,
                     context: context, rope: rope, cache: cache[index],
                     ropeSpec: rSpec, contextCodes: cCodes,
-                    precomputedContextKV: precomputedKV?[index],
+                    precomputedContextKV: precomputedKV?[index], contextRowIndex: projected?.contextRowIndex,
                     submitAttention: index == 0 && projected != nil,
                     front: index == 0 ? front : nil)
                 h = step.h
@@ -2197,6 +2210,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
         let (hidden, finalCodes) = try hiddenStatesWithCodes(
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1, projected: contextUse)
+        if ProcessInfo.processInfo.environment["DF2_FINITE_DIAGNOSTIC"] == "1" {
+            let values = hidden.asType(.float32).asArray(Float.self)
+            FileHandle.standardError.write(Data("DF2_FINITE_DIAGNOSTIC\t\(values.count)\t\(values.filter { $0.isFinite }.count)\n".utf8))
+        }
         if DF2Fast.on, anchor.count == 1 {
             let sel = candidateSelector
             let projected =
@@ -2376,11 +2393,25 @@ enum DF2Fast {
             auto cT = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(Bt)>, int32_t>();
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[16], accb[16];
             for (int i = 0; i < 16; i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
@@ -2407,7 +2438,7 @@ enum DF2Fast {
                 const float s = (i >> 3) ? s1v[j] : s0v[j];
                 const float b = (i >> 3) ? b1v[j] : b0v[j];
                 const bool hi = (i >> 2) & 1;
-                acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 accb[i] = fma(b, hi ? x1 : x0, accb[i]);
               }
               simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -3778,7 +3809,7 @@ enum DF2Fast {
                   const float s = \(pickS);
                   const float b = \(pickB);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                   accb[i] = fma(b, hi ? x1 : x0, accb[i]);
                 }
 
@@ -3797,7 +3828,7 @@ enum DF2Fast {
                   const int j = (i & 3);
                   const float s = \(pickS);
                   const bool hi = (i >> 2) & 1;
-                  acc[i] = fma(s * (hi ? a1 : a0), float(cT[i]), acc[i]);
+                  acc[i] = fma(s * (hi ? a1 : a0), fragment_at(i), acc[i]);
                 }
 
             """
@@ -3990,11 +4021,25 @@ enum DF2Fast {
             """ + operandB + """
             const int mrow = int((lane >> 1) & 3u) + 4 * int((lane >> 4) & 1u);
             const int nb = 4 * int(lane & 1u) + 8 * int((lane >> 3) & 1u);
-            bool ok = cT.get_capacity() == 16;
-            for (int i = 0; i < 16 && ok; i++) {
+            bool record_layout = cT.get_capacity() == 16;
+            bool alternate_layout = cT.get_capacity() == 16;
+            for (int i = 0; i < 16 && (record_layout || alternate_layout); i++) {
               auto ids = cT.get_multidimensional_index(i);
-              ok = ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              record_layout = record_layout && ids[0] == nb + (i & 3) + 16 * (i >> 3) && ids[1] == mrow + 8 * ((i >> 2) & 1);
+              alternate_layout = alternate_layout
+                && ids[0] == 2 * (lane & 1u) + 4 * ((lane >> 3) & 1u) + (i & 1) + 8 * ((i >> 1) & 3)
+                && ids[1] == mrow + 8 * (i >> 3);
             }
+            const bool ok = record_layout || alternate_layout;
+            auto fragment_at = [&](int i) -> float {
+              if (record_layout) { return float(cT[i]); }
+              const uint n = uint(nb + (i & 3) + 16 * (i >> 3));
+              const uint src_lane = (lane & ~9u) | ((n >> 1) & 1u) | (((n >> 2) & 1u) << 3);
+              const int ix = (i & 1) | ((i >> 3) << 2) | (((i >> 2) & 1) << 3);
+              const float lo = simd_shuffle(float(cT[ix]), src_lane);
+              const float hi = simd_shuffle(float(cT[ix | 2]), src_lane);
+              return (lane & 8u) ? hi : lo;
+            };
             float acc[\(ne)], accb[\(ne)];
             for (int i = 0; i < \(ne); i++) { acc[i] = 0.0f; accb[i] = 0.0f; }
             const int m0 = mrow, m1 = mrow + 8;
@@ -4788,11 +4833,7 @@ enum DF2Fast {
     /// Fused `qNorm` + `kNorm` + `YarnRoPE` + `[1, S, H, 128] -> [1, H, S, 128]` transpose for BOTH
     /// block `(queries, blockKeys, blockValues)` and context `(contextKeys, contextValues)`, producing
     /// `queries` `[1, 32, L, 128]`, `combinedKeys` `[1, 8, C + L, 128]`, `combinedValues` `[1, 8, C + L, 128]`.
-    static let qkvAllNormRopeKernel = MLXFast.metalKernel(
-        name: "df2_qkv_all_norm_rope",
-        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
-        outputNames: ["q_out", "k_out", "v_out"],
-        source: """
+    private static let qkvAllNormRopeSource = """
             const int L = params[0];
             const int C = params[1];
             const int offset = params[2];
@@ -4880,13 +4921,28 @@ enum DF2Fast {
             dst[dstBase + d0 + 64] = nx0 * s0 + ny0 * c0;
             dst[dstBase + d1] = nx1 * c1 - ny1 * s1;
             dst[dstBase + d1 + 64] = nx1 * s1 + ny1 * c1;
-            """)
+            """
+    static let qkvAllNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_all_norm_rope",
+        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams"],
+        outputNames: ["q_out", "k_out", "v_out"], source: qkvAllNormRopeSource)
+    private static let qkvIndexedNormRopeKernel = MLXFast.metalKernel(
+        name: "df2_qkv_indexed_context_norm_rope",
+        inputNames: ["q", "bk", "bv", "ck", "cv", "qw", "kw", "freqs", "params", "fparams", "context_index"],
+        outputNames: ["q_out", "k_out", "v_out"],
+        source: qkvAllNormRopeSource
+            .replacingOccurrences(of: "const int s = (t < C) ? t : (t - C);",
+                with: "const int s = (t < C) ? int(context_index[t]) : (t - C);")
+            .replacingOccurrences(of: "s = (t < C) ? t : (t - C);",
+                with: "s = (t < C) ? int(context_index[t]) : (t - C);"))
+    nonisolated(unsafe) private static var pathRopeAudited = false
 
     static func qkvAllNormRope(
         q: MLXArray, k: MLXArray, v: MLXArray,
         ck: MLXArray, cv: MLXArray,
         qNorm: RMSNorm, kNorm: RMSNorm, ropeSpec: RopeSpec,
-        L: Int, C: Int, blockOffset: Int, ctxOffset: Int
+        L: Int, C: Int, blockOffset: Int, ctxOffset: Int,
+        contextRowIndex: MLXArray? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
         guard on, L > 0, C > 0, blockOffset == ctxOffset + C else { return nil }
         let qw = normWeight(qNorm)
@@ -4896,16 +4952,49 @@ enum DF2Fast {
         let tgs = (totalVecs + 3) / 4
         let phases = ropeSpec.phaseOffset == ctxOffset && ropeSpec.phaseRows >= C + L
             ? ropeSpec.phases : nil
-        let outs = qkvAllNormRopeKernel(
-            [
+        let args = [
                 q, k, v, ck, cv, qw, kw, phases ?? ropeSpec.freqs,
                 HostConstants.recentInt32([Int32(L), Int32(C), Int32(ctxOffset)]),
                 ropeSpec.floatParameters(eps: qNorm.eps),
-            ],
+            ]
+        let outs = (contextRowIndex != nil ? qkvIndexedNormRopeKernel : qkvAllNormRopeKernel)(
+            args + (contextRowIndex.map { [$0] } ?? []),
             template: [("PHASES", phases != nil)],
             grid: (tgs * 128, 1, 1), threadGroup: (128, 1, 1),
             outputShapes: [[1, 32, L, 128], [1, 8, CL, 128], [1, 8, CL, 128]],
             outputDTypes: [.float32, .float32, .float32])
+        if let index = contextRowIndex,
+            ProcessInfo.processInfo.environment["DF2_PATH_ROPE_AUDIT"] == "1", !pathRopeAudited {
+            pathRopeAudited = true
+            var words = 0
+            for count in 1 ... 16 {
+                let ids = (0 ..< count).map { Int32(ck.dim(1) - 1 - ($0 * 3 % ck.dim(1))) }
+                let ix = MLXArray(ids)
+                let actual = qkvAllNormRope(q: q, k: k, v: v, ck: ck, cv: cv,
+                    qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                    L: L, C: count, blockOffset: ctxOffset + count, ctxOffset: ctxOffset,
+                    contextRowIndex: ix)!
+                let reference = qkvAllNormRope(q: q, k: k, v: v,
+                    ck: ck.take(ix, axis: 1), cv: cv.take(ix, axis: 1),
+                    qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                    L: L, C: count, blockOffset: ctxOffset + count, ctxOffset: ctxOffset)!
+                for (aa, bb) in [(actual.0, reference.0), (actual.1, reference.1), (actual.2, reference.2)] {
+                    let a = aa.asArray(Float.self), b = bb.asArray(Float.self)
+                    precondition(a.allSatisfy({ $0.isFinite }) && a.count == b.count)
+                    precondition(zip(a, b).allSatisfy({ $0.bitPattern == $1.bitPattern }))
+                    words += a.count
+                }
+            }
+            let wrongIndex = (index + Int32(1)) % Int32(ck.dim(1))
+            let wrong = qkvAllNormRope(q: q, k: k, v: v, ck: ck, cv: cv,
+                qNorm: qNorm, kNorm: kNorm, ropeSpec: ropeSpec,
+                L: L, C: C, blockOffset: blockOffset, ctxOffset: ctxOffset,
+                contextRowIndex: wrongIndex)!.1.asArray(Float.self)
+            let exact = outs[1].asArray(Float.self)
+            precondition(zip(exact, wrong).contains(where: { $0.bitPattern != $1.bitPattern }))
+            FileHandle.standardError.write(Data(
+                "DF2_PATH_ROPE_AUDIT cases=16 words=\(words) finite_bitexact=1 negative_detected=1 source_rows=\(ck.dim(1)) L=\(L)\n".utf8))
+        }
         return (outs[0], outs[1], outs[2])
     }
 
@@ -6512,12 +6601,14 @@ public final class DFlash2ContextProjection {
     let context: MLXArray
     let contextKV: [(MLXArray, MLXArray)]
     let lookupFCOutput: MLXArray?
+    private let contextRowIndex: MLXArray?
     var front: DFlash2LayerZeroFront?
 
     init(
         anchorEmbeddings: MLXArray, context: MLXArray, contextKV: [(MLXArray, MLXArray)],
-        lookupFCOutput: MLXArray?
+        lookupFCOutput: MLXArray?, contextRowIndex: MLXArray? = nil
     ) {
+        self.contextRowIndex = contextRowIndex
         self.anchorEmbeddings = anchorEmbeddings
         self.context = context
         self.contextKV = contextKV
@@ -6542,27 +6633,45 @@ public final class DFlash2ContextProjection {
         let anchorEmbedding: MLXArray
         let context: MLXArray
         let contextKV: [(MLXArray, MLXArray)]
+        let contextRowIndex: MLXArray?
         let front: DFlash2LayerZeroFront?
     }
 
     /// The projection of the verify columns `rows` (a draft tree's accepted path), in order.
     func gathered(_ rows: [Int32]) -> DFlash2ContextProjection {
         let index = MLXArray(rows)
+        if let priorIndex = contextRowIndex {
+            let composed = priorIndex.take(index)
+            return DFlash2ContextProjection(
+                anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
+                context: context.take(index, axis: 1),
+                contextKV: contextKV.map { ($0.0.take(composed, axis: 1), $0.1.take(composed, axis: 1)) },
+                lookupFCOutput: lookupFCOutput?.take(index, axis: 1))
+        }
+        let indexed = ProcessInfo.processInfo.environment["DF2_PATH_ROPE"] != "0"
+            && contextRowIndex == nil && contextKV.count == 6
+            && (1 ... 16).contains(self.rows) && (1 ... 16).contains(rows.count)
+            && rows.allSatisfy({ $0 >= 0 && Int($0) < self.rows })
+            && contextKV.allSatisfy({ $0.0.dtype == .float32 && $0.1.dtype == .float32
+                && $0.0.shape == [1, self.rows, 1024] && $0.1.shape == [1, self.rows, 1024] })
         return DFlash2ContextProjection(
             anchorEmbeddings: anchorEmbeddings.take(index, axis: 1),
             context: context.take(index, axis: 1),
-            contextKV: contextKV.map { ($0.0.take(index, axis: 1), $0.1.take(index, axis: 1)) },
-            lookupFCOutput: lookupFCOutput?.take(index, axis: 1))
+            contextKV: indexed ? contextKV
+                : contextKV.map { ($0.0.take(index, axis: 1), $0.1.take(index, axis: 1)) },
+            lookupFCOutput: lookupFCOutput?.take(index, axis: 1),
+            contextRowIndex: indexed ? index : nil)
     }
 
     func use(rows: Int) -> Use {
-        let kv = contextKV.map { pair -> (MLXArray, MLXArray) in
+        let kv = contextRowIndex != nil ? contextKV : contextKV.map { pair -> (MLXArray, MLXArray) in
             (pair.0[0..., 0 ..< rows, 0...], pair.1[0..., 0 ..< rows, 0...])
         }
         return Use(
             anchorEmbedding: anchorEmbeddings[0..., (rows - 1) ..< rows, 0...],
             context: context[0..., 0 ..< rows, 0...],
             contextKV: kv,
+            contextRowIndex: contextRowIndex.map { $0[0 ..< rows] },
             front: front)
     }
 }

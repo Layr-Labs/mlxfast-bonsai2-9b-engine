@@ -6684,6 +6684,27 @@ enum VerifyInt8Matmul {
             outputShapes: [[m, n]], outputDTypes: [.float32])[0]
     }
 
+    /// Independent reference for every advertised verify row, including rows 8...15.
+    /// The plain kernel assigns rows to `lane & 7`, so each call must own at most
+    /// eight rows. Slice both the codes and their flat per-row metadata together.
+    private static func plainReference(
+        codes: MLXArray, ascale: MLXArray, rsb: MLXArray, weight: MLXArray,
+        scalesT: MLXArray, biasesT: MLXArray, m: Int, k: Int, n: Int,
+        negative: Bool
+    ) -> MLXArray {
+        let kg = k / 128
+        let outputs = stride(from: 0, to: m, by: 8).map { start in
+            let end = min(start + 8, m)
+            return run(
+                .plain, codes: codes[start ..< end],
+                ascale: ascale[(start * kg) ..< (end * kg)],
+                rsb: rsb[(start * kg) ..< (end * kg)], weight: weight,
+                scalesT: scalesT[0 ..< kg, 0 ..< n], biasesT: biasesT[0 ..< kg, 0 ..< n],
+                m: end - start, k: k, n: n, vector: false, negative: negative)
+        }
+        return concatenated(outputs, axis: 0)
+    }
+
     /// The fast tensor kernel over `layers` (one to three) sharing `codes`.
     private static func runFast(
         codes: MLXArray, ascale: MLXArray, rsb: MLXArray,
@@ -6859,8 +6880,8 @@ enum VerifyInt8Matmul {
     nonisolated(unsafe) private static var checkFailed = false
     nonisolated(unsafe) private static var checkNote = "not run"
 
-    /// Runs the kernels on a fixed, input-independent 4 x 64 x 1024 problem
-    /// (two threadgroups, two groups per simdgroup) and compares output
+    /// Runs the kernels on a fixed, input-independent 16 x 64 x 1024 problem
+    /// (two threadgroups, two groups per simdgroup) and compares finite output
     /// bits, as `PromptInt8Matmul.checkKernels`: the plain `NEG = 1` form
     /// against `NEG = 0` on negated-scale offsets, then on a NAX device the
     /// fast tensor kernel (both forms, then its two- and three-layer forms on
@@ -6869,7 +6890,7 @@ enum VerifyInt8Matmul {
     @discardableResult
     private static func checkKernels(nax: Bool) -> Bool {
         checkFailed = false
-        let m = 4, n = 64, k = 1024, kg = k / 128
+        let m = tileRows, n = 64, k = 1024, kg = k / 128
         let codes = MLXArray(
             (0 ..< tileRows * k).map { $0 < m * k ? Int8(truncatingIfNeeded: ($0 * 37 + 11) % 255 - 127) : 0 },
             [tileRows, k])
@@ -6901,12 +6922,17 @@ enum VerifyInt8Matmul {
         }
         let rsb = MLXArray(rsbValues, [m * kg])
         func output(_ route: Route, _ offsets: MLXArray, vector: Bool, negative: Bool) -> MLXArray {
-            run(route, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
-                scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, vector: vector, negative: negative)
-                .view(dtype: .uint32)
+            let values = route == .plain
+                ? plainReference(codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                    scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, negative: negative)
+                : run(route, codes: codes, ascale: ascale, rsb: rsb, weight: weight,
+                    scalesT: scalesT, biasesT: offsets, m: m, k: k, n: n, vector: vector, negative: negative)
+            return values.view(dtype: .uint32)
         }
         func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
             let equal = MLX.all(a .== b)
+                .&& MLX.all(isFinite(a.view(dtype: .float32)))
+                .&& MLX.all(isFinite(b.view(dtype: .float32)))
             eval(equal)
             return !checkFailed && equal.item(Bool.self)
         }
@@ -6929,6 +6955,7 @@ enum VerifyInt8Matmul {
             let plain = output(.plain, biasesT, vector: false, negative: false)
             let plainNegated = output(.plain, negatedT, vector: false, negative: false)
             let plainNeg = same(output(.plain, negatedT, vector: false, negative: true), plainNegated)
+            guard same(plain, plain), same(plainNegated, plainNegated) else { return }
             guard nax else {
                 matched = !checkFailed
                 negativeForms = plainNeg
@@ -6960,14 +6987,14 @@ enum VerifyInt8Matmul {
         }
         if !checkFailed {
             checkNote = !matched ? "outputs differ"
-                : "bit-identical (\(nax ? (naxFast ? (naxShared ? "fast, shared" : "fast") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
+                : "finite, bit-identical M16 split-plain reference (\(nax ? (naxFast ? (naxShared ? "fast, shared" : "fast") : naxVector ? "vector" : "record") : "plain") kernel, offset skip \(negativeForms ? "on" : "off"))"
         }
         return matched
     }
 
     nonisolated(unsafe) private static var formsFailed = false
 
-    /// Runs each compile-time form against the record's fast kernel on a fixed, input-independent 16 x 64 x K problem
+    /// Runs each compile-time form against the split-plain reference on a fixed, input-independent 16 x 64 x K problem
     /// at each real K (16 rows, the verify width, so these pipelines are also built here, before any timed work) and
     /// compares output bits: one layer with `NEG = 0` and, where the offset skip is on, `NEG = 1`; two and three
     /// layers on column slices where the shared forms are on.
@@ -7007,10 +7034,20 @@ enum VerifyInt8Matmul {
             }
             let rsb = MLXArray(rsbValues, [m * kg])
             func bits(_ offsets: MLXArray, negative: Bool, _ columns: [Range<Int>], forms: Bool) -> MLXArray {
-                let outputs = runFast(
-                    codes: codes, ascale: ascale, rsb: rsb,
-                    layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
-                    m: m, k: k, negative: negative, forms: forms)
+                let outputs: [MLXArray]
+                if forms {
+                    outputs = runFast(
+                        codes: codes, ascale: ascale, rsb: rsb,
+                        layers: columns.map { (weight: weight[$0], scalesT: scalesT[0..., $0], biasesT: offsets[0..., $0]) },
+                        m: m, k: k, negative: negative, forms: true)
+                } else {
+                    outputs = columns.map { columns in
+                        plainReference(
+                            codes: codes, ascale: ascale, rsb: rsb, weight: weight[columns],
+                            scalesT: scalesT[0..., columns], biasesT: offsets[0..., columns],
+                            m: m, k: k, n: columns.count, negative: false)
+                    }
+                }
                 return concatenated(outputs, axis: 1).view(dtype: .uint32)
             }
             func matches(_ columns: [Range<Int>]) -> Bool {
@@ -7018,9 +7055,11 @@ enum VerifyInt8Matmul {
                 var cases = [(biasesT, false)]
                 if negativeForms { cases.append((negatedT, true)) }
                 for (offsets, negative) in cases {
-                    let equal = MLX.all(
-                        bits(offsets, negative: negative, columns, forms: true)
-                            .== bits(offsets, negative: negative, columns, forms: false))
+                    let actual = bits(offsets, negative: negative, columns, forms: true)
+                    let reference = bits(offsets, negative: negative, columns, forms: false)
+                    let equal = MLX.all(actual .== reference)
+                        .&& MLX.all(isFinite(actual.view(dtype: .float32)))
+                        .&& MLX.all(isFinite(reference.view(dtype: .float32)))
                     eval(equal)
                     if formsFailed || !equal.item(Bool.self) { return false }
                 }
