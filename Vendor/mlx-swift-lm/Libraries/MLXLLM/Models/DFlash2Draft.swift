@@ -2056,8 +2056,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
+        // Once every layer's K/V succeeds, attention reads those projections;
+        // this tensor carries shape only. Keep full norm output when sliding
+        // truncation could discard the precomputed K/V and need its values.
+        let codesOnly = config.slidingWindow.map { fcOut.dim(1) < $0 } ?? true
+        guard let normed = DF2Fast.rmsQuant(
+            fcOut, hiddenNorm, group: group, writeNorm: !codesOnly) else { return nil }
+        let context = codesOnly ? fcOut : normed.0
         guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
