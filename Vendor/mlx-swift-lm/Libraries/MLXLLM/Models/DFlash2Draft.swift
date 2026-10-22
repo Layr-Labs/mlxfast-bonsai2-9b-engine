@@ -2056,9 +2056,12 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         else { return nil }
         let fcInput = targetHidden.asType(dtype)
         let fcOut = DF2Fast.linear(fcInput, fc)
-        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group) else { return nil }
-        let context = normed.0
-        guard let kv = contextKeysValues(normed.1, rows: context.dim(1)) else { return nil }
+        let rows = targetHidden.dim(1)
+        let writeNorm = layers.contains { $0.selfAttn.slidingWindow.map { rows >= $0 } ?? false }
+        guard let normed = DF2Fast.rmsQuant(fcOut, hiddenNorm, group: group, writeNorm: writeNorm) else { return nil }
+        // Every precomputed K/V stays live when no layer drops context rows.
+        let context = writeNorm ? normed.0 : fcOut
+        guard let kv = contextKeysValues(normed.1, rows: rows) else { return nil }
         let embeddings = target.embedTokensForDFlash2(anchors.reshaped([1, -1])).asType(dtype)
         let lookupFC = DF2Fast.fcLookupPrefixReuseEligible(fc, input: fcInput) ? fcOut : nil
         return DFlash2ContextProjection(
@@ -2196,11 +2199,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             block, targetHidden: targetHidden, cache: cache, logitsStart: 1, projected: contextUse)
         if DF2Fast.on, anchor.count == 1 {
             let sel = candidateSelector
-            let projected =
-                (finalCodes.flatMap {
-                    DF2Fast.w4LinearsFromCodes(
-                        $0, leadShape: Array(hidden.shape.dropLast()), [sel.hiddenProjection])
-                }?[0]) ?? DF2Fast.linear(hidden, sel.hiddenProjection)
+            let projected = sel.hiddenProjection(hidden)
             let top: [MLXArray] = try draftTop(hidden, blockSize: blockSize, draftRows: draftRows)
             if DF2Fast.treeOn, blockSize == 16 {
                 let (tokens, desc) = DF2Fast.selectTree(
@@ -2688,7 +2687,7 @@ enum DF2Fast {
     /// in {1, 0.95, ..., 0.75} with the least squared error against the pinned weights, then FP16
     /// scale (hi - lo) / 15 and offset lo. Codes are row-major [N, K / 2]; a word holds k = 8j ... 8j + 3
     /// in its low nibbles and k = 8j + 4 ... 8j + 7 in its high nibbles. Scales and offsets are [G, N].
-    static func w4Operands(_ layer: Linear, group: Int) -> W4Operands? {
+    static func w4Operands(_ layer: Linear, group: Int, packPair: Bool = false) -> W4Operands? {
         if let o = w4Cache[ObjectIdentifier(layer)] { return o }
         guard let q = layer as? QuantizedLinear, q.mode == .affine, let biases = q.biases, q.bias == nil
         else { return nil }
@@ -2734,7 +2733,8 @@ enum DF2Fast {
         eval(packed, sT, bT)
         let o = W4Operands(w: packed, sT: sT, bT: bT, n: N, k: K)
         if group == 64 && ((N == 4096 && K == 32768)
-            || (N == 12288 && K == 4096) || (N == 4096 && K == 12288))
+            || (N == 12288 && K == 4096) || (N == 4096 && K == 12288)
+            || (packPair && N == 4096 && K == 4096))
         {
             o.pair24 = W4Pair24(sT, bT)
         }
@@ -4463,11 +4463,18 @@ enum DF2Fast {
             outputDTypes: [.int8, .float32, .float32])
     }
 
+    private static let pair24OProj: Bool = {
+        let arch = GPU.deviceInfo().architecture
+        return arch.hasPrefix("applegpu_g17") && !arch.hasPrefix("applegpu_g17p")
+    }()
+
     static func w4LinearsFromCodes(
         _ codes: W4Codes, leadShape: [Int], _ layers: [Linear]
     ) -> [MLXArray]? {
         guard on, (1 ... 6).contains(layers.count) else { return nil }
-        let ops = layers.compactMap { w4Operands($0, group: codes.group) }
+        let compactO = pair24OProj && codes.rows == 16 && codes.group == 64
+            && codes.K == 4096 && layers.count == 1
+        let ops = layers.compactMap { w4Operands($0, group: codes.group, packPair: compactO) }
         guard ops.count == layers.count, ops.allSatisfy({ $0.k == codes.K }) else { return nil }
         let ns = ops.map(\.n)
         let (form, narrow) = w4LaunchForm(ns)
@@ -4478,7 +4485,11 @@ enum DF2Fast {
         let sizeDescriptor = ops[0].dispatchSizes(K: codes.K, rows: codes.rows, ns: ns)
         let metadata = w4LaunchMetadata(ops, K: codes.K, rows: codes.rows, group: codes.group)
         let outs: [MLXArray]
-        if let metadata {
+        if compactO, ns == [4096], let pair = ops[0].pair24 {
+            outs = w4Pair24MLPRun(
+                form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale, xs: codes.xs,
+                rows: codes.rows, ops: ops, metadata: [pair], sizeDescriptor: sizeDescriptor)
+        } else if let metadata {
             let method = w4Pair24Selected(ops, ns: ns, metadata: metadata, form: form, narrow: narrow).method(rows: codes.rows)
             outs = w4Pair24Output(method, form: form, narrow: narrow, xq: codes.xq, ascale: codes.ascale,
                 xs: codes.xs, rows: codes.rows, ops: ops, ns: ns, metadata: metadata, sizeDescriptor: sizeDescriptor)
