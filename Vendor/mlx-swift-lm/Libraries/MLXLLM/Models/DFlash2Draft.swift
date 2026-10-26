@@ -7207,7 +7207,8 @@ private enum DraftSDPA {
     }()
 
     static let columns: Int = {
-        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_COLUMNS"] ?? "32") ?? 32
+        let defaultColumns = enabled ? "64" : "32"
+        let requested = Int(ProcessInfo.processInfo.environment["DF2_SDPA16_COLUMNS"] ?? defaultColumns) ?? 32
         return [32, 64, 128].contains(requested) ? requested : 32
     }()
 
@@ -7612,3 +7613,4 @@ private enum DF2LeanIndex {
         FileHandle.standardError.write(Data("DF2 lean index tree: \(note)\n".utf8))
     }
 }
+private let gauntletRedraw_182007e3_20261022T201511Z: Int = 0
