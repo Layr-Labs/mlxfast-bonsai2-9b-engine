@@ -88,10 +88,10 @@ run on. Those tests exercise the transform, not a Gemma model.
   toolchain policy in `setup.sh` treats macOS 26 as its own case.
 - Swift 6, through Xcode or through the Xcode Command Line Tools.
   `Package.swift` declares `swift-tools-version: 6.3`.
-- Xcode 26.4.1 (build 17E202) for a build check that matches the ranked box.
-  The ranked runners build with Apple Swift 6.3.1 against the macOS 26.4 SDK,
-  on macOS 26.6.2. The hosted CI uses a newer Swift. See "The ranked box
-  toolchain".
+- Xcode 27.2 (build 27B52) for a build check that matches the ranked box.
+  Xcode 27.2 needs macOS 26.6 or later. The ranked runners build with Apple
+  Swift 6.4.2 against the macOS 27.2 SDK, on macOS 26.6.2. The hosted CI
+  builds with the same Xcode. See "The ranked box toolchain".
 - The Xcode Metal Toolchain. `./setup.sh` tries to download it. The Command
   Line Tools alone carry no `metal` compiler, so a box that builds the metallib
   needs full Xcode. Install it, open it once, and accept the license with
@@ -546,31 +546,32 @@ memory. They build with this toolchain.
 
 | Component | Version |
 |---|---|
-| Xcode | 26.4.1 (build 17E202) |
-| Swift | Apple Swift 6.3.1 |
-| SDK | macOS 26.4 |
+| Xcode | 27.2 (build 27B52) |
+| Swift | Apple Swift 6.4.2 (swiftlang-6.4.2.1.9) |
+| SDK | macOS 27.2 |
 | macOS | 26.6.2 |
-| Metal toolchain | `com.apple.dt.toolchain.Metal.32023.883` |
+| Metal toolchain | TODO before merge: the identifier that `xcodebuild -showComponent MetalToolchain` prints on a converged ranked box |
 
 The hosted CI job "swift build + test (hosted macOS, no GPU)" runs on the
-GitHub `macos-26` image. That image has Xcode 26.6 (build 17F113) and Apple
-Swift 6.3.3. A green hosted CI run does not prove that your code compiles on
-the ranked box.
+GitHub `xcode-27` image. It selects Xcode 27.2 (build 27B52), the Xcode of the
+ranked box. When the image has no 27B52, the job uses another 27.2 build and
+prints a warning that names it. The image runs macOS 27 and has no GPU, so a
+green hosted CI run does not prove that your code runs on the ranked box.
 
 A ranked job builds your candidate in its Setup step, "Setup (toolchain, Metal
 kernels, pinned checkpoint)". A compile failure there fails the submission
 before any scoring.
 
-Build-check with Xcode 26.4.1 before you submit. Select it with
+Build-check with Xcode 27.2 (build 27B52) before you submit. Select it with
 `DEVELOPER_DIR` or with `sudo xcode-select -s`.
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode_26.4.1.app/Contents/Developer \
+DEVELOPER_DIR=/Applications/Xcode_27.2.app/Contents/Developer \
   swift build --build-tests --force-resolved-versions
 ```
 
 The time limit of the Swift type checker differs between compiler versions.
-When the 6.3.1 compiler reports a type-check timeout, split the long
+When the Swift 6.4.2 compiler reports a type-check timeout, split the long
 expression into sub-expressions.
 
 ### What each local mode checks
@@ -1034,8 +1035,8 @@ where the benchmarker resolves them.
 
 `.github/workflows/ci.yml` runs on every pull request and on every push to
 `main`. It runs repository hygiene checks on `ubuntu-latest`. It runs
-`swift build --build-tests` and `swift test` on a hosted `macos-26` runner. It
-treats first-party warnings as errors.
+`swift build --build-tests` and `swift test` on a hosted `xcode-27` runner
+with Xcode 27.2 (build 27B52). It treats first-party warnings as errors.
 
 CI is advisory. No status check is required. A red run blocks neither a merge
 nor a dispatch. `docs/ci-coverage.md` holds the detail.
